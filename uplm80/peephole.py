@@ -252,6 +252,21 @@ class PeepholeOptimizer:
                 pattern=[("CMA", ""), ("CMA", "")],
                 replacement=[],
             ),
+            # POP H; PUSH H; LXI H,x -> LXI H,x
+            # The POP/PUSH just peeks at TOS (leaves stack unchanged), then HL is overwritten
+            PeepholePattern(
+                name="pop_push_lxi",
+                pattern=[("POP", "H"), ("PUSH", "H"), ("LXI", None)],
+                replacement=None,  # Handled specially - keep only LXI
+                condition=lambda ops: ops[2][1].startswith("H,"),
+            ),
+            # PUSH PSW; STA addr; POP PSW -> STA addr
+            # Saving/restoring A around a store of A is pointless
+            PeepholePattern(
+                name="push_sta_pop",
+                pattern=[("PUSH", "PSW"), ("STA", None), ("POP", "PSW")],
+                replacement=None,  # Keep only STA
+            ),
             # RAL; RAR -> (effectively nothing, but changes flags)
             # Skip - affects flags
 
@@ -433,6 +448,66 @@ class PeepholeOptimizer:
                 pattern=[("SHLD", None), ("LHLD", None)],
                 replacement=None,  # Keep first only
                 condition=lambda ops: ops[0][1] == ops[1][1],
+            ),
+
+            # SHLD x; CALL y; LHLD x -> PUSH H; CALL y; POP H
+            # (Save/restore HL around a call using stack instead of memory)
+            PeepholePattern(
+                name="shld_call_lhld_same",
+                pattern=[("SHLD", None), ("CALL", None), ("LHLD", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+
+            # SHLD x; CALL y; LHLD x; JMP z -> PUSH H; CALL y; POP H; JMP z
+            # (Same pattern but with tail optimization)
+            PeepholePattern(
+                name="shld_call_lhld_jmp_same",
+                pattern=[("SHLD", None), ("CALL", None), ("LHLD", None), ("JMP", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+
+            # SHLD x; MVI r,n; LHLD x -> MVI r,n (MVI doesn't touch HL)
+            PeepholePattern(
+                name="shld_mvi_lhld_same",
+                pattern=[("SHLD", None), ("MVI", None), ("LHLD", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+
+            # SHLD x; MVI r,n; LHLD x; XCHG -> MVI r,n; XCHG
+            PeepholePattern(
+                name="shld_mvi_lhld_xchg_same",
+                pattern=[("SHLD", None), ("MVI", None), ("LHLD", None), ("XCHG", "")],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+
+            # STA x; CALL y; LDA x -> PUSH PSW; CALL y; POP PSW
+            # (Save/restore A around a call using stack instead of memory)
+            PeepholePattern(
+                name="sta_call_lda_same",
+                pattern=[("STA", None), ("CALL", None), ("LDA", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+
+            # STA x; MVI r,n; LDA x -> MVI r,n (MVI doesn't touch A, when r != A)
+            PeepholePattern(
+                name="sta_mvi_lda_same",
+                pattern=[("STA", None), ("MVI", None), ("LDA", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1] and not ops[1][1].startswith("A,"),
+            ),
+
+            # PUSH H; LXI H,const; MOV C,L; POP H -> MVI C,const
+            # Loading a constant into C while preserving HL
+            PeepholePattern(
+                name="push_lxi_mov_cl_pop",
+                pattern=[("PUSH", "H"), ("LXI", None), ("MOV", "C,L"), ("POP", "H")],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[1][1].startswith("H,"),
             ),
 
             # MVI H,0; MVI L,x -> LXI H,x (smaller on Z80)
@@ -1429,6 +1504,191 @@ class PeepholeOptimizer:
                         i += 2
                         continue
 
+                # LD HL,(addr1); PUSH HL; LD HL,(addr2); EX DE,HL; POP HL
+                # -> LD DE,(addr2); LD HL,(addr1)
+                # Saves 3 bytes (10 -> 7) by using Z80's LD DE,(nn) instruction
+                if opcode == "LD" and operands.startswith("HL,(") and operands.endswith(")"):
+                    addr1 = operands[3:]  # Keep the (addr) part
+                    if i + 4 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        p2 = self._parse_z80_line(lines[i + 2].strip())
+                        p3 = self._parse_z80_line(lines[i + 3].strip())
+                        p4 = self._parse_z80_line(lines[i + 4].strip())
+                        if (p1 and p1[0] == "PUSH" and p1[1] == "HL" and
+                            p2 and p2[0] == "LD" and p2[1].startswith("HL,(") and
+                            p3 and p3[0] == "EX" and p3[1] == "DE,HL" and
+                            p4 and p4[0] == "POP" and p4[1] == "HL"):
+                            addr2 = p2[1][3:]  # Get (addr2)
+                            result.append(f"\tLD DE,{addr2}")
+                            result.append(f"\tLD HL,{addr1}")
+                            changed = True
+                            self.stats["z80_ld_de_nn"] = self.stats.get("z80_ld_de_nn", 0) + 1
+                            i += 5
+                            continue
+
+                # LD HL,const; PUSH HL; LD HL,(addr); LD E,(HL); LD D,0; POP HL
+                # -> LD HL,(addr); LD E,(HL); LD D,0; LD HL,const
+                # Defer loading constant until after memory access, saves PUSH/POP (2 bytes)
+                if opcode == "LD" and operands.startswith("HL,") and not operands.startswith("HL,("):
+                    const_val = operands[3:]  # Get the constant
+                    if i + 5 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        p2 = self._parse_z80_line(lines[i + 2].strip())
+                        p3 = self._parse_z80_line(lines[i + 3].strip())
+                        p4 = self._parse_z80_line(lines[i + 4].strip())
+                        p5 = self._parse_z80_line(lines[i + 5].strip())
+                        if (p1 and p1[0] == "PUSH" and p1[1] == "HL" and
+                            p2 and p2[0] == "LD" and p2[1].startswith("HL,(") and
+                            p3 and p3[0] == "LD" and p3[1] in ("E,(HL)", "E,M") and
+                            p4 and p4[0] == "LD" and p4[1] in ("D,0", "D,00H") and
+                            p5 and p5[0] == "POP" and p5[1] == "HL"):
+                            addr = p2[1][3:]  # Get (addr)
+                            result.append(f"\tLD HL,{addr}")
+                            result.append("\tLD E,(HL)")
+                            result.append("\tLD D,0")
+                            result.append(f"\tLD HL,{const_val}")
+                            changed = True
+                            self.stats["z80_defer_const_load"] = self.stats.get("z80_defer_const_load", 0) + 1
+                            i += 6
+                            continue
+
+                # LD HL,0; PUSH HL; LD A,L; LD (addr),A; POP HL
+                # -> XOR A; LD (addr),A; LD HL,0
+                # Using HL just to get 0 into A is wasteful. XOR A is 1 byte.
+                # Saves PUSH/POP (2 bytes) and LXI->XOR saves 2 more bytes
+                if opcode == "LD" and operands == "HL,0":
+                    if i + 4 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        p2 = self._parse_z80_line(lines[i + 2].strip())
+                        p3 = self._parse_z80_line(lines[i + 3].strip())
+                        p4 = self._parse_z80_line(lines[i + 4].strip())
+                        if (p1 and p1[0] == "PUSH" and p1[1] == "HL" and
+                            p2 and p2[0] == "LD" and p2[1] == "A,L" and
+                            p3 and p3[0] == "LD" and p3[1].startswith("(") and p3[1].endswith("),A") and
+                            p4 and p4[0] == "POP" and p4[1] == "HL"):
+                            addr = p3[1][:-2]  # Get (addr) part
+                            result.append("\tXOR A")
+                            result.append(f"\tLD {addr},A")
+                            result.append("\tLD HL,0")
+                            changed = True
+                            self.stats["z80_xor_a_store"] = self.stats.get("z80_xor_a_store", 0) + 1
+                            i += 5
+                            continue
+
+                # LD HL,0; LD A,L; LD (addr),A -> XOR A; LD (addr),A; LD HL,0
+                # Loading 0 via HL just to get it into A is wasteful
+                # XOR A is 1 byte vs LD A,L which is 1 byte, but we eliminate the dependency
+                # Keep LD HL,0 at end in case subsequent code needs it
+                if opcode == "LD" and operands == "HL,0":
+                    if i + 2 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        p2 = self._parse_z80_line(lines[i + 2].strip())
+                        if (p1 and p1[0] == "LD" and p1[1] == "A,L" and
+                            p2 and p2[0] == "LD" and p2[1].startswith("(") and p2[1].endswith("),A")):
+                            addr = p2[1][:-2]  # Get (addr) part
+                            result.append("\tXOR A")
+                            result.append(f"\tLD {addr},A")
+                            result.append("\tLD HL,0")
+                            changed = True
+                            self.stats["z80_xor_a_store_simple"] = self.stats.get("z80_xor_a_store_simple", 0) + 1
+                            i += 3
+                            continue
+
+                # POP HL; PUSH HL; LD HL,x -> LD HL,x
+                # POP/PUSH just peeks at TOS (no stack change), then HL is overwritten
+                if opcode == "POP" and operands == "HL" and i + 2 < len(lines):
+                    p1 = self._parse_z80_line(lines[i + 1].strip())
+                    p2 = self._parse_z80_line(lines[i + 2].strip())
+                    if (p1 and p1[0] == "PUSH" and p1[1] == "HL" and
+                        p2 and p2[0] == "LD" and p2[1].startswith("HL,")):
+                        result.append(lines[i + 2])  # Keep only LD HL,x
+                        changed = True
+                        self.stats["z80_pop_push_ld"] = self.stats.get("z80_pop_push_ld", 0) + 1
+                        i += 3
+                        continue
+
+                # PUSH HL; LD HL,(addr); EX DE,HL; POP HL -> LD DE,(addr)
+                # Z80 has direct LD DE,(addr) which 8080 doesn't have
+                if opcode == "PUSH" and operands == "HL" and i + 3 < len(lines):
+                    p1 = self._parse_z80_line(lines[i + 1].strip())
+                    p2 = self._parse_z80_line(lines[i + 2].strip())
+                    p3 = self._parse_z80_line(lines[i + 3].strip())
+                    if (p1 and p1[0] == "LD" and p1[1].startswith("HL,(") and p1[1].endswith(")") and
+                        p2 and p2[0] == "EX" and p2[1] == "DE,HL" and
+                        p3 and p3[0] == "POP" and p3[1] == "HL"):
+                        addr = p1[1][3:]  # Get (addr) including parens
+                        result.append(f"\tLD DE,{addr}")
+                        changed = True
+                        self.stats["z80_ld_de_addr"] = self.stats.get("z80_ld_de_addr", 0) + 1
+                        i += 4
+                        continue
+
+                # PUSH AF; LD (addr),A; POP AF -> LD (addr),A
+                # Saving/restoring A around a store of A is pointless
+                if opcode == "PUSH" and operands == "AF" and i + 2 < len(lines):
+                    p1 = self._parse_z80_line(lines[i + 1].strip())
+                    p2 = self._parse_z80_line(lines[i + 2].strip())
+                    if (p1 and p1[0] == "LD" and p1[1].startswith("(") and p1[1].endswith("),A") and
+                        p2 and p2[0] == "POP" and p2[1] == "AF"):
+                        result.append(lines[i + 1])  # Keep only LD (addr),A
+                        changed = True
+                        self.stats["z80_push_sta_pop"] = self.stats.get("z80_push_sta_pop", 0) + 1
+                        i += 3
+                        continue
+
+                # LD HL,const; LD r,L -> LD r,const (when const fits in byte)
+                # Loading constant via HL just to move low byte is wasteful
+                if opcode == "LD" and operands.startswith("HL,") and not operands.startswith("HL,("):
+                    const_val = operands[3:]
+                    if i + 1 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        if p1 and p1[0] == "LD" and p1[1].endswith(",L"):
+                            dest_reg = p1[1][:-2]  # Get destination register
+                            if dest_reg in ("A", "B", "C", "D", "E"):
+                                result.append(f"\tLD {dest_reg},{const_val}")
+                                changed = True
+                                self.stats["z80_ld_via_hl"] = self.stats.get("z80_ld_via_hl", 0) + 1
+                                i += 2
+                                continue
+
+                # PUSH HL; LD HL,const; <ops not using HL>; POP HL -> <ops not using HL>
+                # If HL is saved, loaded with constant, then restored without using it
+                if opcode == "PUSH" and operands == "HL" and i + 2 < len(lines):
+                    p1 = self._parse_z80_line(lines[i + 1].strip())
+                    # Check for LD HL,const (not memory load)
+                    if p1 and p1[0] == "LD" and p1[1].startswith("HL,") and not p1[1].startswith("HL,("):
+                        # Look for operations that don't use HL, followed by POP HL
+                        j = i + 2
+                        middle_ops = []
+                        hl_used = False
+                        while j < len(lines):
+                            pj = self._parse_z80_line(lines[j].strip())
+                            if not pj:
+                                middle_ops.append(lines[j])
+                                j += 1
+                                continue
+                            if pj[0] == "POP" and pj[1] == "HL":
+                                # Found the matching POP - can eliminate PUSH/LD/POP
+                                if not hl_used:
+                                    for op in middle_ops:
+                                        result.append(op)
+                                    changed = True
+                                    self.stats["z80_push_ld_pop_unused"] = self.stats.get("z80_push_ld_pop_unused", 0) + 1
+                                    i = j + 1
+                                break
+                            # Check if this op uses HL
+                            op_str = pj[1] if pj[1] else ""
+                            if "HL" in pj[0] or "HL" in op_str or "(HL)" in op_str or "H" in op_str.split(",")[0] or "L" in op_str.split(",")[0]:
+                                hl_used = True
+                                break
+                            middle_ops.append(lines[j])
+                            j += 1
+                            # Limit search depth
+                            if len(middle_ops) > 5:
+                                break
+                        if not hl_used and j < len(lines) and changed:
+                            continue
+
             result.append(lines[i])
             i += 1
 
@@ -1546,6 +1806,79 @@ class PeepholeOptimizer:
                     i += 1
                     continue
 
+            # Special case: ORA A; JZ label where label: XRA A; RET -> ORA A; RZ
+            # This handles the common IF condition THEN ... RETURN TRUE; RETURN FALSE pattern
+            # Also handles: ORA A; JNZ label where label: MVI A,1; RET -> ORA A; RNZ
+            if parsed and parsed[0] == "ORA" and parsed[1] == "A":
+                # Check if next instruction is JZ or JNZ
+                next_parsed = None
+                j = i + 1
+                while j < len(lines):
+                    next_line = lines[j].strip()
+                    if not next_line or next_line.startswith(";"):
+                        j += 1
+                        continue
+                    next_parsed = self._parse_line(lines[j])
+                    break
+
+                if next_parsed and next_parsed[0] in ("JZ", "JNZ"):
+                    is_jz = next_parsed[0] == "JZ"
+                    target = next_parsed[1]
+                    # Search for the target label and check pattern
+                    for k in range(j + 1, min(j + 100, len(lines))):
+                        line_k = lines[k].strip()
+                        if line_k.startswith(target + ":"):
+                            # Found the label, check next instructions
+                            m = k + 1
+                            while m < len(lines):
+                                line_m = lines[m].strip()
+                                if not line_m or line_m.startswith(";"):
+                                    m += 1
+                                    continue
+                                parsed_m = self._parse_line(lines[m])
+
+                                # For JZ: look for XRA A; RET (return 0)
+                                if is_jz and parsed_m and parsed_m[0] == "XRA" and parsed_m[1] == "A":
+                                    # Check for RET after XRA A
+                                    n = m + 1
+                                    while n < len(lines):
+                                        line_n = lines[n].strip()
+                                        if not line_n or line_n.startswith(";"):
+                                            n += 1
+                                            continue
+                                        parsed_n = self._parse_line(lines[n])
+                                        if parsed_n and parsed_n[0] == "RET" and parsed_n[1] == "":
+                                            # Pattern matched! Replace ORA A; JZ label with ORA A; RZ
+                                            result.append(lines[i])  # Keep ORA A
+                                            result.append("\tRZ")    # Replace JZ with RZ
+                                            self.stats["jz_xra_ret_to_rz"] = self.stats.get("jz_xra_ret_to_rz", 0) + 1
+                                            changed = True
+                                            i = j + 1  # Skip past JZ
+                                            break
+                                        break
+
+                                # For JNZ: look for MVI A,1; RET (return 1/TRUE)
+                                elif not is_jz and parsed_m and parsed_m[0] == "MVI" and parsed_m[1] == "A,1":
+                                    # Check for RET after MVI A,1
+                                    n = m + 1
+                                    while n < len(lines):
+                                        line_n = lines[n].strip()
+                                        if not line_n or line_n.startswith(";"):
+                                            n += 1
+                                            continue
+                                        parsed_n = self._parse_line(lines[n])
+                                        if parsed_n and parsed_n[0] == "RET" and parsed_n[1] == "":
+                                            # Pattern matched! Replace ORA A; JNZ label with ORA A; RNZ
+                                            result.append(lines[i])  # Keep ORA A
+                                            result.append("\tRNZ")   # Replace JNZ with RNZ
+                                            self.stats["jnz_mvi_ret_to_rnz"] = self.stats.get("jnz_mvi_ret_to_rnz", 0) + 1
+                                            changed = True
+                                            i = j + 1  # Skip past JNZ
+                                            break
+                                        break
+                                break
+                            break
+
             # Try to match patterns starting at current position
             matched = False
 
@@ -1615,6 +1948,13 @@ class PeepholeOptimizer:
                         # CALL x; RET -> JMP x
                         call_target = instructions[0][1]
                         result.append(f"\tJMP\t{call_target}")
+                    elif pattern.name == "pop_push_lxi":
+                        # POP H; PUSH H; LXI H,x -> LXI H,x
+                        # POP/PUSH peeks TOS (no stack change), then HL overwritten
+                        result.append(lines[instruction_lines[2]])  # Keep only LXI H,x
+                    elif pattern.name == "push_sta_pop":
+                        # PUSH PSW; STA addr; POP PSW -> STA addr
+                        result.append(lines[instruction_lines[1]])  # Keep only STA
                     elif pattern.name == "lxi_xchg_pop":
                         # LXI H,x; XCHG; POP H -> LXI D,x; POP H
                         operand = instructions[0][1][2:]  # Remove "H," prefix
@@ -1725,6 +2065,49 @@ class PeepholeOptimizer:
                         result.append(lines[instruction_lines[2]])  # MOV A,H
                         result.append(lines[instruction_lines[3]])  # SBB D
                         result.append(lines[instruction_lines[5]])  # JM/JP x
+
+                    elif pattern.name == "shld_call_lhld_same":
+                        # SHLD x; CALL y; LHLD x -> PUSH H; CALL y; POP H
+                        call_target = instructions[1][1]
+                        result.append("\tPUSH\tH")
+                        result.append(f"\tCALL\t{call_target}")
+                        result.append("\tPOP\tH")
+
+                    elif pattern.name == "shld_call_lhld_jmp_same":
+                        # SHLD x; CALL y; LHLD x; JMP z -> PUSH H; CALL y; POP H; JMP z
+                        call_target = instructions[1][1]
+                        jmp_target = instructions[3][1]
+                        result.append("\tPUSH\tH")
+                        result.append(f"\tCALL\t{call_target}")
+                        result.append("\tPOP\tH")
+                        result.append(f"\tJMP\t{jmp_target}")
+
+                    elif pattern.name == "sta_call_lda_same":
+                        # STA x; CALL y; LDA x -> PUSH PSW; CALL y; POP PSW
+                        call_target = instructions[1][1]
+                        result.append("\tPUSH\tPSW")
+                        result.append(f"\tCALL\t{call_target}")
+                        result.append("\tPOP\tPSW")
+
+                    elif pattern.name == "shld_mvi_lhld_same":
+                        # SHLD x; MVI r,n; LHLD x -> MVI r,n
+                        # MVI doesn't touch HL, so save/restore is unnecessary
+                        result.append(lines[instruction_lines[1]])  # MVI r,n
+
+                    elif pattern.name == "sta_mvi_lda_same":
+                        # STA x; MVI r,n; LDA x -> MVI r,n
+                        # MVI doesn't touch A (when r != A), so save/restore is unnecessary
+                        result.append(lines[instruction_lines[1]])  # MVI r,n
+
+                    elif pattern.name == "push_lxi_mov_cl_pop":
+                        # PUSH H; LXI H,const; MOV C,L; POP H -> MVI C,const
+                        const = instructions[1][1][2:]  # Remove "H," prefix
+                        result.append(f"\tMVI\tC,{const}")
+
+                    elif pattern.name == "shld_mvi_lhld_xchg_same":
+                        # SHLD x; MVI r,n; LHLD x; XCHG -> MVI r,n; XCHG
+                        result.append(lines[instruction_lines[1]])  # MVI r,n
+                        result.append("\tXCHG")
 
                     i = j
                     break

@@ -37,8 +37,10 @@ class Symbol:
     is_external: bool = False
     # For procedures
     params: list[str] = field(default_factory=list)
+    param_types: list[DataType] = field(default_factory=list)  # Types of parameters
     return_type: DataType | None = None
     is_reentrant: bool = False
+    uses_reg_param: bool = False  # Single param passed in A (BYTE) or HL (ADDRESS)
     interrupt_num: int | None = None
     # For literals (macros)
     literal_value: str | None = None
