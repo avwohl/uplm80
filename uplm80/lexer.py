@@ -129,7 +129,8 @@ class Lexer:
                 break
 
         lexeme = self.source[start_pos : self.pos]
-        upper_lexeme = lexeme.upper()
+        # Remove $ break characters (PL/M allows $ for readability in identifiers)
+        upper_lexeme = lexeme.upper().replace("$", "")
 
         # Check if it's a reserved word
         if upper_lexeme in RESERVED_WORDS:

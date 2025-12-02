@@ -47,6 +47,8 @@ class Symbol:
     size: int = 0  # Size in bytes
     # Scope level where defined
     scope_level: int = 0
+    # Mangled assembly name (for register conflicts)
+    asm_name: str | None = None
 
 
 @dataclass

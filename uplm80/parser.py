@@ -63,6 +63,24 @@ class Parser:
         # Macro table for LITERALLY substitutions
         self.macros: dict[str, str] = {}
 
+    @staticmethod
+    def _parse_plm_number(s: str) -> int:
+        """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
+        # Remove $ digit separators and convert to uppercase
+        s = s.upper().replace("$", "")
+        # Handle suffixes for different bases
+        if s.endswith("H"):
+            return int(s[:-1], 16)
+        elif s.endswith("B"):
+            return int(s[:-1], 2)
+        elif s.endswith("O") or s.endswith("Q"):
+            return int(s[:-1], 8)
+        elif s.endswith("D"):
+            return int(s[:-1], 10)
+        else:
+            # Default: try as Python literal (handles 0x, 0b, 0o prefixes)
+            return int(s, 0)
+
     def _error(self, message: str) -> ParserError:
         """Create a parser error at current position."""
         return ParserError(
@@ -121,9 +139,26 @@ class Parser:
         return False
 
     def _is_dcl_abbreviation(self) -> bool:
-        """Check if current identifier is DCL (abbreviation for DECLARE)."""
-        if self._check(TokenType.IDENTIFIER) and self.current.value == "DCL":
-            return True
+        """Check if current identifier is DCL (abbreviation for DECLARE) or a LITERALLY macro expanding to 'DECLARE'."""
+        if self._check(TokenType.IDENTIFIER):
+            name = self.current.value
+            if name == "DCL":
+                return True
+            # Also check if it's a LITERALLY macro that expands to 'DECLARE'
+            if name in self.macros:
+                expansion = self.macros[name].strip().strip("'").upper()
+                if expansion == "DECLARE":
+                    return True
+        return False
+
+    def _is_proc_abbreviation(self) -> bool:
+        """Check if current identifier is a LITERALLY macro expanding to 'PROCEDURE'."""
+        if self._check(TokenType.IDENTIFIER):
+            name = self.current.value
+            if name in self.macros:
+                expansion = self.macros[name].strip().strip("'").upper()
+                if expansion == "PROCEDURE":
+                    return True
         return False
 
     def _is_lit_abbreviation(self) -> bool:
@@ -181,6 +216,39 @@ class Parser:
         # Identifier (variable, procedure call, or builtin)
         if self._match(TokenType.IDENTIFIER):
             name = token.value
+
+            # Check if this identifier is a LITERALLY macro that needs expansion
+            if name in self.macros:
+                macro_value = self.macros[name]
+                # Check if the macro value is a simple numeric literal or complex expression
+                try:
+                    # Try parsing as a PL/M number (handles B/H/O/Q/D suffixes and $ separators)
+                    val = self._parse_plm_number(macro_value)
+                    # It's a simple number - just create number literal
+                    return NumberLiteral(val, span=self._span_from(token))
+                except ValueError:
+                    # Not a simple number - try parsing as expression
+                    # Re-lex and re-parse the macro value
+                    lexer = Lexer(macro_value, f"<macro:{name}>")
+                    macro_tokens = lexer.tokenize()
+                    # Create a sub-parser with the same macro table
+                    sub_parser = Parser(macro_tokens, f"<macro:{name}>")
+                    sub_parser.macros = self.macros.copy()
+                    try:
+                        expanded_expr = sub_parser._parse_expression()
+                        # If it's just an identifier, use it as the base and continue
+                        # to parse subscripts/calls with the main parser
+                        if isinstance(expanded_expr, Identifier):
+                            # Use the expanded identifier name
+                            name = expanded_expr.name
+                            # Fall through to normal processing below
+                        else:
+                            # Complex expression - return it directly
+                            return expanded_expr
+                    except ParserError:
+                        # If parsing fails, fall through to normal identifier handling
+                        pass
+
             expr: Expr = Identifier(name, span=self._span_from(token))
 
             # Check for subscript or member access or call
@@ -193,12 +261,10 @@ class Parser:
                         while self._match(TokenType.COMMA):
                             args.append(self._parse_argument_or_embedded_assign())
                     self._expect(TokenType.RPAREN, "Expected ')' after arguments")
-                    # Determine if subscript or call based on context
-                    # For now, treat single arg as subscript, multiple as call
-                    if len(args) == 1 and isinstance(expr, Identifier):
-                        expr = SubscriptExpr(expr, args[0], span=self._span_from(token))
-                    else:
-                        expr = CallExpr(expr, args, span=self._span_from(token))
+                    # All parenthesized expressions become CallExpr
+                    # The codegen will handle array subscripts vs procedure calls
+                    # by looking up the symbol type
+                    expr = CallExpr(expr, args, span=self._span_from(token))
                 elif self._match(TokenType.DOT):
                     # Member access
                     member_tok = self._expect(TokenType.IDENTIFIER, "Expected member name after '.'")
@@ -365,7 +431,16 @@ class Parser:
         # Check for label definition (IDENTIFIER:)
         if self._check(TokenType.IDENTIFIER) and self._peek(1).type == TokenType.COLON:
             # Check if this is a procedure definition
-            if self._peek(2).type == TokenType.PROCEDURE:
+            # Either PROCEDURE keyword or a LITERALLY macro expanding to 'PROCEDURE' (e.g., PROC)
+            peek2 = self._peek(2)
+            is_proc_def = peek2.type == TokenType.PROCEDURE
+            if not is_proc_def and peek2.type == TokenType.IDENTIFIER:
+                macro_name = peek2.value
+                if macro_name in self.macros:
+                    expansion = self.macros[macro_name].strip().strip("'").upper()
+                    if expansion == "PROCEDURE":
+                        is_proc_def = True
+            if is_proc_def:
                 return self._parse_procedure_as_stmt()
             label_tok = self._advance()
             self._advance()  # consume colon
@@ -695,7 +770,8 @@ class Parser:
                     dim_name = self._advance().value
                     if dim_name in self.macros:
                         try:
-                            dimension = int(self.macros[dim_name], 0)
+                            # Use PL/M number parser to handle H/B/O/Q/D suffixes
+                            dimension = self._parse_plm_number(self.macros[dim_name])
                         except ValueError:
                             dimension = -2
                     else:
@@ -778,7 +854,8 @@ class Parser:
                 dim_name = self._advance().value
                 if dim_name in self.macros:
                     try:
-                        dimension = int(self.macros[dim_name], 0)
+                        # Use PL/M number parser to handle H/B/O/Q/D suffixes
+                        dimension = self._parse_plm_number(self.macros[dim_name])
                     except ValueError:
                         dimension = -2  # Mark as macro reference
                 else:
@@ -945,7 +1022,12 @@ class Parser:
         name_tok = self._expect(TokenType.IDENTIFIER, "Expected procedure name")
         name = name_tok.value
         self._expect(TokenType.COLON, "Expected ':' after procedure name")
-        self._expect(TokenType.PROCEDURE, "Expected PROCEDURE")
+        # Accept PROCEDURE keyword or identifier that expands to 'PROCEDURE' via LITERALLY
+        if not self._match(TokenType.PROCEDURE):
+            if self._is_proc_abbreviation():
+                self._advance()  # Consume the PROC macro identifier
+            else:
+                raise ParseError(f"Expected PROCEDURE", self._current_location())
 
         # Parse parameters
         params: list[str] = []

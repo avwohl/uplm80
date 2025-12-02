@@ -56,6 +56,97 @@ from .ast_nodes import (
 )
 
 
+def _get_expr_vars(expr: Expr) -> set[str]:
+    """Get all variable names referenced in an expression."""
+    result: set[str] = set()
+
+    if isinstance(expr, Identifier):
+        result.add(expr.name)
+    elif isinstance(expr, BinaryExpr):
+        result.update(_get_expr_vars(expr.left))
+        result.update(_get_expr_vars(expr.right))
+    elif isinstance(expr, UnaryExpr):
+        result.update(_get_expr_vars(expr.operand))
+    elif isinstance(expr, SubscriptExpr):
+        result.update(_get_expr_vars(expr.base))
+        result.update(_get_expr_vars(expr.index))
+    elif isinstance(expr, MemberExpr):
+        result.update(_get_expr_vars(expr.base))
+    elif isinstance(expr, CallExpr):
+        for arg in expr.args:
+            result.update(_get_expr_vars(arg))
+    elif isinstance(expr, LocationExpr):
+        result.update(_get_expr_vars(expr.operand))
+    elif isinstance(expr, EmbeddedAssignExpr):
+        result.update(_get_expr_vars(expr.target))
+        result.update(_get_expr_vars(expr.value))
+
+    return result
+
+
+def _expr_key(expr: Expr) -> str | None:
+    """Generate a hashable key for an expression for CSE.
+
+    Returns None for expressions that shouldn't be cached (with side effects).
+    """
+    if isinstance(expr, NumberLiteral):
+        return f"NUM:{expr.value}"
+    if isinstance(expr, StringLiteral):
+        return f"STR:{expr.value}"
+    if isinstance(expr, Identifier):
+        return f"ID:{expr.name}"
+    if isinstance(expr, BinaryExpr):
+        left_key = _expr_key(expr.left)
+        right_key = _expr_key(expr.right)
+        if left_key is None or right_key is None:
+            return None
+        return f"BIN:{expr.op.name}:{left_key}:{right_key}"
+    if isinstance(expr, UnaryExpr):
+        operand_key = _expr_key(expr.operand)
+        if operand_key is None:
+            return None
+        return f"UN:{expr.op.name}:{operand_key}"
+    if isinstance(expr, SubscriptExpr):
+        base_key = _expr_key(expr.base)
+        idx_key = _expr_key(expr.index)
+        if base_key is None or idx_key is None:
+            return None
+        return f"SUB:{base_key}:{idx_key}"
+    if isinstance(expr, MemberExpr):
+        base_key = _expr_key(expr.base)
+        if base_key is None:
+            return None
+        return f"MEM:{base_key}:{expr.member}"
+    if isinstance(expr, CallExpr):
+        # Only pure built-in functions can be CSE'd
+        if isinstance(expr.callee, Identifier):
+            name = expr.callee.name
+            # These built-ins are pure (no side effects)
+            pure_builtins = {"LOW", "HIGH", "DOUBLE", "SHL", "SHR", "ROL", "ROR",
+                           "LENGTH", "LAST", "SIZE"}
+            if name in pure_builtins:
+                arg_keys = [_expr_key(a) for a in expr.args]
+                if all(k is not None for k in arg_keys):
+                    return f"CALL:{name}:{':'.join(arg_keys)}"
+        return None  # Function calls with side effects
+    if isinstance(expr, LocationExpr):
+        operand_key = _expr_key(expr.operand)
+        if operand_key is None:
+            return None
+        return f"LOC:{operand_key}"
+    return None
+
+
+from enum import Enum
+
+
+class OptimizeFor(Enum):
+    """Optimization target preference."""
+    SPEED = "speed"  # Prefer faster code (may increase size)
+    SIZE = "size"    # Prefer smaller code (may be slower)
+    BALANCED = "balanced"  # Balance between size and speed
+
+
 @dataclass
 class OptimizationStats:
     """Statistics about optimizations performed."""
@@ -65,6 +156,13 @@ class OptimizationStats:
     dead_code_eliminated: int = 0
     algebraic_simplifications: int = 0
     cse_eliminations: int = 0
+    loop_invariants_moved: int = 0
+    boolean_simplifications: int = 0
+    copies_propagated: int = 0
+    dead_stores_eliminated: int = 0
+    loops_unrolled: int = 0
+    procedures_inlined: int = 0
+    tail_calls_optimized: int = 0
 
 
 class ASTOptimizer:
@@ -78,13 +176,43 @@ class ASTOptimizer:
     - 3: Aggressive (+ CSE, loop optimizations)
     """
 
-    def __init__(self, opt_level: int = 2) -> None:
+    def __init__(self, opt_level: int = 2, optimize_for: OptimizeFor = OptimizeFor.BALANCED) -> None:
         self.opt_level = opt_level
+        self.optimize_for = optimize_for
         self.stats = OptimizationStats()
         # Known constant values for propagation
         self.constants: dict[str, int] = {}
         # Track which variables are modified in current scope
         self.modified_vars: set[str] = set()
+        # CSE: map from expression key to (temp_var_name, expr) for level 3
+        self.cse_cache: dict[str, tuple[str, Expr]] = {}
+        self.cse_counter: int = 0
+        # Track variables used in expressions for invalidation
+        self.expr_vars: dict[str, set[str]] = {}  # expr_key -> set of var names
+        # Copy propagation: x = y means copies[x] = y
+        self.copies: dict[str, str] = {}
+        # Procedure inlining: track small procedures that can be inlined
+        self.inlinable_procs: dict[str, ProcDecl] = {}
+
+    def _parse_plm_number(self, s: str) -> int | None:
+        """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
+        try:
+            # Remove $ digit separators and convert to uppercase
+            s = s.upper().replace("$", "").strip()
+            if not s:
+                return None
+            if s.endswith("H"):
+                return int(s[:-1], 16)
+            elif s.endswith("B"):
+                return int(s[:-1], 2)
+            elif s.endswith("O") or s.endswith("Q"):
+                return int(s[:-1], 8)
+            elif s.endswith("D"):
+                return int(s[:-1], 10)
+            else:
+                return int(s, 0)  # Let Python auto-detect base
+        except (ValueError, TypeError):
+            return None
 
     def optimize(self, module: Module) -> Module:
         """Optimize an entire module."""
@@ -145,11 +273,9 @@ class ASTOptimizer:
         elif isinstance(decl, LiterallyDecl):
             # Track literal for potential constant propagation
             # Try to evaluate if it's a simple number
-            try:
-                val = int(decl.value, 0)
+            val = self._parse_plm_number(decl.value)
+            if val is not None:
                 self.constants[decl.name] = val
-            except (ValueError, TypeError):
-                pass
             return decl
 
         elif isinstance(decl, ProcDecl):
@@ -160,7 +286,11 @@ class ASTOptimizer:
             new_stmts = [
                 s for s in (self._optimize_stmt(s) for s in decl.stmts) if s
             ]
-            return ProcDecl(
+            # Eliminate unreachable code after RETURN/GOTO/HALT
+            new_stmts = self._eliminate_unreachable(new_stmts)
+            # Eliminate dead stores
+            new_stmts = self._eliminate_dead_stores(new_stmts)
+            optimized_proc = ProcDecl(
                 name=decl.name,
                 params=decl.params,
                 return_type=decl.return_type,
@@ -172,8 +302,371 @@ class ASTOptimizer:
                 stmts=new_stmts,
                 span=decl.span,
             )
+            # Level 3: Track inlinable procedures
+            if self.opt_level >= 3 and self._is_inlinable(optimized_proc):
+                self.inlinable_procs[decl.name] = optimized_proc
+            return optimized_proc
 
         return decl
+
+    def _is_terminator(self, stmt: Stmt) -> bool:
+        """Check if a statement is a control flow terminator (no fall-through)."""
+        if isinstance(stmt, ReturnStmt):
+            return True
+        if isinstance(stmt, GotoStmt):
+            return True
+        if isinstance(stmt, HaltStmt):
+            return True
+        # A labeled statement is a terminator if its inner statement is
+        if isinstance(stmt, LabeledStmt):
+            return self._is_terminator(stmt.stmt)
+        return False
+
+    def _eliminate_unreachable(self, stmts: list[Stmt]) -> list[Stmt]:
+        """Remove statements after terminators (RETURN, GOTO, HALT)."""
+        if self.opt_level < 2:
+            return stmts
+
+        result: list[Stmt] = []
+        for stmt in stmts:
+            result.append(stmt)
+            if self._is_terminator(stmt):
+                # Count eliminated statements
+                remaining = len(stmts) - len(result)
+                if remaining > 0:
+                    self.stats.dead_code_eliminated += remaining
+                break
+        return result
+
+    def _eliminate_dead_stores(self, stmts: list[Stmt]) -> list[Stmt]:
+        """Remove assignments that are immediately overwritten without being read.
+
+        This is a simple local analysis - a variable assigned and then reassigned
+        in consecutive statements without being read is a dead store.
+        """
+        if self.opt_level < 3:
+            return stmts
+
+        result: list[Stmt] = []
+        i = 0
+        while i < len(stmts):
+            stmt = stmts[i]
+
+            # Check if this is a simple assignment
+            if isinstance(stmt, AssignStmt) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                if isinstance(target, Identifier):
+                    # Look ahead - is the next statement an assignment to the same var?
+                    if i + 1 < len(stmts):
+                        next_stmt = stmts[i + 1]
+                        if (isinstance(next_stmt, AssignStmt) and
+                                len(next_stmt.targets) == 1 and
+                                isinstance(next_stmt.targets[0], Identifier) and
+                                next_stmt.targets[0].name == target.name):
+                            # Check if target is NOT used in the value of next assignment
+                            if target.name not in _get_expr_vars(next_stmt.value):
+                                # This is a dead store - skip it
+                                self.stats.dead_stores_eliminated += 1
+                                i += 1
+                                continue
+
+            result.append(stmt)
+            i += 1
+
+        return result
+
+    def _get_modified_vars_in_stmts(self, stmts: list[Stmt]) -> set[str]:
+        """Get all variables modified within a list of statements."""
+        modified: set[str] = set()
+
+        def visit_stmt(s: Stmt) -> None:
+            if isinstance(s, AssignStmt):
+                for target in s.targets:
+                    if isinstance(target, Identifier):
+                        modified.add(target.name)
+                    elif isinstance(target, SubscriptExpr):
+                        if isinstance(target.base, Identifier):
+                            modified.add(target.base.name)
+                    # Check for embedded assignments in value
+                visit_expr(s.value)
+            elif isinstance(s, DoBlock):
+                for sub in s.stmts:
+                    visit_stmt(sub)
+            elif isinstance(s, DoWhileBlock):
+                for sub in s.stmts:
+                    visit_stmt(sub)
+            elif isinstance(s, DoIterBlock):
+                if isinstance(s.index_var, Identifier):
+                    modified.add(s.index_var.name)
+                for sub in s.stmts:
+                    visit_stmt(sub)
+            elif isinstance(s, DoCaseBlock):
+                for case in s.cases:
+                    for sub in case:
+                        visit_stmt(sub)
+            elif isinstance(s, IfStmt):
+                visit_stmt(s.then_stmt)
+                if s.else_stmt:
+                    visit_stmt(s.else_stmt)
+            elif isinstance(s, LabeledStmt):
+                visit_stmt(s.stmt)
+            elif isinstance(s, CallStmt):
+                # Calls may modify globals - be conservative
+                for arg in s.args:
+                    visit_expr(arg)
+
+        def visit_expr(e: Expr | None) -> None:
+            if e is None:
+                return
+            if isinstance(e, EmbeddedAssignExpr):
+                if isinstance(e.target, Identifier):
+                    modified.add(e.target.name)
+                visit_expr(e.value)
+            elif isinstance(e, BinaryExpr):
+                visit_expr(e.left)
+                visit_expr(e.right)
+            elif isinstance(e, UnaryExpr):
+                visit_expr(e.operand)
+            elif isinstance(e, CallExpr):
+                for arg in e.args:
+                    visit_expr(arg)
+
+        for s in stmts:
+            visit_stmt(s)
+
+        return modified
+
+    def _cache_invariant_exprs(self, expr: Expr, modified_vars: set[str]) -> None:
+        """Cache loop-invariant subexpressions for CSE to find later."""
+        if self._is_loop_invariant(expr, modified_vars):
+            key = _expr_key(expr)
+            if key is not None and key not in self.cse_cache:
+                self.cse_cache[key] = (f"??INV{self.cse_counter}", expr)
+                self.expr_vars[key] = _get_expr_vars(expr)
+                self.cse_counter += 1
+                self.stats.loop_invariants_moved += 1
+
+        # Recursively check subexpressions
+        if isinstance(expr, BinaryExpr):
+            self._cache_invariant_exprs(expr.left, modified_vars)
+            self._cache_invariant_exprs(expr.right, modified_vars)
+        elif isinstance(expr, UnaryExpr):
+            self._cache_invariant_exprs(expr.operand, modified_vars)
+        elif isinstance(expr, CallExpr):
+            for arg in expr.args:
+                self._cache_invariant_exprs(arg, modified_vars)
+
+    def _is_loop_invariant(self, expr: Expr, modified_vars: set[str]) -> bool:
+        """Check if an expression is invariant (not modified) within a loop."""
+        if isinstance(expr, NumberLiteral):
+            return True
+        if isinstance(expr, StringLiteral):
+            return True
+        if isinstance(expr, Identifier):
+            return expr.name not in modified_vars
+        if isinstance(expr, BinaryExpr):
+            return (self._is_loop_invariant(expr.left, modified_vars) and
+                    self._is_loop_invariant(expr.right, modified_vars))
+        if isinstance(expr, UnaryExpr):
+            return self._is_loop_invariant(expr.operand, modified_vars)
+        if isinstance(expr, SubscriptExpr):
+            # Array access is tricky - if base is modified, we can't assume invariance
+            if isinstance(expr.base, Identifier) and expr.base.name in modified_vars:
+                return False
+            return (self._is_loop_invariant(expr.base, modified_vars) and
+                    self._is_loop_invariant(expr.index, modified_vars))
+        if isinstance(expr, CallExpr):
+            # Only pure builtins can be loop-invariant
+            if isinstance(expr.callee, Identifier):
+                pure_builtins = {"LOW", "HIGH", "DOUBLE", "SHL", "SHR", "ROL", "ROR",
+                               "LENGTH", "LAST", "SIZE"}
+                if expr.callee.name in pure_builtins:
+                    return all(self._is_loop_invariant(a, modified_vars) for a in expr.args)
+            return False
+        if isinstance(expr, LocationExpr):
+            return self._is_loop_invariant(expr.operand, modified_vars)
+        return False
+
+    def _invalidate_cse_for_var(self, var_name: str) -> None:
+        """Invalidate CSE cache entries that depend on a modified variable."""
+        if self.opt_level < 3:
+            return
+        # Find and remove all cached expressions that use this variable
+        to_remove = []
+        for key, vars_used in self.expr_vars.items():
+            if var_name in vars_used:
+                to_remove.append(key)
+        for key in to_remove:
+            self.cse_cache.pop(key, None)
+            self.expr_vars.pop(key, None)
+
+    def _invalidate_copies_for_var(self, var_name: str) -> None:
+        """Invalidate copy propagation entries when a variable is modified."""
+        # Remove if var_name is the target of a copy
+        self.copies.pop(var_name, None)
+        # Remove any copies where var_name is the source
+        to_remove = [k for k, v in self.copies.items() if v == var_name]
+        for k in to_remove:
+            del self.copies[k]
+
+    def _count_stmts(self, stmts: list[Stmt]) -> int:
+        """Count the number of statements (recursively)."""
+        count = 0
+        for stmt in stmts:
+            count += 1
+            if isinstance(stmt, DoBlock):
+                count += self._count_stmts(stmt.stmts)
+            elif isinstance(stmt, DoWhileBlock):
+                count += self._count_stmts(stmt.stmts)
+            elif isinstance(stmt, DoIterBlock):
+                count += self._count_stmts(stmt.stmts)
+            elif isinstance(stmt, DoCaseBlock):
+                for case in stmt.cases:
+                    count += self._count_stmts(case)
+            elif isinstance(stmt, IfStmt):
+                if isinstance(stmt.then_stmt, (DoBlock, DoWhileBlock)):
+                    count += self._count_stmts([stmt.then_stmt])
+                if stmt.else_stmt and isinstance(stmt.else_stmt, (DoBlock, DoWhileBlock)):
+                    count += self._count_stmts([stmt.else_stmt])
+        return count
+
+    def _is_inlinable(self, proc: ProcDecl) -> bool:
+        """Check if a procedure is suitable for inlining."""
+        # Don't inline external, reentrant, or interrupt procedures
+        if proc.is_external or proc.is_reentrant or proc.interrupt_num is not None:
+            return False
+        # Don't inline procedures with nested procedures
+        for decl in proc.decls:
+            if isinstance(decl, ProcDecl):
+                return False
+        # Don't inline procedures with too many statements
+        stmt_count = self._count_stmts(proc.stmts)
+        if stmt_count > 5:
+            return False
+        # Don't inline procedures with too many parameters
+        if len(proc.params) > 3:
+            return False
+        # Don't inline procedures that have local declarations (complex scoping)
+        if proc.decls:
+            return False
+        return True
+
+    def _inline_procedure(self, proc: ProcDecl, args: list[Expr], span) -> Stmt | None:
+        """Inline a procedure call, substituting parameters with arguments."""
+        # Build parameter substitution map
+        param_map: dict[str, Expr] = {}
+        for param, arg in zip(proc.params, args):
+            param_map[param.name] = arg
+
+        # Deep copy and substitute parameters in procedure body
+        inlined_stmts: list[Stmt] = []
+        for stmt in proc.stmts:
+            # Skip RETURN statements for void procedures (they just return)
+            if isinstance(stmt, ReturnStmt) and stmt.value is None:
+                continue
+            # Substitute and copy
+            subst_stmt = self._substitute_params(deepcopy(stmt), param_map)
+            if subst_stmt is not None:
+                inlined_stmts.append(subst_stmt)
+
+        if not inlined_stmts:
+            return NullStmt(span=span)
+        if len(inlined_stmts) == 1:
+            return inlined_stmts[0]
+        return DoBlock([], inlined_stmts, None, span=span)
+
+    def _substitute_params(self, node: ASTNode, param_map: dict[str, Expr]) -> ASTNode | None:
+        """Substitute parameter references with argument expressions."""
+        if isinstance(node, Identifier):
+            if node.name in param_map:
+                return deepcopy(param_map[node.name])
+            return node
+
+        if isinstance(node, BinaryExpr):
+            node.left = self._substitute_params(node.left, param_map)
+            node.right = self._substitute_params(node.right, param_map)
+            return node
+
+        if isinstance(node, UnaryExpr):
+            node.operand = self._substitute_params(node.operand, param_map)
+            return node
+
+        if isinstance(node, CallExpr):
+            node.callee = self._substitute_params(node.callee, param_map)
+            node.args = [self._substitute_params(a, param_map) for a in node.args]
+            return node
+
+        if isinstance(node, SubscriptExpr):
+            node.base = self._substitute_params(node.base, param_map)
+            node.index = self._substitute_params(node.index, param_map)
+            return node
+
+        if isinstance(node, AssignStmt):
+            node.targets = [self._substitute_params(t, param_map) for t in node.targets]
+            node.value = self._substitute_params(node.value, param_map)
+            return node
+
+        if isinstance(node, CallStmt):
+            node.callee = self._substitute_params(node.callee, param_map)
+            node.args = [self._substitute_params(a, param_map) for a in node.args]
+            return node
+
+        if isinstance(node, ReturnStmt):
+            if node.value:
+                node.value = self._substitute_params(node.value, param_map)
+            return node
+
+        if isinstance(node, IfStmt):
+            node.condition = self._substitute_params(node.condition, param_map)
+            node.then_stmt = self._substitute_params(node.then_stmt, param_map)
+            if node.else_stmt:
+                node.else_stmt = self._substitute_params(node.else_stmt, param_map)
+            return node
+
+        if isinstance(node, DoBlock):
+            node.stmts = [self._substitute_params(s, param_map) for s in node.stmts]
+            return node
+
+        if isinstance(node, DoWhileBlock):
+            node.condition = self._substitute_params(node.condition, param_map)
+            node.stmts = [self._substitute_params(s, param_map) for s in node.stmts]
+            return node
+
+        if isinstance(node, DoIterBlock):
+            node.index_var = self._substitute_params(node.index_var, param_map)
+            node.start = self._substitute_params(node.start, param_map)
+            node.bound = self._substitute_params(node.bound, param_map)
+            if node.step:
+                node.step = self._substitute_params(node.step, param_map)
+            node.stmts = [self._substitute_params(s, param_map) for s in node.stmts]
+            return node
+
+        # For other node types, return as-is
+        return node
+
+    def _normalize_commutative(self, op: BinaryOp, left: Expr, right: Expr) -> tuple[Expr, Expr]:
+        """Normalize operand order for commutative operations to improve CSE."""
+        # Only for commutative operations
+        if op not in (BinaryOp.ADD, BinaryOp.MUL, BinaryOp.AND, BinaryOp.OR,
+                      BinaryOp.XOR, BinaryOp.EQ, BinaryOp.NE):
+            return left, right
+
+        # Get sort keys for expressions
+        def sort_key(e: Expr) -> tuple[int, str]:
+            if isinstance(e, NumberLiteral):
+                return (2, str(e.value))  # Constants last
+            elif isinstance(e, Identifier):
+                return (0, e.name)  # Identifiers first, sorted by name
+            else:
+                return (1, _expr_key(e) or "")  # Complex expressions in middle
+
+        left_key = sort_key(left)
+        right_key = sort_key(right)
+
+        # Swap if right should come before left
+        if right_key < left_key:
+            return right, left
+        return left, right
 
     def _optimize_stmt(self, stmt: Stmt) -> Stmt | None:
         """Optimize a statement. Returns None to remove it."""
@@ -181,21 +674,48 @@ class ASTOptimizer:
             opt_value = self._optimize_expr(stmt.value)
             opt_targets = [self._optimize_expr(t) for t in stmt.targets]
 
-            # Track modified variables
+            # Track modified variables and invalidate caches
             for target in opt_targets:
                 if isinstance(target, Identifier):
                     self.modified_vars.add(target.name)
                     # Remove from constants if modified
                     self.constants.pop(target.name, None)
+                    # Invalidate CSE entries using this variable
+                    self._invalidate_cse_for_var(target.name)
+                    # Invalidate copy propagation entries
+                    self._invalidate_copies_for_var(target.name)
 
-            # Dead store elimination: assignment to unused variable
-            # (Would need full dataflow analysis - skip for now)
+            # Level 3: Track copies and constants
+            if self.opt_level >= 3 and len(opt_targets) == 1:
+                target = opt_targets[0]
+                if isinstance(target, Identifier):
+                    if isinstance(opt_value, NumberLiteral):
+                        # Constant propagation
+                        self.constants[target.name] = opt_value.value
+                    elif isinstance(opt_value, Identifier):
+                        # Copy propagation: x = y
+                        self.copies[target.name] = opt_value.name
 
             return AssignStmt(opt_targets, opt_value, span=stmt.span)
 
         elif isinstance(stmt, CallStmt):
             opt_callee = self._optimize_expr(stmt.callee)
             opt_args = [self._optimize_expr(a) for a in stmt.args]
+
+            # Level 3: Inline small procedures
+            # Skip if optimizing for size (inlining increases code size)
+            if (self.opt_level >= 3
+                    and self.optimize_for != OptimizeFor.SIZE
+                    and isinstance(opt_callee, Identifier)
+                    and opt_callee.name in self.inlinable_procs):
+                proc = self.inlinable_procs[opt_callee.name]
+                # Only inline if argument count matches parameter count
+                if len(opt_args) == len(proc.params):
+                    inlined = self._inline_procedure(proc, opt_args, stmt.span)
+                    if inlined is not None:
+                        self.stats.procedures_inlined += 1
+                        return inlined
+
             return CallStmt(opt_callee, opt_args, span=stmt.span)
 
         elif isinstance(stmt, ReturnStmt):
@@ -232,6 +752,10 @@ class ASTOptimizer:
             new_stmts = [
                 s for s in (self._optimize_stmt(s) for s in stmt.stmts) if s
             ]
+            # Eliminate unreachable code after RETURN/GOTO/HALT
+            new_stmts = self._eliminate_unreachable(new_stmts)
+            # Eliminate dead stores (consecutive assignments without read)
+            new_stmts = self._eliminate_dead_stores(new_stmts)
             return DoBlock(new_decls, new_stmts, stmt.end_label, span=stmt.span)
 
         elif isinstance(stmt, DoWhileBlock):
@@ -243,9 +767,16 @@ class ASTOptimizer:
                     self.stats.dead_code_eliminated += 1
                     return NullStmt(span=stmt.span)
 
+            # Level 3: Check for loop-invariant subexpressions in condition
+            if self.opt_level >= 3:
+                modified_vars = self._get_modified_vars_in_stmts(stmt.stmts)
+                # Cache invariant expressions in condition for CSE
+                self._cache_invariant_exprs(opt_cond, modified_vars)
+
             new_stmts = [
                 s for s in (self._optimize_stmt(s) for s in stmt.stmts) if s
             ]
+            new_stmts = self._eliminate_unreachable(new_stmts)
             return DoWhileBlock(opt_cond, new_stmts, stmt.end_label, span=stmt.span)
 
         elif isinstance(stmt, DoIterBlock):
@@ -267,9 +798,55 @@ class ASTOptimizer:
                     self.stats.dead_code_eliminated += 1
                     return NullStmt(span=stmt.span)
 
+            # Level 3: Loop unrolling for small constant-bound loops
+            # Skip if optimizing for size (unrolling increases code size)
+            if (
+                self.opt_level >= 3
+                and self.optimize_for != OptimizeFor.SIZE
+                and isinstance(opt_start, NumberLiteral)
+                and isinstance(opt_bound, NumberLiteral)
+                and isinstance(opt_index, Identifier)
+            ):
+                step_val = 1
+                if isinstance(opt_step, NumberLiteral):
+                    step_val = opt_step.value
+                if step_val > 0:
+                    iterations = (opt_bound.value - opt_start.value) // step_val + 1
+                    # Unroll loops with <= 4 iterations and <= 3 statements
+                    # For balanced mode, be more conservative (<=2 iterations)
+                    max_iter = 4 if self.optimize_for == OptimizeFor.SPEED else 2
+                    if 1 <= iterations <= max_iter and len(stmt.stmts) <= 3:
+                        unrolled_stmts: list[Stmt] = []
+                        for i in range(iterations):
+                            val = opt_start.value + i * step_val
+                            # Add assignment: index = val
+                            unrolled_stmts.append(AssignStmt(
+                                [Identifier(opt_index.name, span=stmt.span)],
+                                NumberLiteral(val, span=stmt.span),
+                                span=stmt.span
+                            ))
+                            # Add loop body (deep copy to avoid sharing)
+                            for s in stmt.stmts:
+                                unrolled_stmts.append(deepcopy(s))
+                        self.stats.loops_unrolled += 1
+                        # Wrap in a DoBlock and optimize it
+                        block = DoBlock([], unrolled_stmts, stmt.end_label, span=stmt.span)
+                        return self._optimize_stmt(block)
+
+            # Level 3: Cache loop-invariant bound expressions
+            if self.opt_level >= 3:
+                modified_vars = self._get_modified_vars_in_stmts(stmt.stmts)
+                if isinstance(stmt.index_var, Identifier):
+                    modified_vars.add(stmt.index_var.name)
+                # The bound is computed every iteration - cache if invariant
+                self._cache_invariant_exprs(opt_bound, modified_vars)
+                if opt_step:
+                    self._cache_invariant_exprs(opt_step, modified_vars)
+
             new_stmts = [
                 s for s in (self._optimize_stmt(s) for s in stmt.stmts) if s
             ]
+            new_stmts = self._eliminate_unreachable(new_stmts)
 
             return DoIterBlock(
                 opt_index, opt_start, opt_bound, opt_step, new_stmts,
@@ -298,6 +875,7 @@ class ASTOptimizer:
             new_cases: list[list[Stmt]] = []
             for case in stmt.cases:
                 opt_case = [s for s in (self._optimize_stmt(s) for s in case) if s]
+                opt_case = self._eliminate_unreachable(opt_case)
                 new_cases.append(opt_case)
 
             return DoCaseBlock(opt_selector, new_cases, stmt.end_label, span=stmt.span)
@@ -335,6 +913,10 @@ class ASTOptimizer:
             if self.opt_level >= 1 and expr.name in self.constants:
                 self.stats.constants_folded += 1
                 return NumberLiteral(self.constants[expr.name], span=expr.span)
+            # Copy propagation (level 3) - replace x with y if x = y was seen
+            if self.opt_level >= 3 and expr.name in self.copies:
+                self.stats.copies_propagated += 1
+                return Identifier(self.copies[expr.name], span=expr.span)
             return expr
 
         if isinstance(expr, BinaryExpr):
@@ -409,7 +991,36 @@ class ASTOptimizer:
                 self.stats.algebraic_simplifications += 1
                 return simplified
 
-        return BinaryExpr(expr.op, left, right, span=expr.span)
+        # Boolean/comparison simplifications (level 2+)
+        if self.opt_level >= 2:
+            bool_simp = self._boolean_simplify(expr.op, left, right, expr.span)
+            if bool_simp is not None:
+                self.stats.boolean_simplifications += 1
+                return bool_simp
+
+        # Commutative normalization for better CSE (level 3)
+        # Put operands in canonical order: constants on right, identifiers sorted
+        if self.opt_level >= 3:
+            left, right = self._normalize_commutative(expr.op, left, right)
+
+        result_expr = BinaryExpr(expr.op, left, right, span=expr.span)
+
+        # CSE: check if we've seen this expression before (level 3)
+        if self.opt_level >= 3:
+            key = _expr_key(result_expr)
+            if key is not None:
+                if key in self.cse_cache:
+                    # Return reference to cached value
+                    self.stats.cse_eliminations += 1
+                    cached_expr = self.cse_cache[key][1]
+                    return deepcopy(cached_expr)
+                else:
+                    # Cache this expression
+                    self.cse_cache[key] = (f"??CSE{self.cse_counter}", result_expr)
+                    self.expr_vars[key] = _get_expr_vars(result_expr)
+                    self.cse_counter += 1
+
+        return result_expr
 
     def _optimize_unary(self, expr: UnaryExpr) -> Expr:
         """Optimize a unary expression."""
@@ -608,6 +1219,138 @@ class ASTOptimizer:
             if isinstance(left, Identifier) and isinstance(right, Identifier):
                 if left.name == right.name:
                     return NumberLiteral(0, span=span)
+            # x XOR FFFF = NOT x
+            if isinstance(right, NumberLiteral) and right.value == 0xFFFF:
+                return UnaryExpr(UnaryOp.NOT, left, span=span)
+            if isinstance(left, NumberLiteral) and left.value == 0xFFFF:
+                return UnaryExpr(UnaryOp.NOT, right, span=span)
+
+        # (x + c1) + c2 -> x + (c1 + c2)  - constant folding on nested adds
+        if op == BinaryOp.ADD:
+            if isinstance(right, NumberLiteral) and isinstance(left, BinaryExpr):
+                if left.op == BinaryOp.ADD and isinstance(left.right, NumberLiteral):
+                    new_const = (left.right.value + right.value) & 0xFFFF
+                    return BinaryExpr(BinaryOp.ADD, left.left,
+                                     NumberLiteral(new_const, span=span), span=span)
+                if left.op == BinaryOp.SUB and isinstance(left.right, NumberLiteral):
+                    # (x - c1) + c2 -> x + (c2 - c1)
+                    new_const = (right.value - left.right.value) & 0xFFFF
+                    if new_const == 0:
+                        return left.left
+                    return BinaryExpr(BinaryOp.ADD, left.left,
+                                     NumberLiteral(new_const, span=span), span=span)
+
+        # (x - c1) - c2 -> x - (c1 + c2)
+        if op == BinaryOp.SUB:
+            if isinstance(right, NumberLiteral) and isinstance(left, BinaryExpr):
+                if left.op == BinaryOp.SUB and isinstance(left.right, NumberLiteral):
+                    new_const = (left.right.value + right.value) & 0xFFFF
+                    return BinaryExpr(BinaryOp.SUB, left.left,
+                                     NumberLiteral(new_const, span=span), span=span)
+                if left.op == BinaryOp.ADD and isinstance(left.right, NumberLiteral):
+                    # (x + c1) - c2 -> x + (c1 - c2) or x - (c2 - c1)
+                    diff = left.right.value - right.value
+                    if diff == 0:
+                        return left.left
+                    if diff > 0:
+                        return BinaryExpr(BinaryOp.ADD, left.left,
+                                         NumberLiteral(diff & 0xFFFF, span=span), span=span)
+                    else:
+                        return BinaryExpr(BinaryOp.SUB, left.left,
+                                         NumberLiteral((-diff) & 0xFFFF, span=span), span=span)
+
+        # x MOD 1 = 0
+        if op == BinaryOp.MOD:
+            if isinstance(right, NumberLiteral) and right.value == 1:
+                return NumberLiteral(0, span=span)
+
+        # 0 / x = 0 (unless x is 0, but we can't check that)
+        if op == BinaryOp.DIV:
+            if isinstance(left, NumberLiteral) and left.value == 0:
+                return NumberLiteral(0, span=span)
+
+        # 0 MOD x = 0
+        if op == BinaryOp.MOD:
+            if isinstance(left, NumberLiteral) and left.value == 0:
+                return NumberLiteral(0, span=span)
+
+        return None
+
+    def _boolean_simplify(
+        self, op: BinaryOp, left: Expr, right: Expr, span
+    ) -> Expr | None:
+        """Apply boolean and comparison simplifications."""
+        # x = x -> FFFF (always true)
+        if op == BinaryOp.EQ:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return NumberLiteral(0xFFFF, span=span)
+            # 0 = 0 is handled by constant folding, but check nested
+            if isinstance(left, NumberLiteral) and isinstance(right, NumberLiteral):
+                return NumberLiteral(0xFFFF if left.value == right.value else 0, span=span)
+
+        # x <> x -> 0 (always false)
+        if op == BinaryOp.NE:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return NumberLiteral(0, span=span)
+
+        # x < x -> 0 (always false)
+        if op == BinaryOp.LT:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return NumberLiteral(0, span=span)
+
+        # x > x -> 0 (always false)
+        if op == BinaryOp.GT:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return NumberLiteral(0, span=span)
+
+        # x <= x -> FFFF (always true)
+        if op == BinaryOp.LE:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return NumberLiteral(0xFFFF, span=span)
+
+        # x >= x -> FFFF (always true)
+        if op == BinaryOp.GE:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return NumberLiteral(0xFFFF, span=span)
+
+        # (a AND b) AND b -> a AND b (idempotent)
+        if op == BinaryOp.AND:
+            if isinstance(left, BinaryExpr) and left.op == BinaryOp.AND:
+                # Check if right matches left.right or left.left
+                if (isinstance(right, Identifier) and isinstance(left.right, Identifier)
+                        and right.name == left.right.name):
+                    return left
+                if (isinstance(right, Identifier) and isinstance(left.left, Identifier)
+                        and right.name == left.left.name):
+                    return left
+
+        # (a OR b) OR b -> a OR b (idempotent)
+        if op == BinaryOp.OR:
+            if isinstance(left, BinaryExpr) and left.op == BinaryOp.OR:
+                if (isinstance(right, Identifier) and isinstance(left.right, Identifier)
+                        and right.name == left.right.name):
+                    return left
+                if (isinstance(right, Identifier) and isinstance(left.left, Identifier)
+                        and right.name == left.left.name):
+                    return left
+
+        # x AND x -> x (idempotent)
+        if op == BinaryOp.AND:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return left
+
+        # x OR x -> x (idempotent)
+        if op == BinaryOp.OR:
+            if isinstance(left, Identifier) and isinstance(right, Identifier):
+                if left.name == right.name:
+                    return left
 
         return None
 
@@ -667,7 +1410,8 @@ class ASTOptimizer:
         return n.bit_length() - 1
 
 
-def optimize_ast(module: Module, opt_level: int = 2) -> Module:
+def optimize_ast(module: Module, opt_level: int = 2,
+                 optimize_for: OptimizeFor = OptimizeFor.BALANCED) -> Module:
     """Convenience function to optimize a module's AST."""
-    optimizer = ASTOptimizer(opt_level)
+    optimizer = ASTOptimizer(opt_level, optimize_for)
     return optimizer.optimize(module)

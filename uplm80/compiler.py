@@ -103,7 +103,7 @@ class Compiler:
                 if self.debug:
                     print("[DEBUG] Phase 5: Peephole Optimization", file=sys.stderr)
 
-                peephole = PeepholeOptimizer()
+                peephole = PeepholeOptimizer(self.target)
                 asm_code = peephole.optimize(asm_code)
 
                 if self.debug:
