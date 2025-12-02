@@ -1365,10 +1365,15 @@ class CodeGenerator:
             pass
         else:
             # Fallback: evaluate condition and test result
-            self._gen_expr(stmt.condition)
-            # Test result - for ADDRESS, check if HL is zero
-            self._emit("MOV", "A,L")
-            self._emit("ORA", "H")  # A = L | H
+            result_type = self._gen_expr(stmt.condition)
+            # Test result - BYTE in A, ADDRESS in HL
+            if result_type == DataType.BYTE:
+                # Value is in A - just ORA A to set flags
+                self._emit("ORA", "A")
+            else:
+                # Value is in HL - test if zero
+                self._emit("MOV", "A,L")
+                self._emit("ORA", "H")  # A = L | H
             self._emit("JZ", false_target)
 
         # Then branch
@@ -1393,6 +1398,21 @@ class CodeGenerator:
                 self._emit("JMP", false_label)
             # If non-zero (always true), no code needed - just fall through
             return True
+
+        # Handle simple identifier - load and test directly
+        if isinstance(condition, Identifier):
+            cond_type = self._get_expr_type(condition)
+            if cond_type == DataType.BYTE:
+                self._gen_expr(condition)  # Loads into A
+                self._emit("ORA", "A")     # Set Z flag
+                self._emit("JZ", false_label)
+                return True
+            else:
+                self._gen_expr(condition)  # Loads into HL
+                self._emit("MOV", "A,L")
+                self._emit("ORA", "H")
+                self._emit("JZ", false_label)
+                return True
 
         if not isinstance(condition, BinaryExpr):
             return False
@@ -1861,9 +1881,13 @@ class CodeGenerator:
 
             # Try optimized condition jump, fallback to generic
             if not self._gen_condition_jump_false(stmt.condition, end_label):
-                self._gen_expr(stmt.condition)
-                self._emit("MOV", "A,L")
-                self._emit("ORA", "H")
+                result_type = self._gen_expr(stmt.condition)
+                # Test result - BYTE in A, ADDRESS in HL
+                if result_type == DataType.BYTE:
+                    self._emit("ORA", "A")
+                else:
+                    self._emit("MOV", "A,L")
+                    self._emit("ORA", "H")
                 self._emit("JZ", end_label)
 
             # Loop body
