@@ -1414,6 +1414,11 @@ class CodeGenerator:
                 self._emit("JZ", false_label)
                 return True
 
+        # Handle NOT - invert the condition
+        if isinstance(condition, UnaryExpr) and condition.op == UnaryOp.NOT:
+            # NOT x is false when x is true, so jump to false_label when x is true
+            return self._gen_condition_jump_true(condition.operand, false_label)
+
         if not isinstance(condition, BinaryExpr):
             return False
 
@@ -1538,6 +1543,26 @@ class CodeGenerator:
                 self._emit("JMP", true_label)
             # If zero (always false), no code needed - just fall through
             return True
+
+        # Handle simple identifier
+        if isinstance(condition, Identifier):
+            cond_type = self._get_expr_type(condition)
+            if cond_type == DataType.BYTE:
+                self._gen_expr(condition)  # Loads into A
+                self._emit("ORA", "A")     # Set Z flag
+                self._emit("JNZ", true_label)
+                return True
+            else:
+                self._gen_expr(condition)  # Loads into HL
+                self._emit("MOV", "A,L")
+                self._emit("ORA", "H")
+                self._emit("JNZ", true_label)
+                return True
+
+        # Handle NOT - invert the condition
+        if isinstance(condition, UnaryExpr) and condition.op == UnaryOp.NOT:
+            # NOT x is true when x is false, so jump to true_label when x is false
+            return self._gen_condition_jump_false(condition.operand, true_label)
 
         if not isinstance(condition, BinaryExpr):
             return False

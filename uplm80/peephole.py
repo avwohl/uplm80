@@ -466,6 +466,22 @@ class PeepholeOptimizer:
             # ADI 0 -> ORA A (same effect on Z flag, but not on C)
             # Skip - different carry behavior
 
+            # LDA x; ADI 1; STA x -> LXI H,x; INR M (in-place increment)
+            # Saves 3 bytes when result not needed in A
+            PeepholePattern(
+                name="lda_adi1_sta_same",
+                pattern=[("LDA", None), ("ADI", "1"), ("STA", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+            # LDA x; SUI 1; STA x -> LXI H,x; DCR M (in-place decrement)
+            PeepholePattern(
+                name="lda_sui1_sta_same",
+                pattern=[("LDA", None), ("SUI", "1"), ("STA", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1] == ops[2][1],
+            ),
+
             # SUI 0 -> ORA A (same effect on Z flag, but not on C)
             # Skip - different carry behavior
 
@@ -588,6 +604,22 @@ class PeepholeOptimizer:
             # LDA x; ORA A; JZ -> load and test combined
             # Skip - context dependent
 
+            # PUSH H; XCHG; POP H -> MOV D,H; MOV E,L
+            # The XCHG swaps HL<->DE, then POP restores HL, so DE = original HL
+            PeepholePattern(
+                name="push_xchg_pop",
+                pattern=[("PUSH", "H"), ("XCHG", ""), ("POP", "H")],
+                replacement=[("MOV", "D,H"), ("MOV", "E,L")],
+            ),
+
+            # MVI H,0; MOV D,H; MOV E,L -> MVI D,0; MOV E,L
+            # D = H = 0, so just load D directly with 0
+            PeepholePattern(
+                name="mvi_h0_mov_dh_mov_el",
+                pattern=[("MVI", "H,0"), ("MOV", "D,H"), ("MOV", "E,L")],
+                replacement=[("MVI", "D,0"), ("MOV", "E,L")],
+            ),
+
             # PUSH H; LXI D,x; POP H; DAD D -> LXI D,x; DAD D
             # The PUSH/POP is unnecessary since we're just adding D to H
             PeepholePattern(
@@ -595,6 +627,15 @@ class PeepholeOptimizer:
                 pattern=[("PUSH", "H"), ("LXI", None), ("POP", "H"), ("DAD", "D")],
                 replacement=None,  # Handled specially
                 condition=lambda ops: ops[1][1].startswith("D,"),
+            ),
+
+            # MOV E,A; MVI D,0; POP H; XCHG; MOV M,E -> POP D; XCHG; MOV M,A
+            # When storing a byte (in A) to a stacked address, we can use A directly
+            # instead of copying to E then storing from E
+            PeepholePattern(
+                name="store_byte_via_stack",
+                pattern=[("MOV", "E,A"), ("MVI", "D,0"), ("POP", "H"), ("XCHG", ""), ("MOV", "M,E")],
+                replacement=[("POP", "D"), ("XCHG", ""), ("MOV", "M,A")],
             ),
 
             # MOV B,A; ... ; MOV A,B; SUB C -> remove MOV A,B if A==B already
@@ -1610,6 +1651,18 @@ class PeepholeOptimizer:
                         result.append(lines[instruction_lines[0]])  # LDA
                         result.append(lines[instruction_lines[1]])  # CPI/ORA
                         result.append(lines[instruction_lines[2]])  # Jcond
+
+                    elif pattern.name == "lda_adi1_sta_same":
+                        # LDA x; ADI 1; STA x -> LXI H,x; INR M
+                        addr = instructions[0][1]
+                        result.append(f"\tLXI\tH,{addr}")
+                        result.append(f"\tINR\tM")
+                    elif pattern.name == "lda_sui1_sta_same":
+                        # LDA x; SUI 1; STA x -> LXI H,x; DCR M
+                        addr = instructions[0][1]
+                        result.append(f"\tLXI\tH,{addr}")
+                        result.append(f"\tDCR\tM")
+
                     elif pattern.name == "lxi_mov_al_sta":
                         # LXI H,const; MOV A,L; STA x -> MVI A,const; STA x
                         const = instructions[0][1][2:]  # Remove "H," prefix
