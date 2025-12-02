@@ -109,6 +109,30 @@ class Parser:
             start.line, start.column, prev.line, prev.column + len(prev.lexeme), self.filename
         )
 
+    def _is_literally_macro(self) -> bool:
+        """Check if current identifier is a macro that expands to LITERALLY."""
+        if self._check(TokenType.IDENTIFIER):
+            name = self.current.value
+            if name in self.macros:
+                expansion = self.macros[name].strip().upper()
+                if expansion == "LITERALLY":
+                    self._advance()  # consume the macro identifier
+                    return True
+        return False
+
+    def _is_dcl_abbreviation(self) -> bool:
+        """Check if current identifier is DCL (abbreviation for DECLARE)."""
+        if self._check(TokenType.IDENTIFIER) and self.current.value == "DCL":
+            return True
+        return False
+
+    def _is_lit_abbreviation(self) -> bool:
+        """Check if current identifier is LIT (abbreviation for LITERALLY)."""
+        if self._check(TokenType.IDENTIFIER) and self.current.value == "LIT":
+            self._advance()  # consume LIT
+            return True
+        return False
+
     # ========================================================================
     # Expression Parsing (Precedence Climbing)
     # ========================================================================
@@ -165,9 +189,9 @@ class Parser:
                     # Could be subscript or function call
                     args: list[Expr] = []
                     if not self._check(TokenType.RPAREN):
-                        args.append(self._parse_expression())
+                        args.append(self._parse_argument_or_embedded_assign())
                         while self._match(TokenType.COMMA):
-                            args.append(self._parse_expression())
+                            args.append(self._parse_argument_or_embedded_assign())
                     self._expect(TokenType.RPAREN, "Expected ')' after arguments")
                     # Determine if subscript or call based on context
                     # For now, treat single arg as subscript, multiple as call
@@ -314,6 +338,22 @@ class Parser:
         """Parse a full expression."""
         return self._parse_or_xor()
 
+    def _parse_expression_with_embedded_assign(self) -> Expr:
+        """Parse an expression which may contain an embedded assignment at top level."""
+        start_token = self.current
+        expr = self._parse_expression()
+        # Check for embedded assignment :=
+        if self._check(TokenType.COLON) and self._peek(1).type == TokenType.OP_EQ:
+            self._advance()  # consume :
+            self._advance()  # consume =
+            value = self._parse_expression_with_embedded_assign()  # Allow chaining
+            return EmbeddedAssignExpr(expr, value, span=self._span_from(start_token))
+        return expr
+
+    def _parse_argument_or_embedded_assign(self) -> Expr:
+        """Parse a function argument which may be an embedded assignment."""
+        return self._parse_expression_with_embedded_assign()
+
     # ========================================================================
     # Statement Parsing
     # ========================================================================
@@ -377,6 +417,12 @@ class Parser:
         # Null statement (just semicolon)
         if self._match(TokenType.SEMICOLON):
             return NullStmt(span=self._span_from(token))
+
+        # DECLARE statement (can appear in statement position)
+        # Also handle DCL abbreviation
+        if self._check(TokenType.DECLARE) or self._is_dcl_abbreviation():
+            decls = self._parse_declare()
+            return DeclareStmt(decls, span=self._span_from(token))
 
         # END statement (handled by block parsing)
         if self._check(TokenType.END):
@@ -446,7 +492,7 @@ class Parser:
         """Parse RETURN statement."""
         value: Expr | None = None
         if not self._check(TokenType.SEMICOLON):
-            value = self._parse_expression()
+            value = self._parse_expression_with_embedded_assign()
         self._expect(TokenType.SEMICOLON, "Expected ';' after RETURN")
         return ReturnStmt(value, span=self._span_from(start_token))
 
@@ -473,6 +519,41 @@ class Parser:
             stmts = self._parse_block_body()
             end_label = self._parse_end()
             return DoWhileBlock(condition, stmts, end_label, span=self._span_from(start_token))
+
+        # DO FOREVER (built-in, equivalent to DO WHILE TRUE)
+        # FOREVER is not a reserved word, but when used after DO, it means WHILE TRUE
+        if (
+            self._check(TokenType.IDENTIFIER)
+            and self.current.value == "FOREVER"
+            and self._peek(1).type == TokenType.SEMICOLON
+        ):
+            self._advance()  # consume FOREVER
+            self._expect(TokenType.SEMICOLON, "Expected ';' after DO FOREVER")
+            condition = NumberLiteral(1, span=self._span_from(start_token))
+            stmts = self._parse_block_body()
+            end_label = self._parse_end()
+            return DoWhileBlock(condition, stmts, end_label, span=self._span_from(start_token))
+
+        # Check for LITERALLY macro that expands to WHILE TRUE (e.g., FOREVER)
+        if self._check(TokenType.IDENTIFIER):
+            macro_name = self.current.value
+            if macro_name in self.macros:
+                expansion = self.macros[macro_name].strip().upper()
+                if expansion.startswith("WHILE"):
+                    # Handle DO FOREVER -> DO WHILE TRUE
+                    self._advance()  # consume the macro identifier
+                    # Parse the rest of the expansion - condition comes from macro
+                    # For 'WHILE TRUE', the condition is TRUE
+                    if expansion == "WHILE TRUE":
+                        condition = NumberLiteral(1, span=self._span_from(start_token))
+                    else:
+                        # Try to parse any expression after WHILE in the expansion
+                        # This is a simplified approach
+                        condition = NumberLiteral(1, span=self._span_from(start_token))
+                    self._expect(TokenType.SEMICOLON, "Expected ';' after DO WHILE")
+                    stmts = self._parse_block_body()
+                    end_label = self._parse_end()
+                    return DoWhileBlock(condition, stmts, end_label, span=self._span_from(start_token))
 
         # DO CASE
         if self._match(TokenType.CASE):
@@ -551,8 +632,13 @@ class Parser:
     # ========================================================================
 
     def _parse_declare(self) -> list[Declaration]:
-        """Parse DECLARE statement."""
-        self._expect(TokenType.DECLARE, "Expected DECLARE")
+        """Parse DECLARE statement (also handles DCL abbreviation)."""
+        if self._check(TokenType.DECLARE):
+            self._advance()
+        elif self._check(TokenType.IDENTIFIER) and self.current.value == "DCL":
+            self._advance()  # consume DCL
+        else:
+            raise self._error("Expected DECLARE or DCL")
         decls: list[Declaration] = []
 
         # Parse declaration element list
@@ -571,34 +657,78 @@ class Parser:
 
     def _parse_declare_element(self) -> Declaration | list[Declaration]:
         """Parse a single declaration element."""
-        # Check for factored declaration: (name, name, ...) type
+        # Check for factored declaration: (name [BASED x], name [BASED x], ...) type
         if self._match(TokenType.LPAREN):
-            names: list[str] = []
-            names.append(self._expect(TokenType.IDENTIFIER, "Expected identifier").value)
-            while self._match(TokenType.COMMA):
-                names.append(self._expect(TokenType.IDENTIFIER, "Expected identifier").value)
+            # Parse list of names, each potentially with BASED clause
+            name_infos: list[tuple[str, str | None, str | None]] = []  # (name, based_on, based_member)
+
+            while True:
+                name = self._expect(TokenType.IDENTIFIER, "Expected identifier").value
+                based_on: str | None = None
+                based_member: str | None = None
+
+                # Check for BASED clause on this name
+                if self._match(TokenType.BASED):
+                    based_tok = self._expect(TokenType.IDENTIFIER, "Expected identifier after BASED")
+                    based_on = based_tok.value
+                    if self._match(TokenType.DOT):
+                        member_tok = self._expect(TokenType.IDENTIFIER, "Expected member name")
+                        based_member = member_tok.value
+
+                name_infos.append((name, based_on, based_member))
+
+                if not self._match(TokenType.COMMA):
+                    break
+
             self._expect(TokenType.RPAREN, "Expected ')' after identifier list")
 
-            # Parse common attributes
+            # Parse common attributes (dimension, type)
             dimension: int | None = None
             if self._match(TokenType.LPAREN):
                 if self._match(TokenType.OP_STAR):
                     dimension = -1  # Implicit dimension
-                else:
-                    dim_tok = self._expect(TokenType.NUMBER, "Expected dimension")
+                elif self._check(TokenType.NUMBER):
+                    dim_tok = self._advance()
                     dimension = dim_tok.value
+                elif self._check(TokenType.IDENTIFIER):
+                    # Could be a LITERALLY macro
+                    dim_name = self._advance().value
+                    if dim_name in self.macros:
+                        try:
+                            dimension = int(self.macros[dim_name], 0)
+                        except ValueError:
+                            dimension = -2
+                    else:
+                        dimension = -2
+                else:
+                    raise self._error("Expected dimension")
                 self._expect(TokenType.RPAREN, "Expected ')' after dimension")
+
+            # Check for LABEL type in factored declaration
+            if self._match(TokenType.LABEL):
+                attrs = self._parse_var_attributes()
+                decls: list[Declaration] = []
+                for name, _, _ in name_infos:  # Ignore BASED for labels
+                    decl = LabelDecl(
+                        name=name,
+                        is_public=attrs.get("public", False),
+                        is_external=attrs.get("external", False),
+                    )
+                    decls.append(decl)
+                return decls
 
             data_type = self._parse_type()
             attrs = self._parse_var_attributes()
             init_values = self._parse_initialization()
 
             # Create a declaration for each name
-            decls: list[Declaration] = []
-            for name in names:
+            decls = []
+            for name, based_on, based_member in name_infos:
                 decl = VarDecl(
                     name=name,
                     data_type=data_type,
+                    based_on=based_on,
+                    based_member=based_member,
                     dimension=dimension if dimension != -1 else None,
                     is_public=attrs.get("public", False),
                     is_external=attrs.get("external", False),
@@ -612,9 +742,11 @@ class Parser:
         name_tok = self._expect(TokenType.IDENTIFIER, "Expected identifier")
         name = name_tok.value
 
-        # Check for LITERALLY (macro)
-        if self._match(TokenType.LITERALLY):
+        # Check for LITERALLY (macro) - also check for macro-defined LITERALLY aliases and LIT abbreviation
+        if self._match(TokenType.LITERALLY) or self._is_literally_macro() or self._is_lit_abbreviation():
             value_tok = self._expect(TokenType.STRING, "Expected string after LITERALLY")
+            # Register macro for expansion during parsing
+            self.macros[name] = value_tok.value
             return LiterallyDecl(name, value_tok.value)
 
         # Check for LABEL
@@ -638,9 +770,21 @@ class Parser:
         if self._match(TokenType.LPAREN):
             if self._match(TokenType.OP_STAR):
                 dimension = -1  # Implicit
-            else:
-                dim_tok = self._expect(TokenType.NUMBER, "Expected dimension")
+            elif self._check(TokenType.NUMBER):
+                dim_tok = self._advance()
                 dimension = dim_tok.value
+            elif self._check(TokenType.IDENTIFIER):
+                # Could be a LITERALLY macro - expand if known
+                dim_name = self._advance().value
+                if dim_name in self.macros:
+                    try:
+                        dimension = int(self.macros[dim_name], 0)
+                    except ValueError:
+                        dimension = -2  # Mark as macro reference
+                else:
+                    dimension = -2  # Unknown macro - will resolve at compile time
+            else:
+                raise self._error("Expected dimension")
             self._expect(TokenType.RPAREN, "Expected ')' after dimension")
 
         # Parse type
@@ -653,6 +797,17 @@ class Parser:
             data_type = DataType.BYTE
         elif self._match(TokenType.ADDRESS):
             data_type = DataType.ADDRESS
+        elif self._check(TokenType.IDENTIFIER):
+            # Check if this is a LITERALLY macro for a type
+            type_name = self.current.value
+            if type_name in self.macros:
+                expansion = self.macros[type_name].strip().upper()
+                if expansion == "BYTE":
+                    self._advance()
+                    data_type = DataType.BYTE
+                elif expansion == "ADDRESS":
+                    self._advance()
+                    data_type = DataType.ADDRESS
         # Type might be implied for BASED variables
 
         # Parse attributes
@@ -686,6 +841,17 @@ class Parser:
             return DataType.BYTE
         elif self._match(TokenType.ADDRESS):
             return DataType.ADDRESS
+        elif self._check(TokenType.IDENTIFIER):
+            # Check for LITERALLY macro that expands to a type
+            type_name = self.current.value
+            if type_name in self.macros:
+                expansion = self.macros[type_name].strip().upper()
+                if expansion == "BYTE":
+                    self._advance()
+                    return DataType.BYTE
+                elif expansion == "ADDRESS":
+                    self._advance()
+                    return DataType.ADDRESS
         return None
 
     def _parse_structure_type(self) -> list[StructMember]:
@@ -822,27 +988,27 @@ class Parser:
 
         self._expect(TokenType.SEMICOLON, "Expected ';' after procedure header")
 
-        # Parse body (unless EXTERNAL)
+        # Parse body
         decls: list[Declaration] = []
         stmts: list[Stmt] = []
 
-        if not is_external:
-            # Parse declarations
-            while self._check(TokenType.DECLARE):
-                decls.extend(self._parse_declare())
+        # Parse declarations (allowed even for EXTERNAL to declare parameter types)
+        while self._check(TokenType.DECLARE):
+            decls.extend(self._parse_declare())
 
-            # Parse statements
+        if not is_external:
+            # Parse statements (only for non-EXTERNAL procedures)
             while not self._check(TokenType.END) and not self._check(TokenType.EOF):
                 stmts.append(self._parse_statement())
 
-            # Parse END
-            self._expect(TokenType.END, "Expected END")
-            if self._match(TokenType.IDENTIFIER):
-                end_name = self._peek(-1).value
-                if end_name != name:
-                    # Warning: end label doesn't match
-                    pass
-            self._expect(TokenType.SEMICOLON, "Expected ';' after END")
+        # Parse END - even EXTERNAL procedures have END name;
+        self._expect(TokenType.END, "Expected END")
+        if self._match(TokenType.IDENTIFIER):
+            end_name = self._peek(-1).value
+            if end_name != name:
+                # Warning: end label doesn't match
+                pass
+        self._expect(TokenType.SEMICOLON, "Expected ';' after END")
 
         return ProcDecl(
             name=name,

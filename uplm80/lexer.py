@@ -55,9 +55,20 @@ class Lexer:
                 self._advance()
                 continue
 
+            # CP/M EOF marker (Ctrl-Z)
+            if ch == "\x1a":
+                self._advance()
+                continue
+
             # Comment: /* ... */
             if ch == "/" and self._peek(1) == "*":
                 self._skip_comment()
+                continue
+
+            # Control directive: $... (skip to end of line)
+            # e.g., $Q=1, $INCLUDE, $PAGELENGTH
+            if ch == "$" and self.column == 1:
+                self._skip_control_directive()
                 continue
 
             break
@@ -76,6 +87,23 @@ class Lexer:
             self._advance()
 
         raise LexerError("Unterminated comment", start_loc)
+
+    def _skip_control_directive(self) -> None:
+        """Skip a $... control directive line.
+
+        PL/M-80 uses $ at the start of a line for compiler controls like:
+        $Q=1, $INCLUDE, $PAGELENGTH(60), etc.
+        We skip these as they don't affect parsing.
+        """
+        # Skip everything until end of line
+        while self.pos < len(self.source):
+            ch = self._peek()
+            if ch == "\n" or ch == "\r":
+                self._advance()
+                return
+            if ch == "\0":
+                return
+            self._advance()
 
     def _make_token(
         self, token_type: TokenType, value: object, lexeme: str, start_line: int, start_col: int
@@ -118,12 +146,13 @@ class Lexer:
         start_col = self.column
         start_pos = self.pos
 
-        # Collect all alphanumeric characters
-        while self._peek().isalnum():
+        # Collect all alphanumeric characters and $ (digit separator)
+        while self._peek().isalnum() or self._peek() == "$":
             self._advance()
 
         lexeme = self.source[start_pos : self.pos]
-        upper_lexeme = lexeme.upper()
+        # Remove $ digit separators for parsing
+        upper_lexeme = lexeme.upper().replace("$", "")
 
         # Determine the base and parse the number
         try:
