@@ -138,7 +138,7 @@ class PeepholeOptimizer:
     Patterns are applied repeatedly until no more changes are made.
     """
 
-    def __init__(self, target: Target = Target.I8080) -> None:
+    def __init__(self, target: Target = Target.Z80) -> None:
         self.target = target
         self.patterns = self._init_patterns()
         self.stats: dict[str, int] = {}
@@ -854,6 +854,9 @@ class PeepholeOptimizer:
             # Phase 4: Convert long jumps to relative jumps where possible
             lines = self._convert_to_relative_jumps(lines)
 
+            # Phase 5: Apply Z80-specific patterns again (for DJNZ after JR conversion)
+            lines, _ = self._optimize_z80_pass(lines)
+
         return "\n".join(lines)
 
     def _register_tracking_pass(self, lines: list[str]) -> tuple[list[str], bool]:
@@ -1414,6 +1417,17 @@ class PeepholeOptimizer:
                             self.stats["z80_ld_hl_same"] = self.stats.get("z80_ld_hl_same", 0) + 1
                             i += 2
                             continue
+
+                # DEC B; JR NZ,label -> DJNZ label (saves 1 byte)
+                if opcode == "DEC" and operands == "B" and i + 1 < len(lines):
+                    next_parsed = self._parse_z80_line(lines[i + 1].strip())
+                    if next_parsed and next_parsed[0] == "JR" and next_parsed[1].startswith("NZ,"):
+                        target = next_parsed[1][3:]  # Remove "NZ,"
+                        result.append(f"\tDJNZ {target}")
+                        changed = True
+                        self.stats["z80_djnz"] = self.stats.get("z80_djnz", 0) + 1
+                        i += 2
+                        continue
 
             result.append(lines[i])
             i += 1

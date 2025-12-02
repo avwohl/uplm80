@@ -31,7 +31,7 @@ class Compiler:
 
     def __init__(
         self,
-        target: Target = Target.I8080,
+        target: Target = Target.Z80,
         opt_level: int = 2,
         debug: bool = False,
     ) -> None:

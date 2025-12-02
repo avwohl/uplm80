@@ -103,7 +103,7 @@ class CodeGenerator:
     RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
                       'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
 
-    def __init__(self, target: Target = Target.I8080) -> None:
+    def __init__(self, target: Target = Target.Z80) -> None:
         self.target = target
         self.symbols = SymbolTable()
         self.output: list[AsmLine] = []
@@ -3404,7 +3404,7 @@ class CodeGenerator:
         return DataType.ADDRESS
 
 
-def generate(module: Module, target: Target = Target.I8080) -> str:
+def generate(module: Module, target: Target = Target.Z80) -> str:
     """Convenience function to generate code from a module."""
     gen = CodeGenerator(target)
     return gen.generate(module)
