@@ -180,8 +180,8 @@ def main() -> None:
     parser.add_argument(
         "-t", "--target",
         choices=["8080", "z80"],
-        default="8080",
-        help="Target processor (default: 8080)",
+        default="z80",
+        help="Target processor (default: z80)",
     )
 
     parser.add_argument(
@@ -199,6 +199,14 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # TEMPORARY: Force Z80 target during development
+    # DO NOT REMOVE THIS CHECK UNTIL A HUMAN SAYS OK
+    # Claude keeps accidentally switching to 8080 mode
+    if args.target == "8080":
+        print("ERROR: 8080 target is temporarily disabled during development.", file=sys.stderr)
+        print("Use -t z80 or wait for a human to re-enable 8080 support.", file=sys.stderr)
+        sys.exit(1)
 
     # Select target
     target = Target.Z80 if args.target == "z80" else Target.I8080

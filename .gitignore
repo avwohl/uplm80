@@ -2,6 +2,7 @@
 \#*
 # Python
 __pycache__/
+output/
 *.pyc
 *.pyo
 *.pyd

@@ -125,6 +125,14 @@ class CodeGenerator:
         self.param_slots: dict[str, int] = {}  # param_key -> slot number
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
         self.proc_params: dict[str, list[tuple[str, str, DataType, int]]] = {}  # proc -> [(name, asm_name, type, size)]
+        # For liveness analysis: remaining statements in current scope
+        self.pending_stmts: list[Stmt] = []
+        # For tracking embedded assignment target for return optimization
+        self.embedded_assign_target: str | None = None  # Variable name of last embedded assignment
+        # Current IF statement being processed (for embedded assign optimization)
+        self.current_if_stmt: IfStmt | None = None
+        # Flag: A register contains L (low byte of HL) - for avoiding redundant MOV A,L
+        self.a_has_l: bool = False
 
     def _parse_plm_number(self, s: str) -> int:
         """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
@@ -146,6 +154,271 @@ class CodeGenerator:
         if name.upper() in self.RESERVED_NAMES:
             return f"@{name}"
         return name
+
+    # ========================================================================
+    # Loop Index Usage Analysis
+    # ========================================================================
+
+    def _var_used_in_expr(self, var_name: str, expr: Expr) -> bool:
+        """Check if variable is referenced in expression."""
+        if isinstance(expr, Identifier):
+            return expr.name == var_name
+        elif isinstance(expr, NumberLiteral) or isinstance(expr, StringLiteral):
+            return False
+        elif isinstance(expr, BinaryExpr):
+            return self._var_used_in_expr(var_name, expr.left) or self._var_used_in_expr(var_name, expr.right)
+        elif isinstance(expr, UnaryExpr):
+            return self._var_used_in_expr(var_name, expr.operand)
+        elif isinstance(expr, CallExpr):
+            for arg in expr.args:
+                if self._var_used_in_expr(var_name, arg):
+                    return True
+            if isinstance(expr.callee, Expr):
+                return self._var_used_in_expr(var_name, expr.callee)
+            return False
+        elif isinstance(expr, SubscriptExpr):
+            if self._var_used_in_expr(var_name, expr.index):
+                return True
+            if isinstance(expr.base, Expr):
+                return self._var_used_in_expr(var_name, expr.base)
+            return False
+        elif isinstance(expr, MemberExpr):
+            if isinstance(expr.base, Expr):
+                return self._var_used_in_expr(var_name, expr.base)
+            return False
+        elif isinstance(expr, LocationExpr):
+            return self._var_used_in_expr(var_name, expr.operand)
+        elif isinstance(expr, EmbeddedAssignExpr):
+            return self._var_used_in_expr(var_name, expr.target) or self._var_used_in_expr(var_name, expr.value)
+        return False
+
+    def _var_used_in_stmt(self, var_name: str, stmt: Stmt) -> bool:
+        """Check if variable is referenced in statement."""
+        if isinstance(stmt, AssignStmt):
+            # Check if var is read (on RHS or in index of LHS)
+            if self._var_used_in_expr(var_name, stmt.value):
+                return True
+            # Check if var is used in index of target (targets is a list)
+            for target in stmt.targets:
+                if isinstance(target, SubscriptExpr):
+                    if self._var_used_in_expr(var_name, target.index):
+                        return True
+            return False
+        elif isinstance(stmt, CallStmt):
+            # Check callee and all arguments for variable usage
+            if isinstance(stmt.callee, Expr) and self._var_used_in_expr(var_name, stmt.callee):
+                return True
+            for arg in stmt.args:
+                if self._var_used_in_expr(var_name, arg):
+                    return True
+            return False
+        elif isinstance(stmt, ReturnStmt):
+            if stmt.value:
+                return self._var_used_in_expr(var_name, stmt.value)
+            return False
+        elif isinstance(stmt, IfStmt):
+            if self._var_used_in_expr(var_name, stmt.condition):
+                return True
+            if self._var_used_in_stmt(var_name, stmt.then_stmt):
+                return True
+            if stmt.else_stmt and self._var_used_in_stmt(var_name, stmt.else_stmt):
+                return True
+            return False
+        elif isinstance(stmt, DoBlock):
+            for s in stmt.stmts:
+                if self._var_used_in_stmt(var_name, s):
+                    return True
+            return False
+        elif isinstance(stmt, DoWhileBlock):
+            if self._var_used_in_expr(var_name, stmt.condition):
+                return True
+            for s in stmt.stmts:
+                if self._var_used_in_stmt(var_name, s):
+                    return True
+            return False
+        elif isinstance(stmt, DoIterBlock):
+            # Don't recurse into nested DO-ITER as inner loop var shadows outer
+            if self._var_used_in_expr(var_name, stmt.start):
+                return True
+            if self._var_used_in_expr(var_name, stmt.bound):
+                return True
+            if stmt.step and self._var_used_in_expr(var_name, stmt.step):
+                return True
+            for s in stmt.stmts:
+                if self._var_used_in_stmt(var_name, s):
+                    return True
+            return False
+        elif isinstance(stmt, DoCaseBlock):
+            if self._var_used_in_expr(var_name, stmt.selector):
+                return True
+            for case_stmts in stmt.cases:
+                for s in case_stmts:
+                    if self._var_used_in_stmt(var_name, s):
+                        return True
+            return False
+        elif isinstance(stmt, LabeledStmt):
+            return self._var_used_in_stmt(var_name, stmt.stmt)
+        return False
+
+    def _index_used_in_body(self, index_var: Expr, stmts: list[Stmt]) -> bool:
+        """Check if loop index variable is used in loop body."""
+        if isinstance(index_var, Identifier):
+            var_name = index_var.name
+            for stmt in stmts:
+                if self._var_used_in_stmt(var_name, stmt):
+                    return True
+        return False
+
+    # ========================================================================
+    # Register Liveness Analysis
+    # ========================================================================
+
+    def _expr_clobbers_a(self, expr: Expr) -> bool:
+        """Check if evaluating expression will clobber A register.
+
+        Most expressions clobber A because they compute into A (for BYTE) or use A
+        as a scratch register. Only certain simple operations preserve A.
+        """
+        if isinstance(expr, NumberLiteral):
+            return False  # LXI H,const doesn't touch A
+
+        if isinstance(expr, Identifier):
+            # Loading a variable clobbers A (for BYTE) or doesn't touch A (for ADDRESS in HL)
+            sym = self._lookup_symbol(expr.name)
+            if sym and sym.data_type == DataType.BYTE:
+                return True  # LDA clobbers A
+            return False  # LHLD doesn't clobber A
+
+        if isinstance(expr, BinaryExpr):
+            # Check expression type - ADDRESS operations use HL, not A
+            expr_type = self._get_expr_type(expr)
+            if expr_type == DataType.ADDRESS:
+                # ADDRESS arithmetic uses DAD which doesn't clobber A
+                # But we need to check if operands clobber A
+                op = expr.op
+                if op == BinaryOp.ADD:
+                    # LHLD, DAD preserves A
+                    left_clobbers = self._expr_clobbers_a(expr.left)
+                    right_clobbers = self._expr_clobbers_a(expr.right)
+                    return left_clobbers or right_clobbers
+            # BYTE operations and other ADDRESS ops may clobber A
+            return True
+
+        # Most other expressions clobber A
+        return True
+
+    def _stmt_clobbers_a(self, stmt: Stmt) -> bool:
+        """Check if a statement will clobber the A register.
+
+        This is used for liveness analysis to determine if we need to save A
+        across an IF block or other control structure.
+        """
+        if isinstance(stmt, NullStmt):
+            return False
+
+        if isinstance(stmt, LabeledStmt):
+            return self._stmt_clobbers_a(stmt.stmt)
+
+        if isinstance(stmt, AssignStmt):
+            # Assignment to HL-based variable (ADDRESS type) without touching A
+            # Check if all targets are ADDRESS type
+            for target in stmt.targets:
+                if isinstance(target, Identifier):
+                    sym = self._lookup_symbol(target.name)
+                    if not sym or sym.data_type == DataType.BYTE:
+                        return True  # BYTE assignment uses STA -> doesn't clobber but value changes
+                else:
+                    return True  # Complex target likely clobbers A
+            # Check if value expression clobbers A
+            return self._expr_clobbers_a(stmt.value)
+
+        if isinstance(stmt, CallStmt):
+            # Procedure calls clobber A
+            return True
+
+        if isinstance(stmt, ReturnStmt):
+            # Return may load a value into A
+            if stmt.value:
+                return True
+            return False
+
+        if isinstance(stmt, GotoStmt):
+            return False  # JMP doesn't clobber A
+
+        if isinstance(stmt, HaltStmt):
+            return False  # HLT doesn't clobber A
+
+        if isinstance(stmt, EnableStmt) or isinstance(stmt, DisableStmt):
+            return False  # EI/DI don't clobber A
+
+        if isinstance(stmt, IfStmt):
+            # IF condition evaluation may clobber A
+            # But we special-case conditions that don't change A
+
+            # Simple identifier test: ORA A / OR A doesn't change A
+            if isinstance(stmt.condition, Identifier):
+                cond_type = self._get_expr_type(stmt.condition)
+                if cond_type == DataType.BYTE:
+                    # LDA x; ORA A - LDA clobbers A, so this does clobber
+                    return True
+                # For ADDRESS: MOV A,L; ORA H - this clobbers A
+                return True
+
+            # Comparisons: CPI doesn't change A
+            if isinstance(stmt.condition, BinaryExpr):
+                op = stmt.condition.op
+                if op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE):
+                    # Comparison: CPI doesn't clobber A, but we need to check
+                    # if the left side is already in A or requires loading
+                    left_type = self._get_expr_type(stmt.condition.left)
+                    if left_type == DataType.BYTE:
+                        # For byte comparisons, if right is constant, uses CPI which preserves A
+                        if isinstance(stmt.condition.right, NumberLiteral):
+                            # Check if then/else branches clobber A
+                            then_clobbers = self._stmt_clobbers_a(stmt.then_stmt)
+                            else_clobbers = stmt.else_stmt and self._stmt_clobbers_a(stmt.else_stmt)
+                            return then_clobbers or else_clobbers
+
+            return True  # Conservative: condition evaluation clobbers A
+
+        if isinstance(stmt, (DoBlock, DoWhileBlock, DoIterBlock, DoCaseBlock)):
+            # Loop bodies likely clobber A
+            return True
+
+        if isinstance(stmt, DeclareStmt):
+            return False  # Declarations don't generate code
+
+        # Default: assume clobbers A
+        return True
+
+    def _a_survives_stmts(self, stmts: list[Stmt]) -> bool:
+        """Check if A register survives through a list of statements.
+
+        Returns True if A is preserved, False if any statement clobbers A.
+        """
+        for stmt in stmts:
+            if self._stmt_clobbers_a(stmt):
+                return False
+        return True
+
+    def _lookup_symbol(self, name: str) -> Symbol | None:
+        """Look up a symbol in the current scope hierarchy."""
+        # Check for LITERALLY macro first
+        if name in self.literal_macros:
+            return None  # Literals are not symbols
+
+        # Look up in scope hierarchy
+        sym = None
+        if self.current_proc:
+            parts = self.current_proc.split('$')
+            for i in range(len(parts), 0, -1):
+                scoped_name = '$'.join(parts[:i]) + '$' + name
+                sym = self.symbols.lookup(scoped_name)
+                if sym:
+                    break
+        if sym is None:
+            sym = self.symbols.lookup(name)
+        return sym
 
     # ========================================================================
     # Call Graph Analysis and Storage Sharing
@@ -444,6 +717,14 @@ class CodeGenerator:
         """Emit a label."""
         self.output.append(AsmLine(label=label))
 
+    def _emit_sub16(self) -> None:
+        """Emit 16-bit subtract: HL = HL - DE.
+
+        Uses CALL ??SUBDE runtime routine to save code space.
+        """
+        self.needs_runtime.add("SUBDE")
+        self._emit("CALL", "??SUBDE")
+
     def _new_label(self, prefix: str = "L") -> str:
         """Generate a new unique label."""
         self.label_counter += 1
@@ -647,7 +928,7 @@ class CodeGenerator:
         if self.needs_runtime:
             self._emit()
             self._emit(comment="Runtime library")
-            runtime = get_runtime_library()
+            runtime = get_runtime_library(self.needs_runtime, target_z80=(self.target == Target.Z80))
             for line in runtime.split("\n"):
                 stripped = line.strip()
                 if stripped:
@@ -1149,11 +1430,14 @@ class CodeGenerator:
             else:
                 statements_to_gen.append(stmt)
 
-        # Generate code for statements
+        # Generate code for statements with liveness tracking
         ends_with_return = False
-        for stmt in statements_to_gen:
+        for i, stmt in enumerate(statements_to_gen):
+            # Track remaining statements for liveness analysis
+            self.pending_stmts = statements_to_gen[i + 1:]
             self._gen_stmt(stmt)
             ends_with_return = isinstance(stmt, ReturnStmt)
+        self.pending_stmts = []  # Clear after procedure
 
         # Procedure epilogue (implicit return if no explicit RETURN at end)
         if not ends_with_return:
@@ -1500,8 +1784,20 @@ class CodeGenerator:
     def _gen_return(self, stmt: ReturnStmt) -> None:
         """Generate code for RETURN statement."""
         if stmt.value:
+            # Check if A already has the value from embedded assignment optimization
+            skip_load = False
+            if (self.embedded_assign_target and
+                isinstance(stmt.value, Identifier) and
+                stmt.value.name == self.embedded_assign_target):
+                # A already has this value - skip the load
+                skip_load = True
+                self.embedded_assign_target = None  # Clear after use
+
+            if skip_load:
+                # A already contains the return value - just return
+                pass
             # Optimize: if returning BYTE and value is a small constant, use MVI A directly
-            if (self.current_proc_decl and
+            elif (self.current_proc_decl and
                 self.current_proc_decl.return_type == DataType.BYTE and
                 isinstance(stmt.value, NumberLiteral) and stmt.value.value <= 255):
                 self._emit("MVI", f"A,{self._format_number(stmt.value.value)}")
@@ -1538,6 +1834,10 @@ class CodeGenerator:
         end_label = self._new_label("ENDIF")
         false_target = else_label if stmt.else_stmt else end_label
 
+        # Track current IF statement for embedded assignment optimization
+        old_if_stmt = self.current_if_stmt
+        self.current_if_stmt = stmt
+
         # Try to generate optimized conditional jump for comparisons
         if self._gen_condition_jump_false(stmt.condition, false_target):
             # Condition jump was generated directly
@@ -1554,6 +1854,8 @@ class CodeGenerator:
                 self._emit("MOV", "A,L")
                 self._emit("ORA", "H")  # A = L | H
             self._emit("JZ", false_target)
+
+        self.current_if_stmt = old_if_stmt  # Restore before generating body
 
         # Then branch
         self._gen_stmt(stmt.then_stmt)
@@ -1673,39 +1975,52 @@ class CodeGenerator:
                 self._emit_jump_on_false(op, false_label)
                 return True
             else:
-                # Byte-to-byte comparison
-                self._gen_expr(condition.left)  # Result in A
-                self._emit("MOV", "B,A")  # Save left
-                self._gen_expr(condition.right)  # Result in A (right)
-                self._emit("MOV", "C,A")  # Save right
-                self._emit("MOV", "A,B")  # A = left
-                self._emit("SUB", "C")    # A = left - right, flags set
+                # Byte-to-byte comparison - load right first for efficient SUB
+                self._gen_expr(condition.right)  # Result in A
+                self._emit("MOV", "B,A")  # Save right
+                self._gen_expr(condition.left)  # Result in A (left)
+                self._emit("SUB", "B")    # A = left - right, flags set
                 self._emit_jump_on_false(op, false_label)
                 return True
         else:
-            # 16-bit comparison - still optimize by not materializing boolean
-            # Evaluate left, push, evaluate right, subtract
-            self._gen_expr(condition.left)
-            if left_type == DataType.BYTE:
-                self._emit("MOV", "L,A")
-                self._emit("MVI", "H,0")
-            self._emit("PUSH", "H")
+            # 16-bit comparison - optimize evaluation order when possible
+            # Only optimize if left is simple AND right is complex
+            # (if right is simple, loading it to DE directly is more efficient)
+            left_simple = self._expr_preserves_de(condition.left)
+            right_simple = self._expr_preserves_de(condition.right)
 
-            self._gen_expr(condition.right)
-            if right_type == DataType.BYTE:
-                self._emit("MOV", "L,A")
-                self._emit("MVI", "H,0")
+            if left_simple and not right_simple:
+                # Evaluate complex right first, save to DE, then simple left
+                self._gen_expr(condition.right)
+                if right_type == DataType.BYTE:
+                    self._emit("MOV", "E,A")
+                    self._emit("MVI", "D,0")
+                else:
+                    self._emit("XCHG")  # DE = right
+                # Evaluate left - DE is preserved
+                self._gen_expr(condition.left)
+                if left_type == DataType.BYTE:
+                    self._emit("MOV", "L,A")
+                    self._emit("MVI", "H,0")
+                # Now: HL = left, DE = right (no PUSH/POP needed!)
+            else:
+                # Either left is complex, or right is simple - use standard approach
+                self._gen_expr(condition.left)
+                if left_type == DataType.BYTE:
+                    self._emit("MOV", "L,A")
+                    self._emit("MVI", "H,0")
+                self._emit("PUSH", "H")
 
-            self._emit("XCHG")  # DE = right
-            self._emit("POP", "H")  # HL = left
+                self._gen_expr(condition.right)
+                if right_type == DataType.BYTE:
+                    self._emit("MOV", "L,A")
+                    self._emit("MVI", "H,0")
 
-            # 16-bit subtract: HL - DE
-            self._emit("MOV", "A,L")
-            self._emit("SUB", "E")
-            self._emit("MOV", "L,A")
-            self._emit("MOV", "A,H")
-            self._emit("SBB", "D")
-            self._emit("MOV", "H,A")
+                self._emit("XCHG")  # DE = right
+                self._emit("POP", "H")  # HL = left
+
+            # 16-bit subtract: HL = HL - DE
+            self._emit_sub16()
 
             # For EQ/NE, check if result is zero
             if op in (BinaryOp.EQ, BinaryOp.NE):
@@ -1827,12 +2142,11 @@ class CodeGenerator:
                 self._emit_jump_on_true(op, true_label)
                 return True
             else:
-                self._gen_expr(condition.left)
-                self._emit("MOV", "B,A")
+                # Byte-to-byte comparison - load right first for efficient SUB
                 self._gen_expr(condition.right)
-                self._emit("MOV", "C,A")
-                self._emit("MOV", "A,B")
-                self._emit("SUB", "C")
+                self._emit("MOV", "B,A")  # Save right
+                self._gen_expr(condition.left)
+                self._emit("SUB", "B")    # A = left - right
                 self._emit_jump_on_true(op, true_label)
                 return True
         else:
@@ -1851,12 +2165,7 @@ class CodeGenerator:
             self._emit("XCHG")
             self._emit("POP", "H")
 
-            self._emit("MOV", "A,L")
-            self._emit("SUB", "E")
-            self._emit("MOV", "L,A")
-            self._emit("MOV", "A,H")
-            self._emit("SBB", "D")
-            self._emit("MOV", "H,A")
+            self._emit_sub16()
 
             if op in (BinaryOp.EQ, BinaryOp.NE):
                 self._emit("MOV", "A,L")
@@ -2142,6 +2451,207 @@ class CodeGenerator:
 
         self.loop_stack.append((incr_label, end_label))
 
+        # Determine if index variable is BYTE
+        index_type = DataType.ADDRESS
+        if isinstance(stmt.index_var, Identifier):
+            sym = self._lookup_symbol(stmt.index_var.name)
+            if sym and sym.data_type == DataType.BYTE:
+                index_type = DataType.BYTE
+
+        # Also check bound type
+        bound_type = self._get_expr_type(stmt.bound)
+        both_bytes = (index_type == DataType.BYTE and bound_type == DataType.BYTE)
+
+        # Get step value
+        step_val = 1
+        if stmt.step and isinstance(stmt.step, NumberLiteral):
+            step_val = stmt.step.value
+
+        # Check if loop index is used in body - if not, we can use DJNZ on Z80
+        index_used = self._index_used_in_body(stmt.index_var, stmt.stmts)
+
+        # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
+        # Convert to: B = N+1; do { body } while (--B != 0)
+        if (self.target == Target.Z80 and both_bytes and
+            step_val == 1 and not index_used and
+            isinstance(stmt.start, NumberLiteral) and stmt.start.value == 0):
+            # Calculate iteration count = bound + 1
+            # If bound is constant, emit LD B,bound+1
+            # If bound is variable, emit: load bound; INC A; LD B,A
+            if isinstance(stmt.bound, NumberLiteral):
+                iter_count = stmt.bound.value + 1
+                if iter_count <= 255:
+                    self._emit("MVI", f"B,{self._format_number(iter_count)}")
+                else:
+                    # Too many iterations for DJNZ
+                    pass  # Fall through to regular loop
+            else:
+                # Variable bound: A = bound; A++; B = A
+                bound_type = self._gen_expr(stmt.bound)
+                if bound_type == DataType.ADDRESS:
+                    self._emit("MOV", "A,L")
+                self._emit("INR", "A")  # A = bound + 1 = iteration count
+                self._emit("MOV", "B,A")  # B = iteration count
+
+            # Only proceed with DJNZ if we set up B
+            if isinstance(stmt.bound, NumberLiteral) and stmt.bound.value + 1 <= 255:
+                # Loop body
+                self._emit_label(loop_label)
+                for s in stmt.stmts:
+                    self._gen_stmt(s)
+
+                # DJNZ - decrement B and jump if not zero
+                self._emit_label(incr_label)
+                self._emit("DJNZ", loop_label)
+
+                self._emit_label(end_label)
+                self.loop_stack.pop()
+                return
+            elif not isinstance(stmt.bound, NumberLiteral):
+                # Variable bound case - we set up B above
+                # But need to handle the case where bound might be 255 (iter count = 256 = 0 in byte)
+                # Skip loop if B is 0 (this handles bound = 255 case)
+                self._emit("MOV", "A,B")
+                self._emit("ORA", "A")
+                self._emit("JZ", end_label)  # Skip if iteration count is 0
+
+                # Loop body
+                self._emit_label(loop_label)
+                for s in stmt.stmts:
+                    self._gen_stmt(s)
+
+                # DJNZ
+                self._emit_label(incr_label)
+                self._emit("DJNZ", loop_label)
+
+                self._emit_label(end_label)
+                self.loop_stack.pop()
+                return
+
+        # Check for optimized down-counting loop: DO I = N TO 0
+        # When start is variable, bound is 0, and step is -1 (or default counting down)
+        is_downcount_to_zero = (
+            both_bytes and
+            isinstance(stmt.bound, NumberLiteral) and stmt.bound.value == 0 and
+            (step_val == -1 or step_val == 0xFF)
+        )
+
+        if is_downcount_to_zero:
+            # Optimized down-counting byte loop
+            # Initialize: load start into A, store to index
+            start_type = self._gen_expr(stmt.start)
+            if start_type == DataType.ADDRESS:
+                self._emit("MOV", "A,L")
+            self._gen_store(stmt.index_var, DataType.BYTE)
+
+            # Jump to test
+            self._emit("JMP", test_label)
+
+            # Loop body
+            self._emit_label(loop_label)
+            for s in stmt.stmts:
+                self._gen_stmt(s)
+
+            # Decrement
+            self._emit_label(incr_label)
+            self._gen_load(stmt.index_var)  # A = index
+            self._emit("DEC", "A")
+            self._gen_store(stmt.index_var, DataType.BYTE)
+
+            # Test: if A >= 0 (not wrapped), continue
+            # After DEC, if result is not negative (i.e., >= 0), continue
+            self._emit_label(test_label)
+            self._gen_load(stmt.index_var)  # A = index
+            self._emit("OR", "A")  # Set flags
+            self._emit("JP", loop_label)  # Jump if positive (bit 7 clear)
+
+            self._emit_label(end_label)
+            self.loop_stack.pop()
+            return
+
+        # Check for optimized byte loop with constant bound
+        if both_bytes and isinstance(stmt.bound, NumberLiteral):
+            bound_val = stmt.bound.value
+
+            # Initialize index variable
+            start_type = self._gen_expr(stmt.start)
+            if start_type == DataType.ADDRESS:
+                self._emit("MOV", "A,L")
+            self._gen_store(stmt.index_var, DataType.BYTE)
+
+            # Jump to test
+            self._emit("JMP", test_label)
+
+            # Loop body
+            self._emit_label(loop_label)
+            for s in stmt.stmts:
+                self._gen_stmt(s)
+
+            # Increment/Decrement
+            self._emit_label(incr_label)
+            self._gen_load(stmt.index_var)  # A = index
+            if step_val == 1:
+                self._emit("INC", "A")
+            elif step_val == -1 or step_val == 0xFF:
+                self._emit("DEC", "A")
+            else:
+                self._emit("ADD", f"A,{self._format_number(step_val & 0xFF)}")
+            self._gen_store(stmt.index_var, DataType.BYTE)
+
+            # Test condition: compare index with bound
+            self._emit_label(test_label)
+            self._gen_load(stmt.index_var)  # A = index
+            self._emit("CP", self._format_number(bound_val + 1))  # Compare with bound+1
+            self._emit("JR", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
+
+            self._emit_label(end_label)
+            self.loop_stack.pop()
+            return
+
+        # Check for byte loop with variable bound
+        if both_bytes:
+            # Initialize index variable as BYTE
+            start_type = self._gen_expr(stmt.start)
+            if start_type == DataType.ADDRESS:
+                self._emit("MOV", "A,L")
+            self._gen_store(stmt.index_var, DataType.BYTE)
+
+            # Jump to test
+            self._emit("JMP", test_label)
+
+            # Loop body
+            self._emit_label(loop_label)
+            for s in stmt.stmts:
+                self._gen_stmt(s)
+
+            # Increment/Decrement
+            self._emit_label(incr_label)
+            self._gen_load(stmt.index_var)  # A = index
+            if step_val == 1:
+                self._emit("INC", "A")
+            elif step_val == -1 or step_val == 0xFF:
+                self._emit("DEC", "A")
+            else:
+                self._emit("ADD", f"A,{self._format_number(step_val & 0xFF)}")
+            self._gen_store(stmt.index_var, DataType.BYTE)
+
+            # Test condition: compare index with bound variable
+            self._emit_label(test_label)
+            self._gen_load(stmt.index_var)  # A = index
+            self._emit("MOV", "B,A")  # B = index
+            bound_result = self._gen_expr(stmt.bound)  # A = bound
+            if bound_result == DataType.ADDRESS:
+                self._emit("MOV", "A,L")  # Get low byte if ADDRESS
+            # CP B computes A - B (bound - index) without storing:
+            # NC (no carry) if bound >= index (i.e., index <= bound)
+            self._emit("CP", "B")  # Compare bound with index
+            self._emit("JR", f"NC,{loop_label}")  # Continue if bound >= index
+
+            self._emit_label(end_label)
+            self.loop_stack.pop()
+            return
+
+        # General case: 16-bit loop (original code)
         # Initialize index variable
         self._gen_expr(stmt.start)
         self._gen_store(stmt.index_var, DataType.ADDRESS)
@@ -2156,10 +2666,6 @@ class CodeGenerator:
 
         # Increment
         self._emit_label(incr_label)
-        step_val = 1
-        if stmt.step and isinstance(stmt.step, NumberLiteral):
-            step_val = stmt.step.value
-
         self._gen_load(stmt.index_var)
         if step_val == 1:
             self._emit("INX", "H")
@@ -2178,10 +2684,7 @@ class CodeGenerator:
 
         # Compare: if index > bound, exit (for positive step)
         # HL - DE: if negative (carry), index > bound
-        self._emit("MOV", "A,L")
-        self._emit("SUB", "E")
-        self._emit("MOV", "A,H")
-        self._emit("SBB", "D")
+        self._emit_sub16()
 
         # If no borrow (NC), bound >= index, continue
         self._emit("JNC", loop_label)
@@ -2271,7 +2774,108 @@ class CodeGenerator:
             return DataType.ADDRESS
         elif isinstance(expr, LocationExpr):
             return DataType.ADDRESS
+        elif isinstance(expr, CallExpr):
+            # Check for built-in functions first
+            if isinstance(expr.callee, Identifier):
+                name = expr.callee.name.upper()
+                # Built-ins that return BYTE
+                if name in ('LOW', 'HIGH', 'INPUT', 'ROL', 'ROR'):
+                    return DataType.BYTE
+                # MEMORY(addr) returns BYTE - it's a byte array
+                if name == 'MEMORY':
+                    return DataType.BYTE
+                # Built-ins that return ADDRESS
+                if name in ('SHL', 'SHR', 'DOUBLE', 'LENGTH', 'LAST', 'SIZE',
+                           'STACKPTR', 'TIME', 'CPUTIME'):
+                    return DataType.ADDRESS
+                # Look up symbol to determine type
+                sym = self.symbols.lookup(expr.callee.name)
+                if sym:
+                    if sym.kind == SymbolKind.PROCEDURE:
+                        return sym.return_type or DataType.ADDRESS
+                    # It's a variable - if it has dimension, this is an array subscript
+                    if sym.dimension is not None:
+                        # Array subscript returns element type
+                        return sym.data_type or DataType.BYTE
+                    # Non-array variable being "called" - return its type
+                    return sym.data_type or DataType.ADDRESS
+            return DataType.ADDRESS
+        elif isinstance(expr, UnaryExpr):
+            # Unary operations - check which ones return BYTE
+            if expr.op in (UnaryOp.NOT, UnaryOp.LOW, UnaryOp.HIGH):
+                return DataType.BYTE
+            # MINUS and others preserve operand type
+            return self._get_expr_type(expr.operand)
+        elif isinstance(expr, SubscriptExpr):
+            # Array subscript - check the element type of the array
+            if isinstance(expr.base, Identifier):
+                # Check for MEMORY built-in
+                if expr.base.name.upper() == "MEMORY":
+                    return DataType.BYTE  # MEMORY is a BYTE array
+                sym = self.symbols.lookup(expr.base.name)
+                if sym:
+                    return sym.data_type or DataType.BYTE
+            return DataType.BYTE  # Default to BYTE for array elements
         return DataType.ADDRESS
+
+    def _expr_preserves_de(self, expr: Expr) -> bool:
+        """
+        Check if evaluating this expression preserves the DE register.
+        Used to optimize binary expression evaluation order.
+        """
+        if isinstance(expr, NumberLiteral):
+            return True  # LXI H doesn't touch DE
+        if isinstance(expr, StringLiteral):
+            return True  # MVI A or LXI H doesn't touch DE
+        if isinstance(expr, Identifier):
+            name = expr.name
+            # Check for LITERALLY macro
+            if name in self.literal_macros:
+                return True  # Expands to constant or simple identifier
+            # Look up symbol
+            sym = None
+            if self.current_proc:
+                parts = self.current_proc.split('$')
+                for i in range(len(parts), 0, -1):
+                    scoped_name = '$'.join(parts[:i]) + '$' + name
+                    sym = self.symbols.lookup(scoped_name)
+                    if sym:
+                        break
+            if sym is None:
+                sym = self.symbols.lookup(name)
+            if sym:
+                # Procedure calls can touch any register
+                if sym.kind == SymbolKind.PROCEDURE:
+                    return False
+                # BASED variables: LHLD then MOV - no DE touch
+                if sym.based_on:
+                    return True
+                # Simple variable: LDA/LHLD - no DE touch
+                return True
+            # Unknown symbol - assume LHLD
+            return True
+        if isinstance(expr, UnaryExpr):
+            # Unary ops on simple expressions don't touch DE
+            return self._expr_preserves_de(expr.operand)
+        if isinstance(expr, CallExpr):
+            # Check for SHL/SHR with constant shift - these don't touch DE
+            if isinstance(expr.callee, Identifier):
+                name = expr.callee.name.upper()
+                if name in ('SHL', 'SHR') and len(expr.args) == 2:
+                    # Check if shift amount is constant
+                    shift_arg = expr.args[1]
+                    is_const_shift = False
+                    if isinstance(shift_arg, NumberLiteral):
+                        is_const_shift = True
+                    elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
+                        is_const_shift = True
+                    if is_const_shift:
+                        # SHL/SHR with constant shift only touches HL and C
+                        # Check if the value arg preserves DE
+                        return self._expr_preserves_de(expr.args[0])
+        # Complex expressions (BinaryExpr, SubscriptExpr, CallExpr, etc.)
+        # may touch DE
+        return False
 
     def _gen_expr(self, expr: Expr) -> DataType:
         """
@@ -2279,6 +2883,10 @@ class CodeGenerator:
         Result is left in A (for BYTE) or HL (for ADDRESS).
         Returns the type of the expression.
         """
+        # Clear a_has_l for most expression types (embedded assign sets it)
+        if not isinstance(expr, (EmbeddedAssignExpr, CallExpr)):
+            self.a_has_l = False
+
         if isinstance(expr, NumberLiteral):
             # Use LXI H for all constants - more efficient (3 bytes vs 5 bytes)
             # Always return ADDRESS since value is in HL, not A
@@ -2338,17 +2946,71 @@ class CodeGenerator:
         elif isinstance(expr, EmbeddedAssignExpr):
             # Evaluate value
             val_type = self._gen_expr(expr.value)
-            # Save value and store to target
-            if val_type == DataType.BYTE:
+
+            # Track embedded assignment target for liveness optimization
+            target_name = None
+            if isinstance(expr.target, Identifier):
+                target_name = expr.target.name
+
+            # Check if we can skip the store because A survives to return
+            # Conditions:
+            # 1. Value is BYTE (in A)
+            # 2. Target is simple identifier
+            # 3. A survives through IF body (if in IF condition) and remaining stmts
+            # 4. Final statement is RETURN of same variable
+            skip_store = False
+            if val_type == DataType.BYTE and target_name:
+                # Gather all statements that A must survive through
+                stmts_to_check: list[Stmt] = []
+
+                # If we're in an IF condition, include the IF body
+                if self.current_if_stmt:
+                    stmts_to_check.append(self.current_if_stmt.then_stmt)
+                    if self.current_if_stmt.else_stmt:
+                        stmts_to_check.append(self.current_if_stmt.else_stmt)
+
+                # Add remaining statements (after current IF if any)
+                stmts_to_check.extend(self.pending_stmts)
+
+                # Check if all statements except last preserve A, and last is RETURN of target
+                if stmts_to_check:
+                    # All but last must not clobber A
+                    last_stmt = stmts_to_check[-1]
+                    preceding = stmts_to_check[:-1]
+
+                    if self._a_survives_stmts(preceding):
+                        if isinstance(last_stmt, ReturnStmt):
+                            if isinstance(last_stmt.value, Identifier):
+                                if last_stmt.value.name == target_name:
+                                    # A survives to return of same variable - skip store
+                                    skip_store = True
+                                    self.embedded_assign_target = target_name
+
+            if skip_store:
+                # Value is already in A, will be used by return - skip store entirely
+                pass
+            elif val_type == DataType.BYTE:
                 # Value is in A - save it in B, store, restore to A
                 self._emit("MOV", "B,A")
                 self._gen_store(expr.target, val_type)
                 self._emit("MOV", "A,B")
             else:
-                # Value is in HL - push, store, pop
-                self._emit("PUSH", "H")
-                self._gen_store(expr.target, val_type)
-                self._emit("POP", "H")
+                # Value is in HL
+                # Check if target is BYTE - _gen_store only touches A, not HL
+                target_sym = None
+                if isinstance(expr.target, Identifier):
+                    target_sym = self.symbols.lookup(expr.target.name)
+
+                if target_sym and target_sym.data_type == DataType.BYTE:
+                    # BYTE target - _gen_store does MOV A,L; STA - HL preserved
+                    # After this, A contains L
+                    self._gen_store(expr.target, val_type)
+                    self.a_has_l = True  # Signal that A already has L
+                else:
+                    # ADDRESS target - need to preserve HL
+                    self._emit("PUSH", "H")
+                    self._gen_store(expr.target, val_type)
+                    self._emit("POP", "H")
             return val_type
 
         return DataType.ADDRESS
@@ -2398,12 +3060,8 @@ class CodeGenerator:
                 if sym.kind == SymbolKind.PROCEDURE:
                     call_name = sym.asm_name if sym.asm_name else name
                     self._emit("CALL", call_name)
-                    # Result is in HL (for typed procedures) or undefined (for untyped)
+                    # Result is in A (for BYTE) or HL (for ADDRESS/untyped)
                     if sym.return_type == DataType.BYTE:
-                        # Move result from L to A for consistency
-                        self._emit("MOV", "A,L")
-                        self._emit("MOV", "L,A")
-                        self._emit("MVI", "H,0")
                         return DataType.BYTE
                     return sym.return_type or DataType.ADDRESS
 
@@ -2517,9 +3175,17 @@ class CodeGenerator:
         elif isinstance(expr, SubscriptExpr):
             # Check for MEMORY(addr) = value special case
             if isinstance(expr.base, Identifier) and expr.base.name.upper() == "MEMORY":
-                # MEMORY(addr) = value - store byte to memory address
+                # MEMORY(addr) = value - store byte to ??MEMORY + addr
+                # MEMORY is the predeclared byte array starting at end of program
                 self._emit("PUSH", "H")  # Save value
-                self._gen_expr(expr.index)  # HL = address
+                if isinstance(expr.index, NumberLiteral) and expr.index.value == 0:
+                    # MEMORY(0) - just use ??MEMORY directly
+                    self._emit("LXI", "H,??MEMORY")
+                else:
+                    # MEMORY(n) - compute ??MEMORY + n
+                    self._gen_expr(expr.index)  # HL = offset
+                    self._emit("LXI", "D,??MEMORY")
+                    self._emit("DAD", "D")  # HL = ??MEMORY + offset
                 self._emit("XCHG")  # DE = address
                 self._emit("POP", "H")  # HL = value
                 self._emit("MOV", "A,L")
@@ -2615,9 +3281,9 @@ class CodeGenerator:
                     self.needs_runtime.add("??OUTP")
                 return
 
-            # Check for MEMORY(addr) = value special case (built-in byte array at address 0)
+            # Check for MEMORY(addr) = value special case (built-in byte array at ??MEMORY)
             if isinstance(expr.callee, Identifier) and expr.callee.name.upper() == "MEMORY" and len(expr.args) == 1:
-                # MEMORY(addr) = value - store byte to direct memory address
+                # MEMORY(addr) = value - store byte to ??MEMORY + addr
                 addr_arg = expr.args[0]
                 # Check for constant address
                 addr_val = None
@@ -2630,19 +3296,26 @@ class CodeGenerator:
                         pass
 
                 if addr_val is not None:
-                    # Constant address - use STA directly
+                    # Constant offset - use STA to ??MEMORY+offset
                     if val_type != DataType.BYTE:
                         self._emit("MOV", "A,L")
-                    self._emit("STA", self._format_number(addr_val))
+                    if addr_val == 0:
+                        self._emit("STA", "??MEMORY")
+                    else:
+                        self._emit("STA", f"??MEMORY+{self._format_number(addr_val)}")
                 else:
-                    # Variable address - save value, compute addr, store
+                    # Variable offset - compute ??MEMORY + offset, then store
                     if val_type == DataType.BYTE:
                         self._emit("MOV", "B,A")  # Save value in B
-                        self._gen_expr(addr_arg)  # HL = address
+                        self._gen_expr(addr_arg)  # HL = offset
+                        self._emit("LXI", "D,??MEMORY")
+                        self._emit("DAD", "D")  # HL = ??MEMORY + offset
                         self._emit("MOV", "M,B")  # Store value at (HL)
                     else:
                         self._emit("PUSH", "H")  # Save value
-                        self._gen_expr(addr_arg)  # HL = address
+                        self._gen_expr(addr_arg)  # HL = offset
+                        self._emit("LXI", "D,??MEMORY")
+                        self._emit("DAD", "D")  # HL = ??MEMORY + offset
                         self._emit("XCHG")  # DE = address
                         self._emit("POP", "H")  # HL = value
                         self._emit("MOV", "A,L")
@@ -2750,13 +3423,19 @@ class CodeGenerator:
                                   BinaryOp.OR, BinaryOp.XOR):
             return self._gen_byte_binary(expr.left, expr.right, op)
 
-        # Optimize ADDRESS +/- small constant: use INX/DCX
+        # Optimize ADDRESS +/- constant: use INX/DCX for small, LXI D + DAD for larger
         if op == BinaryOp.ADD and isinstance(expr.right, NumberLiteral):
             const_val = expr.right.value
             if 1 <= const_val <= 4:  # Small constants: use repeated INX
                 self._gen_expr(expr.left)
                 for _ in range(const_val):
                     self._emit("INX", "H")
+                return DataType.ADDRESS
+            else:
+                # Larger constants: use LXI D,const; DAD D (no PUSH/POP needed)
+                self._gen_expr(expr.left)  # HL = left
+                self._emit("LXI", f"D,{self._format_number(const_val)}")
+                self._emit("DAD", "D")  # HL = HL + DE
                 return DataType.ADDRESS
         elif op == BinaryOp.SUB and isinstance(expr.right, NumberLiteral):
             const_val = expr.right.value
@@ -2765,39 +3444,59 @@ class CodeGenerator:
                 for _ in range(const_val):
                     self._emit("DCX", "H")
                 return DataType.ADDRESS
+            else:
+                # Larger constants: use subtraction without PUSH/POP
+                self._gen_expr(expr.left)  # HL = left
+                self._emit("LXI", f"D,{self._format_number(const_val)}")
+                # HL = HL - DE
+                self._emit_sub16()
+                return DataType.ADDRESS
 
         # Fall through to 16-bit operations
-        # Evaluate left operand
-        left_result = self._gen_expr(expr.left)
-        if left_result == DataType.BYTE:
-            # Extend A to HL
-            self._emit("MOV", "L,A")
-            self._emit("MVI", "H,0")
-        self._emit("PUSH", "H")  # Save left on stack
+        # Optimize evaluation order to avoid PUSH/POP when possible:
+        # If left is simple (doesn't touch DE), evaluate right first, save to DE, then left
+        if self._expr_preserves_de(expr.left):
+            # Evaluate right first
+            right_result = self._gen_expr(expr.right)
+            if right_result == DataType.BYTE:
+                self._emit("MOV", "E,A")
+                self._emit("MVI", "D,0")
+            else:
+                self._emit("XCHG")  # DE = right
+            # Now evaluate left - DE is preserved
+            left_result = self._gen_expr(expr.left)
+            if left_result == DataType.BYTE:
+                self._emit("MOV", "L,A")
+                self._emit("MVI", "H,0")
+            # Now: HL = left, DE = right (no PUSH/POP needed!)
+        else:
+            # Left is complex - use traditional PUSH/POP approach
+            # Evaluate left operand
+            left_result = self._gen_expr(expr.left)
+            if left_result == DataType.BYTE:
+                # Extend A to HL
+                self._emit("MOV", "L,A")
+                self._emit("MVI", "H,0")
+            self._emit("PUSH", "H")  # Save left on stack
 
-        # Evaluate right operand
-        right_result = self._gen_expr(expr.right)
-        if right_result == DataType.BYTE:
-            # Extend A to HL
-            self._emit("MOV", "L,A")
-            self._emit("MVI", "H,0")
+            # Evaluate right operand
+            right_result = self._gen_expr(expr.right)
+            if right_result == DataType.BYTE:
+                # Extend A to HL
+                self._emit("MOV", "L,A")
+                self._emit("MVI", "H,0")
 
-        # Pop left into DE
-        self._emit("XCHG")  # DE = right
-        self._emit("POP", "H")  # HL = left
-        # Now: HL = left, DE = right
+            # Pop left into DE
+            self._emit("XCHG")  # DE = right
+            self._emit("POP", "H")  # HL = left
+            # Now: HL = left, DE = right
 
         if op == BinaryOp.ADD:
             self._emit("DAD", "D")  # HL = HL + DE
 
         elif op == BinaryOp.SUB:
             # HL = HL - DE
-            self._emit("MOV", "A,L")
-            self._emit("SUB", "E")
-            self._emit("MOV", "L,A")
-            self._emit("MOV", "A,H")
-            self._emit("SBB", "D")
-            self._emit("MOV", "H,A")
+            self._emit_sub16()
 
         elif op == BinaryOp.MUL:
             self.needs_runtime.add("MUL16")
@@ -2864,19 +3563,17 @@ class CodeGenerator:
         true_label = self._new_label("TRUE")
         end_label = self._new_label("CMP")
 
-        # Subtract: HL - DE
-        self._emit("MOV", "A,L")
-        self._emit("SUB", "E")
-        self._emit("MOV", "B,A")  # Save low result
-        self._emit("MOV", "A,H")
-        self._emit("SBB", "D")
-        # Now: A = high byte of (left-right), B = low byte, flags set
+        # Subtract: HL = HL - DE, flags set from high byte subtraction
+        self._emit_sub16()
+        # Now: HL = left - right, flags set from SBB D (carry = borrow)
 
         if op == BinaryOp.EQ:
-            self._emit("ORA", "B")  # OR high and low
+            self._emit("MOV", "A,L")
+            self._emit("ORA", "H")  # OR high and low
             self._emit("JZ", true_label)
         elif op == BinaryOp.NE:
-            self._emit("ORA", "B")
+            self._emit("MOV", "A,L")
+            self._emit("ORA", "H")
             self._emit("JNZ", true_label)
         elif op == BinaryOp.LT:
             # left < right if borrow occurred
@@ -2949,18 +3646,12 @@ class CodeGenerator:
 
     def _gen_byte_comparison(self, left: Expr, right: Expr, op: BinaryOp) -> DataType:
         """Generate optimized byte comparison between two byte values."""
-        # Load left into A, save to B
-        self._gen_expr(left)  # Result in A
-        self._emit("MOV", "B,A")  # Save left in B
-
-        # Load right into A
+        # Load right first, then left, so we can SUB B directly
         self._gen_expr(right)  # Result in A
-        # Now B = left, A = right
+        self._emit("MOV", "B,A")  # Save right in B
 
-        # Compare: B - A (left - right)
-        self._emit("MOV", "C,A")  # Save right in C
-        self._emit("MOV", "A,B")  # A = left
-        self._emit("SUB", "C")    # A = left - right, flags set
+        self._gen_expr(left)  # Result in A (left)
+        self._emit("SUB", "B")    # A = left - right, flags set
 
         # Generate result
         true_label = self._new_label("TRUE")
@@ -3011,6 +3702,31 @@ class CodeGenerator:
                 self._emit("XRI", const)  # A = A XOR const
             return DataType.BYTE
 
+        # Special case: const - var (left is constant, subtraction)
+        if op == BinaryOp.SUB and isinstance(left, NumberLiteral) and left.value <= 255:
+            if left.value == 1:
+                # 1 - x is a boolean toggle: use XOR 1
+                self._gen_expr_to_a(right)
+                self._emit("XRI", "1")
+            else:
+                # const - x: negate x then add const
+                # -x = NOT(x) + 1, so const - x = NOT(x) + 1 + const = NOT(x) + (const+1)
+                # But we need to handle overflow: use CMA; ADI const; INR A for (const-x)
+                # Actually: A = right; CMA; INR A gives -right; then ADI const
+                self._gen_expr_to_a(right)
+                self._emit("CMA")  # A = NOT(right)
+                self._emit("INR", "A")  # A = -right (two's complement)
+                self._emit("ADI", self._format_number(left.value))  # A = const - right
+            return DataType.BYTE
+
+        # For subtraction, load right first so we can do SUB B directly
+        if op == BinaryOp.SUB:
+            self._gen_expr_to_a(right)
+            self._emit("MOV", "B,A")  # Save right in B
+            self._gen_expr_to_a(left)
+            self._emit("SUB", "B")    # A = left - right
+            return DataType.BYTE
+
         # General case: load left into A, save to B
         self._gen_expr_to_a(left)
         self._emit("MOV", "B,A")  # Save left in B
@@ -3022,10 +3738,6 @@ class CodeGenerator:
         # Perform operation: result = left op right
         if op == BinaryOp.ADD:
             self._emit("ADD", "B")  # A = A + B = right + left
-        elif op == BinaryOp.SUB:
-            self._emit("MOV", "C,A")  # C = right
-            self._emit("MOV", "A,B")  # A = left
-            self._emit("SUB", "C")    # A = left - right
         elif op == BinaryOp.AND:
             self._emit("ANA", "B")  # A = A AND B
         elif op == BinaryOp.OR:
@@ -3094,12 +3806,18 @@ class CodeGenerator:
                 return DataType.ADDRESS
 
         elif expr.op == UnaryOp.LOW:
-            self._emit("MVI", "H,0")
+            # Value is in HL (ADDRESS) or A (BYTE from operand)
+            if operand_type == DataType.ADDRESS:
+                self._emit("MOV", "A,L")  # Get low byte into A
+            # else: already in A from BYTE operand
             return DataType.BYTE
 
         elif expr.op == UnaryOp.HIGH:
-            self._emit("MOV", "L,H")
-            self._emit("MVI", "H,0")
+            # Value is in HL (ADDRESS) or A (BYTE from operand)
+            if operand_type == DataType.ADDRESS:
+                self._emit("MOV", "A,H")  # Get high byte into A
+            else:
+                self._emit("XRA", "A")  # BYTE has no high byte, return 0
             return DataType.BYTE
 
         return DataType.ADDRESS
@@ -3470,14 +4188,22 @@ class CodeGenerator:
             return DataType.BYTE
 
         if name == "LOW":
-            self._gen_expr(args[0])
-            self._emit("MVI", "H,0")
+            arg_type = self._gen_expr(args[0])
+            if arg_type == DataType.ADDRESS:
+                # Check if A already has L (from embedded assign to BYTE)
+                if self.a_has_l:
+                    self.a_has_l = False  # Consume the flag
+                else:
+                    self._emit("MOV", "A,L")  # Get low byte into A
+            # else: already in A from BYTE operand
             return DataType.BYTE
 
         if name == "HIGH":
-            self._gen_expr(args[0])
-            self._emit("MOV", "L,H")
-            self._emit("MVI", "H,0")
+            arg_type = self._gen_expr(args[0])
+            if arg_type == DataType.ADDRESS:
+                self._emit("MOV", "A,H")  # Get high byte into A
+            else:
+                self._emit("XRA", "A")  # BYTE has no high byte, return 0
             return DataType.BYTE
 
         if name == "DOUBLE":
@@ -3486,6 +4212,47 @@ class CodeGenerator:
             return DataType.ADDRESS
 
         if name == "SHL":
+            # Check for constant shift amount
+            shift_arg = args[1]
+            shift_count = None
+            if isinstance(shift_arg, NumberLiteral):
+                shift_count = shift_arg.value
+            elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
+                try:
+                    shift_count = self._parse_plm_number(self.literal_macros[shift_arg.name])
+                except ValueError:
+                    pass
+
+            if shift_count is not None and 0 <= shift_count <= 15:
+                self._gen_expr(args[0])  # Value in HL
+
+                if shift_count == 0:
+                    pass  # No shift needed
+                elif shift_count >= 8:
+                    # Shift by 8+: L goes to H, L becomes 0, then shift H left
+                    self._emit("MOV", "H,L")  # H = L (shift by 8)
+                    self._emit("MVI", "L,0")
+                    remaining = shift_count - 8
+                    for _ in range(remaining):
+                        self._emit("DAD", "H")  # HL *= 2
+                elif shift_count <= 4:
+                    # Small shifts: inline DAD H
+                    for _ in range(shift_count):
+                        self._emit("DAD", "H")  # HL *= 2
+                else:
+                    # For 5-7 shifts, use a counted loop
+                    self._emit("MVI", f"C,{shift_count}")
+                    shift_loop = self._new_label("SHL")
+                    end_label = self._new_label("SHLE")
+                    self._emit_label(shift_loop)
+                    self._emit("DCR", "C")
+                    self._emit("JM", end_label)
+                    self._emit("DAD", "H")
+                    self._emit("JMP", shift_loop)
+                    self._emit_label(end_label)
+                return DataType.ADDRESS
+
+            # Variable shift - use loop
             self._gen_expr(args[0])
             self._emit("PUSH", "H")
             self._gen_expr(args[1])
@@ -3502,6 +4269,86 @@ class CodeGenerator:
             return DataType.ADDRESS
 
         if name == "SHR":
+            # Check for constant shift amount
+            shift_arg = args[1]
+            shift_count = None
+            if isinstance(shift_arg, NumberLiteral):
+                shift_count = shift_arg.value
+            elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
+                try:
+                    shift_count = self._parse_plm_number(self.literal_macros[shift_arg.name])
+                except ValueError:
+                    pass
+
+            if shift_count is not None and 0 <= shift_count <= 15:
+                self._gen_expr(args[0])  # Value in HL
+
+                if shift_count == 0:
+                    pass  # No shift needed
+                elif shift_count >= 8:
+                    # Shift by 8+ : result is H >> (count-8)
+                    remaining = shift_count - 8
+                    if remaining == 0:
+                        # Exact shift by 8
+                        self._emit("MOV", "L,H")  # L = H
+                        self._emit("MVI", "H,0")
+                    elif self.target == Target.Z80 and remaining <= 4:
+                        # Z80: use SRL which doesn't need carry clearing
+                        # Note: SRL is Z80-only, no 8080 equivalent, so we emit it directly
+                        # But use 8080 mnemonics for LD/MOV so peephole can optimize
+                        self._emit("MOV", "A,H")
+                        for _ in range(remaining):
+                            self._emit("SRL", "A")  # Z80-only instruction
+                        self._emit("MOV", "L,A")
+                        self._emit("MVI", "H,0")
+                    else:
+                        # 8080 or larger shifts: load H into A, shift, store
+                        self._emit("MOV", "A,H")
+                        for _ in range(remaining):
+                            self._emit("ORA", "A")  # Clear carry
+                            self._emit("RAR")
+                        self._emit("MOV", "L,A")
+                        self._emit("MVI", "H,0")
+                elif shift_count == 7:
+                    # Special case for shift by 7: result = (H << 1) | (L >> 7)
+                    # This is faster than 7 iterations
+                    # RLC sets carry from bit 7, so no need to clear carry first
+                    self._emit("MOV", "A,L")
+                    self._emit("RLC")        # Carry = bit 7 of L (A also rotated but we discard it)
+                    self._emit("MOV", "A,H")
+                    self._emit("RAL")        # A = (H << 1) | carry
+                    self._emit("MOV", "L,A")
+                    self._emit("MVI", "H,0")
+                elif shift_count <= 3:
+                    # Small shifts: inline the loop
+                    for _ in range(shift_count):
+                        self._emit("ORA", "A")  # Clear carry
+                        self._emit("MOV", "A,H")
+                        self._emit("RAR")
+                        self._emit("MOV", "H,A")
+                        self._emit("MOV", "A,L")
+                        self._emit("RAR")
+                        self._emit("MOV", "L,A")
+                else:
+                    # For 4-6 shifts, use a counted loop
+                    self._emit("MVI", f"C,{shift_count}")
+                    shift_loop = self._new_label("SHR")
+                    end_label = self._new_label("SHRE")
+                    self._emit_label(shift_loop)
+                    self._emit("DCR", "C")
+                    self._emit("JM", end_label)
+                    self._emit("ORA", "A")
+                    self._emit("MOV", "A,H")
+                    self._emit("RAR")
+                    self._emit("MOV", "H,A")
+                    self._emit("MOV", "A,L")
+                    self._emit("RAR")
+                    self._emit("MOV", "L,A")
+                    self._emit("JMP", shift_loop)
+                    self._emit_label(end_label)
+                return DataType.ADDRESS
+
+            # Variable shift - use loop
             self._gen_expr(args[0])
             self._emit("PUSH", "H")
             self._gen_expr(args[1])
@@ -3592,13 +4439,18 @@ class CodeGenerator:
             return DataType.ADDRESS
 
         if name == "MEMORY":
-            # MEMORY(addr) - direct memory access as a byte array at address
-            # Generate address into HL
-            self._gen_expr(args[0])
+            # MEMORY(addr) - direct memory access as byte array starting at ??MEMORY
+            # Generate ??MEMORY + offset into HL
+            if isinstance(args[0], NumberLiteral) and args[0].value == 0:
+                # MEMORY(0) - just use ??MEMORY directly
+                self._emit("LXI", "H,??MEMORY")
+            else:
+                # MEMORY(n) - compute ??MEMORY + n
+                self._gen_expr(args[0])  # HL = offset
+                self._emit("LXI", "D,??MEMORY")
+                self._emit("DAD", "D")  # HL = ??MEMORY + offset
             # Load byte from (HL)
             self._emit("MOV", "A,M")
-            self._emit("MOV", "L,A")
-            self._emit("MVI", "H,0")
             return DataType.BYTE
 
         if name == "MOVE":

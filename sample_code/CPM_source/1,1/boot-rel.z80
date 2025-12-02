@@ -1,0 +1,98 @@
+;	CP/M 1975 boot-loader for Z80-Simulator
+;
+;	Copyright (C) 2007 by Udo Munk
+;
+; This old version of CP/M doesn't use any vectors in page zero.
+; To be able to use some CP/M software from later versions, this
+; boot loader relocates to FF00H and sets up page zero, as it
+; is done in later versions by the BIOS.
+;
+; This is the Z80 version to be assembled with z80asm.
+;
+	ORG	0		;mem base of boot
+;
+CCP	EQU	2900H		;base of the ccp
+BDOS	EQU	3206H		;BDOS entry point
+RELOC	EQU	0FF00H		;boot loader relocated to here
+SECTS	EQU	51		;# of sectors to load (26 * 2 - 1)
+;
+;	I/O ports
+;
+DRIVE   EQU	10		;fdc-port: # of drive
+TRACK   EQU	11		;fdc-port: # of track
+SECTOR  EQU	12		;fdc-port: # of sector
+FDCOP   EQU	13		;fdc-port: command
+FDCST   EQU	14		;fdc-port: status
+DMAL    EQU	15		;dma-port: dma address low
+DMAH    EQU	16		;dma-port: dma address high
+;
+;	move boot loader to FF00H
+;
+	LD	DE,RELOC	;destination
+	LD	HL,COLD		;source
+	LD	BC,FINI-COLD	;size
+	LDIR			;move the loader
+	JP	RELOC		;and run it
+;
+;	begin the load operation
+;	code from here on needs to be relocatable
+;
+COLD:	LD	A,0C3H		;JP instruction
+	LD	(0),A		;at 0
+	LD	(5),A		;and 5
+	LD	HL,RELOC	;boot jump vector
+	LD	(1),HL
+	LD	HL,BDOS		;BDOS jump vector
+	LD	(6),HL
+	XOR	A
+	LD	(3),A		;clear IOBYTE
+	LD	(4),A		;and current drive
+	LD	BC,2		;b=track 0, c=sector 2
+	LD	D,SECTS		;d=# sectors to load
+	LD	HL,CCP		;base transfer address
+	XOR	A		;select drive A
+	OUT	(DRIVE),A
+;
+;	load the next sector
+;
+LSECT:	LD	A,B		;set track
+	OUT	(TRACK),A
+	LD	A,C		;set sector
+	OUT	(SECTOR),A
+	LD	A,L		;set dma address low
+	OUT	(DMAL),A
+	LD	A,H		;set dma address high
+	OUT	(DMAH),A
+	XOR	A		;read sector
+	OUT	(FDCOP),A
+	IN	A,(FDCST)	;get status of fdc
+	OR	A		;read successful ?
+	JR	Z,CONT		;yes, continue
+	DI
+	HALT			;no, halt cpu
+CONT:
+				;go to next sector if load is incomplete
+	DEC	D		;sects=sects-1
+	JP	Z,CCP		;head for the ccp
+;
+;	more sectors to load
+;
+;	we aren't using a stack, so use <sp> as scratch register
+;	to hold the load address increment
+;
+	LD	SP,128		;128 bytes per sector
+	ADD	HL,SP		;<hl> = <hl> + 128
+;
+	INC	C		;sector = sector + 1
+	LD	A,C
+	CP	27		;last sector of track ?
+	JR	C,LSECT		;no, go read another
+;
+;	end of track, increment to next track
+;
+	LD	C,1		;sector = 1
+	INC	B		;track = track + 1
+	JR	LSECT		;for another group
+FINI:
+;
+	END			;of boot loader

@@ -1,0 +1,7 @@
+a:xsub
+a:sid
+f100,3000,00
+ra:sysgen.com
+rboot.hex,900
+rccp.hex,e080
+rbdos.hex,e080

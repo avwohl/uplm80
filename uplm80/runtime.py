@@ -167,6 +167,34 @@ RUNTIME_MOVE = """\
 	RET
 """
 
+# 16-bit subtract: HL = HL - DE (8080 version)
+# Compact routine to save bytes when used frequently
+RUNTIME_SUBDE = """\
+??SUBDE:
+	; 16-bit subtract: HL = HL - DE
+	; Input: HL, DE
+	; Output: HL = HL - DE, flags set
+	; Destroys: A
+	MOV	A,L
+	SUB	E
+	MOV	L,A
+	MOV	A,H
+	SBB	D
+	MOV	H,A
+	RET
+"""
+
+# 16-bit subtract: HL = HL - DE (Z80 version - 4 bytes shorter!)
+RUNTIME_SUBDE_Z80 = """\
+??SUBDE:
+	; 16-bit subtract: HL = HL - DE (Z80)
+	; Input: HL, DE
+	; Output: HL = HL - DE, flags set
+	OR	A		; Clear carry
+	SBC	HL,DE
+	RET
+"""
+
 # Compare strings for equality
 RUNTIME_STRCMP = """\
 ??STRCMP:
@@ -186,19 +214,39 @@ RUNTIME_STRCMP = """\
 	JMP	??STRCML
 """
 
-def get_runtime_library(include_all: bool = False) -> str:
-    """Get the runtime library assembly code."""
-    # For now, always include all routines
-    # A smarter compiler would only include what's needed
-    parts = [
-        "; PL/M-80 Runtime Library",
-        "",
-        RUNTIME_MUL16,
-        RUNTIME_DIV16,
-        RUNTIME_MOD16,
-        RUNTIME_MUL8,
-        RUNTIME_MOVE,
-    ]
+def get_runtime_library(needed: set[str] | None = None, target_z80: bool = True) -> str:
+    """Get the runtime library assembly code.
+
+    Args:
+        needed: Set of routine names that are needed (e.g., {"MUL16", "SUBDE"}).
+                If None, includes all routines.
+        target_z80: If True, use Z80-specific optimized routines. If False, use 8080.
+    """
+    # Map routine names to their code
+    # Use Z80-optimized SUBDE if targeting Z80
+    subde_routine = RUNTIME_SUBDE_Z80 if target_z80 else RUNTIME_SUBDE
+
+    routines = {
+        "MUL16": RUNTIME_MUL16,
+        "DIV16": RUNTIME_DIV16,
+        "MOD16": RUNTIME_MOD16,
+        "MUL8": RUNTIME_MUL8,
+        "MOVE": RUNTIME_MOVE,
+        "SUBDE": subde_routine,
+    }
+
+    parts = ["; PL/M-80 Runtime Library", ""]
+
+    if needed is None:
+        # Include all
+        for code in routines.values():
+            parts.append(code)
+    else:
+        # Include only what's needed
+        for name, code in routines.items():
+            if name in needed:
+                parts.append(code)
+
     return "\n".join(parts)
 
 

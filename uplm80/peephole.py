@@ -202,6 +202,34 @@ class PeepholeOptimizer:
                 pattern=[("MOV", "A,A")],
                 replacement=[],
             ),
+            # Duplicate MOV: MOV X,Y; MOV X,Y -> MOV X,Y
+            PeepholePattern(
+                name="duplicate_mov",
+                pattern=[("MOV", None), ("MOV", None)],
+                replacement=None,  # Keep first only
+                condition=lambda ops: ops[0][1] == ops[1][1],
+            ),
+            # Duplicate LD (Z80): LD X,Y; LD X,Y -> LD X,Y
+            PeepholePattern(
+                name="duplicate_ld",
+                pattern=[("LD", None), ("LD", None)],
+                replacement=None,  # Keep first only
+                condition=lambda ops: ops[0][1] == ops[1][1],
+            ),
+            # Wasteful byte extension before byte op: LD L,A; LD H,0; SUB x -> SUB x
+            # (Also for CP, AND, OR, XOR, ADD byte ops)
+            PeepholePattern(
+                name="useless_extend_before_sub",
+                pattern=[("LD", "L,A"), ("LD", "H,0"), ("SUB", None)],
+                replacement=None,  # Keep last only
+                condition=lambda ops: True,  # Always apply
+            ),
+            PeepholePattern(
+                name="useless_extend_before_cp",
+                pattern=[("LD", "L,A"), ("LD", "H,0"), ("CP", None)],
+                replacement=None,  # Keep last only
+                condition=lambda ops: True,
+            ),
             # Redundant byte extension: MOV L,A; MVI H,0; MOV L,A; MVI H,0 -> MOV L,A; MVI H,0
             PeepholePattern(
                 name="double_byte_extend",
@@ -347,8 +375,8 @@ class PeepholeOptimizer:
                 condition=lambda ops: ops[0][1].startswith("H,"),
             ),
 
-            # PUSH H; LXI H,x; XCHG; POP H -> PUSH H; LXI D,x
-            # (Constant goes to DE, no need to touch HL)
+            # PUSH H; LXI H,x; XCHG; POP H -> LXI D,x
+            # (Constant goes to DE directly, PUSH/POP eliminated entirely)
             PeepholePattern(
                 name="push_lxi_xchg_pop",
                 pattern=[("PUSH", "H"), ("LXI", None), ("XCHG", ""), ("POP", "H")],
@@ -362,6 +390,14 @@ class PeepholeOptimizer:
                 name="mov_la_mvi_h0_xchg_pop",
                 pattern=[("MOV", "L,A"), ("MVI", "H,0"), ("XCHG", ""), ("POP", "H")],
                 replacement=[("MOV", "E,A"), ("MVI", "D,0"), ("POP", "H")],
+            ),
+
+            # MOV L,A; MVI H,0; DCX H; MOV A,L -> DCR A; MOV L,A
+            # (16-bit decrement of byte value - just decrement A directly)
+            PeepholePattern(
+                name="mov_la_mvi_h0_dcx_mov_al",
+                pattern=[("MOV", "L,A"), ("MVI", "H,0"), ("DCX", "H"), ("MOV", "A,L")],
+                replacement=[("DCR", "A"), ("MOV", "L,A")],
             ),
 
             # LXI H,0; DAD SP -> LXI H,0; DAD SP (reading SP, can't optimize easily)
@@ -412,6 +448,58 @@ class PeepholeOptimizer:
                 name="test_false_const",
                 pattern=[("LXI", "H,0"), ("MOV", "A,L"), ("ORA", "H")],
                 replacement=[("XRA", "A")],  # Sets Z flag and clears HL conceptually
+            ),
+
+            # PUSH H; SHLD x; POP H -> SHLD x (SHLD doesn't modify HL)
+            PeepholePattern(
+                name="push_shld_pop",
+                pattern=[("PUSH", "H"), ("SHLD", None), ("POP", "H")],
+                replacement=None,  # Handled specially - keep only SHLD
+            ),
+
+            # PUSH H; MVI A,x; MOV E,A; MVI D,0; POP H -> MVI E,x; MVI D,0
+            # (HL not modified, PUSH/POP is wasteful)
+            PeepholePattern(
+                name="push_mvi_a_mov_e_mvi_d_pop",
+                pattern=[("PUSH", "H"), ("MVI", None), ("MOV", "E,A"), ("MVI", "D,0"), ("POP", "H")],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[1][1].startswith("A,"),
+            ),
+
+            # PUSH H; LDA x; MOV B,A; LDA y; SUB B; MOV E,A; MVI D,0; POP H
+            # -> LDA x; MOV B,A; LDA y; SUB B; MOV E,A; MVI D,0
+            # (HL not modified, PUSH/POP is wasteful)
+            PeepholePattern(
+                name="push_lda_sub_to_de_pop",
+                pattern=[("PUSH", "H"), ("LDA", None), ("MOV", "B,A"), ("LDA", None),
+                         ("SUB", "B"), ("MOV", "E,A"), ("MVI", "D,0"), ("POP", "H")],
+                replacement=None,  # Handled specially - remove PUSH/POP
+            ),
+
+            # PUSH H; LHLD x; POP D -> XCHG; LHLD x; XCHG (Z80: use LD DE,(x) directly)
+            # Gets (x) into HL and old HL into DE
+            PeepholePattern(
+                name="push_lhld_pop_d",
+                pattern=[("PUSH", "H"), ("LHLD", None), ("POP", "D")],
+                replacement=None,  # Handled specially
+            ),
+
+            # PUSH H; MOV E,A; MVI D,0; POP H -> MOV E,A; MVI D,0
+            # (HL not modified, PUSH/POP is wasteful)
+            PeepholePattern(
+                name="push_mov_ea_mvi_d0_pop",
+                pattern=[("PUSH", "H"), ("MOV", "E,A"), ("MVI", "D,0"), ("POP", "H")],
+                replacement=[("MOV", "E,A"), ("MVI", "D,0")],
+            ),
+
+            # LHLD x; PUSH H; LDED y; LHLD z; CALL ??SUBDE; XCHG; POP H; CALL ??SUBDE
+            # -> LDED y; LHLD z; CALL ??SUBDE; XCHG; LHLD x; CALL ??SUBDE
+            # (Delay loading x until it's actually needed)
+            PeepholePattern(
+                name="early_load_push_subde",
+                pattern=[("LHLD", None), ("PUSH", "H"), ("LDED", None), ("LHLD", None),
+                         ("CALL", "??SUBDE"), ("XCHG", ""), ("POP", "H"), ("CALL", "??SUBDE")],
+                replacement=None,  # Handled specially
             ),
 
             # ============================================================
@@ -508,6 +596,14 @@ class PeepholeOptimizer:
                 pattern=[("PUSH", "H"), ("LXI", None), ("MOV", "C,L"), ("POP", "H")],
                 replacement=None,  # Handled specially
                 condition=lambda ops: ops[1][1].startswith("H,"),
+            ),
+
+            # PUSH H; MOV A,L; STA x; POP H; MVI H,0 -> MOV A,L; STA x; MVI H,0
+            # The PUSH/POP is pointless since we're about to overwrite H anyway
+            PeepholePattern(
+                name="push_mov_sta_pop_mvi_h0",
+                pattern=[("PUSH", "H"), ("MOV", "A,L"), ("STA", None), ("POP", "H"), ("MVI", "H,0")],
+                replacement=None,  # Handled specially
             ),
 
             # MVI H,0; MVI L,x -> LXI H,x (smaller on Z80)
@@ -912,6 +1008,19 @@ class PeepholeOptimizer:
                 if did_change:
                     changed = True
 
+        # Phase 1.6: Eliminate useless PUSH/POP pairs where register isn't modified
+        lines, did_change = self._eliminate_useless_push_pop(lines)
+        if did_change:
+            # Run pattern matching again
+            changed = True
+            passes = 0
+            while changed and passes < max_passes:
+                changed = False
+                passes += 1
+                lines, did_change = self._optimize_pass(lines)
+                if did_change:
+                    changed = True
+
         # Phase 2: For Z80, translate to Z80 mnemonics
         if self.target == Target.Z80:
             lines = self._translate_to_z80(lines)
@@ -933,6 +1042,153 @@ class PeepholeOptimizer:
             lines, _ = self._optimize_z80_pass(lines)
 
         return "\n".join(lines)
+
+    def _eliminate_useless_push_pop(self, lines: list[str]) -> tuple[list[str], bool]:
+        """
+        Eliminate PUSH H / POP H pairs when HL isn't modified between them.
+
+        This handles the general case where we save HL, do operations that don't
+        touch HL, then restore it - the save/restore is wasteful.
+        """
+        result: list[str] = []
+        changed = False
+        i = 0
+
+        # Instructions that modify H or L (or HL as a pair)
+        hl_modifying_opcodes = {
+            'LHLD', 'LXI', 'INX', 'DCX', 'DAD', 'XTHL', 'SPHL', 'PCHL',
+            'POP',  # POP H modifies HL
+            'MOV',  # MOV H,x or MOV L,x modifies HL
+            'MVI',  # MVI H,x or MVI L,x modifies HL
+            'INR', 'DCR',  # INR H, DCR L etc
+            'ADD', 'ADC', 'SUB', 'SBB', 'ANA', 'XRA', 'ORA', 'CMP',  # Don't modify HL but check operand
+            'XCHG',  # Swaps HL with DE
+            'CALL', 'RST',  # Could modify anything
+        }
+
+        def modifies_hl(line: str) -> bool:
+            """Check if an instruction modifies H or L registers."""
+            stripped = line.strip()
+            if not stripped or stripped.startswith(';') or stripped.endswith(':'):
+                return False
+
+            parts = stripped.split(None, 1)
+            if not parts:
+                return False
+            opcode = parts[0].upper()
+            operands = parts[1] if len(parts) > 1 else ""
+
+            # CALL modifies everything (conservatively)
+            if opcode in ('CALL', 'RST'):
+                return True
+
+            # XCHG swaps HL with DE
+            if opcode == 'XCHG':
+                return True
+
+            # These always modify HL
+            if opcode in ('LHLD', 'XTHL', 'SPHL', 'PCHL'):
+                return True
+
+            # LXI H modifies HL
+            if opcode == 'LXI' and operands.upper().startswith('H'):
+                return True
+
+            # INX H, DCX H modify HL
+            if opcode in ('INX', 'DCX') and operands.upper() == 'H':
+                return True
+
+            # DAD modifies HL
+            if opcode == 'DAD':
+                return True
+
+            # POP H modifies HL
+            if opcode == 'POP' and operands.upper() == 'H':
+                return True
+
+            # MOV H,x or MOV L,x modifies H or L
+            if opcode == 'MOV':
+                dest = operands.split(',')[0].upper().strip() if ',' in operands else ""
+                if dest in ('H', 'L', 'M'):  # M uses HL as pointer but doesn't modify it
+                    if dest != 'M':
+                        return True
+
+            # MVI H,x or MVI L,x
+            if opcode == 'MVI':
+                dest = operands.split(',')[0].upper().strip() if ',' in operands else ""
+                if dest in ('H', 'L'):
+                    return True
+
+            # INR H, DCR L, etc
+            if opcode in ('INR', 'DCR'):
+                if operands.upper().strip() in ('H', 'L'):
+                    return True
+
+            return False
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            parts = stripped.split(None, 1)
+
+            # Look for PUSH H
+            if parts and parts[0].upper() == 'PUSH' and len(parts) > 1 and parts[1].upper() == 'H':
+                # Found PUSH H - scan forward for matching POP H
+                push_idx = i
+                j = i + 1
+                hl_modified = False
+                pop_idx = -1
+
+                while j < len(lines):
+                    inner_line = lines[j]
+                    inner_stripped = inner_line.strip()
+
+                    # Skip empty lines and comments
+                    if not inner_stripped or inner_stripped.startswith(';'):
+                        j += 1
+                        continue
+
+                    # Check for label - can't optimize across labels
+                    if inner_stripped.endswith(':'):
+                        break
+
+                    inner_parts = inner_stripped.split(None, 1)
+                    if not inner_parts:
+                        j += 1
+                        continue
+
+                    opcode = inner_parts[0].upper()
+                    operands = inner_parts[1].upper() if len(inner_parts) > 1 else ""
+
+                    # Found POP H?
+                    if opcode == 'POP' and operands == 'H':
+                        pop_idx = j
+                        break
+
+                    # Another PUSH H? Nested, can't optimize simply
+                    if opcode == 'PUSH' and operands == 'H':
+                        break
+
+                    # Check if this instruction modifies HL
+                    if modifies_hl(inner_line):
+                        hl_modified = True
+                        break
+
+                    j += 1
+
+                # If we found a matching POP H and HL wasn't modified, eliminate both
+                if pop_idx > 0 and not hl_modified:
+                    # Skip the PUSH H, copy everything in between, skip the POP H
+                    for k in range(push_idx + 1, pop_idx):
+                        result.append(lines[k])
+                    i = pop_idx + 1
+                    changed = True
+                    continue
+
+            result.append(line)
+            i += 1
+
+        return result, changed
 
     def _register_tracking_pass(self, lines: list[str]) -> tuple[list[str], bool]:
         """
@@ -1781,9 +2037,9 @@ class PeepholeOptimizer:
         i = 0
 
         while i < len(lines):
-            # Special case: JMP to immediately following label
+            # Special case: JMP/JR to immediately following label
             parsed = self._parse_line(lines[i])
-            if parsed and parsed[0] == "JMP":
+            if parsed and parsed[0] in ("JMP", "JR"):
                 target = parsed[1]
                 # Look ahead for the target label (skip comments/empty lines)
                 j = i + 1
@@ -1938,12 +2194,15 @@ class PeepholeOptimizer:
                     elif pattern.name.startswith("cond_uncond"):
                         # Keep second instruction only
                         result.append(lines[instruction_lines[-1]])
-                    elif pattern.name == "redundant_mov":
+                    elif pattern.name in ("redundant_mov", "duplicate_mov", "duplicate_ld"):
                         # Keep first instruction only
                         result.append(lines[instruction_lines[0]])
                     elif pattern.name in ("load_store_same", "shld_lhld_same"):
                         # Keep first instruction only
                         result.append(lines[instruction_lines[0]])
+                    elif pattern.name in ("useless_extend_before_sub", "useless_extend_before_cp"):
+                        # Keep last instruction only (SUB or CP)
+                        result.append(lines[instruction_lines[-1]])
                     elif pattern.name == "tail_call":
                         # CALL x; RET -> JMP x
                         call_target = instructions[0][1]
@@ -1976,9 +2235,9 @@ class PeepholeOptimizer:
                         result.append(f"\tLXI\tD,{operand}")
                         result.append(lines[instruction_lines[2]])  # LDA/STA/LHLD y
                     elif pattern.name == "push_lxi_xchg_pop":
-                        # PUSH H; LXI H,x; XCHG; POP H -> PUSH H; LXI D,x
+                        # PUSH H; LXI H,x; XCHG; POP H -> LXI D,x
+                        # The PUSH is no longer needed since we're not saving/restoring HL
                         operand = instructions[1][1][2:]  # Remove "H," prefix
-                        result.append("\tPUSH\tH")
                         result.append(f"\tLXI\tD,{operand}")
                     elif pattern.name == "double_push_same_const":
                         # LXI H,x; PUSH H; LXI H,x; PUSH H -> LXI H,x; PUSH H; PUSH H
@@ -2031,6 +2290,47 @@ class PeepholeOptimizer:
                         # MOV A,L; MVI H,0; STA x -> MOV A,L; STA x
                         result.append(lines[instruction_lines[0]])  # MOV A,L
                         result.append(lines[instruction_lines[2]])  # STA x
+
+                    elif pattern.name == "push_shld_pop":
+                        # PUSH H; SHLD x; POP H -> SHLD x
+                        # SHLD doesn't modify HL, so save/restore is unnecessary
+                        result.append(lines[instruction_lines[1]])  # Keep only SHLD
+
+                    elif pattern.name == "push_mvi_a_mov_e_mvi_d_pop":
+                        # PUSH H; MVI A,x; MOV E,A; MVI D,0; POP H -> MVI E,x; MVI D,0
+                        # HL not modified, PUSH/POP is wasteful
+                        const = instructions[1][1][2:]  # Get constant from "A,x"
+                        result.append(f"\tMVI\tE,{const}")
+                        result.append(f"\tMVI\tD,0")
+
+                    elif pattern.name == "push_lda_sub_to_de_pop":
+                        # PUSH H; LDA x; MOV B,A; LDA y; SUB B; MOV E,A; MVI D,0; POP H
+                        # -> just the middle instructions without PUSH/POP
+                        # HL not modified, PUSH/POP is wasteful
+                        for idx in range(1, 7):  # Instructions 1-6 (skip PUSH at 0 and POP at 7)
+                            result.append(lines[instruction_lines[idx]])
+
+                    elif pattern.name == "push_lhld_pop_d":
+                        # PUSH H; LHLD x; POP D -> XCHG; LHLD x
+                        # Old HL goes to DE, new value from (x) into HL
+                        # This is 1 byte smaller (5 -> 4 bytes)
+                        addr = instructions[1][1]  # Get address from LHLD
+                        result.append(f"\tXCHG")
+                        result.append(f"\tLHLD\t{addr}")
+
+                    elif pattern.name == "early_load_push_subde":
+                        # LHLD x; PUSH H; LDED y; LHLD z; CALL ??SUBDE; XCHG; POP H; CALL ??SUBDE
+                        # -> LDED y; LHLD z; CALL ??SUBDE; XCHG; LHLD x; CALL ??SUBDE
+                        # Delay loading x until needed, eliminate PUSH/POP
+                        addr_x = instructions[0][1]  # First LHLD operand
+                        addr_y = instructions[2][1]  # LDED operand
+                        addr_z = instructions[3][1]  # Second LHLD operand
+                        result.append(f"\tLDED\t{addr_y}")
+                        result.append(f"\tLHLD\t{addr_z}")
+                        result.append(f"\tCALL\t??SUBDE")
+                        result.append(f"\tXCHG")
+                        result.append(f"\tLHLD\t{addr_x}")
+                        result.append(f"\tCALL\t??SUBDE")
 
                     elif pattern.name in ("mov_ba_sta_mov_ab", "mov_ca_sta_mov_ac",
                                           "mov_da_sta_mov_ad", "mov_ea_sta_mov_ae"):
@@ -2103,6 +2403,13 @@ class PeepholeOptimizer:
                         # PUSH H; LXI H,const; MOV C,L; POP H -> MVI C,const
                         const = instructions[1][1][2:]  # Remove "H," prefix
                         result.append(f"\tMVI\tC,{const}")
+
+                    elif pattern.name == "push_mov_sta_pop_mvi_h0":
+                        # PUSH H; MOV A,L; STA x; POP H; MVI H,0 -> MOV A,L; STA x; MVI H,0
+                        sta_addr = instructions[2][1]
+                        result.append("\tMOV\tA,L")
+                        result.append(f"\tSTA\t{sta_addr}")
+                        result.append("\tMVI\tH,0")
 
                     elif pattern.name == "shld_mvi_lhld_xchg_same":
                         # SHLD x; MVI r,n; LHLD x; XCHG -> MVI r,n; XCHG
