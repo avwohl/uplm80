@@ -291,6 +291,47 @@ class PeepholeOptimizer:
                 condition=lambda ops: ops[0][1].startswith("H,"),
             ),
 
+            # LXI H,x; XCHG; CALL y -> LXI D,x; CALL y
+            # (Loading constant into DE directly saves the XCHG)
+            PeepholePattern(
+                name="lxi_xchg_call",
+                pattern=[("LXI", None), ("XCHG", ""), ("CALL", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1].startswith("H,"),
+            ),
+
+            # LXI H,x; XCHG; JMP y -> LXI D,x; JMP y
+            PeepholePattern(
+                name="lxi_xchg_jmp",
+                pattern=[("LXI", None), ("XCHG", ""), ("JMP", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1].startswith("H,"),
+            ),
+
+            # LXI H,x; XCHG; LDA y -> LXI D,x; LDA y
+            PeepholePattern(
+                name="lxi_xchg_lda",
+                pattern=[("LXI", None), ("XCHG", ""), ("LDA", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1].startswith("H,"),
+            ),
+
+            # LXI H,x; XCHG; STA y -> LXI D,x; STA y
+            PeepholePattern(
+                name="lxi_xchg_sta",
+                pattern=[("LXI", None), ("XCHG", ""), ("STA", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1].startswith("H,"),
+            ),
+
+            # LXI H,x; XCHG; LHLD y -> LXI D,x; LHLD y
+            PeepholePattern(
+                name="lxi_xchg_lhld",
+                pattern=[("LXI", None), ("XCHG", ""), ("LHLD", None)],
+                replacement=None,  # Handled specially
+                condition=lambda ops: ops[0][1].startswith("H,"),
+            ),
+
             # PUSH H; LXI H,x; XCHG; POP H -> PUSH H; LXI D,x
             # (Constant goes to DE, no need to touch HL)
             PeepholePattern(
@@ -300,9 +341,13 @@ class PeepholeOptimizer:
                 condition=lambda ops: ops[1][1].startswith("H,"),
             ),
 
-            # MOV L,A; MVI H,0; PUSH H; LXI D,x -> PUSH H; LXI D,x (if A already in L)
-            # Actually: MOV L,A; MVI H,0; PUSH H -> MOV L,A; MVI H,0; PUSH H (no change)
-            # But we can use: LDA x; MOV L,A; MVI H,0 -> LDA x; MOV L,A; MVI H,0
+            # MOV L,A; MVI H,0; XCHG; POP H -> MOV E,A; MVI D,0; POP H
+            # (Putting byte value in DE directly, saves XCHG)
+            PeepholePattern(
+                name="mov_la_mvi_h0_xchg_pop",
+                pattern=[("MOV", "L,A"), ("MVI", "H,0"), ("XCHG", ""), ("POP", "H")],
+                replacement=[("MOV", "E,A"), ("MVI", "D,0"), ("POP", "H")],
+            ),
 
             # LXI H,0; DAD SP -> LXI H,0; DAD SP (reading SP, can't optimize easily)
 
@@ -441,6 +486,48 @@ class PeepholeOptimizer:
                 replacement=[("RET", "")],
             ),
 
+            # LDA x; CPI y; JZ z; LDA x -> LDA x; CPI y; JZ z
+            # (A unchanged after CPI/Jcond, so redundant reload)
+            PeepholePattern(
+                name="lda_cpi_jz_lda_same",
+                pattern=[("LDA", None), ("CPI", None), ("JZ", None), ("LDA", None)],
+                replacement=None,  # Keep first 3 only
+                condition=lambda ops: ops[0][1] == ops[3][1],
+            ),
+            PeepholePattern(
+                name="lda_cpi_jnz_lda_same",
+                pattern=[("LDA", None), ("CPI", None), ("JNZ", None), ("LDA", None)],
+                replacement=None,
+                condition=lambda ops: ops[0][1] == ops[3][1],
+            ),
+            PeepholePattern(
+                name="lda_cpi_jc_lda_same",
+                pattern=[("LDA", None), ("CPI", None), ("JC", None), ("LDA", None)],
+                replacement=None,
+                condition=lambda ops: ops[0][1] == ops[3][1],
+            ),
+            PeepholePattern(
+                name="lda_cpi_jnc_lda_same",
+                pattern=[("LDA", None), ("CPI", None), ("JNC", None), ("LDA", None)],
+                replacement=None,
+                condition=lambda ops: ops[0][1] == ops[3][1],
+            ),
+
+            # LDA x; ORA A; JZ z; LDA x -> LDA x; ORA A; JZ z
+            # (A unchanged after ORA A/Jcond)
+            PeepholePattern(
+                name="lda_ora_jz_lda_same",
+                pattern=[("LDA", None), ("ORA", "A"), ("JZ", None), ("LDA", None)],
+                replacement=None,
+                condition=lambda ops: ops[0][1] == ops[3][1],
+            ),
+            PeepholePattern(
+                name="lda_ora_jnz_lda_same",
+                pattern=[("LDA", None), ("ORA", "A"), ("JNZ", None), ("LDA", None)],
+                replacement=None,
+                condition=lambda ops: ops[0][1] == ops[3][1],
+            ),
+
             # MOV B,A; MOV A,B -> MOV B,A
             PeepholePattern(
                 name="mov_ba_ab",
@@ -471,6 +558,31 @@ class PeepholeOptimizer:
                 name="mov_la_al",
                 pattern=[("MOV", "L,A"), ("MOV", "A,L")],
                 replacement=[("MOV", "L,A")],
+            ),
+
+            # MOV A,M; MOV E,A -> MOV E,M (load byte into E directly)
+            PeepholePattern(
+                name="mov_am_mov_ea",
+                pattern=[("MOV", "A,M"), ("MOV", "E,A")],
+                replacement=[("MOV", "E,M")],
+            ),
+            # MOV A,M; MOV D,A -> MOV D,M
+            PeepholePattern(
+                name="mov_am_mov_da",
+                pattern=[("MOV", "A,M"), ("MOV", "D,A")],
+                replacement=[("MOV", "D,M")],
+            ),
+            # MOV A,M; MOV C,A -> MOV C,M
+            PeepholePattern(
+                name="mov_am_mov_ca",
+                pattern=[("MOV", "A,M"), ("MOV", "C,A")],
+                replacement=[("MOV", "C,M")],
+            ),
+            # MOV A,M; MOV B,A -> MOV B,M
+            PeepholePattern(
+                name="mov_am_mov_ba",
+                pattern=[("MOV", "A,M"), ("MOV", "B,A")],
+                replacement=[("MOV", "B,M")],
             ),
 
             # LDA x; ORA A; JZ -> load and test combined
@@ -1453,6 +1565,21 @@ class PeepholeOptimizer:
                         operand = instructions[0][1][2:]  # Remove "H," prefix
                         result.append(f"\tLXI\tD,{operand}")
                         result.append("\tPOP\tH")
+                    elif pattern.name == "lxi_xchg_call":
+                        # LXI H,x; XCHG; CALL y -> LXI D,x; CALL y
+                        operand = instructions[0][1][2:]  # Remove "H," prefix
+                        result.append(f"\tLXI\tD,{operand}")
+                        result.append(lines[instruction_lines[2]])  # CALL y
+                    elif pattern.name == "lxi_xchg_jmp":
+                        # LXI H,x; XCHG; JMP y -> LXI D,x; JMP y
+                        operand = instructions[0][1][2:]  # Remove "H," prefix
+                        result.append(f"\tLXI\tD,{operand}")
+                        result.append(lines[instruction_lines[2]])  # JMP y
+                    elif pattern.name in ("lxi_xchg_lda", "lxi_xchg_sta", "lxi_xchg_lhld"):
+                        # LXI H,x; XCHG; LDA/STA/LHLD y -> LXI D,x; LDA/STA/LHLD y
+                        operand = instructions[0][1][2:]  # Remove "H," prefix
+                        result.append(f"\tLXI\tD,{operand}")
+                        result.append(lines[instruction_lines[2]])  # LDA/STA/LHLD y
                     elif pattern.name == "push_lxi_xchg_pop":
                         # PUSH H; LXI H,x; XCHG; POP H -> PUSH H; LXI D,x
                         operand = instructions[1][1][2:]  # Remove "H," prefix
@@ -1474,6 +1601,15 @@ class PeepholeOptimizer:
                     elif pattern.name == "sta_lda_same":
                         # STA x; LDA x -> STA x
                         result.append(lines[instruction_lines[0]])
+
+                    elif pattern.name in ("lda_cpi_jz_lda_same", "lda_cpi_jnz_lda_same",
+                                          "lda_cpi_jc_lda_same", "lda_cpi_jnc_lda_same",
+                                          "lda_ora_jz_lda_same", "lda_ora_jnz_lda_same"):
+                        # LDA x; CPI/ORA; Jcond; LDA x -> LDA x; CPI/ORA; Jcond
+                        # Keep first 3 instructions, drop the redundant reload
+                        result.append(lines[instruction_lines[0]])  # LDA
+                        result.append(lines[instruction_lines[1]])  # CPI/ORA
+                        result.append(lines[instruction_lines[2]])  # Jcond
                     elif pattern.name == "lxi_mov_al_sta":
                         # LXI H,const; MOV A,L; STA x -> MVI A,const; STA x
                         const = instructions[0][1][2:]  # Remove "H," prefix

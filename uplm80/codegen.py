@@ -1386,6 +1386,14 @@ class CodeGenerator:
 
         Returns True if optimized jump was generated, False if caller should use fallback.
         """
+        # Handle constant conditions - no code needed for always-true, unconditional jump for always-false
+        if isinstance(condition, NumberLiteral):
+            if condition.value == 0:
+                # Always false - unconditional jump
+                self._emit("JMP", false_label)
+            # If non-zero (always true), no code needed - just fall through
+            return True
+
         if not isinstance(condition, BinaryExpr):
             return False
 
@@ -1503,6 +1511,14 @@ class CodeGenerator:
 
         Returns True if optimized jump was generated, False if caller should use fallback.
         """
+        # Handle constant conditions
+        if isinstance(condition, NumberLiteral):
+            if condition.value != 0:
+                # Always true - unconditional jump
+                self._emit("JMP", true_label)
+            # If zero (always false), no code needed - just fall through
+            return True
+
         if not isinstance(condition, BinaryExpr):
             return False
 
