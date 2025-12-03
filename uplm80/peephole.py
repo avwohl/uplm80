@@ -1297,7 +1297,10 @@ class PeepholeOptimizer:
                 continue
 
             # Track SHLD - memory gets HL, but HL is unchanged
+            # Also track that HL now contains the same value as mem:addr
             if opcode == 'SHLD':
+                addr = operands
+                hl_value = f"mem:{addr}"  # HL contains what was just stored
                 result.append(line)
                 continue
 
@@ -1867,14 +1870,17 @@ class PeepholeOptimizer:
 
                 # CP 1; JP Z/NZ -> DEC A; JP Z/NZ (saves 1 byte: CP 1 is 2 bytes, DEC A is 1 byte)
                 # Only valid when A is not needed afterward (comparison just sets flags)
-                if opcode == "CP" and operands == "1" and i + 1 < len(lines):
-                    next_parsed = self._parse_z80_line(lines[i + 1].strip())
-                    if next_parsed and next_parsed[0] in ("JP", "JR") and next_parsed[1].startswith(("Z,", "NZ,")):
-                        result.append("\tDEC A")
-                        changed = True
-                        self.stats["z80_cp1_dec"] = self.stats.get("z80_cp1_dec", 0) + 1
-                        i += 1
-                        continue
+                # DISABLED: This optimization breaks DO CASE sequential comparisons where
+                # multiple CP instructions test the same A value. The DEC A modifies A,
+                # breaking subsequent comparisons.
+                # if opcode == "CP" and operands == "1" and i + 1 < len(lines):
+                #     next_parsed = self._parse_z80_line(lines[i + 1].strip())
+                #     if next_parsed and next_parsed[0] in ("JP", "JR") and next_parsed[1].startswith(("Z,", "NZ,")):
+                #         result.append("\tDEC A")
+                #         changed = True
+                #         self.stats["z80_cp1_dec"] = self.stats.get("z80_cp1_dec", 0) + 1
+                #         i += 1
+                #         continue
 
                 # Skip trick: JP label; LD A,0FFH; label: -> DB 21H; LD A,0FFH; label:
                 # The 21H byte is the opcode for LD HL,nn which "eats" the next 2 bytes
@@ -2767,13 +2773,15 @@ class PeepholeOptimizer:
                         result.append("\tPOP\tPSW")
 
                     elif pattern.name == "shld_mvi_lhld_same":
-                        # SHLD x; MVI r,n; LHLD x -> MVI r,n
-                        # MVI doesn't touch HL, so save/restore is unnecessary
+                        # SHLD x; MVI r,n; LHLD x -> SHLD x; MVI r,n
+                        # Keep the SHLD (variable may be needed), remove LHLD (HL unchanged)
+                        result.append(lines[instruction_lines[0]])  # SHLD x
                         result.append(lines[instruction_lines[1]])  # MVI r,n
 
                     elif pattern.name == "sta_mvi_lda_same":
-                        # STA x; MVI r,n; LDA x -> MVI r,n
-                        # MVI doesn't touch A (when r != A), so save/restore is unnecessary
+                        # STA x; MVI r,n; LDA x -> STA x; MVI r,n
+                        # Keep the STA (variable may be needed), remove LDA (A unchanged by MVI r)
+                        result.append(lines[instruction_lines[0]])  # STA x
                         result.append(lines[instruction_lines[1]])  # MVI r,n
 
                     elif pattern.name == "push_lxi_mov_cl_pop":
@@ -2789,7 +2797,9 @@ class PeepholeOptimizer:
                         result.append("\tMVI\tH,0")
 
                     elif pattern.name == "shld_mvi_lhld_xchg_same":
-                        # SHLD x; MVI r,n; LHLD x; XCHG -> MVI r,n; XCHG
+                        # SHLD x; MVI r,n; LHLD x; XCHG -> SHLD x; MVI r,n; XCHG
+                        # Keep the SHLD (variable may be needed), remove LHLD (HL unchanged)
+                        result.append(lines[instruction_lines[0]])  # SHLD x
                         result.append(lines[instruction_lines[1]])  # MVI r,n
                         result.append("\tXCHG")
 

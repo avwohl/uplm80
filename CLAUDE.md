@@ -36,12 +36,17 @@ cpmemu program.com arg1 arg2      # Run with arguments
    python -m uplm80.compiler input.plm -o output.mac
    ```
 
-2. Assemble to relocatable object:
+2. (Optional) Run post-assembly optimizer:
+   ```bash
+   python -m uplm80.postopt output.mac -o output_opt.mac
+   ```
+
+3. Assemble to relocatable object:
    ```bash
    um80 output.mac
    ```
 
-3. Link with runtime library:
+4. Link with runtime library:
    ```bash
    ul80 -o output.com output.rel runtime.rel
    ```
@@ -66,6 +71,20 @@ For CP/M programs, provide stubs for:
 - `MON3` - BDOS call (address return)
 - `BOOT` - Warm boot
 - Memory locations: BDISK, MAXB, FCB, BUFF, IOBYTE
+
+## Optimizations
+
+### Compiler Optimizations (codegen.py, peephole.py)
+- **SHL(DOUBLE(x),8) OR y pattern**: Combines two bytes into 16-bit address efficiently using `LD H,A; LD L,A` instead of 14+ instruction 16-bit OR
+- **Peephole optimizer**: Register tracking, redundant load elimination, strength reduction
+- **Z80-specific**: DJNZ for loops, relative jumps, block instructions
+
+### Post-Assembly Optimizer (postopt.py)
+Multi-pass optimizer that works on generated assembly:
+- **Tail merging**: Finds procedures with identical tail sequences and merges them using the DB 21H (LD HL,nn) skip trick to fall through to shared code
+- **Skip trick**: Adjacent procedures ending with JP can skip 2-byte instructions using DB 21H
+
+Example: If 4 procedures end with `LD DE,0; JP 5`, three are rewritten to fall through to the fourth, saving ~15 bytes.
 
 ## Reference Binaries
 

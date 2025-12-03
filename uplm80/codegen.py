@@ -2703,22 +2703,29 @@ class CodeGenerator:
         # Create labels for each case
         case_labels = [self._new_label(f"CASE{i}") for i in range(len(stmt.cases))]
 
-        # Evaluate selector into HL
-        self._gen_expr(stmt.selector)
+        # Evaluate selector
+        selector_type = self._gen_expr(stmt.selector)
 
         # Generate jump table
         # For small number of cases, use sequential comparisons
-        # For larger, could use computed jump
+        # For larger, use computed jump
 
         if len(stmt.cases) <= 8:
-            # Sequential comparisons
-            for i, label in enumerate(case_labels):
+            # Sequential comparisons - selector can stay in A for BYTE
+            if selector_type == DataType.ADDRESS:
+                # ADDRESS selector is in HL, move L to A for comparisons
                 self._emit("MOV", "A,L")
+            # else: BYTE selector already in A
+            for i, label in enumerate(case_labels):
                 self._emit("CPI", str(i))
                 self._emit("JZ", label)
             self._emit("JMP", end_label)  # Default: skip all
         else:
-            # Jump table approach
+            # Jump table approach - needs selector in HL
+            if selector_type == DataType.BYTE:
+                # Extend BYTE in A to HL
+                self._emit("MOV", "L,A")
+                self._emit("MVI", "H,0")
             table_label = self._new_label("JMPTBL")
             self._emit("DAD", "H")  # HL = HL * 2 (addresses are 2 bytes)
             self._emit("LXI", f"D,{table_label}")
@@ -2729,10 +2736,10 @@ class CodeGenerator:
             self._emit("XCHG")
             self._emit("PCHL")
 
-            # Jump table
+            # Jump table (in code segment, right after the PCHL)
             self._emit_label(table_label)
             for label in case_labels:
-                self.data_segment.append(AsmLine(opcode="DW", operands=label))
+                self.output.append(AsmLine(opcode="DW", operands=label))
 
         # Generate each case
         for i, (case_stmts, label) in enumerate(zip(stmt.cases, case_labels)):
@@ -2780,6 +2787,9 @@ class CodeGenerator:
         elif isinstance(expr, Identifier):
             sym = self.symbols.lookup(expr.name)
             if sym:
+                # For procedures, return the return type (a bare identifier is a call)
+                if sym.kind == SymbolKind.PROCEDURE:
+                    return sym.return_type or DataType.ADDRESS
                 return sym.data_type or DataType.ADDRESS
             return DataType.ADDRESS
         elif isinstance(expr, EmbeddedAssignExpr):
@@ -3494,9 +3504,73 @@ class CodeGenerator:
                 self._emit("INX", "H")
                 self._emit("MOV", "M,D")
 
+    def _match_shl_double_8(self, expr: Expr) -> Expr | None:
+        """
+        Match the pattern SHL(DOUBLE(x), 8) and return x.
+
+        This pattern represents: x * 256 (shift byte to high position)
+        Returns None if pattern doesn't match.
+        """
+        # Must be a call to SHL
+        if not isinstance(expr, CallExpr):
+            return None
+        if not isinstance(expr.callee, Identifier):
+            return None
+        if expr.callee.name.upper() != 'SHL':
+            return None
+        if len(expr.args) != 2:
+            return None
+
+        # Second arg must be 8 (shift count)
+        shift_arg = expr.args[1]
+        shift_count = None
+        if isinstance(shift_arg, NumberLiteral):
+            shift_count = shift_arg.value
+        elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
+            try:
+                shift_count = self._parse_plm_number(self.literal_macros[shift_arg.name])
+            except ValueError:
+                pass
+        if shift_count != 8:
+            return None
+
+        # First arg must be DOUBLE(x)
+        double_expr = expr.args[0]
+        if not isinstance(double_expr, CallExpr):
+            return None
+        if not isinstance(double_expr.callee, Identifier):
+            return None
+        if double_expr.callee.name.upper() != 'DOUBLE':
+            return None
+        if len(double_expr.args) != 1:
+            return None
+
+        # Return the inner expression (the byte value)
+        inner = double_expr.args[0]
+        # Verify it's a byte type
+        if self._get_expr_type(inner) != DataType.BYTE:
+            return None
+
+        return inner
+
     def _gen_binary(self, expr: BinaryExpr) -> DataType:
         """Generate code for binary expression."""
         op = expr.op
+
+        # Special case: SHL(DOUBLE(hi), 8) OR lo -> combine two bytes into address
+        # Pattern: (hi * 256) OR lo where hi and lo are bytes
+        if op == BinaryOp.OR:
+            hi_expr = self._match_shl_double_8(expr.left)
+            if hi_expr is not None:
+                lo_type = self._get_expr_type(expr.right)
+                if lo_type == DataType.BYTE:
+                    # Generate optimized: hi -> H, lo -> L
+                    self._gen_expr(hi_expr)  # Result in A
+                    self._emit("MOV", "H,A")  # H = high byte
+                    self._gen_expr(expr.right)  # Result in A
+                    self._emit("MOV", "L,A")  # L = low byte
+                    # HL now contains combined address
+                    return DataType.ADDRESS
 
         # Determine operand types for optimization
         left_type = self._get_expr_type(expr.left)
@@ -3540,7 +3614,8 @@ class CodeGenerator:
             return DataType.BYTE
 
         # Optimize ADDRESS +/- constant: use INX/DCX for small, LXI D + DAD for larger
-        if op == BinaryOp.ADD and isinstance(expr.right, NumberLiteral):
+        # Only apply if left operand actually ends up in HL (ADDRESS type)
+        if op == BinaryOp.ADD and isinstance(expr.right, NumberLiteral) and left_type == DataType.ADDRESS:
             const_val = expr.right.value
             if 1 <= const_val <= 4:  # Small constants: use repeated INX
                 self._gen_expr(expr.left)
@@ -3553,7 +3628,7 @@ class CodeGenerator:
                 self._emit("LXI", f"D,{self._format_number(const_val)}")
                 self._emit("DAD", "D")  # HL = HL + DE
                 return DataType.ADDRESS
-        elif op == BinaryOp.SUB and isinstance(expr.right, NumberLiteral):
+        elif op == BinaryOp.SUB and isinstance(expr.right, NumberLiteral) and left_type == DataType.ADDRESS:
             const_val = expr.right.value
             if 1 <= const_val <= 4:  # Small constants: use repeated DCX
                 self._gen_expr(expr.left)
