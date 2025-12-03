@@ -7,7 +7,7 @@ in the code generator, particularly cross-procedure optimizations.
 
 Optimizations:
 1. Tail merging with skip trick - merge procedures with common tails
-2. (Future) Common sequence factoring
+2. JP to JR conversion - convert 3-byte JP to 2-byte JR when target in range
 """
 
 import re
@@ -41,9 +41,9 @@ def get_instr_size(instr: str) -> int | None:
         return 1
     if re.match(r'^LD\s+[ABCDEHL],[ABCDEHL]$', instr):
         return 1
-    if re.match(r'^(ADD|ADC|SUB|SBC|AND|OR|XOR|CP)\s+[ABCDEHL]$', instr):
+    if re.match(r'^(ADD|ADC|SUB|SBC|AND|OR|XOR|CP)\s+A?,?[ABCDEHL]$', instr):
         return 1
-    if re.match(r'^(ADD|ADC|SBC)\s+HL,(BC|DE|HL|SP)$', instr):
+    if re.match(r'^(ADD|ADC|SBC)\s+HL,(BC|DE|HL|SP)', instr):  # May have comment
         return 1
     if instr in ('XOR A', 'OR A', 'AND A', 'CP A'):
         return 1
@@ -51,13 +51,9 @@ def get_instr_size(instr: str) -> int | None:
         return 1
         
     # 2-byte instructions
-    if re.match(r'^LD\s+[ABCDEHL],\d+H?$', instr):
+    if re.match(r'^LD\s+[ABCDEHL],[0-9][0-9A-F]*H?$', instr):
         return 2  # LD r,n
-    if re.match(r'^LD\s+[ABCDEHL],0[0-9A-F]+H$', instr):
-        return 2
-    if re.match(r'^(ADD|ADC|SUB|SBC|AND|OR|XOR|CP)\s+\d+H?$', instr):
-        return 2
-    if re.match(r'^(ADD|ADC|SUB|SBC|AND|OR|XOR|CP)\s+0[0-9A-F]+H$', instr):
+    if re.match(r'^(ADD|ADC|SUB|SBC|AND|OR|XOR|CP)\s+(A,)?[0-9][0-9A-F]*H?$', instr):
         return 2
     if re.match(r'^JR\s+', instr):
         return 2
@@ -444,6 +440,216 @@ def apply_skip_trick(lines: list[str], opportunities: list[dict]) -> tuple[list[
     return result, total_savings
 
 
+def find_jp_to_jr_candidates(lines: list[str]) -> tuple[dict[str, int], list[tuple[int, str, str]]]:
+    """
+    First pass: Find all labels and JP instructions.
+
+    Returns:
+        - label_positions: dict mapping label name to line index
+        - jp_candidates: list of (line_idx, condition, target_label)
+    """
+    label_positions = {}
+    jp_candidates = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Collect label definitions
+        if stripped.endswith(':') and not stripped.startswith(';'):
+            label = stripped[:-1]
+            label_positions[label] = i
+
+        # Collect JP instructions (unconditional and conditional)
+        # Match: JP target, JP Z,target, JP NZ,target, JP C,target, JP NC,target
+        # But NOT JP (HL), JP (IX), JP (IY)
+        m = re.match(r'^JP\s+(?:(Z|NZ|C|NC|PE|PO|P|M),\s*)?([A-Za-z@$?_][A-Za-z0-9@$?_]*)$', stripped)
+        if m:
+            condition = m.group(1)  # None for unconditional
+            target = m.group(2)
+            jp_candidates.append((i, condition, target))
+
+    return label_positions, jp_candidates
+
+
+def calculate_byte_offset(lines: list[str], from_line: int, to_line: int) -> int | None:
+    """
+    Calculate the byte offset between two lines.
+
+    The offset is calculated from the END of the JP instruction to the target.
+    For JR, the offset is relative to the byte AFTER the JR instruction.
+
+    Returns None if any instruction size is unknown.
+    """
+    if from_line == to_line:
+        return 0
+
+    total = 0
+    start, end = (from_line, to_line) if from_line < to_line else (to_line, from_line)
+
+    for i in range(start, end):
+        line = lines[i].strip()
+
+        # Skip empty lines and comments
+        if not line or line.startswith(';'):
+            continue
+
+        # Skip directives that don't generate code
+        if line.startswith('.') or line.startswith('EXTRN') or line == 'END':
+            continue
+
+        # Skip pure labels (ending with : but no instruction after)
+        if line.endswith(':'):
+            continue
+
+        # Handle label: instruction on same line
+        if ':' in line and not line.endswith(':'):
+            # Extract instruction part after the label
+            colon_pos = line.index(':')
+            line = line[colon_pos + 1:].strip()
+            if not line:
+                continue
+
+        # Handle directives
+        if line.startswith('DB ') or line.startswith('DB\t'):
+            # Count bytes in DB directive - handle strings
+            db_content = line[2:].strip()
+            byte_count = 0
+            in_string = False
+            i = 0
+            while i < len(db_content):
+                c = db_content[i]
+                if c == "'":
+                    in_string = not in_string
+                elif in_string:
+                    byte_count += 1
+                elif c == ',':
+                    pass  # separator
+                elif c.isalnum():
+                    # Start of a number - count as 1 byte
+                    byte_count += 1
+                    # Skip rest of number
+                    while i + 1 < len(db_content) and db_content[i+1].isalnum():
+                        i += 1
+                i += 1
+            total += max(1, byte_count)
+            continue
+        if line.startswith('DS ') or line.startswith('DS\t'):
+            # DS n reserves n bytes
+            m = re.match(r'DS\s+(\d+)', line)
+            if m:
+                total += int(m.group(1))
+            continue
+        if line.startswith('DW ') or line.startswith('DW\t'):
+            parts = line[3:].split(',')
+            total += 2 * len(parts)
+            continue
+        if 'EQU' in line:
+            continue  # EQU doesn't generate code
+
+        # Strip trailing comments
+        if ';' in line:
+            line = line[:line.index(';')].strip()
+
+        # Normalize whitespace (replace tabs with spaces)
+        line = ' '.join(line.split())
+
+        size = get_instr_size(line)
+        if size is None:
+            return None
+        total += size
+
+    # If jumping backward, offset is negative
+    if from_line > to_line:
+        total = -total
+
+    return total
+
+
+def apply_jp_to_jr(lines: list[str], label_positions: dict[str, int],
+                   jp_candidates: list[tuple[int, str, str]],
+                   verbose: bool = False) -> tuple[list[str], int]:
+    """
+    Convert JP to JR where target is within range.
+
+    JR range is -126 to +129 bytes from the JP instruction.
+    (The actual JR offset is from end of JR, which is 2 bytes shorter than JP)
+    """
+    result = lines.copy()
+    total_savings = 0
+    converted = []
+
+    for line_idx, condition, target in jp_candidates:
+        if target not in label_positions:
+            continue
+
+        # JR only supports Z, NZ, C, NC conditions (not P, M, PE, PO)
+        if condition and condition not in ('Z', 'NZ', 'C', 'NC'):
+            continue
+
+        target_line = label_positions[target]
+
+        # Calculate byte offset from JP to target
+        # JP is 3 bytes, JR is 2 bytes
+        # JR offset is from end of JR instruction
+        offset = calculate_byte_offset(lines, line_idx, target_line)
+        if offset is None:
+            continue
+
+        # Adjust: JP is at line_idx, we're measuring to target_line
+        # For JR, offset is from the byte AFTER the JR instruction
+        # If forward jump: offset needs to account for JP being 3 bytes, JR being 2
+        # The offset as calculated is from start of JP to start of target
+        # For JR: offset is from (JP_addr + 2) to target
+        # Original offset is from JP_addr to target
+        # So JR offset = original_offset - 2 (we start 2 bytes later with JR, not 3)
+        # Actually, JR offset = target - (JR_addr + 2) = target - JP_addr - 2
+        # Our offset = target - JP_addr (approximately)
+        # So JR_offset = offset - 2 for forward, offset + 1 for backward
+
+        # For forward jumps (offset > 0):
+        # JP at addr, target at addr + offset
+        # JR at addr, JR ends at addr + 2, target at addr + offset
+        # JR offset = offset - 2 (but we save 1 byte, so target moves closer by 1 for each conversion)
+
+        # For backward jumps (offset < 0):
+        # Target before JP. JR offset = offset (target addr relative to JR+2)
+        # Since target doesn't move and JR+2 is same position as JP+3-1,
+        # JR offset = offset + 1
+
+        # JR range is -128 to +127
+        # But the actual displacement after JR+2:
+        # Forward: need offset - 2 to be in 0..127, so offset in 2..129
+        # Backward: need offset + 1 to be in -128..-1, so offset in -129..-2
+        # But we only support -126..+129 to be conservative
+
+        if offset > 0:
+            jr_offset = offset - 2  # Forward jump offset adjustment
+        else:
+            jr_offset = offset + 1  # Backward jump offset adjustment
+
+        # Check if in JR range
+        if jr_offset < -128 or jr_offset > 127:
+            continue
+
+        # Convert JP to JR
+        old_line = result[line_idx]
+        indent = len(old_line) - len(old_line.lstrip())
+
+        if condition:
+            new_instr = f'JR {condition},{target}'
+        else:
+            new_instr = f'JR {target}'
+
+        result[line_idx] = ' ' * indent + new_instr + '\n'
+        total_savings += 1  # JP is 3 bytes, JR is 2 bytes
+        converted.append((target, jr_offset))
+
+    if verbose and converted:
+        print(f"  JP->JR conversions: {len(converted)} ({total_savings} bytes)")
+
+    return result, total_savings
+
+
 def select_best_tails(tail_groups: dict[tuple, list[Procedure]]) -> list[tuple[tuple, list[Procedure]]]:
     """
     Select the best tail merges, avoiding conflicts where one procedure
@@ -487,6 +693,7 @@ def optimize_asm(asm_code: str, verbose: bool = False) -> tuple[str, int]:
     3. Apply tail merges
     4. Apply skip trick for adjacent procedures
     5. Repeat until no more savings
+    6. Final pass: JP to JR conversion
 
     Returns (optimized_code, total_bytes_saved).
     """
@@ -539,6 +746,13 @@ def optimize_asm(asm_code: str, verbose: bool = False) -> tuple[str, int]:
         # Stop if no savings this pass
         if pass_savings == 0:
             break
+
+    # Final pass: JP to JR conversion
+    # Do this after other optimizations stabilize since it depends on byte offsets
+    label_positions, jp_candidates = find_jp_to_jr_candidates(lines)
+    if jp_candidates:
+        lines, savings = apply_jp_to_jr(lines, label_positions, jp_candidates, verbose=verbose)
+        total_savings += savings
 
     return ''.join(lines), total_savings
 

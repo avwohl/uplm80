@@ -23,7 +23,7 @@ Compiled output is comparable to the original Digital Research PL/M-80 compiler:
 
 | Program | DR PL/M-80 | uplm80 | Difference |
 |---------|------------|--------|------------|
-| PIP.COM | 7424 bytes | 7136 bytes | -3.9% |
+| PIP.COM | 7424 bytes | 7127 bytes | -4.0% |
 
 ## Installation
 
