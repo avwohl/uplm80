@@ -2735,9 +2735,30 @@ class CodeGenerator:
             self._emit_label(label)
             for s in case_stmts:
                 self._gen_stmt(s)
-            self._emit("JMP", end_label)
+            # Only emit JMP end_label if last statement doesn't transfer control
+            if not self._stmt_transfers_control(case_stmts[-1] if case_stmts else None):
+                self._emit("JMP", end_label)
 
         self._emit_label(end_label)
+
+    def _stmt_transfers_control(self, stmt: Stmt | None) -> bool:
+        """Check if a statement unconditionally transfers control (no fallthrough)."""
+        if stmt is None:
+            return False
+        if isinstance(stmt, GotoStmt):
+            return True
+        if isinstance(stmt, ReturnStmt):
+            return True
+        if isinstance(stmt, HaltStmt):
+            return True
+        # A labeled statement transfers if its inner statement does
+        if isinstance(stmt, LabeledStmt):
+            return self._stmt_transfers_control(stmt.stmt)
+        # A DO block transfers if its last statement does
+        if isinstance(stmt, DoBlock):
+            if stmt.stmts:
+                return self._stmt_transfers_control(stmt.stmts[-1])
+        return False
 
     # ========================================================================
     # Expression Code Generation
@@ -3328,8 +3349,8 @@ class CodeGenerator:
                 if sym and sym.kind != SymbolKind.PROCEDURE:
                     # It's an array access - delegate to SubscriptExpr handling
                     subscript = SubscriptExpr(expr.callee, expr.args[0])
-                    # Check for constant index optimization
-                    if isinstance(expr.args[0], NumberLiteral):
+                    # Check for constant index optimization (but NOT for BASED variables)
+                    if isinstance(expr.args[0], NumberLiteral) and not sym.based_on:
                         # Constant index - can compute address directly
                         asm_name = sym.asm_name if sym.asm_name else self._mangle_name(expr.callee.name)
                         offset = expr.args[0].value
@@ -3403,6 +3424,11 @@ class CodeGenerator:
         right_type = self._get_expr_type(expr.right)
         both_bytes = (left_type == DataType.BYTE and right_type == DataType.BYTE)
 
+        # Special case: ADDRESS comparison with 0 - use OR L,H for zero test
+        if op in (BinaryOp.EQ, BinaryOp.NE) and left_type == DataType.ADDRESS:
+            if isinstance(expr.right, NumberLiteral) and expr.right.value == 0:
+                return self._gen_addr_zero_comparison(expr.left, op)
+
         # Special case: byte comparison with constant - use CPI
         if op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT,
                   BinaryOp.LE, BinaryOp.GE):
@@ -3422,6 +3448,17 @@ class CodeGenerator:
         if both_bytes and op in (BinaryOp.ADD, BinaryOp.SUB, BinaryOp.AND,
                                   BinaryOp.OR, BinaryOp.XOR):
             return self._gen_byte_binary(expr.left, expr.right, op)
+
+        # Optimize BYTE PLUS/MINUS 0: just ADC A,0 or SBC A,0 (preserves carry chain)
+        if op == BinaryOp.PLUS and left_type == DataType.BYTE and isinstance(expr.right, NumberLiteral) and expr.right.value == 0:
+            self._gen_expr(expr.left)  # Result in A
+            self._emit("ACI", "0")  # ADC A,0 - add carry
+            return DataType.BYTE
+
+        if op == BinaryOp.MINUS and left_type == DataType.BYTE and isinstance(expr.right, NumberLiteral) and expr.right.value == 0:
+            self._gen_expr(expr.left)  # Result in A
+            self._emit("SBI", "0")  # SBC A,0 - subtract carry
+            return DataType.BYTE
 
         # Optimize ADDRESS +/- constant: use INX/DCX for small, LXI D + DAD for larger
         if op == BinaryOp.ADD and isinstance(expr.right, NumberLiteral):
@@ -3597,6 +3634,42 @@ class CodeGenerator:
         # True case - return 1 in A
         self._emit_label(true_label)
         self._emit("MVI", "A,1")
+
+        self._emit_label(end_label)
+        return DataType.BYTE
+
+    def _gen_addr_zero_comparison(self, left: Expr, op: BinaryOp) -> DataType:
+        """Generate optimized ADDRESS comparison with 0 using ORA.
+
+        For N = 0 or N <> 0 where N is ADDRESS, use:
+            LD A,L
+            OR H
+            JZ/JNZ label
+        instead of full 16-bit subtraction.
+        """
+        # Load left operand into HL
+        self._gen_expr(left)
+
+        # Test if HL is zero: A = L | H
+        self._emit("MOV", "A,L")
+        self._emit("ORA", "H")
+
+        # Generate result based on comparison type
+        true_label = self._new_label("TRUE")
+        end_label = self._new_label("CMP")
+
+        if op == BinaryOp.EQ:
+            self._emit("JZ", true_label)  # If zero, equal
+        elif op == BinaryOp.NE:
+            self._emit("JNZ", true_label)  # If not zero, not equal
+
+        # False case - return 0 in A
+        self._emit("XRA", "A")
+        self._emit("JMP", end_label)
+
+        # True case - return 0FFH in A (PL/M TRUE = 0FFH)
+        self._emit_label(true_label)
+        self._emit("MVI", "A,0FFH")
 
         self._emit_label(end_label)
         return DataType.BYTE
@@ -4521,12 +4594,12 @@ class CodeGenerator:
         if name == "DEC":
             # Convert binary value (0-15) to ASCII decimal digit ('0'-'9')
             # Values 10-15 wrap to produce '0'-'5'
-            self._gen_expr(args[0])
-            self._emit("MOV", "A,L")
+            arg_type = self._gen_expr(args[0])
+            if arg_type == DataType.ADDRESS:
+                self._emit("MOV", "A,L")  # Get low byte from L
+            # else arg_type == BYTE, value already in A
             self._emit("ANI", "0FH")  # Mask to 0-15
             self._emit("ADI", "30H")  # Add '0' ASCII code
-            self._emit("MOV", "L,A")
-            self._emit("MVI", "H,0")
             return DataType.BYTE
 
         if name == "SCL":

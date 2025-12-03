@@ -1760,6 +1760,34 @@ class PeepholeOptimizer:
                         i += 2
                         continue
 
+                # CP 1; JP Z/NZ -> DEC A; JP Z/NZ (saves 1 byte: CP 1 is 2 bytes, DEC A is 1 byte)
+                # Only valid when A is not needed afterward (comparison just sets flags)
+                if opcode == "CP" and operands == "1" and i + 1 < len(lines):
+                    next_parsed = self._parse_z80_line(lines[i + 1].strip())
+                    if next_parsed and next_parsed[0] in ("JP", "JR") and next_parsed[1].startswith(("Z,", "NZ,")):
+                        result.append("\tDEC A")
+                        changed = True
+                        self.stats["z80_cp1_dec"] = self.stats.get("z80_cp1_dec", 0) + 1
+                        i += 1
+                        continue
+
+                # Skip trick: JP label; LD A,0FFH; label: -> DB 21H; LD A,0FFH; label:
+                # The 21H byte is the opcode for LD HL,nn which "eats" the next 2 bytes
+                # This saves 2 bytes (JP is 3 bytes, DB 21H is 1 byte)
+                if opcode == "JP" and "," not in operands and operands != "(HL)" and i + 2 < len(lines):
+                    target = operands.strip()
+                    next_line = lines[i + 1].strip()
+                    next_parsed = self._parse_z80_line(next_line)
+                    third_line = lines[i + 2].strip()
+                    # Check if next instruction is LD A,0FFH (2 bytes) and third is the target label
+                    if (next_parsed and next_parsed[0] == "LD" and next_parsed[1] == "A,0FFH" and
+                        third_line.startswith(target + ":")):
+                        result.append("\tDB 21H\t; skip next 2 bytes (LD HL,nn opcode)")
+                        changed = True
+                        self.stats["z80_skip_trick"] = self.stats.get("z80_skip_trick", 0) + 1
+                        i += 1
+                        continue
+
                 # LD HL,(addr1); PUSH HL; LD HL,(addr2); EX DE,HL; POP HL
                 # -> LD DE,(addr2); LD HL,(addr1)
                 # Saves 3 bytes (10 -> 7) by using Z80's LD DE,(nn) instruction

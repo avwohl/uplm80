@@ -73,21 +73,4 @@ To compare against original Digital Research binaries, disassemble with ud80:
 
 ```bash
 ~/z80/RomWBW/Source/Images/d_cpm22/u0$ ud80 ED.COM -o ~/real_ed.mac
-```
 
-## TODO: Optimization Ideas
-
-1. **OR-chain optimization for RETURN**: `RETURN a OR b OR c` where each is a comparison
-   can use early returns: `if a: ret 1; if b: ret 1; if c: ret 1; ret 0`
-
-2. **Better boolean comparison chaining**: Currently each comparison in an OR chain
-   generates a separate 0/1 value that gets ORed. Could short-circuit more aggressively.
-
-3. **PUSH/POP for parameter preservation**: When a parameter is saved before a call and
-   restored after, use PUSH/POP instead of SHLD/LHLD to memory. Example:
-   ```
-   ; Current:              ; Better:
-   SHLD ??AUTO+2           PUSH H
-   CALL CRLF               CALL CRLF
-   LHLD ??AUTO+2           POP H
-   ```
