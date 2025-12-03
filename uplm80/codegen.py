@@ -2005,14 +2005,14 @@ class CodeGenerator:
                 # Now: HL = left, DE = right (no PUSH/POP needed!)
             else:
                 # Either left is complex, or right is simple - use standard approach
-                self._gen_expr(condition.left)
-                if left_type == DataType.BYTE:
+                actual_left_type = self._gen_expr(condition.left)
+                if actual_left_type == DataType.BYTE:
                     self._emit("MOV", "L,A")
                     self._emit("MVI", "H,0")
                 self._emit("PUSH", "H")
 
-                self._gen_expr(condition.right)
-                if right_type == DataType.BYTE:
+                actual_right_type = self._gen_expr(condition.right)
+                if actual_right_type == DataType.BYTE:
                     self._emit("MOV", "L,A")
                     self._emit("MVI", "H,0")
 
@@ -2493,16 +2493,18 @@ class CodeGenerator:
                 self._emit("INR", "A")  # A = bound + 1 = iteration count
                 self._emit("MOV", "B,A")  # B = iteration count
 
-            # Only proceed with DJNZ if we set up B
+            # Only proceed with B-counter loop if we set up B
             if isinstance(stmt.bound, NumberLiteral) and stmt.bound.value + 1 <= 255:
                 # Loop body
                 self._emit_label(loop_label)
                 for s in stmt.stmts:
                     self._gen_stmt(s)
 
-                # DJNZ - decrement B and jump if not zero
+                # Decrement B and jump if not zero
+                # Use DCR B; JNZ instead of DJNZ - peephole will convert to DJNZ if in range
                 self._emit_label(incr_label)
-                self._emit("DJNZ", loop_label)
+                self._emit("DCR", "B")
+                self._emit("JNZ", loop_label)
 
                 self._emit_label(end_label)
                 self.loop_stack.pop()
@@ -2520,9 +2522,11 @@ class CodeGenerator:
                 for s in stmt.stmts:
                     self._gen_stmt(s)
 
-                # DJNZ
+                # Decrement B and jump if not zero
+                # Use DCR B; JNZ instead of DJNZ - peephole will convert to DJNZ if in range
                 self._emit_label(incr_label)
-                self._emit("DJNZ", loop_label)
+                self._emit("DCR", "B")
+                self._emit("JNZ", loop_label)
 
                 self._emit_label(end_label)
                 self.loop_stack.pop()
@@ -2838,6 +2842,81 @@ class CodeGenerator:
                     return sym.data_type or DataType.BYTE
             return DataType.BYTE  # Default to BYTE for array elements
         return DataType.ADDRESS
+
+    def _is_simple_address_expr(self, expr: Expr) -> bool:
+        """
+        Check if expression is simple enough to load directly into DE.
+        Simple expressions are: constants, identifiers (variables), location-of.
+        """
+        if isinstance(expr, NumberLiteral):
+            return True
+        if isinstance(expr, Identifier):
+            name = expr.name
+            # Check for LITERALLY macro
+            if name in self.literal_macros:
+                return True
+            # Look up symbol - simple variables are fine
+            sym = self.symbols.lookup(name)
+            if sym and sym.kind != SymbolKind.PROCEDURE:
+                return True
+            return True  # Assume simple
+        if isinstance(expr, LocationExpr):
+            # .VAR is simple - just loads address
+            return True
+        return False
+
+    def _gen_simple_to_de(self, expr: Expr) -> None:
+        """Load a simple address expression directly into DE."""
+        if isinstance(expr, NumberLiteral):
+            self._emit("LXI", f"D,{self._format_number(expr.value)}")
+        elif isinstance(expr, Identifier):
+            name = expr.name
+            # Handle built-in MEMORY array
+            if name.upper() == "MEMORY":
+                self._emit("LXI", "D,??MEMORY")
+                return
+            # Check for LITERALLY macro
+            if name in self.literal_macros:
+                macro_val = self.literal_macros[name]
+                try:
+                    val = self._parse_plm_number(macro_val)
+                    self._emit("LXI", f"D,{self._format_number(val)}")
+                    return
+                except ValueError:
+                    name = macro_val  # Use expanded name
+            # Look up symbol
+            sym = self.symbols.lookup(name)
+            asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
+            if sym:
+                # Arrays: load address of array (LXI D,label)
+                if sym.dimension:
+                    self._emit("LXI", f"D,{asm_name}")
+                elif sym.data_type == DataType.BYTE:
+                    # Byte variable - load and extend
+                    self._emit("LDA", asm_name)
+                    self._emit("MOV", "E,A")
+                    self._emit("MVI", "D,0")
+                else:
+                    # Address variable - load contents into DE
+                    self._emit("LDED", asm_name)  # Z80: LD DE,(addr)
+            else:
+                # Unknown - assume it's a label/address constant
+                self._emit("LXI", f"D,{asm_name}")
+        elif isinstance(expr, LocationExpr):
+            # .VAR - load address of variable
+            if isinstance(expr.operand, Identifier):
+                name = expr.operand.name
+                # Handle built-in MEMORY array
+                if name.upper() == "MEMORY":
+                    self._emit("LXI", "D,??MEMORY")
+                    return
+                sym = self.symbols.lookup(name)
+                asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
+                self._emit("LXI", f"D,{asm_name}")
+            else:
+                # Complex location - fall back to gen_expr
+                self._gen_expr(expr)
+                self._emit("XCHG")
 
     def _expr_preserves_de(self, expr: Expr) -> bool:
         """
@@ -3506,6 +3585,18 @@ class CodeGenerator:
                 self._emit("MOV", "L,A")
                 self._emit("MVI", "H,0")
             # Now: HL = left, DE = right (no PUSH/POP needed!)
+        elif self._is_simple_address_expr(expr.left) and op == BinaryOp.ADD:
+            # LEFT is simple (constant/identifier that can be loaded into DE)
+            # Evaluate right first (which ends up in HL), then load left into DE
+            # This avoids PUSH/POP for patterns like: DBUFF + (NDEST + offset)
+            right_result = self._gen_expr(expr.right)
+            if right_result == DataType.BYTE:
+                self._emit("MOV", "L,A")
+                self._emit("MVI", "H,0")
+            # Load simple left expression into DE
+            self._gen_simple_to_de(expr.left)
+            # Now: HL = right, DE = left - swap for correct ADD order
+            self._emit("XCHG")  # HL = left, DE = right
         else:
             # Left is complex - use traditional PUSH/POP approach
             # Evaluate left operand
@@ -3909,10 +4000,8 @@ class CodeGenerator:
             return self._gen_call_expr(call)
 
         self._gen_subscript_addr(expr)
-        # Load value at address
+        # Load value at address - BYTE value goes in A only
         self._emit("MOV", "A,M")
-        self._emit("MOV", "L,A")
-        self._emit("MVI", "H,0")
         return DataType.BYTE
 
     def _gen_subscript_addr(self, expr: SubscriptExpr) -> None:
@@ -3945,6 +4034,27 @@ class CodeGenerator:
                     self._emit("LXI", f"H,{asm_name}+{offset}")
                 return
 
+        # Check for optimized BYTE index path first (avoids loading base into HL)
+        if not isinstance(expr.index, NumberLiteral):
+            idx_type = self._get_expr_type(expr.index)
+            if idx_type == DataType.BYTE and elem_size == 1 and isinstance(expr.base, Identifier):
+                # Optimized byte index with identifier base
+                # Evaluate index first (before loading base), then load base into DE
+                self._gen_expr(expr.index)  # A = index (byte)
+                self._emit("MOV", "L,A")
+                self._emit("MVI", "H,0")  # HL = index (zero-extended)
+                # Load base directly into DE
+                sym = self.symbols.lookup(expr.base.name)
+                if sym and sym.based_on:
+                    base_sym = self.symbols.lookup(sym.based_on)
+                    base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
+                    self._emit("LDED", base_asm_name)  # Z80: LD DE,(addr)
+                else:
+                    asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(expr.base.name)
+                    self._emit("LXI", f"D,{asm_name}")
+                self._emit("DAD", "D")  # HL = index + base
+                return
+
         # Get base address (non-constant or BASED variable case)
         if isinstance(expr.base, Identifier):
             sym = self.symbols.lookup(expr.base.name)
@@ -3975,12 +4085,11 @@ class CodeGenerator:
                 self._emit("LXI", f"D,{offset}")
                 self._emit("DAD", "D")
         else:
-            # Variable index - need to compute
+            # Variable index with complex base or ADDRESS index
             idx_type = self._get_expr_type(expr.index)
 
             if idx_type == DataType.BYTE and elem_size == 1:
-                # Optimized byte index: avoid PUSH/POP
-                # HL = base, put into DE, compute index into HL, add
+                # BYTE index - base is in HL, swap to DE, get index
                 self._emit("XCHG")  # DE = base
                 self._gen_expr(expr.index)  # A = index (byte)
                 self._emit("MOV", "L,A")

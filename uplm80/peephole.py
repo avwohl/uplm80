@@ -1035,11 +1035,24 @@ class PeepholeOptimizer:
                 if did_change:
                     changed = True
 
-            # Phase 4: Convert long jumps to relative jumps where possible
+            # Phase 4: Jump threading - JP to label that is just JP -> thread through
+            changed = True
+            passes = 0
+            while changed and passes < max_passes:
+                changed = False
+                passes += 1
+                lines, did_change = self._jump_threading_pass(lines)
+                if did_change:
+                    changed = True
+
+            # Phase 5: Convert long jumps to relative jumps where possible
             lines = self._convert_to_relative_jumps(lines)
 
-            # Phase 5: Apply Z80-specific patterns again (for DJNZ after JR conversion)
+            # Phase 6: Apply Z80-specific patterns again (for DJNZ after JR conversion)
             lines, _ = self._optimize_z80_pass(lines)
+
+            # Phase 7: Dead store elimination at procedure entry
+            lines, _ = self._dead_store_elimination(lines)
 
         return "\n".join(lines)
 
@@ -1501,6 +1514,10 @@ class PeepholeOptimizer:
         if opcode == "SHLD":
             return f"LD ({operands}),HL"
 
+        # LDED addr -> LD DE,(addr) (custom pseudo-op for Z80)
+        if opcode == "LDED":
+            return f"LD DE,({operands})"
+
         # LDAX rp -> LD A,(rp)
         if opcode == "LDAX":
             rp = Z80_REG_PAIRS.get(operands.upper(), operands)
@@ -1692,6 +1709,14 @@ class PeepholeOptimizer:
         result: list[str] = []
         i = 0
 
+        # Build label_lines map for range checking (used by DJNZ optimization)
+        label_lines: dict[str, int] = {}
+        for line_num, line in enumerate(lines):
+            stripped = line.strip()
+            if ":" in stripped and not stripped.startswith("\t"):
+                label = stripped.split(":")[0].strip()
+                label_lines[label] = line_num
+
         while i < len(lines):
             line = lines[i].strip()
             parsed = self._parse_z80_line(line)
@@ -1706,6 +1731,77 @@ class PeepholeOptimizer:
                     self.stats["z80_xor_a"] = self.stats.get("z80_xor_a", 0) + 1
                     i += 1
                     continue
+
+                # LD A,(addr); INC A; LD (addr),A -> LD HL,addr; INC (HL)
+                # Saves 2 bytes: 3+1+3=7 bytes -> 3+1=4 bytes (actually 6->4 for direct addr)
+                if opcode == "LD" and operands.startswith("A,(") and operands.endswith(")"):
+                    addr = operands[3:-1]  # Extract address
+                    if i + 2 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        p2 = self._parse_z80_line(lines[i + 2].strip())
+                        if (p1 and p1[0] == "INC" and p1[1] == "A" and
+                            p2 and p2[0] == "LD" and p2[1] == f"({addr}),A"):
+                            result.append(f"\tLD HL,{addr}")
+                            result.append("\tINC (HL)")
+                            changed = True
+                            self.stats["z80_inc_mem"] = self.stats.get("z80_inc_mem", 0) + 1
+                            i += 3
+                            continue
+                        # Also check for DEC A
+                        if (p1 and p1[0] == "DEC" and p1[1] == "A" and
+                            p2 and p2[0] == "LD" and p2[1] == f"({addr}),A"):
+                            result.append(f"\tLD HL,{addr}")
+                            result.append("\tDEC (HL)")
+                            changed = True
+                            self.stats["z80_dec_mem"] = self.stats.get("z80_dec_mem", 0) + 1
+                            i += 3
+                            continue
+
+                # LD HL,const; PUSH HL; ... ; POP DE; ADD HL,DE
+                # -> ... ; LD DE,const; ADD HL,DE
+                # Saves PUSH/POP (2 bytes) by deferring the constant load
+                # The value saved by PUSH HL is restored to DE, not HL, so we can defer loading it
+                if opcode == "LD" and operands.startswith("HL,") and not operands.startswith("HL,("):
+                    const_val = operands[3:]
+                    if i + 1 < len(lines):
+                        p1 = self._parse_z80_line(lines[i + 1].strip())
+                        if p1 and p1[0] == "PUSH" and p1[1] == "HL":
+                            # Look for POP DE followed by ADD HL,DE
+                            j = i + 2
+                            middle_ops = []
+                            found_pop_de = False
+                            while j < len(lines) and len(middle_ops) < 15:
+                                pj = self._parse_z80_line(lines[j].strip())
+                                if not pj:
+                                    middle_ops.append(lines[j])
+                                    j += 1
+                                    continue
+                                if pj[0] == "POP" and pj[1] == "DE":
+                                    # Found POP DE - check if next is ADD HL,DE
+                                    if j + 1 < len(lines):
+                                        pk = self._parse_z80_line(lines[j + 1].strip())
+                                        if pk and pk[0] == "ADD" and pk[1] == "HL,DE":
+                                            # Can optimize! Remove LD HL,const; PUSH HL and POP DE
+                                            # Emit middle ops, then LD DE,const; ADD HL,DE
+                                            for op in middle_ops:
+                                                result.append(op)
+                                            result.append(f"\tLD DE,{const_val}")
+                                            result.append("\tADD HL,DE")
+                                            changed = True
+                                            self.stats["z80_defer_const_add"] = self.stats.get("z80_defer_const_add", 0) + 1
+                                            i = j + 2
+                                            found_pop_de = True
+                                    break
+                                # Check for control flow that would break the pattern
+                                if pj[0] in ("JP", "JR", "CALL", "RET", "DJNZ"):
+                                    break
+                                # Check for another PUSH/POP that would unbalance the stack
+                                if pj[0] in ("PUSH", "POP"):
+                                    break
+                                middle_ops.append(lines[j])
+                                j += 1
+                            if found_pop_de:
+                                continue
 
                 # LD r,0 -> LD r,0 can sometimes use XOR for A
                 # OR A -> OR A (can't improve)
@@ -1749,16 +1845,25 @@ class PeepholeOptimizer:
                             i += 2
                             continue
 
-                # DEC B; JR NZ,label -> DJNZ label (saves 1 byte)
+                # DEC B; JR/JP NZ,label -> DJNZ label (saves 1-2 bytes)
+                # Only convert if target is within DJNZ range (±128 bytes)
                 if opcode == "DEC" and operands == "B" and i + 1 < len(lines):
                     next_parsed = self._parse_z80_line(lines[i + 1].strip())
-                    if next_parsed and next_parsed[0] == "JR" and next_parsed[1].startswith("NZ,"):
+                    if next_parsed and next_parsed[0] in ("JR", "JP") and next_parsed[1].startswith("NZ,"):
                         target = next_parsed[1][3:]  # Remove "NZ,"
-                        result.append(f"\tDJNZ {target}")
-                        changed = True
-                        self.stats["z80_djnz"] = self.stats.get("z80_djnz", 0) + 1
-                        i += 2
-                        continue
+                        # Check range - find target label
+                        if target in label_lines:
+                            # Target is earlier in the code (backward jump)
+                            # DJNZ range is -126 to +129 bytes
+                            # Use conservative estimate: ~2.5 bytes per line on average
+                            distance = label_lines[target] - i
+                            # ~50 lines is roughly 125 bytes
+                            if -50 < distance < 50:
+                                result.append(f"\tDJNZ {target}")
+                                changed = True
+                                self.stats["z80_djnz"] = self.stats.get("z80_djnz", 0) + 1
+                                i += 2
+                                continue
 
                 # CP 1; JP Z/NZ -> DEC A; JP Z/NZ (saves 1 byte: CP 1 is 2 bytes, DEC A is 1 byte)
                 # Only valid when A is not needed afterward (comparison just sets flags)
@@ -2057,6 +2162,250 @@ class PeepholeOptimizer:
             result.append(line)
 
         return result
+
+    def _jump_threading_pass(self, lines: list[str]) -> tuple[list[str], bool]:
+        """
+        Jump threading optimization.
+
+        If a jump targets a label whose only content is another unconditional jump,
+        thread through to the final destination.
+
+        Also removes labels that:
+        1. Cannot have fall-through execution (preceded by unconditional jump/ret)
+        2. Only contain an unconditional jump
+        3. Are not referenced elsewhere after threading
+        """
+        changed = False
+
+        # Build map of label -> (line index, first instruction after label)
+        label_info: dict[str, tuple[int, str | None]] = {}
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if ":" in stripped and not stripped.startswith("\t"):
+                label = stripped.split(":")[0].strip()
+                # Find first instruction after this label
+                first_instr = None
+                for j in range(i + 1, len(lines)):
+                    next_line = lines[j].strip()
+                    if not next_line or next_line.startswith(";"):
+                        continue
+                    if ":" in next_line and not next_line.startswith("\t"):
+                        # Another label - no instruction
+                        break
+                    first_instr = next_line
+                    break
+                label_info[label] = (i, first_instr)
+
+        # Build map of label -> final destination (for jump chains)
+        label_target: dict[str, str] = {}
+        for label, (_, first_instr) in label_info.items():
+            if first_instr:
+                parsed = self._parse_z80_line(first_instr)
+                if parsed and parsed[0] in ("JP", "JR") and "," not in parsed[1] and parsed[1] != "(HL)":
+                    target = parsed[1].strip()
+                    # Follow the chain
+                    visited = {label}
+                    while target in label_info and target not in visited:
+                        visited.add(target)
+                        _, target_instr = label_info[target]
+                        if target_instr:
+                            target_parsed = self._parse_z80_line(target_instr)
+                            if target_parsed and target_parsed[0] in ("JP", "JR") and "," not in target_parsed[1] and target_parsed[1] != "(HL)":
+                                target = target_parsed[1].strip()
+                            else:
+                                break
+                        else:
+                            break
+                    if target != label:
+                        label_target[label] = target
+
+        # Track which labels are referenced
+        label_refs: dict[str, int] = {label: 0 for label in label_info}
+
+        # First pass: rewrite jumps AND DW references to use final destinations
+        result: list[str] = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            parsed = self._parse_z80_line(stripped)
+
+            if parsed and parsed[0] in ("JP", "JR", "CALL", "DJNZ"):
+                operands = parsed[1]
+                # Handle conditional jumps like "Z,label" or "NZ,label"
+                if "," in operands:
+                    parts = operands.split(",", 1)
+                    target = parts[1].strip()
+                    prefix = parts[0] + ","
+                else:
+                    target = operands.strip()
+                    prefix = ""
+
+                # Thread through for unconditional jumps only
+                if parsed[0] in ("JP", "JR") and not prefix and target in label_target:
+                    new_target = label_target[target]
+                    if parsed[0] == "JP":
+                        result.append(f"\tJP {new_target}")
+                    else:
+                        result.append(f"\tJR {new_target}")
+                    changed = True
+                    self.stats["jump_thread"] = self.stats.get("jump_thread", 0) + 1
+                    label_refs[new_target] = label_refs.get(new_target, 0) + 1
+                else:
+                    result.append(line)
+                    if target in label_refs:
+                        label_refs[target] += 1
+            elif parsed and parsed[0] == "DW":
+                # Thread DW references through jump-only labels
+                target = parsed[1].strip()
+                if target in label_target:
+                    new_target = label_target[target]
+                    result.append(f"\tDW\t{new_target}")
+                    changed = True
+                    self.stats["dw_thread"] = self.stats.get("dw_thread", 0) + 1
+                    label_refs[new_target] = label_refs.get(new_target, 0) + 1
+                else:
+                    result.append(line)
+                    if target in label_refs:
+                        label_refs[target] += 1
+            else:
+                result.append(line)
+                # Count label references in other contexts (e.g., LXI)
+                # But don't count the label definition itself
+                if ":" in stripped and not stripped.startswith("\t"):
+                    # This is a label definition line, skip it
+                    pass
+                else:
+                    for label in label_info:
+                        if label in stripped:
+                            label_refs[label] = label_refs.get(label, 0) + 1
+
+        # Second pass: remove unreferenced labels that just jump
+        # (Only if they can't have fall-through)
+        final_result: list[str] = []
+        i = 0
+        while i < len(result):
+            line = result[i]
+            stripped = line.strip()
+
+            # Check if this is a label
+            if ":" in stripped and not stripped.startswith("\t"):
+                label = stripped.split(":")[0].strip()
+
+                # Check if label is unreferenced and just contains a jump
+                if label in label_refs and label_refs[label] == 0 and label in label_target:
+                    # Check if previous instruction prevents fall-through
+                    can_fallthrough = True
+                    for j in range(len(final_result) - 1, -1, -1):
+                        prev = final_result[j].strip()
+                        if not prev or prev.startswith(";"):
+                            continue
+                        if ":" in prev and not prev.startswith("\t"):
+                            # Another label - fall-through possible
+                            break
+                        prev_parsed = self._parse_z80_line(prev)
+                        if prev_parsed:
+                            if prev_parsed[0] in ("JP", "JR", "RET") and "," not in prev_parsed[1]:
+                                can_fallthrough = False
+                            break
+
+                    if not can_fallthrough:
+                        # Skip this label and its jump instruction
+                        changed = True
+                        self.stats["dead_label_removed"] = self.stats.get("dead_label_removed", 0) + 1
+                        i += 1
+                        # Skip the jump instruction too
+                        while i < len(result):
+                            next_line = result[i].strip()
+                            if not next_line or next_line.startswith(";"):
+                                i += 1
+                                continue
+                            next_parsed = self._parse_z80_line(next_line)
+                            if next_parsed and next_parsed[0] in ("JP", "JR"):
+                                i += 1
+                                break
+                            break
+                        continue
+
+            final_result.append(line)
+            i += 1
+
+        return final_result, changed
+
+    def _dead_store_elimination(self, lines: list[str]) -> tuple[list[str], bool]:
+        """
+        Eliminate dead stores at procedure entry.
+
+        Pattern: A procedure stores a register parameter to memory at entry,
+        but uses the register directly without ever loading from that memory.
+        The store is dead and can be removed.
+
+        Example:
+            LD (??AUTO+38),A   ; Store param
+            LD L,A             ; Use A directly
+            ...                ; ??AUTO+38 never loaded before RET
+        ->
+            LD L,A
+            ...
+        """
+        result: list[str] = []
+        changed = False
+        i = 0
+
+        # Process one procedure at a time
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            # Look for procedure entry (label followed by LD (addr),A)
+            if ":" in stripped and not stripped.startswith("\t") and not stripped.startswith(";"):
+                label = stripped.split(":")[0].strip()
+                # This might be a procedure entry
+                if i + 1 < len(lines):
+                    next_stripped = lines[i + 1].strip()
+                    parsed = self._parse_z80_line(next_stripped)
+                    # Check for LD (addr),A pattern
+                    if (parsed and parsed[0] == "LD" and
+                        parsed[1].startswith("(") and parsed[1].endswith("),A")):
+                        addr = parsed[1][1:-3]  # Extract addr from (addr),A
+                        # Find end of procedure (next procedure label or end)
+                        proc_end = i + 2
+                        while proc_end < len(lines):
+                            end_stripped = lines[proc_end].strip()
+                            if (":" in end_stripped and
+                                not end_stripped.startswith("\t") and
+                                not end_stripped.startswith(";") and
+                                end_stripped.split(":")[0].strip().startswith("@")):
+                                # Another procedure label
+                                break
+                            proc_end += 1
+
+                        # Check if addr is ever loaded within this procedure
+                        addr_loaded = False
+                        for j in range(i + 2, proc_end):
+                            check_line = lines[j].strip()
+                            # Check for LD A,(addr) or LD r,(addr) patterns
+                            if f"({addr})" in check_line:
+                                p = self._parse_z80_line(check_line)
+                                if p and p[0] == "LD":
+                                    # Check if it's a load (not store)
+                                    # Load: LD r,(addr) - addr is in second part
+                                    # Store: LD (addr),r - addr is in first part
+                                    if not p[1].startswith("("):
+                                        # It's LD r,(addr) - a load
+                                        addr_loaded = True
+                                        break
+
+                        if not addr_loaded:
+                            # Store is dead - skip it
+                            result.append(line)  # Keep the label
+                            i += 2  # Skip the store instruction
+                            changed = True
+                            self.stats["dead_store_elim"] = self.stats.get("dead_store_elim", 0) + 1
+                            continue
+
+            result.append(line)
+            i += 1
+
+        return result, changed
 
     def _optimize_pass(self, lines: list[str]) -> tuple[list[str], bool]:
         """Single optimization pass."""

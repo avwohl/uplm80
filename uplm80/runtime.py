@@ -58,13 +58,13 @@ RUNTIME_DIV16 = """\
 ??DIV16L:
 	PUSH	PSW		; Save counter
 	; Shift HL left, MSB into remainder
-	DAD	H		; HL = HL * 2
-	MOV	A,B
-	RAL
-	MOV	B,A
+	DAD	H		; HL = HL * 2, carry = old H bit 7
 	MOV	A,C
 	RAL
-	MOV	C,A		; BC = BC * 2 + carry from HL
+	MOV	C,A		; C = C<<1 + carry (from HL)
+	MOV	A,B
+	RAL
+	MOV	B,A		; B = B<<1 + carry (from C), BC shifted left with HL carry in
 	; Shift carry into bit 0 of dividend (will be quotient)
 	; Actually we need to track if remainder >= divisor
 	; Compare BC with DE
