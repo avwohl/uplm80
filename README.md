@@ -150,5 +150,6 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## Acknowledgments
 
-- Digital Research for creating PL/M-80 and CP/M
+- Intel for creating PL/M-80
+- Digital Research for creating CP/M
 - The CP/M source code preservation efforts that made the original PL/M sources available
