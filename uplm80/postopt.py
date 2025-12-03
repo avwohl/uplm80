@@ -189,8 +189,11 @@ def find_tail_merge_groups(procs: list[Procedure]) -> dict[tuple, list[Procedure
     return result
 
 
+_tail_merge_counter = 0
+
 def optimize_tail_merge(lines: list[str], procs: list[Procedure],
-                        tail_groups: dict[tuple, list[Procedure]]) -> tuple[list[str], int]:
+                        tail_groups: dict[tuple, list[Procedure]],
+                        verbose: bool = False) -> tuple[list[str], int]:
     """
     Optimize procedures with shared tails using skip trick.
 
@@ -239,15 +242,18 @@ def optimize_tail_merge(lines: list[str], procs: list[Procedure],
         savings_per_proc = tail_size - 1  # Replace tail with just DB 21H
         group_savings = savings_per_proc * (len(usable) - 1)
 
-        print(f"  Tail merge: {len(usable)} procs share {len(tail)}-instr tail")
-        print(f"    Tail: {tail}")
-        print(f"    Procs: {[p.name for p in usable]}")
-        print(f"    Savings: {group_savings} bytes")
+        if verbose:
+            print(f"  Tail merge: {len(usable)} procs share {len(tail)}-instr tail")
+            print(f"    Tail: {tail}")
+            print(f"    Procs: {[p.name for p in usable]}")
+            print(f"    Savings: {group_savings} bytes")
 
         # Now rewrite: for each proc except the last, replace tail with skip
         # The last proc becomes the shared tail target
+        global _tail_merge_counter
+        _tail_merge_counter += 1
         last_proc = usable[-1]
-        tail_label = f"??TAIL${last_proc.name}"
+        tail_label = f"??TAIL${_tail_merge_counter}"
 
         # Find where to insert the tail label (just before the tail in last proc)
         # We need to find the actual line in the file
@@ -276,12 +282,18 @@ def optimize_tail_merge(lines: list[str], procs: list[Procedure],
             # Simpler approach: replace tail with JR to shared tail label
             # This saves (tail_size - 2) bytes per proc
 
-            # First, blank out tail instructions
+            # First, blank out tail instructions but preserve labels
+            preserved_labels = []
             for j in range(tail_start_idx, instr_lines[-1] + 1):
+                line_stripped = result[j].strip()
+                # Keep labels (lines ending with ':' but not just whitespace before)
+                if line_stripped.endswith(':') and not line_stripped.startswith(';'):
+                    preserved_labels.append(result[j])
                 result[j] = ''
 
             # Insert JP to tail label (JR might be out of range)
-            result[tail_start_idx] = f'\tJP {tail_label}\t; tail merged\n'
+            # Put preserved labels first, then the JP
+            result[tail_start_idx] = ''.join(preserved_labels) + f'\tJP {tail_label}\t; tail merged\n'
 
         # Add tail label before the tail in last proc
         for j in range(last_proc.start_line + 1, last_proc.end_line):
@@ -465,9 +477,9 @@ def select_best_tails(tail_groups: dict[tuple, list[Procedure]]) -> list[tuple[t
     return selected
 
 
-def optimize(input_path: str, output_path: str | None = None) -> int:
+def optimize_asm(asm_code: str, verbose: bool = False) -> tuple[str, int]:
     """
-    Run post-assembly optimizations on the given .mac file.
+    Run post-assembly optimizations on assembly code string.
 
     Multi-pass optimization:
     1. Collect all common tails across all procedures
@@ -476,10 +488,14 @@ def optimize(input_path: str, output_path: str | None = None) -> int:
     4. Apply skip trick for adjacent procedures
     5. Repeat until no more savings
 
-    Returns total bytes saved.
+    Returns (optimized_code, total_bytes_saved).
     """
-    with open(input_path, 'r') as f:
-        lines = f.readlines()
+    global _tail_merge_counter
+    _tail_merge_counter = 0
+
+    lines = asm_code.splitlines(keepends=True)
+    # Ensure all lines have newlines
+    lines = [line if line.endswith('\n') else line + '\n' for line in lines]
 
     total_savings = 0
     pass_num = 0
@@ -500,10 +516,11 @@ def optimize(input_path: str, output_path: str | None = None) -> int:
             selected = select_best_tails(tail_groups)
 
             if selected:
-                print(f"  Pass {pass_num}: Found {len(selected)} tail merge groups")
+                if verbose:
+                    print(f"  Pass {pass_num}: Found {len(selected)} tail merge groups")
                 for tail, group in selected:
                     # Apply tail merge for this group
-                    lines, savings = optimize_tail_merge(lines, procs, {tail: group})
+                    lines, savings = optimize_tail_merge(lines, procs, {tail: group}, verbose=verbose)
                     pass_savings += savings
 
                     # Re-parse procs since lines changed
@@ -514,7 +531,7 @@ def optimize(input_path: str, output_path: str | None = None) -> int:
         if skip_opps:
             lines, savings = apply_skip_trick(lines, skip_opps)
             pass_savings += savings
-            if savings > 0:
+            if verbose and savings > 0:
                 print(f"  Pass {pass_num}: Skip trick saved {savings} bytes")
 
         total_savings += pass_savings
@@ -523,14 +540,28 @@ def optimize(input_path: str, output_path: str | None = None) -> int:
         if pass_savings == 0:
             break
 
+    return ''.join(lines), total_savings
+
+
+def optimize(input_path: str, output_path: str | None = None) -> int:
+    """
+    Run post-assembly optimizations on a .mac file.
+
+    Returns total bytes saved.
+    """
+    with open(input_path, 'r') as f:
+        asm_code = f.read()
+
+    optimized, savings = optimize_asm(asm_code, verbose=True)
+
     # Write output
     if output_path is None:
         output_path = input_path
 
     with open(output_path, 'w') as f:
-        f.writelines(lines)
+        f.write(optimized)
 
-    return total_savings
+    return savings
 
 
 if __name__ == '__main__':

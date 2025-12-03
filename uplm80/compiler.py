@@ -14,6 +14,7 @@ from .parser import Parser
 from .ast_optimizer import ASTOptimizer
 from .codegen import CodeGenerator, Target
 from .peephole import PeepholeOptimizer
+from .postopt import optimize_asm as postopt_optimize
 from .errors import CompilerError, ErrorCollector
 
 
@@ -27,6 +28,7 @@ class Compiler:
     3. AST Optimizer: AST -> Optimized AST
     4. Code Generator: AST -> Assembly
     5. Peephole Optimizer: Assembly -> Optimized Assembly
+    6. Post-Assembly Optimizer: Tail merging, skip trick
     """
 
     def __init__(
@@ -109,6 +111,16 @@ class Compiler:
                 if self.debug:
                     for pattern, count in peephole.stats.items():
                         print(f"[DEBUG]   {pattern}: {count} applied", file=sys.stderr)
+
+            # Phase 6: Post-Assembly Optimization (tail merging)
+            if self.opt_level >= 2:
+                if self.debug:
+                    print("[DEBUG] Phase 6: Post-Assembly Optimization", file=sys.stderr)
+
+                asm_code, savings = postopt_optimize(asm_code, verbose=self.debug)
+
+                if self.debug and savings > 0:
+                    print(f"[DEBUG]   Tail merging saved {savings} bytes", file=sys.stderr)
 
             return asm_code
 
