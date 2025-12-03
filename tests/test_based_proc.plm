@@ -1,0 +1,30 @@
+/* Test for BASED variable access within procedures */
+/* This should use indirect addressing through the base pointer parameter */
+
+TEST: DO;
+    DECLARE BUFFER(10) BYTE;
+    DECLARE RESULT BYTE;
+
+    /* Procedure that takes an address and uses BASED to access it */
+    FILLBUF: PROCEDURE(BUFADDR);
+        DECLARE BUFADDR ADDRESS;
+        DECLARE BUF BASED BUFADDR (10) BYTE;  /* BASED array */
+        DECLARE I BYTE;
+
+        /* These accesses should use indirect addressing via BUFADDR */
+        BUF(0) = 10;
+        BUF(1) = 20;
+        BUF(2) = 30;
+
+        DO I = 3 TO 9;
+            BUF(I) = I * 10;
+        END;
+    END FILLBUF;
+
+    /* Call procedure with address of buffer */
+    CALL FILLBUF(.BUFFER);
+
+    /* Check the results */
+    RESULT = BUFFER(0) + BUFFER(1) + BUFFER(2);  /* Should be 60 */
+
+END TEST;
