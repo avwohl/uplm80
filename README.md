@@ -1,8 +1,13 @@
 # uplm80 - PL/M-80 Compiler
 
+[![PyPI version](https://badge.fury.io/py/uplm80.svg)](https://pypi.org/project/uplm80/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 A modern PL/M-80 compiler targeting Intel 8080 and Zilog Z80 assembly language.
 
 PL/M-80 was the primary systems programming language for CP/M and other 8080/Z80 operating systems. This compiler can rebuild original CP/M utilities from their PL/M source code.
+
+**Repository:** https://github.com/avwohl/uplm80
 
 ## Features
 
@@ -22,13 +27,29 @@ Compiled output is comparable to the original Digital Research PL/M-80 compiler:
 
 ## Installation
 
+Install from PyPI:
+
 ```bash
+pip install uplm80
+```
+
+Or install from source:
+
+```bash
+git clone https://github.com/avwohl/uplm80.git
+cd uplm80
 pip install -e .
 ```
 
 ## Usage
 
 ### Compile PL/M-80 to Assembly
+
+```bash
+uplm80 input.plm -o output.mac
+```
+
+Or run as a module:
 
 ```bash
 python -m uplm80.compiler input.plm -o output.mac
@@ -121,7 +142,11 @@ uplm80/
 
 ## License
 
-MIT License
+This project is licensed under the GNU General Public License v3.0 or later - see the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## Acknowledgments
 
