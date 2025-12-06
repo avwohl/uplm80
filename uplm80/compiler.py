@@ -11,11 +11,12 @@ from pathlib import Path
 from . import __version__
 from .lexer import Lexer
 from .parser import Parser
-from .ast_optimizer import ASTOptimizer
 from .codegen import CodeGenerator, Target
-from .peephole import PeepholeOptimizer
 from .postopt import optimize_asm as postopt_optimize
 from .errors import CompilerError, ErrorCollector
+
+# Import optimizers from upeep80 library
+from upeep80 import ASTOptimizer, PeepholeOptimizer
 
 
 class Compiler:

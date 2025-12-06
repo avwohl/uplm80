@@ -24,6 +24,10 @@ classifiers = [
     "Topic :: Software Development :: Compilers",
 ]
 
+dependencies = [
+    "upeep80>=0.1.0",
+]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
