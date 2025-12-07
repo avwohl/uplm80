@@ -18,7 +18,7 @@ from .errors import CompilerError, ErrorCollector
 # Import AST optimizer (PL/M-80 specific)
 from .ast_optimizer import ASTOptimizer
 # Import peephole optimizer from upeep80 library (language-agnostic)
-from upeep80 import PeepholeOptimizer
+from upeep80 import PeepholeOptimizer, InputSyntax
 from upeep80.peephole import Target as PeepholeTarget
 
 
@@ -112,8 +112,9 @@ class Compiler:
                     print("[DEBUG] Phase 5: Peephole Optimization", file=sys.stderr)
 
                 # Convert codegen Target to peephole Target (different enum types)
+                # PL/M-80 codegen uses 8080 mnemonics, so specify I8080 input syntax
                 peep_target = PeepholeTarget.Z80 if self.target == Target.Z80 else PeepholeTarget.I8080
-                peephole = PeepholeOptimizer(peep_target)
+                peephole = PeepholeOptimizer(peep_target, input_syntax=InputSyntax.I8080)
                 asm_code = peephole.optimize(asm_code)
 
                 if self.debug:
