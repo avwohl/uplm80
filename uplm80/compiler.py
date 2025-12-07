@@ -15,8 +15,10 @@ from .codegen import CodeGenerator, Target
 from .postopt import optimize_asm as postopt_optimize
 from .errors import CompilerError, ErrorCollector
 
-# Import optimizers from upeep80 library
-from upeep80 import ASTOptimizer, PeepholeOptimizer
+# Import AST optimizer (PL/M-80 specific)
+from .ast_optimizer import ASTOptimizer
+# Import peephole optimizer from upeep80 library (language-agnostic)
+from upeep80 import PeepholeOptimizer
 
 
 class Compiler:
