@@ -6,4 +6,4 @@ PL/M-80 Programming Manual (9800268B, Jan 1980). It generates optimized
 assembly code for either the Intel 8080 or Zilog Z80 processor.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.6"

@@ -61,6 +61,13 @@ class Target(Enum):
     Z80 = auto()
 
 
+class Mode(Enum):
+    """Runtime environment mode."""
+
+    CPM = auto()   # CP/M program (ORG 100H, stack from BDOS, return to OS)
+    BARE = auto()  # Bare metal program (original Intel PL/M style)
+
+
 @dataclass
 class AsmLine:
     """A single line of assembly output."""
@@ -103,8 +110,9 @@ class CodeGenerator:
     RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
                       'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
 
-    def __init__(self, target: Target = Target.Z80) -> None:
+    def __init__(self, target: Target = Target.Z80, mode: Mode = Mode.CPM) -> None:
         self.target = target
+        self.mode = mode
         self.symbols = SymbolTable()
         self.output: list[AsmLine] = []
         self.label_counter = 0
@@ -904,22 +912,33 @@ class CodeGenerator:
         if entry_proc and not module.stmts:
             self._emit()
             self._emit(comment="Entry point")
-            self._emit("JMP", entry_proc.name)
+            if self.mode == Mode.CPM:
+                # CP/M: Set stack from BDOS, call main, return to OS
+                self._emit("LD", "HL,(6)")
+                self._emit("LD", "SP,HL")
+                self._emit("CALL", entry_proc.name)
+                self._emit("JP", "0")  # Warm boot to return to CP/M
+            else:
+                # BARE: Use locally-defined stack, jump to entry
+                self._emit("LXI", "SP,??STACK")
+                self._emit("JMP", entry_proc.name)
 
         # Generate code for module-level statements
         if module.stmts:
             self._emit()
             self._emit(comment="Module initialization code")
-            if module.origin == 0x100:
+            if self.mode == Mode.CPM:
                 # CP/M: Set stack from BDOS address at 0006H
-                self._emit("LHLD", "6")
-                self._emit("SPHL")
+                self._emit("LD", "HL,(6)")
+                self._emit("LD", "SP,HL")
             else:
-                # Non-CP/M: Use runtime-provided stack
-                self._emit("EXTRN", "??STACK")
+                # BARE: Use locally-defined stack
                 self._emit("LXI", "SP,??STACK")
             for stmt in module.stmts:
                 self._gen_stmt(stmt)
+            # For CPM mode, add warm boot after module statements
+            if self.mode == Mode.CPM:
+                self._emit("JP", "0")  # Warm boot to return to CP/M
 
         # Generate procedures
         for proc in procedures:
@@ -969,6 +988,13 @@ class CodeGenerator:
             self._emit_label("??AUTO")
             self._emit("DS", str(self.total_auto_storage))
 
+        # Emit stack storage for BARE mode
+        if self.mode == Mode.BARE:
+            self._emit()
+            self._emit(comment="Stack storage (64 bytes)")
+            self._emit("DS", "64")
+            self._emit_label("??STACK")  # Label after buffer (top of stack)
+
         # Emit ??MEMORY label - marks end of program data for .MEMORY built-in
         # This is the first free byte after all variables, used by programs
         # to calculate available memory: MAXB - .MEMORY
@@ -976,8 +1002,8 @@ class CodeGenerator:
         self._emit(comment="End of program data")
         self._emit_label("??MEMORY")
 
-        # Note: Stack (??STACK) is expected to be provided by the runtime stubs
-        # when linking for CP/M programs. The stubs define ??STACK at the end.
+        # Note: For CPM mode, stack is provided by CP/M (set from BDOS address at 0006H).
+        # For BARE mode, stack storage (??STACK) is emitted above.
 
         # End directive
         self._emit()

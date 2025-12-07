@@ -1,0 +1,40 @@
+/*
+ * Hello World for CP/M
+ *
+ * Demonstrates basic CP/M BDOS usage with PL/M-80.
+ * Prints "Hello, World!" to the console using BDOS function 9.
+ *
+ * To build and run:
+ *   uplm80 hello_cpm.plm -o hello.mac
+ *   um80 hello.mac
+ *   ul80 -o hello.com hello.rel
+ *   cpmemu hello.com
+ */
+
+0100H:  /* CP/M programs start at 100H */
+
+/* CP/M BDOS interface - function call with no return value */
+MON1: PROCEDURE(FUNC, PARM) EXTERNAL;
+    DECLARE FUNC BYTE,      /* BDOS function number */
+            PARM ADDRESS;   /* Function parameter (byte or address) */
+END MON1;
+
+/* Main program */
+MAIN: PROCEDURE;
+    /* String data - must end with '$' for BDOS function 9 */
+    DECLARE MESSAGE DATA (
+        'Hello, World!', 13, 10, '$'
+    );
+
+    /* BDOS function 9: Print string
+     * C register = 9 (function number)
+     * DE register = address of string (terminated by '$')
+     */
+    CALL MON1(9, .MESSAGE);
+
+END MAIN;
+
+/* Module-level code: Call main and exit */
+CALL MAIN;
+
+EOF

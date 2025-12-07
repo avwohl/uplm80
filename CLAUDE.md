@@ -33,8 +33,15 @@ cpmemu program.com arg1 arg2      # Run with arguments
 
 1. Compile PL/M-80 source to assembly:
    ```bash
-   python -m uplm80.compiler input.plm -o output.mac
+   python -m uplm80.compiler input.plm -o output.mac           # CP/M mode (default)
+   python -m uplm80.compiler input.plm -m bare -o output.mac   # Bare metal mode
    ```
+
+   Options:
+   - `-m cpm` - CP/M mode (default): Stack from BDOS, returns to OS
+   - `-m bare` - Bare metal mode: Local stack, Intel PL/M-80 compatible
+   - `-t z80` or `-t 8080` - Target processor (default: z80)
+   - `-O 0|1|2|3` - Optimization level (default: 2)
 
 2. (Optional) Run post-assembly optimizer:
    ```bash
@@ -63,9 +70,53 @@ The compiler generates code that uses these runtime routines (must be provided i
 - `??MUL` - 16-bit unsigned multiplication
 - `??MOD` - 16-bit unsigned modulo
 
+## Runtime Modes
+
+### CP/M Mode (`-m cpm`, default)
+
+For CP/M programs that run under the CP/M operating system:
+
+**Entry Point Code:**
+```asm
+ORG 100H              ; CP/M TPA start
+LD HL,(6)             ; Get BDOS address from location 6
+LD SP,HL              ; Set stack to top of TPA
+CALL MAIN             ; Call main procedure
+JP 0                  ; Return to CP/M (warm boot)
+```
+
+**Requirements:**
+- CP/M stubs: `MON1`, `MON2`, `MON3`, `BOOT`
+- Memory locations: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`
+- Stack provided by CP/M
+
+### Bare Metal Mode (`-m bare`)
+
+For standalone programs or original Intel PL/M-80 compatibility:
+
+**Entry Point Code:**
+```asm
+ORG 100H              ; Or custom origin
+LXI SP,??STACK        ; Set stack to local stack buffer
+CALL MAIN             ; Call main procedure
+; (falls through - may need HALT or loop)
+```
+
+**Stack Definition:**
+```asm
+DS 64                 ; 64-byte stack buffer
+??STACK:              ; Label at top of stack
+```
+
+**Features:**
+- Local 64-byte stack buffer (emitted by compiler)
+- Compatible with original Intel PL/M-80 programs like PIP.PLM
+- Programs can define custom entry points via DATA declarations
+- No automatic return to OS (program may need explicit HALT or loop)
+
 ## CP/M Stubs
 
-For CP/M programs, provide stubs for:
+For CP/M programs (`-m cpm`), provide stubs for:
 - `MON1` - BDOS call (void return)
 - `MON2` - BDOS call (byte return)
 - `MON3` - BDOS call (address return)

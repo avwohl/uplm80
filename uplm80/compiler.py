@@ -11,7 +11,7 @@ from pathlib import Path
 from . import __version__
 from .lexer import Lexer
 from .parser import Parser
-from .codegen import CodeGenerator, Target
+from .codegen import CodeGenerator, Target, Mode
 from .postopt import optimize_asm as postopt_optimize
 from .errors import CompilerError, ErrorCollector
 
@@ -38,10 +38,12 @@ class Compiler:
     def __init__(
         self,
         target: Target = Target.Z80,
+        mode: Mode = Mode.CPM,
         opt_level: int = 2,
         debug: bool = False,
     ) -> None:
         self.target = target
+        self.mode = mode
         self.opt_level = opt_level
         self.debug = debug
         self.errors = ErrorCollector()
@@ -94,11 +96,11 @@ class Compiler:
             # Phase 4: Code Generation
             if self.debug:
                 print(
-                    f"[DEBUG] Phase 4: Code Generation (target: {self.target.name})",
+                    f"[DEBUG] Phase 4: Code Generation (target: {self.target.name}, mode: {self.mode.name})",
                     file=sys.stderr,
                 )
 
-            codegen = CodeGenerator(self.target)
+            codegen = CodeGenerator(self.target, self.mode)
             asm_code = codegen.generate(ast)
 
             if self.debug:
@@ -203,6 +205,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "-m", "--mode",
+        choices=["cpm", "bare"],
+        default="cpm",
+        help="Runtime mode: cpm=CP/M program, bare=bare metal (default: cpm)",
+    )
+
+    parser.add_argument(
         "-O", "--optimize",
         type=int,
         choices=[0, 1, 2, 3],
@@ -229,9 +238,13 @@ def main() -> None:
     # Select target
     target = Target.Z80 if args.target == "z80" else Target.I8080
 
+    # Select mode
+    mode = Mode.CPM if args.mode == "cpm" else Mode.BARE
+
     # Create compiler
     compiler = Compiler(
         target=target,
+        mode=mode,
         opt_level=args.optimize,
         debug=args.debug,
     )

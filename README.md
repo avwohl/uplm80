@@ -27,11 +27,15 @@ Compiled output is comparable to the original Digital Research PL/M-80 compiler:
 
 ## Installation
 
-Install from PyPI:
+Quick install from PyPI:
 
 ```bash
-pip install uplm80
+pip install uplm80 um80 upeep80
 ```
+
+**Platform-specific guides:**
+- **Raspberry Pi**: See [README_RASPBERRY_PI.md](README_RASPBERRY_PI.md)
+- **General/Development**: See [INSTALL.md](INSTALL.md)
 
 Or install from source:
 
@@ -57,7 +61,11 @@ python -m uplm80.compiler input.plm -o output.mac
 
 Options:
 - `-t 8080` or `-t z80` - Target CPU (default: Z80)
+- `-m cpm` or `-m bare` - Runtime mode (default: cpm)
+  - `cpm`: CP/M program with stack from BDOS, returns to OS on exit
+  - `bare`: Bare metal program with local stack, original Intel PL/M style
 - `-o output.mac` - Output file name
+- `-O 0|1|2|3` - Optimization level (default: 2)
 
 ### Post-Assembly Optimization (Optional)
 
@@ -89,7 +97,7 @@ PL/M-80 is a typed systems programming language with:
 
 Example:
 
-```
+```plm
 hello: DO;
     DECLARE message DATA ('Hello, World!$');
     DECLARE i BYTE;
@@ -103,6 +111,10 @@ hello: DO;
     CALL print(.message);
 END hello;
 ```
+
+See [examples/hello_cpm.plm](examples/hello_cpm.plm) for a complete working example.
+
+For more on CP/M BDOS usage, see [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md).
 
 ## Runtime Library
 
@@ -118,13 +130,28 @@ The compiler generates calls to these runtime routines (provide in a separate .r
 | `??SHRS` | 16-bit arithmetic shift right |
 | `??MOVE` | Block memory move |
 
-## CP/M Programs
+## Runtime Modes
 
-For CP/M programs, provide stubs for:
+### CP/M Mode (default: `-m cpm`)
 
-- `MON1`, `MON2`, `MON3` - BDOS calls
-- `BOOT` - Warm boot
-- `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE` - System variables
+For CP/M programs that run under the CP/M operating system:
+
+- Program starts with `ORG 100H` (CP/M TPA)
+- Stack is set from BDOS address at location 0006H: `LD HL,(6)` / `LD SP,HL`
+- Entry code calls main procedure with `CALL MAIN`
+- Returns to CP/M with `JP 0` (warm boot) when main returns
+- Requires CP/M stubs: `MON1`, `MON2`, `MON3`, `BOOT`
+- System variables: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`
+
+### Bare Metal Mode (`-m bare`)
+
+For standalone programs or original Intel PL/M compatibility:
+
+- Uses locally-defined stack (64 bytes by default)
+- Entry code sets `SP` to `??STACK` label (top of local stack buffer)
+- Compatible with original Intel PL/M-80 programs
+- Program can define custom entry point via DATA declarations
+- No OS return code (program may need explicit HALT or loop)
 
 ## Project Structure
 
