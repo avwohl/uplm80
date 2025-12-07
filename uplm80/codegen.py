@@ -900,10 +900,6 @@ class CodeGenerator:
         for decl in other_decls:
             self._gen_declaration(decl)
 
-        # If module has initialization code, we need the stack from runtime stubs
-        if module.stmts:
-            self._emit("EXTRN", "??STACK")
-
         # If there's an entry procedure, jump to it first
         if entry_proc and not module.stmts:
             self._emit()
@@ -914,9 +910,14 @@ class CodeGenerator:
         if module.stmts:
             self._emit()
             self._emit(comment="Module initialization code")
-            # Emit LXI SP,??STACK at module entry (like DR's compiler)
-            # This is 3 bytes, so .LABEL-3 in DATA will point here
-            self._emit("LXI", "SP,??STACK")
+            if module.origin == 0x100:
+                # CP/M: Set stack from BDOS address at 0006H
+                self._emit("LHLD", "6")
+                self._emit("SPHL")
+            else:
+                # Non-CP/M: Use runtime-provided stack
+                self._emit("EXTRN", "??STACK")
+                self._emit("LXI", "SP,??STACK")
             for stmt in module.stmts:
                 self._gen_stmt(stmt)
 
