@@ -19,6 +19,7 @@ from .errors import CompilerError, ErrorCollector
 from .ast_optimizer import ASTOptimizer
 # Import peephole optimizer from upeep80 library (language-agnostic)
 from upeep80 import PeepholeOptimizer
+from upeep80.peephole import Target as PeepholeTarget
 
 
 class Compiler:
@@ -108,7 +109,9 @@ class Compiler:
                 if self.debug:
                     print("[DEBUG] Phase 5: Peephole Optimization", file=sys.stderr)
 
-                peephole = PeepholeOptimizer(self.target)
+                # Convert codegen Target to peephole Target (different enum types)
+                peep_target = PeepholeTarget.Z80 if self.target == Target.Z80 else PeepholeTarget.I8080
+                peephole = PeepholeOptimizer(peep_target)
                 asm_code = peephole.optimize(asm_code)
 
                 if self.debug:
