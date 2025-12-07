@@ -1154,10 +1154,31 @@ class Parser:
                         pass  # end label
                     self._expect(TokenType.SEMICOLON, "Expected ';' after END")
             elif self._peek(2).type == TokenType.PROCEDURE:
-                # Module is just a procedure
+                # First item is a procedure - use its name as module name
                 proc = self._parse_procedure()
                 name = proc.name
                 decls.append(proc)
+                # Continue parsing the rest of the file
+                while not self._check(TokenType.EOF) and not self._check(TokenType.EOF_KW):
+                    if self._check(TokenType.DECLARE):
+                        decls.extend(self._parse_declare())
+                    else:
+                        stmt = self._parse_statement()
+                        if isinstance(stmt, DeclareStmt):
+                            decls.extend(stmt.declarations)
+                        else:
+                            stmts.append(stmt)
+            else:
+                # Not a DO block and not a procedure - parse as implicit module
+                while not self._check(TokenType.EOF) and not self._check(TokenType.EOF_KW):
+                    if self._check(TokenType.DECLARE):
+                        decls.extend(self._parse_declare())
+                    else:
+                        stmt = self._parse_statement()
+                        if isinstance(stmt, DeclareStmt):
+                            decls.extend(stmt.declarations)
+                        else:
+                            stmts.append(stmt)
         else:
             # Parse declarations and statements directly
             while not self._check(TokenType.EOF) and not self._check(TokenType.EOF_KW):
