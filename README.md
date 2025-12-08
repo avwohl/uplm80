@@ -66,6 +66,7 @@ Options:
   - `bare`: Bare metal program with local stack, original Intel PL/M style
 - `-o output.mac` - Output file name
 - `-O 0|1|2|3` - Optimization level (default: 2)
+- `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
 
 ### Post-Assembly Optimization (Optional)
 
@@ -115,6 +116,44 @@ END hello;
 See [examples/hello_cpm.plm](examples/hello_cpm.plm) for a complete working example.
 
 For more on CP/M BDOS usage, see [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md).
+
+## Conditional Compilation
+
+Later versions of PL/M-80 added conditional compilation directives embedded in comments. This allows the same source to be compiled for different configurations (e.g., CP/M 2.2 vs CP/M 3, single-user vs MP/M).
+
+### Directives
+
+| Directive | Description |
+|-----------|-------------|
+| `/** $set (NAME) **/` | Define a symbol |
+| `/** $reset (NAME) **/` | Undefine a symbol |
+| `/** $cond **/` | Enable conditional compilation |
+| `/** $if NAME **/` | Include following code if NAME is defined |
+| `/** $else **/` | Else branch |
+| `/** $endif **/` | End conditional block |
+
+### Example
+
+```plm
+/** $set (CPM3) **/
+/** $cond **/
+
+DECLARE
+/** $if CPM3 **/
+    VERSION LITERALLY '30H',
+/** $else **/
+    VERSION LITERALLY '22H',
+/** $endif **/
+    MAXFILES BYTE;
+```
+
+### Command Line
+
+Symbols can also be defined from the command line:
+
+```bash
+uplm80 pip.plm -D CPM3 -D MPM -o pip.mac
+```
 
 ## Runtime Library
 

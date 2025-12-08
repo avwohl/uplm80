@@ -42,6 +42,7 @@ cpmemu program.com arg1 arg2      # Run with arguments
    - `-m bare` - Bare metal mode: Local stack, Intel PL/M-80 compatible
    - `-t z80` or `-t 8080` - Target processor (default: z80)
    - `-O 0|1|2|3` - Optimization level (default: 2)
+   - `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
 
 2. (Optional) Run post-assembly optimizer:
    ```bash
@@ -113,6 +114,24 @@ DS 64                 ; 64-byte stack buffer
 - Compatible with original Intel PL/M-80 programs like PIP.PLM
 - Programs can define custom entry points via DATA declarations
 - No automatic return to OS (program may need explicit HALT or loop)
+
+## Conditional Compilation
+
+Supports conditional compilation directives embedded in comments (as used in CP/M 3 sources):
+
+```plm
+/** $set (MPM) **/      /* Define symbol */
+/** $reset (CPM3) **/   /* Undefine symbol */
+/** $cond **/           /* Enable conditional compilation */
+
+/** $if MPM **/
+    /* Code for MP/M */
+/** $else **/
+    /* Code for single-user CP/M */
+/** $endif **/
+```
+
+Command line: `python -m uplm80.compiler input.plm -D MPM -D CPM3`
 
 ## CP/M Stubs
 
