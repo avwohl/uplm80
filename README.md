@@ -62,8 +62,8 @@ python -m uplm80.compiler input.plm -o output.mac
 Options:
 - `-t 8080` or `-t z80` - Target CPU (default: Z80)
 - `-m cpm` or `-m bare` - Runtime mode (default: cpm)
-  - `cpm`: CP/M program with stack from BDOS, returns to OS on exit
-  - `bare`: Bare metal program with local stack, original Intel PL/M style
+  - `cpm`: For new PL/M programs, maximum stack under BDOS
+  - `bare`: Original Digital Research compatible (jump to start-3)
 - `-o output.mac` - Output file name
 - `-O 0|1|2|3` - Optimization level (default: 2)
 - `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
@@ -173,10 +173,11 @@ The compiler generates calls to these runtime routines (provide in a separate .r
 
 ### CP/M Mode (default: `-m cpm`)
 
-For CP/M programs that run under the CP/M operating system:
+For new PL/M programs. Provides maximum stack space by using the area under BDOS:
 
 - Program starts with `ORG 100H` (CP/M TPA)
 - Stack is set from BDOS address at location 0006H: `LD HL,(6)` / `LD SP,HL`
+- Maximum available stack (all memory between program end and BDOS)
 - Entry code calls main procedure with `CALL MAIN`
 - Returns to CP/M with `JP 0` (warm boot) when main returns
 - Requires CP/M stubs: `MON1`, `MON2`, `MON3`, `BOOT`
@@ -184,13 +185,14 @@ For CP/M programs that run under the CP/M operating system:
 
 ### Bare Metal Mode (`-m bare`)
 
-For standalone programs or original Intel PL/M compatibility:
+For original Digital Research PL/M-80 compatibility. Programs begin with a jump to start-3:
 
-- Uses locally-defined stack (64 bytes by default)
-- Entry code sets `SP` to `??STACK` label (top of local stack buffer)
-- Compatible with original Intel PL/M-80 programs
+- Entry begins with `JP ??START` to jump over local stack buffer
+- Uses locally-defined stack (64 bytes in program image)
+- Entry code at `??START` sets `SP` to `??STACK` label, then calls `MAIN`
+- Compatible with original Digital Research programs (ED.PLM, PIP.PLM, etc.)
 - Program can define custom entry point via DATA declarations
-- No OS return code (program may need explicit HALT or loop)
+- No automatic OS return (program controls its own exit behavior)
 
 ## Project Structure
 

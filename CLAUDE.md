@@ -38,8 +38,8 @@ cpmemu program.com arg1 arg2      # Run with arguments
    ```
 
    Options:
-   - `-m cpm` - CP/M mode (default): Stack from BDOS, returns to OS
-   - `-m bare` - Bare metal mode: Local stack, Intel PL/M-80 compatible
+   - `-m cpm` - CP/M mode (default): For new PL/M programs, maximum stack under BDOS
+   - `-m bare` - Bare metal mode: Original Digital Research compatible (jump to start-3)
    - `-t z80` or `-t 8080` - Target processor (default: z80)
    - `-O 0|1|2|3` - Optimization level (default: 2)
    - `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
@@ -75,45 +75,45 @@ The compiler generates code that uses these runtime routines (must be provided i
 
 ### CP/M Mode (`-m cpm`, default)
 
-For CP/M programs that run under the CP/M operating system:
+For new PL/M programs. Provides maximum stack space by using the area under BDOS:
 
 **Entry Point Code:**
 ```asm
 ORG 100H              ; CP/M TPA start
 LD HL,(6)             ; Get BDOS address from location 6
-LD SP,HL              ; Set stack to top of TPA
+LD SP,HL              ; Set stack to top of TPA (maximum stack)
 CALL MAIN             ; Call main procedure
 JP 0                  ; Return to CP/M (warm boot)
 ```
 
-**Requirements:**
-- CP/M stubs: `MON1`, `MON2`, `MON3`, `BOOT`
-- Memory locations: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`
-- Stack provided by CP/M
+**Features:**
+- Maximum available stack (all memory between program end and BDOS)
+- Clean return to CP/M on program exit
+- Requires CP/M stubs: `MON1`, `MON2`, `MON3`, `BOOT`
+- Requires memory locations: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`
 
 ### Bare Metal Mode (`-m bare`)
 
-For standalone programs or original Intel PL/M-80 compatibility:
+For original Digital Research PL/M-80 compatibility. Programs begin with a jump to start-3, which sets SP to a local stack block:
 
 **Entry Point Code:**
 ```asm
 ORG 100H              ; Or custom origin
+JP ??START            ; Jump to initialization at start-3
+DS 64                 ; 64-byte stack buffer
+??STACK:              ; Label at top of stack (SP set here)
+??START:
 LXI SP,??STACK        ; Set stack to local stack buffer
 CALL MAIN             ; Call main procedure
-; (falls through - may need HALT or loop)
-```
-
-**Stack Definition:**
-```asm
-DS 64                 ; 64-byte stack buffer
-??STACK:              ; Label at top of stack
+; (falls through - program controls exit behavior)
 ```
 
 **Features:**
-- Local 64-byte stack buffer (emitted by compiler)
-- Compatible with original Intel PL/M-80 programs like PIP.PLM
+- Compatible with original Digital Research PL/M-80 programs (ED.PLM, PIP.PLM, etc.)
+- Local 64-byte stack buffer embedded in program
+- Entry point at start-3 (jump over stack area)
 - Programs can define custom entry points via DATA declarations
-- No automatic return to OS (program may need explicit HALT or loop)
+- No automatic return to OS (program controls its own exit)
 
 ## Conditional Compilation
 
