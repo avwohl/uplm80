@@ -5,6 +5,7 @@ Converts PL/M-80 source code into a stream of tokens.
 """
 
 from typing import Iterator
+import re
 from .tokens import Token, TokenType, RESERVED_WORDS
 from .errors import LexerError, SourceLocation
 
@@ -20,9 +21,34 @@ class Lexer:
         self.column = 1  # Current column (1-based)
         self.line_start = 0  # Position of start of current line
 
+        # Conditional compilation state
+        self._cond_symbols: set[str] = set()  # Defined symbols
+        self._cond_stack: list[tuple[bool, bool]] = []  # (branch_taken, in_else)
+        self._cond_enabled = False  # Whether $cond has been seen
+
+    def define_symbol(self, symbol: str) -> None:
+        """Define a conditional compilation symbol (like -D on command line)."""
+        self._cond_symbols.add(symbol.upper())
+
     def _current_location(self) -> SourceLocation:
         """Get the current source location."""
         return SourceLocation(self.line, self.column, self.filename)
+
+    def _is_skipping(self) -> bool:
+        """Check if we're in a conditional branch that should be skipped."""
+        if not self._cond_enabled or not self._cond_stack:
+            return False
+        # We're skipping if any level in the stack is in a false branch
+        for branch_taken, in_else in self._cond_stack:
+            # If branch_taken and not in_else: we took the $if branch, include code
+            # If branch_taken and in_else: we're in $else after taking $if, skip
+            # If not branch_taken and not in_else: we're in $if but condition false, skip
+            # If not branch_taken and in_else: we're in $else, condition was false, include
+            if branch_taken and in_else:
+                return True
+            if not branch_taken and not in_else:
+                return True
+        return False
 
     def _peek(self, offset: int = 0) -> str:
         """Peek at character at current position + offset."""
@@ -46,7 +72,7 @@ class Lexer:
         return ch
 
     def _skip_whitespace_and_comments(self) -> None:
-        """Skip whitespace and comments."""
+        """Skip whitespace, comments, and conditionally-excluded code."""
         while self.pos < len(self.source):
             ch = self._peek()
 
@@ -71,22 +97,85 @@ class Lexer:
                 self._skip_control_directive()
                 continue
 
+            # If we're in a skipped conditional branch, skip non-comment characters
+            if self._is_skipping():
+                self._advance()
+                continue
+
             break
 
     def _skip_comment(self) -> None:
-        """Skip a /* ... */ comment."""
+        """Skip a /* ... */ comment, handling conditional directives."""
         start_loc = self._current_location()
+        start_pos = self.pos
         self._advance()  # /
         self._advance()  # *
 
+        # Check for directive comment: /** $... **/
+        is_directive = self._peek() == "*" and self._peek(1) == " " and self._peek(2) == "$"
+
         while self.pos < len(self.source):
             if self._peek() == "*" and self._peek(1) == "/":
+                end_pos = self.pos
                 self._advance()  # *
                 self._advance()  # /
+
+                # Process directive if it matches /** $... **/
+                if is_directive:
+                    comment_text = self.source[start_pos:end_pos + 2]
+                    self._process_directive(comment_text, start_loc)
                 return
             self._advance()
 
         raise LexerError("Unterminated comment", start_loc)
+
+    def _process_directive(self, comment: str, loc: SourceLocation) -> None:
+        """Process a conditional compilation directive comment.
+
+        Supported directives:
+          /** $set (name) **/   - Define a symbol
+          /** $reset (name) **/ - Undefine a symbol
+          /** $cond **/         - Enable conditional compilation
+          /** $if name **/      - Begin conditional block
+          /** $else **/         - Else branch
+          /** $endif **/        - End conditional block
+        """
+        # Extract the directive content between /** and **/
+        match = re.match(r'/\*\*\s*\$(\w+)\s*(.*?)\s*\*\*/', comment, re.IGNORECASE)
+        if not match:
+            return  # Not a valid directive, treat as normal comment
+
+        directive = match.group(1).lower()
+        arg = match.group(2).strip()
+
+        if directive == "set":
+            # $set (name) - define symbol
+            m = re.match(r'\((\w+)\)', arg)
+            if m:
+                self._cond_symbols.add(m.group(1).upper())
+        elif directive == "reset":
+            # $reset (name) - undefine symbol
+            m = re.match(r'\((\w+)\)', arg)
+            if m:
+                self._cond_symbols.discard(m.group(1).upper())
+        elif directive == "cond":
+            # $cond - enable conditional compilation
+            self._cond_enabled = True
+        elif directive == "if":
+            # $if name - begin conditional
+            if self._cond_enabled:
+                symbol = arg.upper()
+                condition_true = symbol in self._cond_symbols
+                self._cond_stack.append((condition_true, False))
+        elif directive == "else":
+            # $else - switch to else branch
+            if self._cond_enabled and self._cond_stack:
+                branch_taken, _ = self._cond_stack[-1]
+                self._cond_stack[-1] = (branch_taken, True)
+        elif directive == "endif":
+            # $endif - end conditional
+            if self._cond_enabled and self._cond_stack:
+                self._cond_stack.pop()
 
     def _skip_control_directive(self) -> None:
         """Skip a $... control directive line.

@@ -41,11 +41,13 @@ class Compiler:
         mode: Mode = Mode.CPM,
         opt_level: int = 2,
         debug: bool = False,
+        defines: list[str] | None = None,
     ) -> None:
         self.target = target
         self.mode = mode
         self.opt_level = opt_level
         self.debug = debug
+        self.defines = defines or []  # Symbols to define for conditional compilation
         self.errors = ErrorCollector()
 
     def compile(self, source: str, filename: str = "<input>") -> str | None:
@@ -60,6 +62,11 @@ class Compiler:
                 print(f"[DEBUG] Phase 1: Lexing {filename}", file=sys.stderr)
 
             lexer = Lexer(source, filename)
+
+            # Set command-line defined symbols
+            for symbol in self.defines:
+                lexer.define_symbol(symbol)
+
             tokens = lexer.tokenize()
 
             if self.debug:
@@ -226,6 +233,15 @@ def main() -> None:
         help="Enable debug output",
     )
 
+    parser.add_argument(
+        "-D", "--define",
+        action="append",
+        dest="defines",
+        default=[],
+        metavar="SYMBOL",
+        help="Define conditional compilation symbol (can be repeated)",
+    )
+
     args = parser.parse_args()
 
     # TEMPORARY: Force Z80 target during development
@@ -248,6 +264,7 @@ def main() -> None:
         mode=mode,
         opt_level=args.optimize,
         debug=args.debug,
+        defines=args.defines,
     )
 
     # Compile
