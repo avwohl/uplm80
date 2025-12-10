@@ -178,21 +178,47 @@ class Lexer:
                 self._cond_stack.pop()
 
     def _skip_control_directive(self) -> None:
-        """Skip a $... control directive line.
+        """Skip or process a $... control directive line.
 
         PL/M-80 uses $ at the start of a line for compiler controls like:
         $Q=1, $INCLUDE, $PAGELENGTH(60), etc.
-        We skip these as they don't affect parsing.
+        Most are skipped, but we process $DEFINE/$SET/$RESET for conditional compilation.
         """
-        # Skip everything until end of line
+        start_pos = self.pos
+        # Collect the entire line
         while self.pos < len(self.source):
             ch = self._peek()
             if ch == "\n" or ch == "\r":
-                self._advance()
-                return
+                break
             if ch == "\0":
-                return
+                break
             self._advance()
+
+        line = self.source[start_pos:self.pos].strip()
+
+        # Skip the newline if present
+        if self.pos < len(self.source) and self._peek() in "\r\n":
+            self._advance()
+
+        # Process conditional compilation directives
+        # $DEFINE name or $SET(name) - define a symbol
+        match = re.match(r'\$(?:DEFINE|SET)\s*\(?(\w+)\)?', line, re.IGNORECASE)
+        if match:
+            self._cond_symbols.add(match.group(1).upper())
+            return
+
+        # $RESET(name) - undefine a symbol
+        match = re.match(r'\$RESET\s*\((\w+)\)', line, re.IGNORECASE)
+        if match:
+            self._cond_symbols.discard(match.group(1).upper())
+            return
+
+        # $COND - enable conditional compilation
+        if re.match(r'\$COND\b', line, re.IGNORECASE):
+            self._cond_enabled = True
+            return
+
+        # Other directives ($TITLE, $INCLUDE, etc.) are just skipped
 
     def _make_token(
         self, token_type: TokenType, value: object, lexeme: str, start_line: int, start_col: int
