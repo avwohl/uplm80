@@ -120,6 +120,22 @@ class Parser:
             raise self._error(msg)
         return self._advance()
 
+    def _expect_number_or_macro(self, error_msg: str) -> int:
+        """Expect a number literal or a LITERALLY macro that expands to a number."""
+        if self._check(TokenType.NUMBER):
+            return self._advance().value
+        elif self._check(TokenType.IDENTIFIER):
+            name = self._advance().value
+            if name in self.macros:
+                try:
+                    return self._parse_plm_number(self.macros[name])
+                except ValueError:
+                    raise self._error(f"Macro '{name}' does not expand to a number")
+            else:
+                raise self._error(f"Unknown identifier '{name}' (expected number or macro)")
+        else:
+            raise self._error(error_msg)
+
     def _span_from(self, start: Token) -> SourceSpan:
         """Create a source span from start token to current position."""
         prev = self._peek(-1) if self.pos > 0 else start
@@ -942,8 +958,7 @@ class Parser:
 
             dimension: int | None = None
             if self._match(TokenType.LPAREN):
-                dim_tok = self._expect(TokenType.NUMBER, "Expected dimension")
-                dimension = dim_tok.value
+                dimension = self._expect_number_or_macro("Expected dimension")
                 self._expect(TokenType.RPAREN, "Expected ')' after dimension")
 
             if self._match(TokenType.BYTE):
@@ -1063,8 +1078,7 @@ class Parser:
             elif self._match(TokenType.REENTRANT):
                 is_reentrant = True
             elif self._match(TokenType.INTERRUPT):
-                int_tok = self._expect(TokenType.NUMBER, "Expected interrupt number")
-                interrupt_num = int_tok.value
+                interrupt_num = self._expect_number_or_macro("Expected interrupt number")
             else:
                 break
 
