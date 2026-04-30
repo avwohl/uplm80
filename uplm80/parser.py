@@ -325,18 +325,13 @@ class Parser:
         raise self._error(f"Expected expression, got {self.current.type.name}")
 
     def _parse_unary(self) -> Expr:
-        """Parse unary expression."""
+        """Parse unary expression (unary -)."""
         token = self.current
 
         # Unary minus
         if self._match(TokenType.OP_MINUS):
             operand = self._parse_unary()
             return UnaryExpr(UnaryOp.NEG, operand, span=self._span_from(token))
-
-        # NOT
-        if self._match(TokenType.NOT):
-            operand = self._parse_unary()
-            return UnaryExpr(UnaryOp.NOT, operand, span=self._span_from(token))
 
         return self._parse_primary()
 
@@ -409,14 +404,22 @@ class Parser:
 
         return left
 
+    def _parse_not(self) -> Expr:
+        """Parse NOT expression. NOT sits between relational and AND per PL/M-80 spec."""
+        token = self.current
+        if self._match(TokenType.NOT):
+            operand = self._parse_not()
+            return UnaryExpr(UnaryOp.NOT, operand, span=self._span_from(token))
+        return self._parse_relational()
+
     def _parse_and(self) -> Expr:
         """Parse AND expression."""
-        left = self._parse_relational()
+        left = self._parse_not()
 
         while True:
             token = self.current
             if self._match(TokenType.AND):
-                right = self._parse_relational()
+                right = self._parse_not()
                 left = BinaryExpr(BinaryOp.AND, left, right, span=self._span_from(token))
             else:
                 break

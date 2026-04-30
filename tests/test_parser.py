@@ -16,8 +16,10 @@ from uplm80.ast_nodes import (
     NumberLiteral,
     Identifier,
     BinaryExpr,
+    UnaryExpr,
     DataType,
     BinaryOp,
+    UnaryOp,
 )
 
 
@@ -223,6 +225,45 @@ class TestParser:
         assert expr.op == BinaryOp.ADD
         assert isinstance(expr.right, BinaryExpr)
         assert expr.right.op == BinaryOp.MUL
+
+    def test_not_relational_precedence(self) -> None:
+        """NOT must bind looser than relational operators (PL/M-80 spec).
+
+        ``NOT A < B`` should parse as ``NOT (A < B)``, not ``(NOT A) < B``.
+        """
+        source = """
+        TEST: PROCEDURE;
+            DECLARE (A, B, C) BYTE;
+            C = NOT A < B;
+        END TEST;
+        """
+        ast = parse(source)
+        proc = ast.decls[0]
+        assert isinstance(proc, ProcDecl)
+        stmt = proc.stmts[0]
+        assert isinstance(stmt, AssignStmt)
+        # Top-level expression should be NOT, with a relational underneath.
+        assert isinstance(stmt.value, UnaryExpr)
+        assert stmt.value.op == UnaryOp.NOT
+        assert isinstance(stmt.value.operand, BinaryExpr)
+        assert stmt.value.operand.op == BinaryOp.LT
+
+    def test_not_binds_tighter_than_and(self) -> None:
+        """NOT must bind tighter than AND: ``NOT A AND B`` -> ``(NOT A) AND B``."""
+        source = """
+        TEST: PROCEDURE;
+            DECLARE (A, B, C) BYTE;
+            C = NOT A AND B;
+        END TEST;
+        """
+        ast = parse(source)
+        proc = ast.decls[0]
+        stmt = proc.stmts[0]
+        assert isinstance(stmt, AssignStmt)
+        assert isinstance(stmt.value, BinaryExpr)
+        assert stmt.value.op == BinaryOp.AND
+        assert isinstance(stmt.value.left, UnaryExpr)
+        assert stmt.value.left.op == UnaryOp.NOT
 
     def test_module_structure(self) -> None:
         """Test parsing module structure."""
