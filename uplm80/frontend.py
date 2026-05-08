@@ -891,6 +891,13 @@ def _build_var_decl(
     dim = array_size
     if dim is None and tail.type_dimension is not None:
         dim = tail.type_dimension
+    # The implicit-size sentinel (`(*)`) is stored as None on VarDecl —
+    # legacy convention, codegen uses ``if d.dimension`` checks and a
+    # truthy ``-1`` would corrupt array length / LENGTH() / storage
+    # calculations. The actual length is recovered later from the
+    # ``data_values`` initialiser when one is present.
+    if dim == -1:
+        dim = None
     return VarDecl(
         name=name,
         data_type=tail.data_type,
