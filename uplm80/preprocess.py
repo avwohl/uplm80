@@ -509,6 +509,24 @@ def macro_pass(source: str) -> str:
             # 19+1.
             in_init_ctx = bool(paren_stack) and paren_stack[-1] in ("INITIAL", "DATA")
             effective_body = _first_top_comma_chunk(body) if in_init_ctx else body
+            # Procedure declarations (`mon1: procedure ... external;`
+            # where ``mon1`` is itself a LITERALLY for ``'ldmon1'``)
+            # take their name from the macro body verbatim, preserving
+            # the body's source case. Legacy uplm80 did this via its
+            # text-only ``_expand_macro`` in ``_parse_procedure`` while
+            # call sites went through the upper-folding sub-lexer; the
+            # net effect is ``extrn ldmon1`` paired with ``call LDMON1``,
+            # which the case-insensitive linker resolves. Detect that
+            # context here by peeking past trivia for ``:``.
+            peek_next, _ = _peek_significant(tokens, i, pending)
+            if (
+                peek_next is not None
+                and peek_next.kind == "PUNCT"
+                and peek_next.text == ":"
+                and _is_simple_ident(effective_body)
+            ):
+                out.append(effective_body.strip())
+                continue
             sub_tokens = _tokenize_for_macros(effective_body)
             pending = list(sub_tokens) + pending
             continue
@@ -517,6 +535,20 @@ def macro_pass(source: str) -> str:
         out.append(text)
 
     return "".join(out)
+
+
+def _is_simple_ident(text: str) -> bool:
+    """Return True if ``text`` (after stripping outer whitespace) is a
+    single PL/M identifier — letters / digits / ``$`` / ``_`` with a
+    leading letter or underscore. Used in the macro pass to detect a
+    body that's a plain name alias (``'ldmon1'``) so it can be
+    spliced into proc-declaration context with its original case."""
+    s = text.strip()
+    if not s:
+        return False
+    if not (s[0].isalpha() or s[0] == "_"):
+        return False
+    return all(c.isalnum() or c in "_$" for c in s)
 
 
 def _first_top_comma_chunk(body: str) -> str:
