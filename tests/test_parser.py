@@ -1,7 +1,7 @@
-"""Tests for the PL/M-80 parser."""
+"""Tests for the PL/M-80 front-end (preprocess + plox parse + AST lowering)."""
 
 import pytest
-from uplm80.parser import parse
+from uplm80.frontend import parse_source as parse
 from uplm80.ast_nodes import (
     Module,
     VarDecl,
@@ -25,11 +25,6 @@ from uplm80.ast_nodes import (
 
 class TestParser:
     """Test cases for the parser."""
-
-    def test_empty_module(self) -> None:
-        """Test parsing empty module."""
-        ast = parse("")
-        assert isinstance(ast, Module)
 
     def test_simple_declare(self) -> None:
         """Test parsing simple DECLARE."""

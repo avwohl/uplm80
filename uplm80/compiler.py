@@ -9,8 +9,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .lexer import Lexer
-from .parser import Parser
+from .frontend import parse_source
 from .codegen import CodeGenerator, Target, Mode
 from .errors import CompilerError, ErrorCollector
 
@@ -70,27 +69,16 @@ class Compiler:
         Returns the assembly code string, or None if compilation failed.
         """
         try:
-            # Phase 1: Lexical Analysis
+            # Phases 1-2: preprocess + plox plm_full LR parse + AST lowering.
             if self.debug:
-                print(f"[DEBUG] Phase 1: Lexing {filename}", file=sys.stderr)
+                print(f"[DEBUG] Front-end (plox plm_full) {filename}", file=sys.stderr)
 
-            lexer = Lexer(source, filename, include_paths=self.include_paths)
-
-            # Set command-line defined symbols
-            for symbol in self.defines:
-                lexer.define_symbol(symbol)
-
-            tokens = lexer.tokenize()
-
-            if self.debug:
-                print(f"[DEBUG] Produced {len(tokens)} tokens", file=sys.stderr)
-
-            # Phase 2: Parsing
-            if self.debug:
-                print("[DEBUG] Phase 2: Parsing", file=sys.stderr)
-
-            parser = Parser(tokens, filename)
-            ast = parser.parse_module()
+            ast = parse_source(
+                source,
+                filename,
+                defines=self.defines,
+                include_paths=self.include_paths,
+            )
 
             if self.debug:
                 print(f"[DEBUG] Parsed module: {ast.name}", file=sys.stderr)
@@ -220,18 +208,14 @@ class Compiler:
                 filenames.append(filename)
 
                 if self.debug:
-                    print(f"[DEBUG] Phase 1: Lexing {filename}", file=sys.stderr)
+                    print(f"[DEBUG] Front-end (plox plm_full) {filename}", file=sys.stderr)
 
-                lexer = Lexer(source, filename, include_paths=self.include_paths)
-                for symbol in self.defines:
-                    lexer.define_symbol(symbol)
-                tokens = lexer.tokenize()
-
-                if self.debug:
-                    print(f"[DEBUG] Phase 2: Parsing {filename}", file=sys.stderr)
-
-                parser = Parser(tokens, filename)
-                ast = parser.parse_module()
+                ast = parse_source(
+                    source,
+                    filename,
+                    defines=self.defines,
+                    include_paths=self.include_paths,
+                )
 
                 # Phase 3: AST Optimization
                 if self.opt_level > 0:
