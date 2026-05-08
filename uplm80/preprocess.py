@@ -395,6 +395,16 @@ def macro_pass(source: str) -> str:
     n = len(tokens)
     pending: list[_Tok] = []  # putback queue for substituted-body tokens
 
+    # Stack of `(` contexts: each entry is the keyword that opened the
+    # outer parens (``"INITIAL"`` / ``"DATA"`` / ``""`` for any other
+    # paren). Used to pick expression-level vs full-text substitution
+    # for macro bodies — inside ``INITIAL(...)`` / ``DATA(...)`` only
+    # the first top-comma chunk of a macro body is substituted, matching
+    # legacy uplm80's "sub-parse macro body as a single expression"
+    # semantics. Elsewhere the full body is substituted.
+    paren_stack: list[str] = []
+    last_significant: str = ""
+
     def next_tok() -> "_Tok | None":
         nonlocal i
         if pending:
@@ -421,9 +431,17 @@ def macro_pass(source: str) -> str:
             out.append(tok.text)
             continue
         if tok.kind == "PUNCT":
+            if tok.text == "(":
+                opener = last_significant if last_significant in ("INITIAL", "DATA") else ""
+                paren_stack.append(opener)
+            elif tok.text == ")":
+                if paren_stack:
+                    paren_stack.pop()
+            last_significant = tok.text
             out.append(tok.text)
             continue
         if tok.kind == "NUMBER":
+            last_significant = tok.text
             out.append(tok.text)
             continue
 
@@ -431,6 +449,7 @@ def macro_pass(source: str) -> str:
         # macro-def shape / macro-use, in that order.
         assert tok.kind == "IDENT"
         text = tok.text  # already upper-folded by the scanner
+        last_significant = text
 
         # Block-scope tracking. PROCEDURE and DO open a scope; END
         # closes the innermost. Detection is purely lexical here —
@@ -481,9 +500,16 @@ def macro_pass(source: str) -> str:
         # machinery, so nested macros expand to the bottom.
         body = lookup(text)
         if body is not None:
-            sub_tokens = _tokenize_for_macros(body)
-            # Drop the trailing WS/COMMENT noise the scanner attaches
-            # when the body has trailing whitespace — keeps output tidy.
+            # Inside INITIAL(...) / DATA(...) the legacy parser
+            # sub-parses the macro body as a single expression and
+            # silently discards anything past the first comma at the
+            # body's top level. Mirror that here so init lists like
+            # `initial(restarts, .status)` — where ``restarts`` is
+            # ``'0C7C7H,0C7C7H,...,0C7C7H'`` — yield 2 init values, not
+            # 19+1.
+            in_init_ctx = bool(paren_stack) and paren_stack[-1] in ("INITIAL", "DATA")
+            effective_body = _first_top_comma_chunk(body) if in_init_ctx else body
+            sub_tokens = _tokenize_for_macros(effective_body)
             pending = list(sub_tokens) + pending
             continue
 
@@ -491,6 +517,34 @@ def macro_pass(source: str) -> str:
         out.append(text)
 
     return "".join(out)
+
+
+def _first_top_comma_chunk(body: str) -> str:
+    """Return everything up to the first top-level (paren-balanced)
+    comma in ``body``. Mimics the legacy parser's behaviour of sub-
+    parsing a macro body as a single expression in INITIAL/DATA arg
+    lists — matters for definitions like
+    ``restarts literally '0C7C7H,0C7C7H,...,0C7C7H'`` whose body has
+    19 comma-separated values but is intended to act as one item when
+    spliced into an INITIAL list."""
+    depth = 0
+    in_str = False
+    for j, c in enumerate(body):
+        if in_str:
+            if c == "'":
+                in_str = False
+            continue
+        if c == "'":
+            in_str = True
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if depth > 0:
+                depth -= 1
+        elif c == "," and depth == 0:
+            return body[:j]
+    return body
 
 
 @dataclass
@@ -605,7 +659,12 @@ def _tokenize_for_macros(source: str) -> list[_Tok]:
             j = i
             while j < n and (source[j].isalnum() or source[j] in "_$"):
                 j += 1
-            text = source[i:j].upper()
+            # PL/M-80 ``$`` inside an identifier is a soft hyphen —
+            # ``STACK$SIZ`` and ``STACKSIZ`` are the same name. The
+            # legacy lexer normalised at tokenize time; we do the same
+            # so macro lookups, keyword checks, and downstream emission
+            # all see one canonical spelling per identifier.
+            text = source[i:j].upper().replace("$", "")
             out.append(_Tok("IDENT", text, line, col))
             col += j - i
             i = j
