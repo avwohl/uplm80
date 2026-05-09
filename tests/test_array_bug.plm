@@ -8,8 +8,12 @@ test$module: do;
 declare fcb(36) byte;
 declare i byte;
 
-get$buf$byte: procedure(offset) byte external;
+/* Local stub instead of EXTERNAL so the test links standalone.
+ * The codegen path under test (assigning a call's return value to an
+ * array element with a computed index) is the same either way. */
+get$buf$byte: procedure(offset) byte;
     declare offset address;
+    return low(offset);
 end get$buf$byte;
 
 /* This triggers the bug - assigning function result to array with computed index */
