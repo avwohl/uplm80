@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import __version__
 from .frontend import parse_source
-from .codegen import CodeGenerator, Target, Mode
+from .codegen import CodeGenerator, Mode
 from .errors import CompilerError, ErrorCollector
 
 # Import AST optimizer (PL/M-80 specific)
@@ -33,14 +33,12 @@ class Compiler:
 
     def __init__(
         self,
-        target: Target = Target.Z80,
         mode: Mode = Mode.CPM,
         opt_level: int = 2,
         debug: bool = False,
         defines: list[str] | None = None,
         include_paths: list[str] | None = None,
     ) -> None:
-        self.target = target
         self.mode = mode
         self.opt_level = opt_level
         self.debug = debug
@@ -104,11 +102,11 @@ class Compiler:
             # Phase 4: Code Generation
             if self.debug:
                 print(
-                    f"[DEBUG] Phase 4: Code Generation (target: {self.target.name}, mode: {self.mode.name})",
+                    f"[DEBUG] Phase 4: Code Generation (mode: {self.mode.name})",
                     file=sys.stderr,
                 )
 
-            codegen = CodeGenerator(self.target, self.mode, reg_debug=self.debug)
+            codegen = CodeGenerator(self.mode, reg_debug=self.debug)
             asm_code = codegen.generate(ast)
 
             # Print any warnings from code generation
@@ -230,7 +228,7 @@ class Compiler:
             if self.debug:
                 print(f"[DEBUG] Phase 4: Code Generation (multi-module, {len(modules)} files)", file=sys.stderr)
 
-            codegen = CodeGenerator(self.target, self.mode, reg_debug=self.debug)
+            codegen = CodeGenerator(self.mode, reg_debug=self.debug)
             asm_code = codegen.generate_multi(modules)
 
             # Print any warnings from code generation
@@ -340,9 +338,7 @@ def main() -> None:
     # Select mode
     mode = Mode.CPM if args.mode == "cpm" else Mode.BARE
 
-    # Create compiler (Z80 only)
     compiler = Compiler(
-        target=Target.Z80,
         mode=mode,
         opt_level=args.optimize,
         debug=args.debug,

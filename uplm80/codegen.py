@@ -54,12 +54,6 @@ from .errors import CodeGenError
 from .runtime import get_runtime_library
 
 
-class Target(Enum):
-    """Target processor."""
-
-    Z80 = auto()  # Z80 only - 8080 target removed
-
-
 class Mode(Enum):
     """Runtime environment mode."""
 
@@ -309,8 +303,7 @@ class CodeGenerator:
     RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
                       'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
 
-    def __init__(self, target: Target = Target.Z80, mode: Mode = Mode.CPM, warn_trivial_if: bool = True, reg_debug: bool = False) -> None:
-        self.target = target
+    def __init__(self, mode: Mode = Mode.CPM, warn_trivial_if: bool = True, reg_debug: bool = False) -> None:
         self.mode = mode
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
         self.reg_debug = reg_debug  # Enable register tracking debug output
@@ -6390,7 +6383,7 @@ class CodeGenerator:
         return DataType.ADDRESS
 
 
-def generate(module: Module, target: Target = Target.Z80) -> str:
+def generate(module: Module) -> str:
     """Convenience function to generate code from a module."""
-    gen = CodeGenerator(target)
+    gen = CodeGenerator()
     return gen.generate(module)
