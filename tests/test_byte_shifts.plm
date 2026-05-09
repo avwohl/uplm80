@@ -191,11 +191,14 @@ TEST$SCL$BYTE: PROCEDURE;
 
     X = 40H;  /* 01000000 */
     Y = SCL(X, 1);
-    CALL PRINT$TEST(.'scl_b2 $', Y);  /* Expected: 128 */
+    CALL PRINT$TEST(.'scl_b2 $', Y);  /* Expected: 128 or 129 depending on initial carry */
 
     X = 0AAH;  /* 10101010 */
     Y = SCL(X, 2);
-    CALL PRINT$TEST(.'scl_b3 $', Y);  /* Expected: 168 (10101000) */
+    /* SCL is rotate-left-through-carry (Z80 RLA), not a logical shift.
+     * 0xAA, C=0: 0xAA -> 0x54 (C=1) -> 0xA9 (10101001 = 169).
+     * 0xAA, C=1: 0xAA -> 0x55 (C=1) -> 0xAB (10101011 = 171). */
+    CALL PRINT$TEST(.'scl_b3 $', Y);  /* Expected: 169 or 171 depending on initial carry */
 
 END TEST$SCL$BYTE;
 
@@ -210,11 +213,14 @@ TEST$SCR$BYTE: PROCEDURE;
 
     X = 02H;  /* 00000010 */
     Y = SCR(X, 1);
-    CALL PRINT$TEST(.'scr_b2 $', Y);  /* Expected: 1 */
+    CALL PRINT$TEST(.'scr_b2 $', Y);  /* Expected: 1 or 129 depending on initial carry */
 
     X = 0AAH;  /* 10101010 */
     Y = SCR(X, 2);
-    CALL PRINT$TEST(.'scr_b3 $', Y);  /* Expected: 42 (00101010) */
+    /* SCR is rotate-right-through-carry (Z80 RRA), not a logical shift.
+     * 0xAA, C=0: 0xAA -> 0x55 (C=0) -> 0x2A (00101010 = 42).
+     * 0xAA, C=1: 0xAA -> 0xD5 (C=0) -> 0x6A (01101010 = 106). */
+    CALL PRINT$TEST(.'scr_b3 $', Y);  /* Expected: 42 or 106 depending on initial carry */
 
 END TEST$SCR$BYTE;
 
