@@ -641,6 +641,35 @@ class CodeGenerator:
                     return True
         return False
 
+    def _stmts_contain_goto(self, stmts: list[Stmt]) -> bool:
+        """Recursively check whether any statement in the tree is a GotoStmt.
+
+        Used to disable loop optimizations (DJNZ) that push state onto the
+        stack across iterations. A GOTO escaping such a loop body would
+        leave that pushed state stranded — see test_goto_loops.
+        """
+        for stmt in stmts:
+            if self._stmt_contains_goto(stmt):
+                return True
+        return False
+
+    def _stmt_contains_goto(self, stmt: Stmt) -> bool:
+        if isinstance(stmt, GotoStmt):
+            return True
+        if isinstance(stmt, LabeledStmt):
+            return self._stmt_contains_goto(stmt.stmt)
+        if isinstance(stmt, IfStmt):
+            if self._stmt_contains_goto(stmt.then_stmt):
+                return True
+            if stmt.else_stmt is not None and self._stmt_contains_goto(stmt.else_stmt):
+                return True
+            return False
+        if isinstance(stmt, (DoBlock, DoWhileBlock, DoIterBlock)):
+            return self._stmts_contain_goto(stmt.stmts)
+        if isinstance(stmt, DoCaseBlock):
+            return any(self._stmts_contain_goto(case) for case in stmt.cases)
+        return False
+
     # ========================================================================
     # Register Liveness Analysis
     # ========================================================================
@@ -3334,10 +3363,15 @@ class CodeGenerator:
         # Check if loop index is used in body - if not, we can use DJNZ on Z80
         index_used = self._index_used_in_body(stmt.index_var, stmt.stmts)
 
+        # Skip DJNZ optimization when the body has a GOTO — the pattern
+        # pushes BC at the top of each iteration and pops at the bottom,
+        # so a GOTO escaping the body strands the pushed BC on the stack.
+        body_has_goto = self._stmts_contain_goto(stmt.stmts)
+
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
         if (both_bytes and
-            step_val == 1 and not index_used and
+            step_val == 1 and not index_used and not body_has_goto and
             isinstance(stmt.start, NumberLiteral) and stmt.start.value == 0):
             # Calculate iteration count = bound + 1
             # If bound is constant, emit LD B,bound+1

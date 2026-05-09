@@ -15,10 +15,6 @@ goto_nest1  25
 goto_nest1s  12345
 goto_deep1  50
 goto_deep1s  12345
-goto_op1  12345
-goto_op1s  12345
-goto_dj1  99
-goto_dj1s  12345
 goto_op1  99
 goto_op1s  12345
 goto_m1  30
