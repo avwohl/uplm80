@@ -4902,16 +4902,28 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
-            # Claim DE to hold right operand while we evaluate left
-            self.regs.need_reg('de', 'binary_right_sethi', self._emit)
-            self._emit("ex", "de,hl")  # DE = right
+            # If left contains an opaque DE-clobberer (procedure call etc.),
+            # the register allocator's nested-spill trick won't save us — the
+            # callee mutates DE without going through the allocator. Spill to
+            # the SP stack instead.
+            if not self._expr_preserves_de(expr.left):
+                self._emit("push", "hl")  # save right on the SP stack
+                left_result = self._gen_expr(expr.left)
+                if left_result == DataType.BYTE:
+                    self._emit("ld", "l,a")
+                    self._emit("ld", "h,0")
+                self._emit("pop", "de")  # DE = right (recovered)
+            else:
+                # Claim DE to hold right operand while we evaluate left
+                self.regs.need_reg('de', 'binary_right_sethi', self._emit)
+                self._emit("ex", "de,hl")  # DE = right
 
-            # Evaluate left operand (simpler subtree) -> HL
-            # This may recursively need DE, causing spill of our right value
-            left_result = self._gen_expr(expr.left)
-            if left_result == DataType.BYTE:
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
+                # Evaluate left operand (simpler subtree) -> HL
+                # This may recursively need DE, causing spill of our right value
+                left_result = self._gen_expr(expr.left)
+                if left_result == DataType.BYTE:
+                    self._emit("ld", "l,a")
+                    self._emit("ld", "h,0")
 
             # Now: HL = left, DE = right (restored from spill if inner expr used DE)
             # This is already in the correct order for HL op DE
@@ -4926,23 +4938,36 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
-            # Claim DE to hold left operand while we evaluate right
-            # If DE is already busy (nested binary expr), it will be spilled
-            self.regs.need_reg('de', 'binary_left', self._emit)
-            self._emit("ex", "de,hl")  # DE = left
+            # If right contains an opaque DE-clobberer (procedure call etc.),
+            # the allocator's nested-spill trick won't save us — the callee
+            # mutates DE behind its back. Save left on the SP stack instead.
+            if not self._expr_preserves_de(expr.right):
+                self._emit("push", "hl")  # save left on the SP stack
+                right_result = self._gen_expr(expr.right)
+                if right_result == DataType.BYTE:
+                    self._emit("ld", "l,a")
+                    self._emit("ld", "h,0")
+                # HL = right; want HL = left, DE = right
+                self._emit("ex", "de,hl")  # DE = right (HL is junk)
+                self._emit("pop", "hl")    # HL = left (recovered)
+            else:
+                # Claim DE to hold left operand while we evaluate right
+                # If DE is already busy (nested binary expr), it will be spilled
+                self.regs.need_reg('de', 'binary_left', self._emit)
+                self._emit("ex", "de,hl")  # DE = left
 
-            # Evaluate right operand -> HL
-            # This may recursively need DE, causing spill of our left value.
-            # When inner expr releases DE, our left value is restored.
-            right_result = self._gen_expr(expr.right)
-            if right_result == DataType.BYTE:
-                # Extend A to HL
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
+                # Evaluate right operand -> HL
+                # This may recursively need DE, causing spill of our left value.
+                # When inner expr releases DE, our left value is restored.
+                right_result = self._gen_expr(expr.right)
+                if right_result == DataType.BYTE:
+                    # Extend A to HL
+                    self._emit("ld", "l,a")
+                    self._emit("ld", "h,0")
 
-            # Now: HL = right, DE = left (restored from spill if inner expr used DE)
-            # Swap so HL = left, DE = right (standard order for operations)
-            self._emit("ex", "de,hl")
+                # Now: HL = right, DE = left (restored from spill if inner expr used DE)
+                # Swap so HL = left, DE = right (standard order for operations)
+                self._emit("ex", "de,hl")
 
             # NOTE: Don't release DE yet - we still need it for the operation!
             # Will release after the operation below.
