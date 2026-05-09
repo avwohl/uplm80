@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uplm80"
-version = "0.2.28"
+version = "0.2.29"
 description = "Highly optimizing PL/M-80 compiler targeting Z80"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
