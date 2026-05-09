@@ -1,20 +1,20 @@
-"""plox-driven PL/M-80 front-end.
+"""uplox-driven PL/M-80 front-end.
 
 Pipeline per source file:
 
 1. ``preprocess.preprocess`` — uplm80's own preprocessor: high-bit
    strip, recursive ``$INCLUDE``, ``$cond/$if/...`` conditional
    compilation.
-2. ``plox.preprocess.plm.preprocess`` — LITERALLY substitution,
+2. ``uplox.preprocess.plm.preprocess`` — LITERALLY substitution,
    EQU/LIT alias bootstrap, harmless ``$``-directive stripping,
    case folding to upper.
-3. plox plm_full LR(1) parse — produces a ``ParseNode`` tree.
+3. uplox plm_full LR(1) parse — produces a ``ParseNode`` tree.
 4. ``_convert_module`` — lower the ``ParseNode`` tree into uplm80's
    ``ast_nodes`` dataclasses (``Module``, ``ProcDecl``, ``DeclareStmt``,
    ``IfStmt``, ``DoBlock``, ``BinaryExpr``, ...).
 
 The plm_full LR table is loaded once at import time from the JSON bundle
-in ``uplm80/data/plm_full.json`` (built by ``plox build``). Building from
+in ``uplm80/data/plm_full.json`` (built by ``uplox build``). Building from
 the grammar source takes ~2 s; loading the JSON takes ~70 ms.
 """
 
@@ -25,9 +25,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import cast
 
-from plox.lex.scanner import Scanner, Token
-from plox.parse.runtime import HookRegistry, ParseNode, parse as _plox_parse
-from plox.tables import balanced_from_json, dfa_from_json, table_from_json
+from uplox.lex.scanner import Scanner, Token
+from uplox.parse.runtime import HookRegistry, ParseNode, parse as _uplox_parse
+from uplox.tables import balanced_from_json, dfa_from_json, table_from_json
 
 from .ast_nodes import (
     AssignStmt,
@@ -100,14 +100,14 @@ def parse_source(
     :class:`Module`."""
     pre1 = uplm_preprocess(source, filename, defines=defines, include_paths=include_paths)
     # Block-scoped LITERALLY substitution + case folding + harmless
-    # ``$``-directive line stripping. Lives in uplm80 (not plox)
+    # ``$``-directive line stripping. Lives in uplm80 (not uplox)
     # because PL/M LITERALLYs are scoped to the enclosing
     # ``DO``/``PROCEDURE`` block — PIP.PLM defines ``M LITERALLY '20'``
     # inside one block then reuses ``M`` as a variable name in another.
     src = macro_pass(pre1)
     scanner, table = _load_plm_full()
     try:
-        tree = _plox_parse(
+        tree = _uplox_parse(
             table,
             scanner.scan(src),
             hooks=HookRegistry(ignore_missing=True),
@@ -122,7 +122,7 @@ def parse_source(
 # ---------------------------------------------------------------------------
 # ParseNode -> uplm80 AST conversion
 #
-# plox emits a verbose CST (one ParseNode per production); we lower it
+# uplox emits a verbose CST (one ParseNode per production); we lower it
 # to uplm80's hand-written AST. The conversion is rule-driven: each
 # function below maps one or two related grammar non-terminals.
 # ---------------------------------------------------------------------------

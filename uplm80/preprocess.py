@@ -1,9 +1,9 @@
 """PL/M-80 preprocessor for uplm80.
 
-Runs ahead of plox's lexer + plm_full parser. Produces plain PL/M source
+Runs ahead of uplox's lexer + plm_full parser. Produces plain PL/M source
 ready for the plm_full LR parser.
 
-Per-compiler preprocessor — plox does not host one. uplm80's surface:
+Per-compiler preprocessor — uplox does not host one. uplm80's surface:
 
 * High-bit / Ctrl-Z source cleaning (CP/M editor artifacts).
 * Recursive ``$INCLUDE(name)`` expansion, with .LIT extension fallback.
@@ -72,7 +72,7 @@ def preprocess(
     """Run uplm80's preprocessor over ``source`` and return the
     transformed text. Handles include expansion and the $cond family;
     leaves LITERALLY / case folding / harmless ``$Q=1``-style directives
-    for the downstream plox preprocess pass."""
+    for the downstream uplox preprocess pass."""
     source = _strip_high_bits(source)
 
     state = _State()
@@ -180,7 +180,7 @@ def _process(source: str, filename: str, state: _State, paths: list[str]) -> str
             # Don't reset at_line_start; the next char is \n or EOF.
             if not consumed and not state.skipping():
                 # Unknown $-directive: leave it in the source so the
-                # downstream plox preprocess can record it ($Q=1 etc).
+                # downstream uplox preprocess can record it ($Q=1 etc).
                 out.append(directive_line)
             continue
 
@@ -328,7 +328,7 @@ def _read_include(name: str, paths: list[str], loc: SourceLocation) -> str:
 # Macro pass: case-fold + scoped LITERALLY substitution + $-directive strip.
 #
 # Runs after the conditional/include pass above; produces the final
-# source string handed to plox's lexer + plm_full parser.
+# source string handed to uplox's lexer + plm_full parser.
 # =====================================================================
 
 

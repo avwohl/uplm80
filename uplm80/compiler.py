@@ -67,9 +67,9 @@ class Compiler:
         Returns the assembly code string, or None if compilation failed.
         """
         try:
-            # Phases 1-2: preprocess + plox plm_full LR parse + AST lowering.
+            # Phases 1-2: preprocess + uplox plm_full LR parse + AST lowering.
             if self.debug:
-                print(f"[DEBUG] Front-end (plox plm_full) {filename}", file=sys.stderr)
+                print(f"[DEBUG] Front-end (uplox plm_full) {filename}", file=sys.stderr)
 
             ast = parse_source(
                 source,
@@ -206,7 +206,7 @@ class Compiler:
                 filenames.append(filename)
 
                 if self.debug:
-                    print(f"[DEBUG] Front-end (plox plm_full) {filename}", file=sys.stderr)
+                    print(f"[DEBUG] Front-end (uplox plm_full) {filename}", file=sys.stderr)
 
                 ast = parse_source(
                     source,
