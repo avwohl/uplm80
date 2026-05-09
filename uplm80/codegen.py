@@ -305,7 +305,7 @@ class CodeGenerator:
     addresses and 16-bit values.
     """
 
-    # Reserved assembler names that conflict with 8080/Z80 registers
+    # Reserved assembler names that conflict with Z80 registers
     RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
                       'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
 
@@ -3343,7 +3343,7 @@ class CodeGenerator:
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
-        if (self.target == Target.Z80 and both_bytes and
+        if (both_bytes and
             step_val == 1 and not index_used and
             isinstance(stmt.start, NumberLiteral) and stmt.start.value == 0):
             # Calculate iteration count = bound + 1
@@ -5787,8 +5787,8 @@ class CodeGenerator:
 
         if name == "INPUT":
             if args:
-                # For 8080, IN instruction requires immediate port number
-                # Check if we can resolve to a constant (number or LITERALLY macro)
+                # IN instruction requires an immediate port number — try to
+                # resolve to a constant (number or LITERALLY macro).
                 arg = args[0]
                 port_num = None
                 if isinstance(arg, NumberLiteral):
@@ -5932,12 +5932,11 @@ class CodeGenerator:
                         # Exact shift by 8
                         self._emit("ld", "l,h")  # L = H
                         self._emit("ld", "h,0")
-                    elif self.target == Target.Z80 and remaining <= 4:
-                        # Z80: use SRL which doesn't need carry clearing
-                        # Note: SRL is Z80-only instruction
+                    elif remaining <= 4:
+                        # Short shift: SRL doesn't need carry clearing.
                         self._emit("ld", "a,h")
                         for _ in range(remaining):
-                            self._emit("srl", "a")  # Z80-only instruction
+                            self._emit("srl", "a")
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
                     else:
@@ -5959,48 +5958,18 @@ class CodeGenerator:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
                 elif shift_count <= 3:
-                    # Small shifts: inline the loop
+                    # Small shifts: inline the loop (SRL/RR — 2 insns per shift).
                     for _ in range(shift_count):
-                        if self.target == Target.Z80:
-                            # Z80: use SRL/RR - 2 instructions per shift
-                            self._emit("srl", "h")  # H >>= 1, bit 0 -> carry
-                            self._emit("rr", "l")   # L = (carry << 7) | (L >> 1)
-                        else:
-                            # 8080: need to go through accumulator - 7 instructions per shift
-                            self._emit("or", "a")  # Clear carry
-                            self._emit("ld", "a,h")
-                            self._emit("rra")
-                            self._emit("ld", "h,a")
-                            self._emit("ld", "a,l")
-                            self._emit("rra")
-                            self._emit("ld", "l,a")
-                else:
-                    # For 4-6 shifts, use a counted loop
-                    if self.target == Target.Z80:
-                        # Z80: use DJNZ for tight loop
-                        self._emit("ld", f"b,{shift_count}")
-                        shift_loop = self._new_label("SHR")
-                        self._emit_label(shift_loop)
                         self._emit("srl", "h")  # H >>= 1, bit 0 -> carry
                         self._emit("rr", "l")   # L = (carry << 7) | (L >> 1)
-                        self._emit("djnz", shift_loop)
-                    else:
-                        # 8080: use C counter and JP m
-                        self._emit("ld", f"c,{shift_count}")
-                        shift_loop = self._new_label("SHR")
-                        end_label = self._new_label("SHRE")
-                        self._emit_label(shift_loop)
-                        self._emit("dec", "c")
-                        self._emit("jp", f"m,{end_label}")
-                        self._emit("or", "a")
-                        self._emit("ld", "a,h")
-                        self._emit("rra")
-                        self._emit("ld", "h,a")
-                        self._emit("ld", "a,l")
-                        self._emit("rra")
-                        self._emit("ld", "l,a")
-                        self._emit("jp", shift_loop)
-                        self._emit_label(end_label)
+                else:
+                    # For 4-6 shifts, use a counted loop with DJNZ.
+                    self._emit("ld", f"b,{shift_count}")
+                    shift_loop = self._new_label("SHR")
+                    self._emit_label(shift_loop)
+                    self._emit("srl", "h")  # H >>= 1, bit 0 -> carry
+                    self._emit("rr", "l")   # L = (carry << 7) | (L >> 1)
+                    self._emit("djnz", shift_loop)
                 return DataType.ADDRESS
 
             # Variable shift - use loop
@@ -6011,44 +5980,22 @@ class CodeGenerator:
                 self._emit("ld", "h,0")
             self._emit("push", "hl")
             count_type = self._gen_expr(args[1])
-            if self.target == Target.Z80:
-                # Z80: use B register with DJNZ, check for zero first
-                if count_type == DataType.BYTE:
-                    self._emit("ld", "b,a")
-                else:
-                    self._emit("ld", "b,l")
-                self._emit("pop", "hl")
-                end_label = self._new_label("SHRE")
-                self._emit("inc", "b")  # Pre-increment so DJNZ works with count=0
-                self._emit("dec", "b")  # Test for zero
-                self._emit("jp", f"z,{end_label}")
-                shift_loop = self._new_label("SHR")
-                self._emit_label(shift_loop)
-                self._emit("srl", "h")
-                self._emit("rr", "l")
-                self._emit("djnz", shift_loop)
-                self._emit_label(end_label)
+            # Variable shift: B holds the count, DJNZ drives the loop.
+            if count_type == DataType.BYTE:
+                self._emit("ld", "b,a")
             else:
-                # 8080: use C counter
-                if count_type == DataType.BYTE:
-                    self._emit("ld", "c,a")  # Count in C (from A for byte)
-                else:
-                    self._emit("ld", "c,l")  # Count in C (from L for address)
-                self._emit("pop", "hl")
-                shift_loop = self._new_label("SHR")
-                end_label = self._new_label("SHRE")
-                self._emit_label(shift_loop)
-                self._emit("dec", "c")
-                self._emit("jp", f"m,{end_label}")
-                self._emit("or", "a")  # Clear carry
-                self._emit("ld", "a,h")
-                self._emit("rra")
-                self._emit("ld", "h,a")
-                self._emit("ld", "a,l")
-                self._emit("rra")
-                self._emit("ld", "l,a")
-                self._emit("jp", shift_loop)
-                self._emit_label(end_label)
+                self._emit("ld", "b,l")
+            self._emit("pop", "hl")
+            end_label = self._new_label("SHRE")
+            self._emit("inc", "b")  # Pre-increment so DJNZ works with count=0
+            self._emit("dec", "b")  # Test for zero
+            self._emit("jp", f"z,{end_label}")
+            shift_loop = self._new_label("SHR")
+            self._emit_label(shift_loop)
+            self._emit("srl", "h")
+            self._emit("rr", "l")
+            self._emit("djnz", shift_loop)
+            self._emit_label(end_label)
             return DataType.ADDRESS
 
         if name == "ROL":
