@@ -1,7 +1,7 @@
 """
 Code Generator for PL/M-80.
 
-Generates 8080 or Z80 assembly code from the optimized AST.
+Generates Z80 assembly code from the optimized AST.
 Outputs MACRO-80 compatible .MAC files.
 """
 

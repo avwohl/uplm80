@@ -69,7 +69,7 @@ ul80 --version
 The complete PL/M-80 development toolchain consists of:
 
 ### 1. uplm80 (PL/M-80 Compiler)
-Compiles PL/M-80 source code to 8080/Z80 assembly language.
+Compiles PL/M-80 source code to Z80 assembly language.
 
 ```bash
 pip install uplm80
@@ -77,7 +77,7 @@ pip install uplm80
 
 Features:
 - Full PL/M-80 language support
-- Targets both 8080 and Z80
+- Targets Z80
 - Multiple optimization passes
 - CP/M and bare metal modes
 
@@ -231,7 +231,6 @@ Common options:
 - `-m {cpm,bare}` - Runtime mode (default: cpm)
   - `cpm`: CP/M program with stack from BDOS, returns to OS
   - `bare`: Bare metal with local stack, Intel PL/M-80 compatible
-- `-t {z80,8080}` - Target processor (default: z80)
 - `-O {0,1,2,3}` - Optimization level (default: 2)
 - `--debug` - Enable debug output
 - `-v, --version` - Show version

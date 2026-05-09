@@ -208,7 +208,6 @@ uplm80 --help
 Common options:
 - `-m cpm` - CP/M mode (default) - for new PL/M programs, maximum stack under BDOS
 - `-m bare` - Bare metal mode - original Digital Research compatible (jump to start-3)
-- `-t z80` or `-t 8080` - Target processor (default: Z80)
 - `-O 0|1|2|3` - Optimization level (default: 2)
 - `-o output.mac` - Output filename
 
