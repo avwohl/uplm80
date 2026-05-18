@@ -58,6 +58,7 @@ from .ast_view import (
     proc_return_type,
     proc_body_items,
     proc_local_decls_stmts,
+    block_items_split,
     proc_end_label,
     iter_declare_items,
     decl_item_names,
@@ -513,12 +514,19 @@ class CodeGenerator:
                     return left_val ^ right_val
         return None
 
-    def _check_impossible_comparison(self, left: Expr, right: Expr, op: BinaryOp) -> None:
+    def _check_impossible_comparison(self, left, right, op) -> None:
         """Check for comparisons that can never or always be true and raise an error.
 
-        For BYTE compared to constant outside 0-255:
-        - For = and <>, allow truncation only for "negative byte" values (0xFF00-0xFFFF, i.e. -256 to -1)
-        - For <, >, <=, >=, these are always true/false so we error
+        ``op`` is either the legacy :class:`BinaryOp` enum or the
+        typed-AST :class:`ast_view.BinaryOpKind`; both flavours share
+        member names (``EQ``/``NE``/``LT``/``LE``/``GT``/``GE``) so
+        we dispatch on ``op.name`` to stay agnostic during the AST
+        migration. For BYTE compared to constant outside 0-255:
+
+        - For ``=`` and ``<>``, allow truncation only for "negative byte"
+          values (``0xFF00`` - ``0xFFFF``, i.e. -256 to -1).
+        - For ``<``, ``>``, ``<=``, ``>=``, the comparison is always
+          true / false so we error.
         """
         left_type = self._get_expr_type(left)
         right_val = self._try_eval_const(right)
@@ -536,27 +544,29 @@ class CodeGenerator:
                 if hasattr(right, 'span') and right.span:
                     loc = SourceLocation(right.span.start_line, right.span.start_col)
 
+                op_name = op.name
+
                 # For = and <>, allow truncation only for "negative byte" values (high byte is 0xFF)
                 # This handles BYTE <> -1 (0xFFFF -> 0xFF) but catches BYTE <> 0x123
-                if op in (BinaryOp.EQ, BinaryOp.NE):
+                if op_name in ("EQ", "NE"):
                     if (unsigned_val & 0xFF00) == 0xFF00:
                         return  # Valid: -256 to -1 range, will truncate to byte
                     # Otherwise, error - constant like 256 or 0x123 shouldn't be compared to BYTE
                     byte_val = unsigned_val & 0xFF
-                    if op == BinaryOp.EQ:
+                    if op_name == "EQ":
                         msg = f"comparison BYTE = {unsigned_val} is always false (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
                     else:
                         msg = f"comparison BYTE <> {unsigned_val} is always true (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
                     raise CodeGenError(msg, loc)
 
                 # For ordering comparisons, values outside 0-255 give always true/false
-                if op == BinaryOp.LT:
+                if op_name == "LT":
                     msg = f"comparison BYTE < {right_val} is always true (BYTE can only hold 0-255)"
-                elif op == BinaryOp.LE:
+                elif op_name == "LE":
                     msg = f"comparison BYTE <= {right_val} is always true (BYTE can only hold 0-255)"
-                elif op == BinaryOp.GT:
+                elif op_name == "GT":
                     msg = f"comparison BYTE > {right_val} is always false (BYTE can only hold 0-255)"
-                elif op == BinaryOp.GE:
+                elif op_name == "GE":
                     msg = f"comparison BYTE >= {right_val} is always false (BYTE can only hold 0-255)"
                 else:
                     return  # Unknown comparison operator
@@ -2625,17 +2635,24 @@ class CodeGenerator:
     # Statement Code Generation
     # ========================================================================
 
-    def _gen_stmt(self, stmt: Stmt) -> None:
-        """Generate code for a statement."""
-        if isinstance(stmt, AssignStmt):
+    def _gen_stmt(self, stmt) -> None:
+        """Generate code for a single typed statement node.
+
+        Dispatches over the uplox-generated :mod:`uplm80._plm_parser`
+        statement classes. The legacy ``IfStmt``/``ReturnStmt``/
+        ``DoIterBlock`` shapes are each split into two typed kinds (with
+        / without an else / value / step) — both variants funnel into
+        the same handler with the optional field defaulted.
+        """
+        if isinstance(stmt, P.AssignStmt):
             self._gen_assign(stmt)
-        elif isinstance(stmt, CallStmt):
+        elif isinstance(stmt, P.CallStmt):
             self._gen_call_stmt(stmt)
-        elif isinstance(stmt, ReturnStmt):
+        elif isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue)):
             self._gen_return(stmt)
-        elif isinstance(stmt, GotoStmt):
+        elif isinstance(stmt, P.GotoStmt):
             # Check if target is a LITERALLY macro
-            target = stmt.target
+            target = ident_text(stmt.label)
             if target in self.literal_macros:
                 target = self.literal_macros[target]
             # Check if this is a module-level label or procedure-local label
@@ -2648,94 +2665,75 @@ class CodeGenerator:
                 # Procedure-local label - prefix with current procedure
                 target = f"@{self.current_proc}${target}"
             self._emit("jp", target)
-        elif isinstance(stmt, HaltStmt):
+        elif isinstance(stmt, P.HaltStmt):
             self._emit("halt")
-        elif isinstance(stmt, EnableStmt):
+        elif isinstance(stmt, P.EnableStmt):
             self._emit("ei")
-        elif isinstance(stmt, DisableStmt):
+        elif isinstance(stmt, P.DisableStmt):
             self._emit("di")
-        elif isinstance(stmt, NullStmt):
+        elif isinstance(stmt, P.NullStmt):
             pass  # No code
-        elif isinstance(stmt, LabeledStmt):
-            label = stmt.label
+        elif isinstance(stmt, P.LabeledStmt):
+            raw_label = ident_text(stmt.label)
             if self.current_proc:
                 # Procedure-local label - prefix with current procedure
-                label = f"@{self.current_proc}${label}"
+                label = f"@{self.current_proc}${raw_label}"
             else:
                 # Module-level label - register in symbol table for GOTO lookups
                 self.symbols.define(
                     Symbol(
-                        name=stmt.label,
+                        name=raw_label,
                         kind=SymbolKind.LABEL,
                     )
                 )
+                label = raw_label
             self._emit_label(label)
             self._gen_stmt(stmt.stmt)
-        elif isinstance(stmt, IfStmt):
+        elif isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             self._gen_if(stmt)
-        elif isinstance(stmt, DoBlock):
+        elif isinstance(stmt, P.DoBlock):
             self._gen_do_block(stmt)
-        elif isinstance(stmt, DoWhileBlock):
+        elif isinstance(stmt, P.DoWhileBlock):
             self._gen_do_while(stmt)
-        elif isinstance(stmt, DoIterBlock):
+        elif isinstance(stmt, (P.DoIterBlock, P.DoIterByBlock)):
             self._gen_do_iter(stmt)
-        elif isinstance(stmt, DoCaseBlock):
+        elif isinstance(stmt, P.DoCaseBlock):
             self._gen_do_case(stmt)
-        elif isinstance(stmt, DeclareStmt):
+        elif isinstance(stmt, P.DeclareStmt):
             for decl in stmt.declarations:
                 self._gen_declaration(decl)
 
-    def _gen_assign(self, stmt: AssignStmt) -> None:
-        """Generate code for assignment."""
-        # Special case: storing small constant to BYTE variable
-        # Use Xor a (for 0) or ld a,n (for other bytes) instead of ld hl,n
-        if isinstance(stmt.value, NumberLiteral) and stmt.value.value <= 255:
-            # Check if all targets are BYTE variables or BYTE array elements
-            all_byte_targets = True
-            for target in stmt.targets:
-                if isinstance(target, Identifier):
-                    sym = self.symbols.lookup(target.name)
-                    if not sym or sym.data_type != DataType.BYTE:
-                        all_byte_targets = False
-                        break
-                elif isinstance(target, SubscriptExpr):
-                    # Check if array element type is BYTE
-                    if isinstance(target.base, Identifier):
-                        sym = self.symbols.lookup(target.base.name)
-                        if not sym or sym.data_type != DataType.BYTE:
-                            all_byte_targets = False
-                            break
-                    else:
-                        all_byte_targets = False
-                        break
-                elif isinstance(target, CallExpr):
-                    # Parser may create CallExpr for array subscript
-                    if isinstance(target.callee, Identifier) and len(target.args) == 1:
-                        sym = self.symbols.lookup(target.callee.name)
-                        if sym and sym.kind != SymbolKind.PROCEDURE and sym.data_type == DataType.BYTE:
-                            pass  # It's a BYTE array element
-                        else:
-                            all_byte_targets = False
-                            break
-                    else:
-                        all_byte_targets = False
-                        break
-                else:
-                    all_byte_targets = False
-                    break
+    def _gen_assign(self, stmt) -> None:
+        """Generate code for assignment.
 
-            if all_byte_targets:
+        ``stmt`` is a typed :class:`P.AssignStmt`; ``stmt.targets`` is
+        the list of LHS expressions (one or many) and ``stmt.value`` is
+        the RHS expression — both kept as raw typed nodes so the
+        downstream :meth:`_gen_expr` / :meth:`_gen_store` (still on the
+        legacy AST) walks them via ``isinstance``. The byte-constant
+        optimisation peeks at the typed shape via :func:`number_value`.
+        """
+        targets = list(stmt.targets)
+
+        # Special case: storing small constant to BYTE variable.
+        # Use ``xor a`` (for 0) or ``ld a,n`` (for other bytes)
+        # instead of ``ld hl,n``.
+        if isinstance(stmt.value, P.NumberLiteral):
+            const_val = number_value(stmt.value)
+            if const_val <= 255 and all(
+                self._is_byte_target(t) for t in targets
+            ):
                 # Generate efficient byte constant
-                if stmt.value.value == 0:
+                if const_val == 0:
                     self._emit("xor", "a")
                 else:
-                    self._emit("ld", f"a,{self._format_number(stmt.value.value)}")
+                    self._emit("ld", f"a,{self._format_number(const_val)}")
 
-                for i, target in enumerate(stmt.targets):
-                    if i < len(stmt.targets) - 1:
+                for i, target in enumerate(targets):
+                    if i < len(targets) - 1:
                         self._emit("push", "af")
                     self._gen_store(target, DataType.BYTE)
-                    if i < len(stmt.targets) - 1:
+                    if i < len(targets) - 1:
                         self._emit("pop", "af")
                 return
 
@@ -2743,8 +2741,8 @@ class CodeGenerator:
         value_type = self._gen_expr(stmt.value)
 
         # Store to each target (multiple assignment support)
-        for i, target in enumerate(stmt.targets):
-            if i < len(stmt.targets) - 1:
+        for i, target in enumerate(targets):
+            if i < len(targets) - 1:
                 # Need to preserve value for next target
                 if value_type == DataType.BYTE:
                     self._emit("push", "af")
@@ -2753,19 +2751,76 @@ class CodeGenerator:
 
             self._gen_store(target, value_type)
 
-            if i < len(stmt.targets) - 1:
+            if i < len(targets) - 1:
                 if value_type == DataType.BYTE:
                     self._emit("pop", "af")
                 else:
                     self._emit("pop", "hl")
 
-    def _gen_call_stmt(self, stmt: CallStmt) -> None:
-        """Generate code for a CALL statement."""
+    def _is_byte_target(self, target) -> bool:
+        """Return True when a typed assignment target is a BYTE variable.
+
+        Recognises bare identifiers, member access, and parser ``Call``
+        forms (which PL/M-80 uses for both calls and array subscripts —
+        the typed AST doesn't distinguish them syntactically). Anything
+        else conservatively returns False so the byte-constant
+        optimisation falls back to the general path.
+        """
+        if isinstance(target, P.Identifier):
+            sym = self.symbols.lookup(ident_text(target.name))
+            return bool(sym and sym.data_type == DataType.BYTE)
+        if isinstance(target, P.MemberAccess):
+            # Member access — let the slow path resolve struct members.
+            return False
+        if isinstance(target, P.Call):
+            # PL/M call syntax doubles as array subscript. Treat a
+            # single-arg call on an identifier as a subscript and look
+            # up the array element type.
+            callee = target.callee
+            if isinstance(callee, P.Identifier) and len(target.args) == 1:
+                sym = self.symbols.lookup(ident_text(callee.name))
+                if (
+                    sym
+                    and sym.kind != SymbolKind.PROCEDURE
+                    and sym.data_type == DataType.BYTE
+                ):
+                    return True
+            return False
+        return False
+
+    def _gen_call_stmt(self, stmt) -> None:
+        """Generate code for a CALL statement.
+
+        ``stmt`` is a typed :class:`P.CallStmt` whose ``.callee`` field
+        carries the call expression itself: a :class:`P.Call`
+        (callee + args), a :class:`P.CallNoArgs` (just the callee), or
+        a bare :class:`P.Identifier` for parameterless invocations. The
+        legacy AST had a separate ``CallStmt(callee, args)`` shape with
+        the arg list hoisted to the statement; unpack into the same
+        ``(callee_expr, args)`` pair here so the rest of the body keeps
+        the legacy structure.
+        """
+        # Unpack the call form into (callee_expr, args).
+        inner = stmt.callee
+        if isinstance(inner, P.Call):
+            callee_expr = inner.callee
+            args = list(inner.args)
+        elif isinstance(inner, P.CallNoArgs):
+            callee_expr = inner.callee
+            args = []
+        else:
+            # Bare identifier or other expression form — treat as a
+            # parameterless call on the expression itself.
+            callee_expr = inner
+            args = []
+
         # Look up procedure symbol to check if it's user-defined
         sym = None
         call_name = None
-        if isinstance(stmt.callee, Identifier):
-            name = stmt.callee.name
+        callee_name_str: str | None = None
+        if isinstance(callee_expr, P.Identifier):
+            callee_name_str = ident_text(callee_expr.name)
+            name = callee_name_str
             # Check if user defined a procedure with this name
             if self.current_proc:
                 parts = self.current_proc.split('$')
@@ -2782,20 +2837,20 @@ class CodeGenerator:
 
         # Treat as builtin if it's a BUILTIN symbol (not user-defined)
         # Builtins are registered in symbol table with SymbolKind.BUILTIN
-        if isinstance(stmt.callee, Identifier):
+        if callee_name_str is not None:
             is_builtin = (sym is None or sym.kind == SymbolKind.BUILTIN)
             if is_builtin:
-                upper_name = stmt.callee.name.upper()
+                upper_name = callee_name_str.upper()
                 # Handle built-in procedures that don't return values
                 if upper_name in self.BUILTIN_FUNCS:
-                    result = self._gen_builtin(upper_name, stmt.args)
+                    result = self._gen_builtin(upper_name, args)
                     if result is not None or upper_name in ('TIME', 'MOVE'):
                         # Built-in was handled
                         return
 
         # If sym/call_name weren't set yet, look up again (for member access etc.)
-        if isinstance(stmt.callee, Identifier) and call_name is None:
-            name = stmt.callee.name
+        if callee_name_str is not None and call_name is None:
+            name = callee_name_str
             if self.current_proc:
                 parts = self.current_proc.split('$')
                 for i in range(len(parts), 0, -1):
@@ -2809,10 +2864,10 @@ class CodeGenerator:
 
         # Optimize CP/M BDOS calls: MON1(func, arg) and MON2(func, arg)
         # This must be checked AFTER symbol resolution but regardless of call_name status
-        if isinstance(stmt.callee, Identifier):
-            upper_name = stmt.callee.name.upper()
-            if upper_name in ('MON1', 'MON2') and len(stmt.args) == 2:
-                func_arg, addr_arg = stmt.args
+        if callee_name_str is not None:
+            upper_name = callee_name_str.upper()
+            if upper_name in ('MON1', 'MON2') and len(args) == 2:
+                func_arg, addr_arg = args
                 # Check if function number is a constant
                 func_num = self._get_const_byte_value(func_arg)
 
@@ -2839,7 +2894,7 @@ class CodeGenerator:
 
         if use_stack:
             # Stack-based parameter passing (reentrant or indirect calls)
-            for arg in stmt.args:
+            for arg in args:
                 arg_type = self._gen_expr(arg)
                 if arg_type == DataType.BYTE:
                     self._emit("ld", "l,a")
@@ -2849,10 +2904,10 @@ class CodeGenerator:
             # Direct memory parameter passing (non-reentrant)
             # Last param is passed in register (A for BYTE, HL for ADDRESS)
             # Other params are stored to memory
-            last_param_idx = len(stmt.args) - 1
-            uses_reg = sym.uses_reg_param and len(stmt.args) > 0
+            last_param_idx = len(args) - 1
+            uses_reg = sym.uses_reg_param and len(args) > 0
 
-            for i, arg in enumerate(stmt.args):
+            for i, arg in enumerate(args):
                 if i < len(sym.params):
                     param_name = sym.params[i]
                     param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
@@ -2862,20 +2917,10 @@ class CodeGenerator:
                     if is_last and uses_reg:
                         # Optimize constants for BYTE
                         if param_type == DataType.BYTE:
-                            if isinstance(arg, NumberLiteral) and arg.value <= 255:
-                                self._emit("ld", f"a,{self._format_number(arg.value)}")
+                            const = self._get_const_byte_value(arg)
+                            if const is not None:
+                                self._emit("ld", f"a,{self._format_number(const)}")
                                 continue
-                            elif isinstance(arg, StringLiteral) and len(arg.value) == 1:
-                                self._emit("ld", f"a,{self._format_number(ord(arg.value[0]))}")
-                                continue
-                            elif isinstance(arg, Identifier) and arg.name in self.literal_macros:
-                                try:
-                                    val = self._parse_plm_number(self.literal_macros[arg.name])
-                                    if val <= 255:
-                                        self._emit("ld", f"a,{self._format_number(val)}")
-                                        continue
-                                except (ValueError, TypeError):
-                                    pass
                         # Evaluate arg - result in A (BYTE) or HL (ADDRESS)
                         arg_type = self._gen_expr(arg)
                         if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
@@ -2894,31 +2939,18 @@ class CodeGenerator:
                         param_asm = self.storage_labels[full_callee_name][param_name]
                     else:
                         # Fallback: build param asm name: @procname$param
-                        proc_base = sym.asm_name if sym.asm_name else name
+                        proc_base = sym.asm_name if sym.asm_name else callee_name_str or ""
                         if proc_base.startswith('@'):
                             proc_base = proc_base[1:]
                         param_asm = f"@{proc_base}${self._mangle_name(param_name)}"
 
                     # Optimize: for BYTE parameter with constant, use ld a,n directly
                     if param_type == DataType.BYTE:
-                        if isinstance(arg, NumberLiteral) and arg.value <= 255:
-                            self._emit("ld", f"a,{self._format_number(arg.value)}")
+                        const = self._get_const_byte_value(arg)
+                        if const is not None:
+                            self._emit("ld", f"a,{self._format_number(const)}")
                             self._emit("ld", f"({param_asm}),a")
                             continue
-                        elif isinstance(arg, StringLiteral) and len(arg.value) == 1:
-                            self._emit("ld", f"a,{self._format_number(ord(arg.value[0]))}")
-                            self._emit("ld", f"({param_asm}),a")
-                            continue
-                        # Check for LITERALLY macro
-                        elif isinstance(arg, Identifier) and arg.name in self.literal_macros:
-                            try:
-                                val = self._parse_plm_number(self.literal_macros[arg.name])
-                                if val <= 255:
-                                    self._emit("ld", f"a,{self._format_number(val)}")
-                                    self._emit("ld", f"({param_asm}),a")
-                                    continue
-                            except (ValueError, TypeError):
-                                pass
 
                     arg_type = self._gen_expr(arg)
                     if param_type == DataType.BYTE or arg_type == DataType.BYTE:
@@ -2931,23 +2963,23 @@ class CodeGenerator:
                         self._emit("ld", f"({param_asm}),hl")
 
         # Call the procedure
-        if isinstance(stmt.callee, Identifier):
+        if callee_name_str is not None:
             self._emit("call", call_name)
         else:
             # Indirect call through address
-            self._gen_expr(stmt.callee)
+            self._gen_expr(callee_expr)
             self._emit("jp", "(hl)")
 
         # Clean up stack (caller cleanup) - only for stack-based calls
-        if use_stack and stmt.args:
-            stack_bytes = len(stmt.args) * 2
+        if use_stack and args:
+            stack_bytes = len(args) * 2
             if stack_bytes == 2:
                 self._emit("pop", "de")  # Dummy pop
             elif stack_bytes == 4:
                 self._emit("pop", "de")
                 self._emit("pop", "de")
             elif stack_bytes <= 8:
-                for _ in range(len(stmt.args)):
+                for _ in range(len(args)):
                     self._emit("pop", "de")
             else:
                 # Adjust stack pointer directly
@@ -2955,14 +2987,31 @@ class CodeGenerator:
                 self._emit("add", "hl,sp")
                 self._emit("ld", "sp,hl")
 
-    def _gen_return(self, stmt: ReturnStmt) -> None:
-        """Generate code for RETURN statement."""
-        if stmt.value:
+    def _gen_return(self, stmt) -> None:
+        """Generate code for a RETURN statement.
+
+        ``stmt`` is either :class:`P.ReturnStmt` (no value) or
+        :class:`P.ReturnStmtValue` (with a typed expression in
+        ``.value``). The legacy single class with ``value=None`` was
+        split into two kinds; treat them uniformly by reading the
+        optional value off the variant. Procedure-context attributes
+        (return type, interrupt-handler flag, reentrant flag) come from
+        the side-cached :attr:`current_proc_return_type` /
+        :attr:`current_proc_attrs` rather than the typed
+        :class:`P.ProcDecl` directly.
+        """
+        value = stmt.value if isinstance(stmt, P.ReturnStmtValue) else None
+        return_type = self.current_proc_return_type
+        proc_attrs_view = self.current_proc_attrs
+
+        if value is not None:
             # Check if A already has the value from embedded assignment optimization
             skip_load = False
-            if (self.embedded_assign_target and
-                isinstance(stmt.value, Identifier) and
-                stmt.value.name == self.embedded_assign_target):
+            if (
+                self.embedded_assign_target
+                and isinstance(value, P.Identifier)
+                and ident_text(value.name) == self.embedded_assign_target
+            ):
                 # A already has this value - skip the load
                 skip_load = True
                 self.embedded_assign_target = None  # Clear after use
@@ -2971,17 +3020,20 @@ class CodeGenerator:
                 # A already contains the return value - just return
                 pass
             # Optimize: if returning BYTE and value is a small constant, use ld a,n directly
-            elif (self.current_proc_decl and
-                self.current_proc_decl.return_type == DataType.BYTE and
-                isinstance(stmt.value, NumberLiteral) and stmt.value.value <= 255):
-                self._emit("ld", f"a,{self._format_number(stmt.value.value)}")
+            elif (
+                return_type == DataType.BYTE
+                and isinstance(value, P.NumberLiteral)
+                and number_value(value) <= 255
+            ):
+                self._emit(
+                    "ld",
+                    f"a,{self._format_number(number_value(value))}",
+                )
             else:
-                result_type = self._gen_expr(stmt.value)
+                result_type = self._gen_expr(value)
                 # Return value is in A (BYTE) or HL (ADDRESS)
                 # If procedure returns BYTE but we have ADDRESS, convert
-                if (self.current_proc_decl and
-                    self.current_proc_decl.return_type == DataType.BYTE and
-                    result_type == DataType.ADDRESS):
+                if return_type == DataType.BYTE and result_type == DataType.ADDRESS:
                     # Convert HL to A: non-zero HL -> 0FFH (TRUE), zero HL -> 0 (FALSE)
                     self._emit("ld", "a,l")
                     self._emit("or", "h")
@@ -2992,13 +3044,11 @@ class CodeGenerator:
                     self._emit("ld", "a,0ffh")
                     self._emit_label(end_label)
                 # If procedure returns ADDRESS but we have BYTE, zero-extend A to HL
-                elif (self.current_proc_decl and
-                      self.current_proc_decl.return_type == DataType.ADDRESS and
-                      result_type == DataType.BYTE):
+                elif return_type == DataType.ADDRESS and result_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
 
-        if self.current_proc_decl and self.current_proc_decl.interrupt_num is not None:
+        if proc_attrs_view is not None and proc_attrs_view.interrupt_num is not None:
             # Interrupt handler return
             self._emit("pop", "hl")
             self._emit("pop", "de")
@@ -3006,7 +3056,7 @@ class CodeGenerator:
             self._emit("pop", "af")
             self._emit("ei")
             self._emit("ret")
-        elif self.current_proc_decl and self.current_proc_decl.is_reentrant:
+        elif proc_attrs_view is not None and proc_attrs_view.is_reentrant:
             # Reentrant procedure return - restore frame pointer
             self._emit("ld", "sp,ix")
             self._emit("pop", "ix")
@@ -3014,14 +3064,22 @@ class CodeGenerator:
         else:
             self._emit("ret")
 
-    def _gen_if(self, stmt: IfStmt) -> None:
-        """Generate code for IF statement."""
+    def _gen_if(self, stmt) -> None:
+        """Generate code for an IF statement.
+
+        ``stmt`` is either :class:`P.IfStmt` (no ELSE) or
+        :class:`P.IfStmtElse` (with ELSE) — the typed grammar splits
+        the two; treat them uniformly by reading the optional
+        else-branch off the variant.
+        """
+        else_stmt = stmt.else_stmt if isinstance(stmt, P.IfStmtElse) else None
+
         # Warn about trivial constant conditions (IF 0, IF 1)
         self._warn_trivial_if(stmt.condition)
 
         else_label = self._new_label("ELSE")
         end_label = self._new_label("ENDIF")
-        false_target = else_label if stmt.else_stmt else end_label
+        false_target = else_label if else_stmt is not None else end_label
 
         # Track current IF statement for embedded assignment optimization
         old_if_stmt = self.current_if_stmt
@@ -3049,28 +3107,46 @@ class CodeGenerator:
         # Then branch
         self._gen_stmt(stmt.then_stmt)
 
-        if stmt.else_stmt:
+        if else_stmt is not None:
             self._emit("jp", end_label)
             self._emit_label(else_label)
-            self._gen_stmt(stmt.else_stmt)
+            self._gen_stmt(else_stmt)
 
         self._emit_label(end_label)
 
-    def _gen_condition_jump_false(self, condition: Expr, false_label: str) -> bool:
-        """Generate conditional jump to false_label if condition is false.
+    # Comparison kinds the optimised branch generators know how to emit.
+    _COMPARISON_KINDS = frozenset(
+        {
+            BinaryOpKind.EQ,
+            BinaryOpKind.NE,
+            BinaryOpKind.LT,
+            BinaryOpKind.GT,
+            BinaryOpKind.LE,
+            BinaryOpKind.GE,
+        }
+    )
 
-        Returns True if optimized jump was generated, False if caller should use fallback.
+    def _gen_condition_jump_false(self, condition, false_label: str) -> bool:
+        """Generate conditional jump to ``false_label`` when ``condition``
+        evaluates to false.
+
+        Accepts a typed expression node; comparison operators are
+        decoded via :func:`binop_kind` so the branch-emit helpers
+        ((:meth:`_emit_jump_on_false`, :meth:`_emit_jump_on_false_16bit`)
+        consume :class:`ast_view.BinaryOpKind`. Returns True if an
+        optimised jump was generated (caller skips the fallback),
+        False otherwise.
         """
         # Handle constant conditions - no code needed for always-true, unconditional jump for always-false
-        if isinstance(condition, NumberLiteral):
-            if condition.value == 0:
+        if isinstance(condition, P.NumberLiteral):
+            if number_value(condition) == 0:
                 # Always false - unconditional jump
                 self._emit("jp", false_label)
             # If non-zero (always true), no code needed - just fall through
             return True
 
         # Handle simple identifier - load and test directly
-        if isinstance(condition, Identifier):
+        if isinstance(condition, P.Identifier):
             cond_type = self._get_expr_type(condition)
             if cond_type == DataType.BYTE:
                 self._gen_expr(condition)  # Loads into A
@@ -3085,7 +3161,7 @@ class CodeGenerator:
                 return True
 
         # Handle function call - evaluate and test result
-        if isinstance(condition, CallExpr):
+        if isinstance(condition, (P.Call, P.CallNoArgs)):
             cond_type = self._gen_call_expr(condition)
             if cond_type == DataType.BYTE:
                 self._emit("or", "a")     # Set Z flag (result in A)
@@ -3097,20 +3173,20 @@ class CodeGenerator:
             return True
 
         # Handle NOT - invert the condition
-        if isinstance(condition, UnaryExpr) and condition.op == UnaryOp.NOT:
+        if isinstance(condition, P.UnaryOp) and unop_kind(condition) == UnaryOpKind.NOT:
             # NOT x is false when x is true, so jump to false_label when x is true
             return self._gen_condition_jump_true(condition.operand, false_label)
 
-        if not isinstance(condition, BinaryExpr):
+        if not isinstance(condition, P.BinaryOp):
             return False
 
-        op = condition.op
+        op = binop_kind(condition)
 
         # NOTE: PL/M-80 AND and OR are BITWISE operators, not short-circuit logical operators.
         # IF X AND Y tests if (X bitwise-and Y) is non-zero, NOT if both X and Y are non-zero.
         # So we do NOT handle AND/OR specially here - they fall through to expression evaluation.
 
-        if op not in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE):
+        if op not in self._COMPARISON_KINDS:
             return False
 
         # Check for impossible comparisons (e.g., BYTE compared to -1)
@@ -3125,13 +3201,15 @@ class CodeGenerator:
         # Handle both regular bytes (0-255) and "negative bytes" (0xFF00-0xFFFF like -1)
         if left_type == DataType.BYTE:
             const_val = None
-            if isinstance(condition.right, NumberLiteral):
-                val = condition.right.value
+            if isinstance(condition.right, P.NumberLiteral):
+                val = number_value(condition.right)
                 # Allow direct byte values (0-255) or negative byte values (0xFF00-0xFFFF)
                 if val <= 255 or (val & 0xFF00) == 0xFF00:
                     const_val = val & 0xFF
-            elif isinstance(condition.right, StringLiteral) and len(condition.right.value) == 1:
-                const_val = ord(condition.right.value[0])
+            elif isinstance(condition.right, P.StringLiteral):
+                s = string_value(condition.right)
+                if len(s) == 1:
+                    const_val = ord(s[0])
 
             if const_val is not None:
                 self._gen_expr(condition.left)  # Result in A
@@ -3152,14 +3230,18 @@ class CodeGenerator:
             pass
         else:
             # Optimize ADDRESS comparison with 0: use ld a,l / or h instead of subtraction
-            if op in (BinaryOp.EQ, BinaryOp.NE) and isinstance(condition.right, NumberLiteral) and condition.right.value == 0:
+            if (
+                op in (BinaryOpKind.EQ, BinaryOpKind.NE)
+                and isinstance(condition.right, P.NumberLiteral)
+                and number_value(condition.right) == 0
+            ):
                 self._gen_expr(condition.left)  # Result in HL
                 if left_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
                 self._emit("ld", "a,l")
                 self._emit("or", "h")  # Z flag set if HL == 0
-                if op == BinaryOp.EQ:
+                if op == BinaryOpKind.EQ:
                     self._emit("jp", f"nz,{false_label}")  # If HL != 0, condition is false
                 else:  # NE
                     self._emit("jp", f"z,{false_label}")  # If HL == 0, condition is false
@@ -3205,10 +3287,10 @@ class CodeGenerator:
             self._emit_sub16()
 
             # For EQ/NE, check if result is zero
-            if op in (BinaryOp.EQ, BinaryOp.NE):
+            if op in (BinaryOpKind.EQ, BinaryOpKind.NE):
                 self._emit("ld", "a,l")
                 self._emit("or", "h")
-                if op == BinaryOp.EQ:
+                if op == BinaryOpKind.EQ:
                     self._emit("jp", f"nz,{false_label}")  # If not zero, condition is false
                 else:
                     self._emit("jp", f"z,{false_label}")   # If zero, condition is false
@@ -3225,21 +3307,25 @@ class CodeGenerator:
 
         return False
 
-    def _gen_condition_jump_true(self, condition: Expr, true_label: str) -> bool:
-        """Generate conditional jump to true_label if condition is true.
+    def _gen_condition_jump_true(self, condition, true_label: str) -> bool:
+        """Generate conditional jump to ``true_label`` when ``condition``
+        evaluates to true. Mirror of :meth:`_gen_condition_jump_false`.
 
-        Returns True if optimized jump was generated, False if caller should use fallback.
+        Accepts a typed expression node; comparison operators are
+        decoded via :func:`binop_kind`. Returns True if an optimised
+        jump was generated, False if the caller should fall back to
+        the generic ``_gen_expr`` + test-flags sequence.
         """
         # Handle constant conditions
-        if isinstance(condition, NumberLiteral):
-            if condition.value != 0:
+        if isinstance(condition, P.NumberLiteral):
+            if number_value(condition) != 0:
                 # Always true - unconditional jump
                 self._emit("jp", true_label)
             # If zero (always false), no code needed - just fall through
             return True
 
         # Handle simple identifier
-        if isinstance(condition, Identifier):
+        if isinstance(condition, P.Identifier):
             cond_type = self._get_expr_type(condition)
             if cond_type == DataType.BYTE:
                 self._gen_expr(condition)  # Loads into A
@@ -3254,7 +3340,7 @@ class CodeGenerator:
                 return True
 
         # Handle function call - evaluate and test result
-        if isinstance(condition, CallExpr):
+        if isinstance(condition, (P.Call, P.CallNoArgs)):
             cond_type = self._gen_call_expr(condition)
             if cond_type == DataType.BYTE:
                 self._emit("or", "a")     # Set Z flag (result in A)
@@ -3266,20 +3352,20 @@ class CodeGenerator:
             return True
 
         # Handle NOT - invert the condition
-        if isinstance(condition, UnaryExpr) and condition.op == UnaryOp.NOT:
+        if isinstance(condition, P.UnaryOp) and unop_kind(condition) == UnaryOpKind.NOT:
             # NOT x is true when x is false, so jump to true_label when x is false
             return self._gen_condition_jump_false(condition.operand, true_label)
 
-        if not isinstance(condition, BinaryExpr):
+        if not isinstance(condition, P.BinaryOp):
             return False
 
-        op = condition.op
+        op = binop_kind(condition)
 
         # NOTE: PL/M-80 AND and OR are BITWISE operators, not short-circuit logical operators.
         # IF X OR Y tests if (X bitwise-or Y) is non-zero, NOT if either X or Y is non-zero.
         # So we do NOT handle AND/OR specially here - they fall through to expression evaluation.
 
-        if op not in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE):
+        if op not in self._COMPARISON_KINDS:
             return False
 
         # Check for impossible comparisons (e.g., BYTE compared to -1)
@@ -3294,13 +3380,15 @@ class CodeGenerator:
         # Handle both regular bytes (0-255) and "negative bytes" (0xFF00-0xFFFF like -1)
         if left_type == DataType.BYTE:
             const_val = None
-            if isinstance(condition.right, NumberLiteral):
-                val = condition.right.value
+            if isinstance(condition.right, P.NumberLiteral):
+                val = number_value(condition.right)
                 # Allow direct byte values (0-255) or negative byte values (0xFF00-0xFFFF)
                 if val <= 255 or (val & 0xFF00) == 0xFF00:
                     const_val = val & 0xFF
-            elif isinstance(condition.right, StringLiteral) and len(condition.right.value) == 1:
-                const_val = ord(condition.right.value[0])
+            elif isinstance(condition.right, P.StringLiteral):
+                s = string_value(condition.right)
+                if len(s) == 1:
+                    const_val = ord(s[0])
 
             if const_val is not None:
                 self._gen_expr(condition.left)
@@ -3318,14 +3406,18 @@ class CodeGenerator:
 
         if not both_bytes:
             # Optimize ADDRESS comparison with 0: use ld a,l / or h instead of subtraction
-            if op in (BinaryOp.EQ, BinaryOp.NE) and isinstance(condition.right, NumberLiteral) and condition.right.value == 0:
+            if (
+                op in (BinaryOpKind.EQ, BinaryOpKind.NE)
+                and isinstance(condition.right, P.NumberLiteral)
+                and number_value(condition.right) == 0
+            ):
                 self._gen_expr(condition.left)  # Result in HL
                 if left_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
                 self._emit("ld", "a,l")
                 self._emit("or", "h")  # Z flag set if HL == 0
-                if op == BinaryOp.EQ:
+                if op == BinaryOpKind.EQ:
                     self._emit("jp", f"z,{true_label}")  # If HL == 0, condition is true
                 else:  # NE
                     self._emit("jp", f"nz,{true_label}")  # If HL != 0, condition is true
@@ -3348,10 +3440,10 @@ class CodeGenerator:
 
             self._emit_sub16()
 
-            if op in (BinaryOp.EQ, BinaryOp.NE):
+            if op in (BinaryOpKind.EQ, BinaryOpKind.NE):
                 self._emit("ld", "a,l")
                 self._emit("or", "h")
-                if op == BinaryOp.EQ:
+                if op == BinaryOpKind.EQ:
                     self._emit("jp", f"z,{true_label}")
                 else:
                     self._emit("jp", f"nz,{true_label}")
@@ -3362,38 +3454,38 @@ class CodeGenerator:
 
         return False
 
-    def _emit_jump_on_true(self, op: BinaryOp, true_label: str) -> None:
-        """Emit jump to true_label if comparison result is true (8-bit compare)."""
-        if op == BinaryOp.EQ:
+    def _emit_jump_on_true(self, op: BinaryOpKind, true_label: str) -> None:
+        """Emit jump to ``true_label`` if comparison result is true (8-bit compare)."""
+        if op == BinaryOpKind.EQ:
             self._emit("jp", f"z,{true_label}")
-        elif op == BinaryOp.NE:
+        elif op == BinaryOpKind.NE:
             self._emit("jp", f"nz,{true_label}")
-        elif op == BinaryOp.LT:
+        elif op == BinaryOpKind.LT:
             self._emit("jp", f"c,{true_label}")
-        elif op == BinaryOp.GE:
+        elif op == BinaryOpKind.GE:
             self._emit("jp", f"nc,{true_label}")
-        elif op == BinaryOp.GT:
+        elif op == BinaryOpKind.GT:
             skip = self._new_label("SKIP")
             self._emit("jp", f"c,{skip}")
             self._emit("jp", f"z,{skip}")
             self._emit("jp", true_label)
             self._emit_label(skip)
-        elif op == BinaryOp.LE:
+        elif op == BinaryOpKind.LE:
             self._emit("jp", f"c,{true_label}")
             self._emit("jp", f"z,{true_label}")
 
-    def _emit_jump_on_true_16bit(self, op: BinaryOp, true_label: str) -> None:
-        """Emit jump to true_label for 16-bit unsigned comparison.
+    def _emit_jump_on_true_16bit(self, op: BinaryOpKind, true_label: str) -> None:
+        """Emit jump to ``true_label`` for 16-bit unsigned comparison.
 
         After CALL ??SUBDE (SBC HL,DE), carry flag is set if HL < DE (borrow).
         """
-        if op == BinaryOp.LT:
+        if op == BinaryOpKind.LT:
             # left < right: true if carry set
             self._emit("jp", f"c,{true_label}")
-        elif op == BinaryOp.GE:
+        elif op == BinaryOpKind.GE:
             # left >= right: true if no carry
             self._emit("jp", f"nc,{true_label}")
-        elif op == BinaryOp.GT:
+        elif op == BinaryOpKind.GT:
             # left > right: true if no carry AND result != 0
             skip = self._new_label("SKIP")
             self._emit("jp", f"c,{skip}")  # left < right -> not greater, skip
@@ -3401,29 +3493,29 @@ class CodeGenerator:
             self._emit("or", "h")
             self._emit("jp", f"nz,{true_label}")  # not equal -> greater
             self._emit_label(skip)
-        elif op == BinaryOp.LE:
+        elif op == BinaryOpKind.LE:
             # left <= right: true if carry OR result == 0
             self._emit("jp", f"c,{true_label}")  # left < right -> true
             self._emit("ld", "a,l")
             self._emit("or", "h")
             self._emit("jp", f"z,{true_label}")  # left == right -> true
 
-    def _emit_jump_on_false(self, op: BinaryOp, false_label: str) -> None:
-        """Emit jump to false_label if comparison result is false (8-bit compare)."""
+    def _emit_jump_on_false(self, op: BinaryOpKind, false_label: str) -> None:
+        """Emit jump to ``false_label`` if comparison result is false (8-bit compare)."""
         # After cp n or SUB, flags reflect left - right
-        if op == BinaryOp.EQ:
+        if op == BinaryOpKind.EQ:
             self._emit("jp", f"nz,{false_label}")  # Jump if not equal (Z=0)
-        elif op == BinaryOp.NE:
+        elif op == BinaryOpKind.NE:
             self._emit("jp", f"z,{false_label}")   # Jump if equal (Z=1)
-        elif op == BinaryOp.LT:
+        elif op == BinaryOpKind.LT:
             self._emit("jp", f"nc,{false_label}")  # Jump if not less (C=0)
-        elif op == BinaryOp.GE:
+        elif op == BinaryOpKind.GE:
             self._emit("jp", f"c,{false_label}")   # Jump if less (C=1)
-        elif op == BinaryOp.GT:
+        elif op == BinaryOpKind.GT:
             # Greater: not less AND not equal -> C=0 AND Z=0
             self._emit("jp", f"c,{false_label}")   # Jump if less
             self._emit("jp", f"z,{false_label}")   # Jump if equal
-        elif op == BinaryOp.LE:
+        elif op == BinaryOpKind.LE:
             # Less or equal: C=1 OR Z=1
             # Jump if greater (C=0 AND Z=0)
             skip = self._new_label("SKIP")
@@ -3432,28 +3524,28 @@ class CodeGenerator:
             self._emit("jp", false_label)  # Greater -> condition false
             self._emit_label(skip)
 
-    def _emit_jump_on_false_16bit(self, op: BinaryOp, false_label: str) -> None:
-        """Emit jump to false_label for 16-bit unsigned comparison.
+    def _emit_jump_on_false_16bit(self, op: BinaryOpKind, false_label: str) -> None:
+        """Emit jump to ``false_label`` for 16-bit unsigned comparison.
 
         After CALL ??SUBDE (SBC HL,DE), carry flag is set if HL < DE (borrow).
         PL/M ADDRESS is unsigned, so we use carry-based comparisons.
         """
-        if op == BinaryOp.LT:
+        if op == BinaryOpKind.LT:
             # left < right: true if carry set (borrow occurred)
             # Jump to false if NO carry (left >= right)
             self._emit("jp", f"nc,{false_label}")
-        elif op == BinaryOp.GE:
+        elif op == BinaryOpKind.GE:
             # left >= right: true if no carry
             # Jump to false if carry set (left < right)
             self._emit("jp", f"c,{false_label}")
-        elif op == BinaryOp.GT:
+        elif op == BinaryOpKind.GT:
             # left > right: true if no carry AND result != 0
             # Jump to false if carry OR result == 0
             self._emit("jp", f"c,{false_label}")  # left < right -> false
             self._emit("ld", "a,l")
             self._emit("or", "h")
             self._emit("jp", f"z,{false_label}")  # left == right -> false
-        elif op == BinaryOp.LE:
+        elif op == BinaryOpKind.LE:
             # left <= right: true if carry OR result == 0
             # Jump to false if no carry AND result != 0
             skip = self._new_label("SKIP")
@@ -3464,8 +3556,17 @@ class CodeGenerator:
             self._emit("jp", false_label)  # left > right -> false
             self._emit_label(skip)
 
-    def _gen_do_block(self, stmt: DoBlock) -> None:
-        """Generate code for simple DO block."""
+    def _gen_do_block(self, stmt) -> None:
+        """Generate code for a simple ``DO ... END`` block.
+
+        ``stmt`` is a typed :class:`P.DoBlock`; its mixed ``items``
+        list is split into local declarations and statements via
+        :func:`block_items_split` (declarations include nested
+        :class:`P.ProcDecl` and the contents of inner ``DECLARE``
+        statements).
+        """
+        decls, stmts = block_items_split(stmt.items)
+
         # Enter scope with unique identifier for DO block local variables
         self.block_scope_counter += 1
         block_id = self.block_scope_counter
@@ -3473,21 +3574,21 @@ class CodeGenerator:
 
         # Save and extend current_proc to include block scope for unique asm names
         old_proc = self.current_proc
-        if stmt.decls:  # Only modify if there are declarations
+        if decls:  # Only modify if there are declarations
             if self.current_proc:
                 self.current_proc = f"{self.current_proc}$B{block_id}"
             else:
                 self.current_proc = f"B{block_id}"
 
         # Local declarations
-        for decl in stmt.decls:
+        for decl in decls:
             self._gen_declaration(decl)
 
         # Restore current_proc for statements
         self.current_proc = old_proc
 
         # Statements
-        for s in stmt.stmts:
+        for s in stmts:
             self._gen_stmt(s)
 
         self.symbols.leave_scope()
@@ -3550,15 +3651,27 @@ class CodeGenerator:
         asm_name = sym.asm_name if sym.asm_name else self._mangle_name(var_name)
         return (asm_name, 255)
 
-    def _gen_do_while(self, stmt: DoWhileBlock) -> None:
-        """Generate code for DO WHILE block."""
+    def _gen_do_while(self, stmt) -> None:
+        """Generate code for a ``DO WHILE ... END`` block.
+
+        ``stmt`` is a typed :class:`P.DoWhileBlock`; its mixed
+        ``items`` list is split into local declarations and statements
+        via :func:`block_items_split` — declarations inside a
+        ``DO WHILE`` are rare but legal, and are emitted before the
+        loop entry like in a plain ``DO`` block.
+        """
         # Note: DO WHILE 1 is a valid pattern (loop exits in middle via RETURN/GOTO)
         # We only error on impossible comparisons like BYTE <> -1
+        decls, stmts = block_items_split(stmt.items)
 
         loop_label = self._new_label("WHILE")
         end_label = self._new_label("WEND")
 
         self.loop_stack.append((loop_label, end_label))
+
+        # Local declarations (emit storage before loop body).
+        for decl in decls:
+            self._gen_declaration(decl)
 
         # Check for optimized byte counter loop: DO WHILE (n := n - 1) <> 255
         # NOTE: This optimization is disabled because it doesn't save code -
@@ -3586,7 +3699,7 @@ class CodeGenerator:
             self.loop_counter_reg = 'C'
 
             # Loop body
-            for s in stmt.stmts:
+            for s in stmts:
                 self._gen_stmt(s)
 
             # Restore loop register tracking
@@ -3613,7 +3726,7 @@ class CodeGenerator:
                 self._emit("jp", f"z,{end_label}")
 
             # Loop body
-            for s in stmt.stmts:
+            for s in stmts:
                 self._gen_stmt(s)
 
             self._emit("jp", loop_label)
@@ -3621,8 +3734,24 @@ class CodeGenerator:
 
         self.loop_stack.pop()
 
-    def _gen_do_iter(self, stmt: DoIterBlock) -> None:
-        """Generate code for iterative DO block."""
+    def _gen_do_iter(self, stmt) -> None:
+        """Generate code for an iterative ``DO I = start TO bound [BY step]`` block.
+
+        ``stmt`` is either :class:`P.DoIterBlock` (no BY clause) or
+        :class:`P.DoIterByBlock` (with explicit step). ``stmt.index``
+        is a :class:`Token` rather than an expression; wrap it as a
+        :class:`P.Identifier` for downstream load/store/usage analysis.
+        Local declarations inside the loop body come out of
+        :func:`block_items_split` just like a plain ``DO`` block.
+        """
+        # Build an Identifier-shaped wrapper around the index Token so
+        # downstream code (which expects an expression node) sees a
+        # uniform shape regardless of which DoIter variant we got.
+        index_var = P.Identifier(name=stmt.index)
+        index_name = ident_text(stmt.index)
+        step_expr = stmt.step if isinstance(stmt, P.DoIterByBlock) else None
+        body_stmts = block_items_split(stmt.items)[1]
+
         loop_label = self._new_label("FOR")
         test_label = self._new_label("TEST")
         incr_label = self._new_label("INCR")
@@ -3632,38 +3761,48 @@ class CodeGenerator:
 
         # Determine if index variable is BYTE
         index_type = DataType.ADDRESS
-        if isinstance(stmt.index_var, Identifier):
-            sym = self._lookup_symbol(stmt.index_var.name)
-            if sym and sym.data_type == DataType.BYTE:
-                index_type = DataType.BYTE
+        sym = self._lookup_symbol(index_name)
+        if sym and sym.data_type == DataType.BYTE:
+            index_type = DataType.BYTE
 
         # Also check bound type
         bound_type = self._get_expr_type(stmt.bound)
         both_bytes = (index_type == DataType.BYTE and bound_type == DataType.BYTE)
 
-        # Get step value
+        # Get step value (default +1 when no BY clause; only constant
+        # NumberLiteral steps drive the byte-loop optimisations).
         step_val = 1
-        if stmt.step and isinstance(stmt.step, NumberLiteral):
-            step_val = stmt.step.value
+        if step_expr is not None and isinstance(step_expr, P.NumberLiteral):
+            step_val = number_value(step_expr)
 
-        # Check if loop index is used in body - if not, we can use DJNZ on Z80
-        index_used = self._index_used_in_body(stmt.index_var, stmt.stmts)
+        # Check if loop index is used in body - if not, we can use DJNZ on Z80.
+        # _index_used_in_body / _stmts_contain_goto still walk the
+        # legacy AST shape; they recurse via isinstance and return
+        # False for unrecognised typed nodes, which is conservative
+        # (forces the safe fallback path).
+        index_used = self._index_used_in_body(index_var, body_stmts)
 
         # Skip DJNZ optimization when the body has a GOTO — the pattern
         # pushes BC at the top of each iteration and pops at the bottom,
         # so a GOTO escaping the body strands the pushed BC on the stack.
-        body_has_goto = self._stmts_contain_goto(stmt.stmts)
+        body_has_goto = self._stmts_contain_goto(body_stmts)
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
-        if (both_bytes and
-            step_val == 1 and not index_used and not body_has_goto and
-            isinstance(stmt.start, NumberLiteral) and stmt.start.value == 0):
+        if (
+            both_bytes
+            and step_val == 1
+            and not index_used
+            and not body_has_goto
+            and isinstance(stmt.start, P.NumberLiteral)
+            and number_value(stmt.start) == 0
+        ):
             # Calculate iteration count = bound + 1
             # If bound is constant, emit LD B,bound+1
             # If bound is variable, emit: load bound; INC A; LD B,A
-            if isinstance(stmt.bound, NumberLiteral):
-                iter_count = stmt.bound.value + 1
+            if isinstance(stmt.bound, P.NumberLiteral):
+                bound_const = number_value(stmt.bound)
+                iter_count = bound_const + 1
                 if iter_count <= 255:
                     self._emit("ld", f"b,{self._format_number(iter_count)}")
                 else:
@@ -3671,18 +3810,21 @@ class CodeGenerator:
                     pass  # Fall through to regular loop
             else:
                 # Variable bound: A = bound; A++; B = A
-                bound_type = self._gen_expr(stmt.bound)
-                if bound_type == DataType.ADDRESS:
+                bt = self._gen_expr(stmt.bound)
+                if bt == DataType.ADDRESS:
                     self._emit("ld", "a,l")
                 self._emit("inc", "a")  # A = bound + 1 = iteration count
                 self._emit("ld", "b,a")  # B = iteration count
 
             # Only proceed with B-counter loop if we set up B
-            if isinstance(stmt.bound, NumberLiteral) and stmt.bound.value + 1 <= 255:
+            if (
+                isinstance(stmt.bound, P.NumberLiteral)
+                and number_value(stmt.bound) + 1 <= 255
+            ):
                 # Loop body - save B since body may clobber it
                 self._emit_label(loop_label)
                 self._emit("push", "bc")
-                for s in stmt.stmts:
+                for s in body_stmts:
                     self._gen_stmt(s)
                 self._emit("pop", "bc")
 
@@ -3695,7 +3837,7 @@ class CodeGenerator:
                 self._emit_label(end_label)
                 self.loop_stack.pop()
                 return
-            elif not isinstance(stmt.bound, NumberLiteral):
+            elif not isinstance(stmt.bound, P.NumberLiteral):
                 # Variable bound case - we set up B above
                 # But need to handle the case where bound might be 255 (iter count = 256 = 0 in byte)
                 # Skip loop if B is 0 (this handles bound = 255 case)
@@ -3706,7 +3848,7 @@ class CodeGenerator:
                 # Loop body - save B since body may clobber it
                 self._emit_label(loop_label)
                 self._emit("push", "bc")
-                for s in stmt.stmts:
+                for s in body_stmts:
                     self._gen_stmt(s)
                 self._emit("pop", "bc")
 
@@ -3723,9 +3865,10 @@ class CodeGenerator:
         # Check for optimized down-counting loop: DO I = N TO 0
         # When start is variable, bound is 0, and step is -1 (or default counting down)
         is_downcount_to_zero = (
-            both_bytes and
-            isinstance(stmt.bound, NumberLiteral) and stmt.bound.value == 0 and
-            (step_val == -1 or step_val == 0xFF)
+            both_bytes
+            and isinstance(stmt.bound, P.NumberLiteral)
+            and number_value(stmt.bound) == 0
+            and (step_val == -1 or step_val == 0xFF)
         )
 
         if is_downcount_to_zero:
@@ -3734,26 +3877,26 @@ class CodeGenerator:
             start_type = self._gen_expr(stmt.start)
             if start_type == DataType.ADDRESS:
                 self._emit("ld", "a,l")
-            self._gen_store(stmt.index_var, DataType.BYTE)
+            self._gen_store(index_var, DataType.BYTE)
 
             # Jump to test
             self._emit("jp", test_label)
 
             # Loop body
             self._emit_label(loop_label)
-            for s in stmt.stmts:
+            for s in body_stmts:
                 self._gen_stmt(s)
 
             # Decrement
             self._emit_label(incr_label)
-            self._gen_load(stmt.index_var)  # A = index
+            self._gen_load(index_var)  # A = index
             self._emit("dec", "a")
-            self._gen_store(stmt.index_var, DataType.BYTE)
+            self._gen_store(index_var, DataType.BYTE)
 
             # Test: if A >= 0 (not wrapped), continue
             # After DEC, if result is not negative (i.e., >= 0), continue
             self._emit_label(test_label)
-            self._gen_load(stmt.index_var)  # A = index
+            self._gen_load(index_var)  # A = index
             self._emit("or", "a")  # Set flags
             self._emit("jp", f"p,{loop_label}")  # Jump if positive (bit 7 clear)
 
@@ -3762,37 +3905,37 @@ class CodeGenerator:
             return
 
         # Check for optimized byte loop with constant bound
-        if both_bytes and isinstance(stmt.bound, NumberLiteral):
-            bound_val = stmt.bound.value
+        if both_bytes and isinstance(stmt.bound, P.NumberLiteral):
+            bound_val = number_value(stmt.bound)
 
             # Initialize index variable
             start_type = self._gen_expr(stmt.start)
             if start_type == DataType.ADDRESS:
                 self._emit("ld", "a,l")
-            self._gen_store(stmt.index_var, DataType.BYTE)
+            self._gen_store(index_var, DataType.BYTE)
 
             # Jump to test
             self._emit("jp", test_label)
 
             # Loop body
             self._emit_label(loop_label)
-            for s in stmt.stmts:
+            for s in body_stmts:
                 self._gen_stmt(s)
 
             # Increment/Decrement
             self._emit_label(incr_label)
-            self._gen_load(stmt.index_var)  # A = index
+            self._gen_load(index_var)  # A = index
             if step_val == 1:
                 self._emit("inc", "a")
             elif step_val == -1 or step_val == 0xFF:
                 self._emit("dec", "a")
             else:
                 self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(stmt.index_var, DataType.BYTE)
+            self._gen_store(index_var, DataType.BYTE)
 
             # Test condition: compare index with bound
             self._emit_label(test_label)
-            self._gen_load(stmt.index_var)  # A = index
+            self._gen_load(index_var)  # A = index
             if bound_val == 255:
                 # Special case: loop to 0xFF can't use cp 0x100 (truncates to 0)
                 # Instead, check if index wrapped to 0 (meaning we exceeded 0xFF)
@@ -3812,26 +3955,26 @@ class CodeGenerator:
             start_type = self._gen_expr(stmt.start)
             if start_type == DataType.ADDRESS:
                 self._emit("ld", "a,l")
-            self._gen_store(stmt.index_var, DataType.BYTE)
+            self._gen_store(index_var, DataType.BYTE)
 
             # Jump to test
             self._emit("jp", test_label)
 
             # Loop body
             self._emit_label(loop_label)
-            for s in stmt.stmts:
+            for s in body_stmts:
                 self._gen_stmt(s)
 
             # Increment/Decrement
             self._emit_label(incr_label)
-            self._gen_load(stmt.index_var)  # A = index
+            self._gen_load(index_var)  # A = index
             if step_val == 1:
                 self._emit("inc", "a")
             elif step_val == -1 or step_val == 0xFF:
                 self._emit("dec", "a")
             else:
                 self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(stmt.index_var, DataType.BYTE)
+            self._gen_store(index_var, DataType.BYTE)
 
             # Test condition: compare index with bound variable
             # Evaluate bound first, then compare with index
@@ -3841,7 +3984,7 @@ class CodeGenerator:
                 self._emit("ld", "a,l")  # Get low byte if ADDRESS
             self._emit("inc", "a")  # A = bound + 1
             self._emit("ld", "b,a")  # B = bound + 1
-            self._gen_load(stmt.index_var)  # A = index
+            self._gen_load(index_var)  # A = index
             # cp b computes a - b (index - (bound+1)), sets C if index < bound+1
             self._emit("cp", "B")  # Compare index with bound+1
             self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
@@ -3853,19 +3996,19 @@ class CodeGenerator:
         # General case: 16-bit loop (original code)
         # Initialize index variable
         self._gen_expr(stmt.start)
-        self._gen_store(stmt.index_var, DataType.ADDRESS)
+        self._gen_store(index_var, DataType.ADDRESS)
 
         # Jump to test
         self._emit("jp", test_label)
 
         # Loop body
         self._emit_label(loop_label)
-        for s in stmt.stmts:
+        for s in body_stmts:
             self._gen_stmt(s)
 
         # Increment
         self._emit_label(incr_label)
-        self._gen_load(stmt.index_var)
+        self._gen_load(index_var)
         if step_val == 1:
             self._emit("inc", "hl")
         elif step_val == -1 or step_val == 0xFFFF:
@@ -3873,11 +4016,11 @@ class CodeGenerator:
         else:
             self._emit("ld", f"de,{self._format_number(step_val)}")
             self._emit("add", "hl,de")
-        self._gen_store(stmt.index_var, DataType.ADDRESS)
+        self._gen_store(index_var, DataType.ADDRESS)
 
         # Test condition
         self._emit_label(test_label)
-        self._gen_load(stmt.index_var)
+        self._gen_load(index_var)
         self._emit("ex", "de,hl")  # DE = index
         self._gen_expr(stmt.bound)  # HL = bound
 
@@ -3891,12 +4034,23 @@ class CodeGenerator:
         self._emit_label(end_label)
         self.loop_stack.pop()
 
-    def _gen_do_case(self, stmt: DoCaseBlock) -> None:
-        """Generate code for DO CASE block."""
+    def _gen_do_case(self, stmt) -> None:
+        """Generate code for a ``DO CASE selector ... END`` block.
+
+        ``stmt`` is a typed :class:`P.DoCaseBlock` whose ``items`` is
+        a flat list of case bodies — one statement per case (the
+        legacy frontend pre-grouped multi-statement cases into a
+        ``cases: list[list[Stmt]]``, but the typed parser keeps them
+        flat). Treat each entry as a single-statement case here; if
+        the input has multiple statements per case the PL/M grammar
+        nests them inside a ``DO ... END`` block, which appears as
+        one :class:`P.DoBlock` item.
+        """
         end_label = self._new_label("CASEND")
 
+        cases = list(stmt.items)
         # Create labels for each case
-        case_labels = [self._new_label(f"CASE{i}") for i in range(len(stmt.cases))]
+        case_labels = [self._new_label(f"CASE{i}") for i in range(len(cases))]
 
         # Evaluate selector
         selector_type = self._gen_expr(stmt.selector)
@@ -3905,7 +4059,7 @@ class CodeGenerator:
         # For small number of cases, use sequential comparisons
         # For larger, use computed jump
 
-        if len(stmt.cases) <= 8:
+        if len(cases) <= 8:
             # Sequential comparisons - selector can stay in A for BYTE
             if selector_type == DataType.ADDRESS:
                 # ADDRESS selector is in HL, move L to A for comparisons
@@ -3937,33 +4091,41 @@ class CodeGenerator:
                 self.output.append(AsmLine(opcode="dw", operands=label))
 
         # Generate each case
-        for i, (case_stmts, label) in enumerate(zip(stmt.cases, case_labels)):
+        for i, (case_item, label) in enumerate(zip(cases, case_labels)):
             self._emit_label(label)
-            for s in case_stmts:
-                self._gen_stmt(s)
+            self._gen_stmt(case_item)
             # Only emit JP end_label if last statement doesn't transfer control
-            if not self._stmt_transfers_control(case_stmts[-1] if case_stmts else None):
+            if not self._stmt_transfers_control(case_item):
                 self._emit("jp", end_label)
 
         self._emit_label(end_label)
 
-    def _stmt_transfers_control(self, stmt: Stmt | None) -> bool:
-        """Check if a statement unconditionally transfers control (no fallthrough)."""
+    def _stmt_transfers_control(self, stmt) -> bool:
+        """Check if a statement unconditionally transfers control (no fallthrough).
+
+        Recognises both the legacy ``ast_nodes`` statement classes and
+        the typed :mod:`uplm80._plm_parser` equivalents so the helper
+        works during the in-progress AST migration.
+        """
         if stmt is None:
             return False
-        if isinstance(stmt, GotoStmt):
+        if isinstance(stmt, (GotoStmt, P.GotoStmt)):
             return True
-        if isinstance(stmt, ReturnStmt):
+        if isinstance(stmt, (ReturnStmt, P.ReturnStmt, P.ReturnStmtValue)):
             return True
-        if isinstance(stmt, HaltStmt):
+        if isinstance(stmt, (HaltStmt, P.HaltStmt)):
             return True
         # A labeled statement transfers if its inner statement does
-        if isinstance(stmt, LabeledStmt):
+        if isinstance(stmt, (LabeledStmt, P.LabeledStmt)):
             return self._stmt_transfers_control(stmt.stmt)
         # A DO block transfers if its last statement does
         if isinstance(stmt, DoBlock):
             if stmt.stmts:
                 return self._stmt_transfers_control(stmt.stmts[-1])
+        if isinstance(stmt, P.DoBlock):
+            _, body_stmts = block_items_split(stmt.items)
+            if body_stmts:
+                return self._stmt_transfers_control(body_stmts[-1])
         return False
 
     # ========================================================================
