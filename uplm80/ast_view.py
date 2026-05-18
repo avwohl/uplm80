@@ -311,3 +311,164 @@ def array_size_value(node) -> Optional[int]:
         # SizeIdent: unresolved at the syntax level
         return None
     return None
+
+
+# ---- declaration attribute / shape unpacking ------------------------------
+
+
+@dataclass
+class DeclAttrs:
+    """Flattened view of a declaration's attribute clauses.
+
+    ``initial_values`` and ``data_values`` are the raw typed expression
+    nodes from the AST; ``at_location`` is the typed expression
+    addressed by an ``AT(...)`` clause, or ``None``.
+    """
+
+    is_public: bool = False
+    is_external: bool = False
+    initial_values: Optional[list] = None
+    data_values: Optional[list] = None
+    at_location = None  # typed expression node | None
+
+
+def _scan_attrs(attrs, out: DeclAttrs) -> None:
+    """Apply each attribute clause's effect to ``out``."""
+    for attr in attrs or []:
+        if isinstance(attr, P.AttrExternal):
+            out.is_external = True
+        elif isinstance(attr, P.AttrPublic):
+            out.is_public = True
+        elif isinstance(attr, P.AttrInitial):
+            out.initial_values = list(attr.values or [])
+        elif isinstance(attr, P.AttrAt):
+            out.at_location = attr.address
+
+
+def decl_attrs(item) -> DeclAttrs:
+    """Flatten a ``DeclItem`` / ``DeclItemBasedGroup`` tail's attribute
+    clauses into a :class:`DeclAttrs` view.
+
+    Walks both the type-tail's ``attrs`` and the DATA-tail's leading +
+    trailing attribute lists, so the caller doesn't need to know which
+    tail variant carries the attributes.
+    """
+    out = DeclAttrs()
+    tail = getattr(item, "tail", None)
+    if tail is None:
+        return out
+    if isinstance(tail, P.DeclTailType):
+        _scan_attrs(tail.attrs, out)
+    elif isinstance(tail, P.DeclTailTypeData):
+        _scan_attrs(tail.leading_attrs, out)
+        out.data_values = list(tail.data_values or [])
+        _scan_attrs(tail.trailing_attrs, out)
+    elif isinstance(tail, P.DeclTailData):
+        _scan_attrs(tail.leading_attrs, out)
+        out.data_values = list(tail.data_values or [])
+        _scan_attrs(tail.trailing_attrs, out)
+    elif isinstance(tail, P.DeclTailStructure):
+        _scan_attrs(tail.attrs, out)
+    elif isinstance(tail, P.DeclTailStructureData):
+        _scan_attrs(tail.leading_attrs, out)
+        out.data_values = list(tail.data_values or [])
+        _scan_attrs(tail.trailing_attrs, out)
+    return out
+
+
+def decl_item_type(item) -> tuple[Optional[DataType], Optional[int]]:
+    """Return ``(view DataType | None, dimension | None)`` for a typed
+    ``DeclItem``. ``dimension`` is ``None`` for scalars, an int for
+    fixed-size arrays, or ``-1`` for the ``(*)`` form. STRUCTURE /
+    user-defined types return ``None`` for the data type — the caller
+    consults :func:`decl_item_struct_members` to detect them."""
+    dt: Optional[DataType] = None
+    tail = getattr(item, "tail", None)
+    type_node = getattr(tail, "type", None) if tail is not None else None
+    if isinstance(type_node, (P.TypeByte, P.TypeByteSized)):
+        dt = DataType.BYTE
+    elif isinstance(type_node, (P.TypeAddress, P.TypeAddressSized)):
+        dt = DataType.ADDRESS
+    elif isinstance(type_node, P.TypeLabel):
+        dt = DataType.LABEL
+    dim = array_size_value(getattr(item, "array_size", None))
+    return dt, dim
+
+
+def decl_item_struct_members(item) -> Optional[list]:
+    """Return the list of typed ``StructMember`` / ``StructMemberUntyped``
+    nodes for a STRUCTURE declaration, else ``None``."""
+    tail = getattr(item, "tail", None)
+    if isinstance(tail, (P.DeclTailStructure, P.DeclTailStructureData)):
+        return list(tail.members or [])
+    return None
+
+
+def dotted_ident_parts(node) -> list[str]:
+    """Walk a ``DottedIdent`` / ``DottedMember`` chain into a list of
+    identifier name strings, base first."""
+    parts: list[str] = []
+    while True:
+        if isinstance(node, P.DottedIdent):
+            parts.append(ident_text(node.name))
+            return list(reversed(parts))
+        if isinstance(node, P.DottedMember):
+            parts.append(ident_text(node.member))
+            node = node.base
+            continue
+        return list(reversed(parts))
+
+
+def decl_item_based(item) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(base_name, member_name)`` for a ``BASED`` declaration's
+    base reference, or ``(None, None)`` if the item is not based.
+
+    ``base.member`` chains become ``("base", "member")``; deeper chains
+    collapse the trailing members into a dotted string, since codegen
+    currently expects a single member name."""
+    based = getattr(item, "based", None)
+    if based is None:
+        return None, None
+    parts = dotted_ident_parts(based.base)
+    if not parts:
+        return None, None
+    if len(parts) == 1:
+        return parts[0], None
+    return parts[0], ".".join(parts[1:])
+
+
+def struct_member_names(m) -> list[str]:
+    """Names declared by a single ``StructMember`` (one or many)."""
+    names = m.names
+    if isinstance(names, P.DeclName):
+        return [ident_text(names.name)]
+    if isinstance(names, P.DeclNames):
+        return [ident_text(n.name) for n in (names.names or [])]
+    raise TypeError(f"unexpected struct member names node: {type(names).__name__}")
+
+
+def struct_member_type(m) -> DataType:
+    """Type of a struct member; untyped members default to BYTE per
+    PL/M-80 semantics."""
+    if isinstance(m, P.StructMemberUntyped):
+        return DataType.BYTE
+    t = m.type
+    if isinstance(t, (P.TypeByte, P.TypeByteSized)):
+        return DataType.BYTE
+    if isinstance(t, (P.TypeAddress, P.TypeAddressSized)):
+        return DataType.ADDRESS
+    # TypeLabel / TypeUserDefined: not legal in struct context; fall back to BYTE
+    return DataType.BYTE
+
+
+def struct_member_dim(m) -> Optional[int]:
+    """Array dimension of a struct member (``None`` for scalars)."""
+    return array_size_value(getattr(m, "array_size", None))
+
+
+def literally_value(decl: P.LiterallyDecl) -> str:
+    """Unquote a ``LITERALLY`` macro's replacement text."""
+    text = decl.value.text
+    if text.startswith("'") and text.endswith("'"):
+        text = text[1:-1]
+    return text

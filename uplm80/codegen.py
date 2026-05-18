@@ -61,6 +61,14 @@ from .ast_view import (
     iter_declare_items,
     decl_item_names,
     array_size_value,
+    decl_attrs,
+    decl_item_type as _view_decl_item_type,
+    decl_item_struct_members,
+    decl_item_based,
+    struct_member_names,
+    struct_member_type,
+    struct_member_dim,
+    literally_value,
     binop_kind,
     unop_kind,
     ident_text,
@@ -72,6 +80,7 @@ from .ast_view import (
     BinaryOpKind,
     UnaryOpKind,
 )
+from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
 from .runtime import get_runtime_library
@@ -113,25 +122,13 @@ def _decl_item_has_data(item):
 def _decl_item_type(item):
     """Extract (legacy DataType, dimension) from a typed ``DeclItem``.
 
-    Returns ``(data_type, dimension)`` where ``data_type`` is the legacy
-    :class:`ast_nodes.DataType` (or ``None`` if not derivable from the
-    tail's type node) and ``dimension`` is ``None`` for scalars or an
-    int for fixed-size arrays. STRUCTURE / based / user-defined types
-    fall back to ``None`` for data_type, matching legacy default
-    behaviour at this layer.
+    Thin shim over :func:`ast_view.decl_item_type` that converts the
+    view-side enum to the legacy :class:`ast_nodes.DataType` still
+    consumed by the symbol table. ``dimension`` is ``None`` for
+    scalars, an int for fixed-size arrays, or ``-1`` for ``(*)``.
     """
-    dt = None
-    tail = getattr(item, "tail", None)
-    type_node = getattr(tail, "type", None) if tail is not None else None
-    if isinstance(type_node, P.TypeByte) or isinstance(type_node, P.TypeByteSized):
-        dt = DataType.BYTE
-    elif isinstance(type_node, P.TypeAddress) or isinstance(type_node, P.TypeAddressSized):
-        dt = DataType.ADDRESS
-    elif isinstance(type_node, P.TypeLabel):
-        dt = DataType.LABEL
-    dim = array_size_value(getattr(item, "array_size", None))
-    # Legacy used None for scalar; -1 for (*) is fine to forward as-is.
-    return dt, dim
+    dt, dim = _view_decl_item_type(item)
+    return _legacy_dt(dt), dim
 
 
 class Mode(Enum):
@@ -1895,72 +1892,136 @@ class CodeGenerator:
     # Declaration Code Generation
     # ========================================================================
 
-    def _gen_declaration(self, decl: Declaration) -> None:
-        """Generate code/storage for a declaration."""
-        if isinstance(decl, VarDecl):
-            self._gen_var_decl(decl)
-        elif isinstance(decl, ProcDecl):
-            self._gen_proc_decl(decl)
-        elif isinstance(decl, LiterallyDecl):
-            # Record in symbol table and literal_macros
-            self.symbols.define(
-                Symbol(
-                    name=decl.name,
-                    kind=SymbolKind.LITERAL,
-                    literal_value=decl.value,
-                )
-            )
-            self.literal_macros[decl.name] = decl.value
-            # Emit EQU for numeric literals (not for built-in names or text macros)
-            try:
-                val = self._parse_plm_number(decl.value)
-                # Generate EQU in data segment
-                asm_name = self._mangle_name(decl.name)
-                self.data_segment.append(
-                    AsmLine(label=asm_name, opcode="EQU", operands=self._format_number(val))
-                )
-            except ValueError:
-                pass  # Non-numeric literal, no EQU needed
-        elif isinstance(decl, LabelDecl):
-            self.symbols.define(
-                Symbol(
-                    name=decl.name,
-                    kind=SymbolKind.LABEL,
-                    is_public=decl.is_public,
-                    is_external=decl.is_external,
-                )
-            )
-            if decl.is_external:
-                self._emit("extrn", decl.name)
+    def _gen_declaration(self, decl) -> None:
+        """Generate code/storage for a typed declaration node.
 
-    def _gen_var_decl(self, decl: VarDecl) -> None:
-        """Generate storage for a variable declaration."""
+        Dispatches over the uplox-generated typed AST kinds:
+        :class:`P.DeclItem` (scalar/array/structure/based variable),
+        :class:`P.DeclItemBasedGroup` (parenthesised BASED group),
+        :class:`P.LiterallyDecl` (LITERALLY macro), or
+        :class:`P.ProcDecl` (procedure).
+        """
+        if isinstance(decl, P.ProcDecl):
+            self._gen_proc_decl(decl)
+        elif isinstance(decl, P.LiterallyDecl):
+            self._gen_literally_decl(decl)
+        elif isinstance(decl, (P.DeclItem, P.DeclItemBasedGroup)):
+            self._gen_var_decl(decl)
+
+    def _gen_literally_decl(self, decl) -> None:
+        """Register a LITERALLY macro in the symbol table and emit an
+        EQU directive if the replacement text parses as a number."""
+        name = ident_text(decl.name)
+        value = literally_value(decl)
+        self.symbols.define(
+            Symbol(
+                name=name,
+                kind=SymbolKind.LITERAL,
+                literal_value=value,
+            )
+        )
+        self.literal_macros[name] = value
+        # Emit EQU for numeric literals only.
+        try:
+            val = self._parse_plm_number(value)
+            asm_name = self._mangle_name(name)
+            self.data_segment.append(
+                AsmLine(label=asm_name, opcode="EQU", operands=self._format_number(val))
+            )
+        except ValueError:
+            pass  # Non-numeric replacement text, no EQU needed
+
+    def _gen_var_decl(self, decl) -> None:
+        """Generate storage for a typed variable declaration.
+
+        ``decl`` may be a :class:`P.DeclItem` (one or many names sharing
+        a tail) or a :class:`P.DeclItemBasedGroup` (a parenthesised list
+        of based names, each becoming one symbol). A single ``DeclItem``
+        with multiple names emits one storage row per name with each
+        getting its own symbol entry.
+        """
+        if isinstance(decl, P.DeclItemBasedGroup):
+            for bd in decl.based_decls or []:
+                base_name = (
+                    ident_text(bd.base.name)
+                    if isinstance(bd.base, P.DottedIdent) else None
+                )
+                self._gen_one_var(
+                    name=ident_text(bd.name),
+                    based_on=base_name,
+                    based_member=None,
+                    item=decl,
+                )
+            return
+
+        # P.DeclItem: one or more names sharing the same tail/clauses.
+        based_on, based_member = decl_item_based(decl)
+        for name in decl_item_names(decl):
+            self._gen_one_var(
+                name=name,
+                based_on=based_on,
+                based_member=based_member,
+                item=decl,
+            )
+
+    def _gen_one_var(self, *, name: str, based_on, based_member, item) -> None:
+        """Generate storage for a single name from a typed DeclItem.
+
+        Split out so a ``(A, B, C) BYTE`` decl can emit one row per
+        identifier while sharing tail/attribute extraction. The legacy
+        ``VarDecl`` carried only one name per node, so this used to live
+        inline in :meth:`_gen_var_decl`.
+        """
+        attrs = decl_attrs(item)
+        data_type, dimension = _decl_item_type(item)
+        members_nodes = decl_item_struct_members(item)
+        is_public = attrs.is_public
+        is_external = attrs.is_external
+        at_location = attrs.at_location  # typed expression node | None
+        data_values_nodes = attrs.data_values
+        initial_values_nodes = attrs.initial_values
+
+        # Build the legacy StructMember list the symbol table expects.
+        struct_members = None
+        if members_nodes is not None:
+            struct_members = []
+            for m in members_nodes:
+                m_type = struct_member_type(m)
+                m_dim = struct_member_dim(m)
+                for sn in struct_member_names(m):
+                    struct_members.append(
+                        _ast_nodes.StructMember(
+                            name=sn,
+                            data_type=_legacy_dt(m_type),
+                            dimension=m_dim,
+                        )
+                    )
+
         # Mangle name if it conflicts with register names
-        base_name = self._mangle_name(decl.name)
+        base_name = self._mangle_name(name)
         asm_name: str | None = base_name  # Default, may be overridden below
 
         # Check if we're in a reentrant procedure - locals go on stack
         in_reentrant = (self.current_proc_decl is not None and
                         self.current_proc_decl.is_reentrant and
-                        not decl.is_public and not decl.is_external and
-                        not decl.based_on and not decl.at_location and
-                        not decl.data_values and not decl.initial_values)
+                        not is_public and not is_external and
+                        not based_on and not at_location and
+                        not data_values_nodes and not initial_values_nodes)
 
         # Check if this is a procedure local that can use shared storage
         use_shared = False
-        if (not in_reentrant and self.current_proc and not decl.is_public and not decl.is_external
-            and not decl.based_on and not decl.at_location and not decl.data_values
-            and not decl.initial_values):
-            # Check if we have shared storage for this proc and var
+        if (not in_reentrant and self.current_proc and not is_public and not is_external
+            and not based_on and not at_location and not data_values_nodes
+            and not initial_values_nodes):
             if (hasattr(self, 'storage_labels')
                 and self.current_proc in self.storage_labels
-                and decl.name in self.storage_labels[self.current_proc]):
-                asm_name = self.storage_labels[self.current_proc][decl.name]
+                and name in self.storage_labels[self.current_proc]):
+                asm_name = self.storage_labels[self.current_proc][name]
                 use_shared = True
 
         if not use_shared and not in_reentrant:
             # For non-public local variables in procedures, prefix with scope name to avoid conflicts
-            if self.current_proc and not decl.is_public and not decl.is_external:
+            if self.current_proc and not is_public and not is_external:
                 asm_name = f"@{self.current_proc}${base_name}"
             else:
                 asm_name = base_name
@@ -1968,18 +2029,18 @@ class CodeGenerator:
             asm_name = None  # Will use stack_offset instead
 
         # Calculate size
-        if decl.struct_members:
+        if struct_members:
             # Size of one structure element
             struct_size = sum(
                 (m.dimension or 1) * (1 if m.data_type == DataType.BYTE else 2)
-                for m in decl.struct_members
+                for m in struct_members
             )
             # Multiply by array dimension if this is an array of structures
-            size = struct_size * (decl.dimension or 1)
+            size = struct_size * (dimension or 1)
             elem_size = 2  # Structures are ADDRESS-sized elements
         else:
-            elem_size = 1 if decl.data_type == DataType.BYTE else 2
-            count = decl.dimension or 1
+            elem_size = 1 if data_type == DataType.BYTE else 2
+            count = dimension or 1
             size = elem_size * count
 
         # For reentrant procedures, allocate stack space for locals
@@ -1990,16 +2051,33 @@ class CodeGenerator:
             self._reentrant_local_offset -= size
             stack_offset = self._reentrant_local_offset
 
+        # LABEL declarations: register the label and emit any extrn/public
+        # directive — labels never get storage.
+        if data_type == DataType.LABEL and not struct_members:
+            self.symbols.define(
+                Symbol(
+                    name=name,
+                    kind=SymbolKind.LABEL,
+                    is_public=is_public,
+                    is_external=is_external,
+                )
+            )
+            if is_external:
+                self._emit("extrn", base_name)
+            elif is_public:
+                self._emit("public", base_name)
+            return
+
         # Record in symbol table (with mangled name for asm output)
         sym = Symbol(
-            name=decl.name,
+            name=name,
             kind=SymbolKind.VARIABLE,
-            data_type=decl.data_type,
-            dimension=decl.dimension,
-            struct_members=decl.struct_members,
-            based_on=decl.based_on,  # Keep original name for symbol lookup
-            is_public=decl.is_public,
-            is_external=decl.is_external,
+            data_type=data_type,
+            dimension=dimension,
+            struct_members=struct_members,
+            based_on=based_on,  # Keep original name for symbol lookup
+            is_public=is_public,
+            is_external=is_external,
             size=size,
             asm_name=asm_name,  # Store mangled name (None for reentrant locals)
             stack_offset=stack_offset,  # Stack offset for reentrant locals
@@ -2007,132 +2085,37 @@ class CodeGenerator:
         self.symbols.define(sym)
 
         # External variables don't get storage here
-        if decl.is_external:
+        if is_external:
             self._emit("extrn", asm_name)
             return
 
         # Public declaration
-        if decl.is_public:
+        if is_public:
             self._emit("public", asm_name)
 
         # Based variables don't allocate storage - they're pointers to other storage
-        if decl.based_on:
+        if based_on:
             return
 
         # AT variables use specified address
-        if decl.at_location:
-            if isinstance(decl.at_location, NumberLiteral):
-                addr = decl.at_location.value
-                self.data_segment.append(
-                    AsmLine(label=asm_name, opcode="EQU", operands=self._format_number(addr))
-                )
-            elif isinstance(decl.at_location, LocationExpr):
-                # AT location is an address expression
-                loc_operand = decl.at_location.operand
-                if isinstance(loc_operand, Identifier):
-                    # Check for built-in MEMORY - address is __END__ (end of program)
-                    if loc_operand.name.upper() == "MEMORY":
-                        self.needs_end_symbol = True
-                        # Use SET instead of EQU to allow forward reference to __END__
-                        # __END__ is defined at the end of the file, so this is a forward ref
-                        self.data_segment.append(
-                            AsmLine(label=asm_name, opcode="SET", operands="__END__")
-                        )
-                    else:
-                        # Reference to another variable - check if external
-                        ref_sym = self.symbols.lookup(loc_operand.name)
-                        if ref_sym and ref_sym.is_external:
-                            # For AT pointing to external, just use external name as alias
-                            # Store asm_name so lookups use the external's address
-                            sym.asm_name = ref_sym.asm_name if ref_sym.asm_name else self._mangle_name(loc_operand.name)
-                            # No EQU needed - we'll reference the external directly
-                        else:
-                            ref_name = ref_sym.asm_name if ref_sym and ref_sym.asm_name else self._mangle_name(loc_operand.name)
-                            # Use SET instead of EQU to allow forward references
-                            # The referenced symbol may be declared later in the file
-                            self.data_segment.append(
-                                AsmLine(label=asm_name, opcode="SET", operands=ref_name)
-                            )
-                elif isinstance(loc_operand, (SubscriptExpr, CallExpr)):
-                    # AT (.array(index)) - generate EQU to array element address
-                    # Note: PL/M uses arr(i) syntax which parses as CallExpr
-                    if isinstance(loc_operand, SubscriptExpr):
-                        base_expr = loc_operand.base
-                        index_expr = loc_operand.index
-                    else:  # CallExpr
-                        base_expr = loc_operand.callee
-                        index_expr = loc_operand.args[0] if loc_operand.args else NumberLiteral(0)
-
-                    if isinstance(base_expr, Identifier):
-                        base_sym = self.symbols.lookup(base_expr.name)
-                        base_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(base_expr.name)
-                        # Calculate element size (1 for BYTE, 2 for ADDRESS)
-                        elem_size = 1
-                        if base_sym and base_sym.data_type == DataType.ADDRESS:
-                            elem_size = 2
-                        # Check if the resolved base_name is an external symbol
-                        # This handles cases like AT(.system$data(0)) where system$data is AT(.fcb)
-                        is_base_external = base_sym and base_sym.is_external
-                        if not is_base_external and base_sym and base_sym.asm_name:
-                            # Check if asm_name refers to an external (indirect reference)
-                            # Extract the base symbol name before any offset (e.g., "FCB+5" -> "FCB")
-                            asm_base = base_sym.asm_name.split('+')[0].strip()
-                            ref_sym = self.symbols.lookup(asm_base)
-                            if ref_sym and ref_sym.is_external:
-                                is_base_external = True
-                        # Get the index - must be a constant for AT declarations
-                        if isinstance(index_expr, NumberLiteral):
-                            offset = index_expr.value * elem_size
-                            if is_base_external:
-                                # External base - can't use SET/EQU with external symbols
-                                # Store expression as asm_name for direct use
-                                if offset == 0:
-                                    sym.asm_name = base_name
-                                else:
-                                    sym.asm_name = f"{base_name}+{offset}"
-                                # No SET/EQU directive needed
-                            elif offset == 0:
-                                self.data_segment.append(
-                                    AsmLine(label=asm_name, opcode="SET", operands=base_name)
-                                )
-                            else:
-                                self.data_segment.append(
-                                    AsmLine(label=asm_name, opcode="SET", operands=f"{base_name}+{offset}")
-                                )
-                        else:
-                            # Non-constant index - can't handle at compile time
-                            self.data_segment.append(
-                                AsmLine(label=asm_name, opcode="EQU", operands="$")
-                            )
-                    else:
-                        # Complex base expression
-                        self.data_segment.append(
-                            AsmLine(label=asm_name, opcode="EQU", operands="$")
-                        )
-                else:
-                    # Complex AT expression - evaluate at assembly time (fallback)
-                    self.data_segment.append(
-                        AsmLine(label=asm_name, opcode="EQU", operands="$")
-                    )
-            else:
-                # Other AT expression - evaluate at assembly time
-                self.data_segment.append(
-                    AsmLine(label=asm_name, opcode="EQU", operands="$")
-                )
+        if at_location is not None:
+            self._emit_at_decl(asm_name, at_location, sym)
             return
 
         # Generate storage
         # DATA values can go inline in code (for module-level bootstrap) or data segment
         target_segment = self.code_data_segment if self.emit_data_inline else self.data_segment
 
-        if decl.data_values:
-            # DATA initialization
+        if data_values_nodes:
             target_segment.append(AsmLine(label=asm_name))
-            self._emit_data_values(decl.data_values, decl.data_type or DataType.BYTE, inline=self.emit_data_inline)
-        elif decl.initial_values:
-            # INITIAL values
+            self._emit_data_values(
+                data_values_nodes,
+                data_type or DataType.BYTE,
+                inline=self.emit_data_inline,
+            )
+        elif initial_values_nodes:
             self.data_segment.append(AsmLine(label=asm_name))
-            self._emit_initial_values(decl.initial_values, decl.data_type or DataType.BYTE)
+            self._emit_initial_values(initial_values_nodes, data_type or DataType.BYTE)
         elif use_shared:
             # Using shared automatic storage - no individual allocation needed
             pass
@@ -2145,24 +2128,135 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
-    def _emit_data_values(self, values: list[Expr], dtype: DataType, inline: bool = False) -> None:
-        """Emit DATA values to data segment or inline code segment."""
+    def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol) -> None:
+        """Emit the EQU/SET line(s) for a ``DECLARE ... AT(addr)`` clause.
+
+        ``at_expr`` is a typed expression node. A bare ``NUMBER`` is
+        emitted as a direct EQU; a ``.NAME`` (LocationOf) becomes a SET
+        to the referenced symbol; ``.ARR(i)`` resolves to a SET with the
+        appropriate element offset when the index is a constant.
+        """
+        # AT(<number>): direct address EQU.
+        if isinstance(at_expr, P.NumberLiteral):
+            addr = parse_plm_number(at_expr.value.text)
+            self.data_segment.append(
+                AsmLine(label=asm_name, opcode="EQU", operands=self._format_number(addr))
+            )
+            return
+
+        if isinstance(at_expr, P.LocationOf):
+            loc_operand = at_expr.operand
+            # AT(.NAME)
+            if isinstance(loc_operand, P.Identifier):
+                ref_name_text = ident_text(loc_operand.name)
+                if ref_name_text.upper() == "MEMORY":
+                    self.needs_end_symbol = True
+                    # SET (not EQU) — forward reference to __END__ at file end.
+                    self.data_segment.append(
+                        AsmLine(label=asm_name, opcode="SET", operands="__END__")
+                    )
+                else:
+                    ref_sym = self.symbols.lookup(ref_name_text)
+                    if ref_sym and ref_sym.is_external:
+                        # AT(.external) — alias the external's name; no directive.
+                        sym.asm_name = (
+                            ref_sym.asm_name if ref_sym.asm_name
+                            else self._mangle_name(ref_name_text)
+                        )
+                    else:
+                        ref_asm = (
+                            ref_sym.asm_name if ref_sym and ref_sym.asm_name
+                            else self._mangle_name(ref_name_text)
+                        )
+                        # SET allows forward references.
+                        self.data_segment.append(
+                            AsmLine(label=asm_name, opcode="SET", operands=ref_asm)
+                        )
+                return
+
+            # AT(.ARR(i)) — the subscript parses as a Call in the typed AST.
+            if isinstance(loc_operand, P.Call):
+                base_expr = loc_operand.callee
+                index_expr = loc_operand.args[0] if loc_operand.args else None
+                if isinstance(base_expr, P.Identifier):
+                    base_name_text = ident_text(base_expr.name)
+                    base_sym = self.symbols.lookup(base_name_text)
+                    base_asm = (
+                        base_sym.asm_name if base_sym and base_sym.asm_name
+                        else self._mangle_name(base_name_text)
+                    )
+                    elem_size = 1
+                    if base_sym and base_sym.data_type == DataType.ADDRESS:
+                        elem_size = 2
+                    # External-base detection (direct or through an AT alias).
+                    is_base_external = bool(base_sym and base_sym.is_external)
+                    if not is_base_external and base_sym and base_sym.asm_name:
+                        asm_base = base_sym.asm_name.split('+')[0].strip()
+                        ref_sym = self.symbols.lookup(asm_base)
+                        if ref_sym and ref_sym.is_external:
+                            is_base_external = True
+                    if isinstance(index_expr, P.NumberLiteral):
+                        offset = parse_plm_number(index_expr.value.text) * elem_size
+                        if is_base_external:
+                            # External base — store the expression as asm_name.
+                            sym.asm_name = (
+                                base_asm if offset == 0 else f"{base_asm}+{offset}"
+                            )
+                        elif offset == 0:
+                            self.data_segment.append(
+                                AsmLine(label=asm_name, opcode="SET", operands=base_asm)
+                            )
+                        else:
+                            self.data_segment.append(
+                                AsmLine(
+                                    label=asm_name, opcode="SET",
+                                    operands=f"{base_asm}+{offset}",
+                                )
+                            )
+                    else:
+                        # Non-constant index - can't resolve at compile time.
+                        self.data_segment.append(
+                            AsmLine(label=asm_name, opcode="EQU", operands="$")
+                        )
+                else:
+                    # Complex base expression
+                    self.data_segment.append(
+                        AsmLine(label=asm_name, opcode="EQU", operands="$")
+                    )
+                return
+
+            # Other LocationOf forms (string-of, etc.) — fall back.
+            self.data_segment.append(
+                AsmLine(label=asm_name, opcode="EQU", operands="$")
+            )
+            return
+
+        # Catch-all: evaluate at assembly time.
+        self.data_segment.append(
+            AsmLine(label=asm_name, opcode="EQU", operands="$")
+        )
+
+    def _emit_data_values(self, values, dtype: DataType, inline: bool = False) -> None:
+        """Emit typed DATA values to the data segment or inline code segment.
+
+        Accepts the raw typed expression nodes from the AST so callers
+        don't need a separate conversion pass.
+        """
         target = self.code_data_segment if inline else self.data_segment
         for val in values:
-            if isinstance(val, NumberLiteral):
+            if isinstance(val, P.NumberLiteral):
                 directive = "db" if dtype == DataType.BYTE else "dw"
                 target.append(
-                    AsmLine(opcode=directive, operands=self._format_number(val.value))
+                    AsmLine(opcode=directive, operands=self._format_number(number_value(val)))
                 )
-            elif isinstance(val, StringLiteral):
+            elif isinstance(val, P.StringLiteral):
                 target.append(
-                    AsmLine(opcode="db", operands=self._escape_string(val.value))
+                    AsmLine(opcode="db", operands=self._escape_string(string_value(val)))
                 )
-            elif isinstance(val, Identifier):
+            elif isinstance(val, P.Identifier):
                 # Could be a LITERALLY macro - expand it
-                name = val.name
+                name = ident_text(val.name)
                 if name in self.literal_macros:
-                    # Try to parse the macro value as a number
                     try:
                         num_val = self._parse_plm_number(self.literal_macros[name])
                         directive = "db" if dtype == DataType.BYTE else "dw"
@@ -2170,7 +2264,7 @@ class CodeGenerator:
                             AsmLine(opcode=directive, operands=self._format_number(num_val))
                         )
                     except ValueError:
-                        # Not a number, use as-is
+                        # Not a number, use the macro body as-is.
                         target.append(
                             AsmLine(opcode="db", operands=self.literal_macros[name])
                         )
@@ -2179,13 +2273,11 @@ class CodeGenerator:
                     target.append(
                         AsmLine(opcode="dw", operands=name)
                     )
-            elif isinstance(val, LocationExpr):
+            elif isinstance(val, P.LocationOf):
                 # Address-of expression: .variable or .procedure
                 operand = val.operand
-                if isinstance(operand, Identifier):
-                    # .name means address of name
-                    # Look up the symbol to get its scoped asm_name
-                    name = operand.name
+                if isinstance(operand, P.Identifier):
+                    name = ident_text(operand.name)
                     sym = None
                     # Search in current scope hierarchy
                     if self.current_proc:
@@ -2197,34 +2289,34 @@ class CodeGenerator:
                                 break
                     if sym is None:
                         sym = self.symbols.lookup(name)
-                    # Use scoped asm_name if available
                     asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
                     target.append(
                         AsmLine(opcode="dw", operands=asm_name)
                     )
                 else:
                     raise CodeGenError(f"Unsupported operand in DATA location expression: {operand}")
-            elif isinstance(val, BinaryExpr):
+            elif isinstance(val, P.BinaryOp):
                 # Binary expression like .name-3 or name+offset
-                # Generate assembly expression string
                 expr_str = self._data_expr_to_string(val)
                 target.append(
                     AsmLine(opcode="dw", operands=expr_str)
                 )
-            elif isinstance(val, ConstListExpr):
-                # Nested constant list
-                for v in val.values:
+            elif isinstance(val, P.LocationOfList):
+                # Nested address-of list: .(a, b, c)
+                for v in val.values or []:
                     self._emit_data_values([v], dtype, inline=inline)
+            elif isinstance(val, P.ParenExpr):
+                # Parenthesised single value — unwrap and re-emit.
+                self._emit_data_values([val.inner], dtype, inline=inline)
 
-    def _data_expr_to_string(self, expr: Expr) -> str:
-        """Convert a DATA expression to assembly string (for DW/DB operands)."""
-        if isinstance(expr, NumberLiteral):
-            return self._format_number(expr.value)
-        elif isinstance(expr, Identifier):
-            name = expr.name
+    def _data_expr_to_string(self, expr) -> str:
+        """Convert a typed DATA expression to an assembly operand string."""
+        if isinstance(expr, P.NumberLiteral):
+            return self._format_number(number_value(expr))
+        elif isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
             if name in self.literal_macros:
                 return self.literal_macros[name]
-            # Look up the symbol to get its scoped asm_name
             sym = None
             if self.current_proc:
                 parts = self.current_proc.split('$')
@@ -2236,36 +2328,38 @@ class CodeGenerator:
             if sym is None:
                 sym = self.symbols.lookup(name)
             return sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
-        elif isinstance(expr, LocationExpr):
+        elif isinstance(expr, P.LocationOf):
             return self._data_expr_to_string(expr.operand)
-        elif isinstance(expr, BinaryExpr):
+        elif isinstance(expr, P.ParenExpr):
+            return self._data_expr_to_string(expr.inner)
+        elif isinstance(expr, P.BinaryOp):
             left = self._data_expr_to_string(expr.left)
             right = self._data_expr_to_string(expr.right)
             op_map = {
-                BinaryOp.ADD: '+',
-                BinaryOp.SUB: '-',
-                BinaryOp.MUL: '*',
-                BinaryOp.DIV: '/',
-                BinaryOp.AND: ' AND ',
-                BinaryOp.OR: ' OR ',
-                BinaryOp.XOR: ' XOR ',
+                BinaryOpKind.ADD: '+',
+                BinaryOpKind.SUB: '-',
+                BinaryOpKind.MUL: '*',
+                BinaryOpKind.DIV: '/',
+                BinaryOpKind.AND: ' AND ',
+                BinaryOpKind.OR: ' OR ',
+                BinaryOpKind.XOR: ' XOR ',
             }
-            op = op_map.get(expr.op, '+')
+            op = op_map.get(binop_kind(expr), '+')
             return f"({left}{op}{right})"
         else:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
 
-    def _emit_initial_values(self, values: list[Expr], dtype: DataType) -> None:
-        """Emit INITIAL values to data segment."""
+    def _emit_initial_values(self, values, dtype: DataType) -> None:
+        """Emit typed INITIAL values to the data segment."""
         for val in values:
-            if isinstance(val, NumberLiteral):
+            if isinstance(val, P.NumberLiteral):
                 directive = "db" if dtype == DataType.BYTE else "dw"
                 self.data_segment.append(
-                    AsmLine(opcode=directive, operands=self._format_number(val.value))
+                    AsmLine(opcode=directive, operands=self._format_number(number_value(val)))
                 )
-            elif isinstance(val, StringLiteral):
+            elif isinstance(val, P.StringLiteral):
                 self.data_segment.append(
-                    AsmLine(opcode="db", operands=self._escape_string(val.value))
+                    AsmLine(opcode="db", operands=self._escape_string(string_value(val)))
                 )
 
     def _gen_proc_decl(self, decl: ProcDecl) -> None:
