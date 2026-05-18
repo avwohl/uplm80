@@ -49,9 +49,89 @@ from .ast_nodes import (
     DeclareStmt,
     Module,
 )
+from . import _plm_parser as P
+from .ast_view import (
+    module_shape,
+    proc_attrs,
+    proc_name,
+    proc_param_names,
+    proc_return_type,
+    proc_body_items,
+    proc_end_label,
+    iter_declare_items,
+    decl_item_names,
+    array_size_value,
+    binop_kind,
+    unop_kind,
+    ident_text,
+    parse_plm_number,
+    number_value,
+    string_value,
+    string_bytes,
+    DataType as ViewDataType,
+    BinaryOpKind,
+    UnaryOpKind,
+)
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
 from .runtime import get_runtime_library
+
+
+# Map ast_view's DataType (used by typed AST helpers) to the legacy
+# ast_nodes.DataType still used by the symbol table and unmigrated
+# codegen paths. Same enum names, different identity.
+_VIEW_DT_TO_LEGACY = {
+    ViewDataType.BYTE: DataType.BYTE,
+    ViewDataType.ADDRESS: DataType.ADDRESS,
+    ViewDataType.LABEL: DataType.LABEL,
+    ViewDataType.PROCEDURE: DataType.PROCEDURE,
+}
+
+
+def _legacy_dt(dt):
+    """Convert an ast_view DataType (or None) to the legacy enum."""
+    if dt is None:
+        return None
+    return _VIEW_DT_TO_LEGACY[dt]
+
+
+def _decl_item_has_data(item):
+    """True if a typed ``DeclItem`` carries a DATA initializer.
+
+    DATA initializers live on the ``DeclTailData`` / ``DeclTailTypeData``
+    / ``DeclTailStructureData`` variants of ``DeclItem.tail``.
+    """
+    tail = getattr(item, "tail", None)
+    if tail is None:
+        return False
+    return isinstance(
+        tail,
+        (P.DeclTailData, P.DeclTailTypeData, P.DeclTailStructureData),
+    )
+
+
+def _decl_item_type(item):
+    """Extract (legacy DataType, dimension) from a typed ``DeclItem``.
+
+    Returns ``(data_type, dimension)`` where ``data_type`` is the legacy
+    :class:`ast_nodes.DataType` (or ``None`` if not derivable from the
+    tail's type node) and ``dimension`` is ``None`` for scalars or an
+    int for fixed-size arrays. STRUCTURE / based / user-defined types
+    fall back to ``None`` for data_type, matching legacy default
+    behaviour at this layer.
+    """
+    dt = None
+    tail = getattr(item, "tail", None)
+    type_node = getattr(tail, "type", None) if tail is not None else None
+    if isinstance(type_node, P.TypeByte) or isinstance(type_node, P.TypeByteSized):
+        dt = DataType.BYTE
+    elif isinstance(type_node, P.TypeAddress) or isinstance(type_node, P.TypeAddressSized):
+        dt = DataType.ADDRESS
+    elif isinstance(type_node, P.TypeLabel):
+        dt = DataType.LABEL
+    dim = array_size_value(getattr(item, "array_size", None))
+    # Legacy used None for scalar; -1 for (*) is fine to forward as-is.
+    return dt, dim
 
 
 class Mode(Enum):
@@ -825,104 +905,134 @@ class CodeGenerator:
     # Call Graph Analysis and Storage Sharing
     # ========================================================================
 
-    def _build_call_graph(self, module: Module) -> None:
+    def _build_call_graph(self, module) -> None:
         """Build call graph by analyzing all procedure bodies."""
         self.call_graph = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}  # proc -> [(var_name, size, type)]
 
+        shape = module_shape(module)
+
         # First pass: collect all procedure names
         all_procs: set[str] = set()
-        self._collect_proc_names(module.decls, None, all_procs)
+        self._collect_proc_names(shape.decls, None, all_procs)
 
         # Initialize call graph
         for proc in all_procs:
             self.call_graph[proc] = set()
 
         # Second pass: analyze calls in each procedure
-        for decl in module.decls:
-            if isinstance(decl, ProcDecl) and not decl.is_external:
-                self._analyze_proc_calls(decl, None)
+        for decl in shape.decls:
+            if isinstance(decl, P.ProcDecl):
+                attrs = proc_attrs(decl)
+                if not attrs.is_external:
+                    self._analyze_proc_calls(decl, None)
 
     def _collect_proc_names(self, decls: list, parent_proc: str | None, all_procs: set[str]) -> None:
         """Recursively collect all procedure names."""
         for decl in decls:
-            if isinstance(decl, ProcDecl):
-                if parent_proc and not decl.is_public and not decl.is_external:
-                    full_name = f"{parent_proc}${decl.name}"
+            if isinstance(decl, P.ProcDecl):
+                attrs = proc_attrs(decl)
+                name = proc_name(decl)
+                if parent_proc and not attrs.is_public and not attrs.is_external:
+                    full_name = f"{parent_proc}${name}"
                 else:
-                    full_name = decl.name
+                    full_name = name
                 all_procs.add(full_name)
-                # Recurse into nested procedures
-                if decl.decls:
-                    self._collect_proc_names(decl.decls, full_name, all_procs)
-                # Also check statements for nested procedures
-                for stmt in decl.stmts:
-                    if isinstance(stmt, DeclareStmt):
-                        self._collect_proc_names(stmt.declarations, full_name, all_procs)
+                # Recurse into nested procedures: the body items are a
+                # flat list mixing decls (incl. nested ProcDecls or
+                # DeclareStmts wrapping them) and statements.
+                body_items = proc_body_items(decl)
+                nested: list = []
+                for item in body_items:
+                    if isinstance(item, P.ProcDecl):
+                        nested.append(item)
+                    elif isinstance(item, P.DeclareStmt):
+                        for inner in iter_declare_items(item):
+                            if isinstance(inner, P.ProcDecl):
+                                nested.append(inner)
+                if nested:
+                    self._collect_proc_names(nested, full_name, all_procs)
 
-    def _analyze_proc_calls(self, decl: ProcDecl, parent_proc: str | None) -> None:
+    def _analyze_proc_calls(self, decl, parent_proc: str | None) -> None:
         """Analyze a procedure to find all calls it makes."""
-        if parent_proc and not decl.is_public and not decl.is_external:
-            full_name = f"{parent_proc}${decl.name}"
-        else:
-            full_name = decl.name
+        attrs = proc_attrs(decl)
+        name = proc_name(decl)
+        params = proc_param_names(decl)
 
-        if decl.is_external:
+        if parent_proc and not attrs.is_public and not attrs.is_external:
+            full_name = f"{parent_proc}${name}"
+        else:
+            full_name = name
+
+        if attrs.is_external:
             return
 
-        # Find all calls in this procedure's body
+        # Split the procedure body into nested decls vs statements.
+        body_items = proc_body_items(decl)
+        nested_procs: list = []
+        decl_items: list = []  # typed DeclItem / DeclItemBasedGroup / LiterallyDecl
+        stmt_items: list = []
+        for item in body_items:
+            if isinstance(item, P.ProcDecl):
+                nested_procs.append(item)
+            elif isinstance(item, P.DeclareStmt):
+                for inner in iter_declare_items(item):
+                    if isinstance(inner, P.ProcDecl):
+                        nested_procs.append(inner)
+                    else:
+                        decl_items.append(inner)
+            else:
+                stmt_items.append(item)
+
+        # Find all calls in this procedure's body. The downstream
+        # _find_calls_in_stmts walker is not yet migrated, so it will
+        # fail at runtime on the typed nodes; that's expected for this
+        # migration chunk.
         calls: set[str] = set()
-        self._find_calls_in_stmts(decl.stmts, full_name, calls)
+        self._find_calls_in_stmts(stmt_items, full_name, calls)
         self.call_graph[full_name] = calls
+
+        # Index DeclItems by declared name for parameter type lookup.
+        decl_by_name: dict[str, tuple[DataType | None, int | None]] = {}
+        for d in decl_items:
+            if isinstance(d, P.DeclItem):
+                d_type, d_dim = _decl_item_type(d)
+                for n in decl_item_names(d):
+                    decl_by_name[n] = (d_type, d_dim)
 
         # Collect storage requirements (params + locals)
         storage: list[tuple[str, int, DataType]] = []
 
         # Parameters
-        for param in decl.params:
+        for param in params:
             param_type = DataType.ADDRESS
-            for d in decl.decls:
-                if isinstance(d, VarDecl) and d.name == param:
-                    param_type = d.data_type or DataType.ADDRESS
-                    break
+            info = decl_by_name.get(param)
+            if info is not None and info[0] is not None:
+                param_type = info[0]
             size = 1 if param_type == DataType.BYTE else 2
             storage.append((param, size, param_type))
 
-        # Local variables (non-parameter VarDecls)
-        for d in decl.decls:
-            if isinstance(d, VarDecl) and d.name not in decl.params:
-                var_type = d.data_type or DataType.ADDRESS
-                if d.dimension:
+        # Local variables (non-parameter DeclItems)
+        for d in decl_items:
+            if not isinstance(d, P.DeclItem):
+                continue
+            d_type, d_dim = _decl_item_type(d)
+            var_type = d_type or DataType.ADDRESS
+            for n in decl_item_names(d):
+                if n in params:
+                    continue
+                if d_dim and d_dim > 0:
                     elem_size = 1 if var_type == DataType.BYTE else 2
-                    size = d.dimension * elem_size
+                    size = d_dim * elem_size
                 else:
                     size = 1 if var_type == DataType.BYTE else 2
-                storage.append((d.name, size, var_type))
-
-        # Also check inline declarations in statements
-        for stmt in decl.stmts:
-            if isinstance(stmt, DeclareStmt):
-                for inner in stmt.declarations:
-                    if isinstance(inner, VarDecl) and inner.name not in decl.params:
-                        var_type = inner.data_type or DataType.ADDRESS
-                        if inner.dimension:
-                            elem_size = 1 if var_type == DataType.BYTE else 2
-                            size = inner.dimension * elem_size
-                        else:
-                            size = 1 if var_type == DataType.BYTE else 2
-                        storage.append((inner.name, size, var_type))
+                storage.append((n, size, var_type))
 
         self.proc_storage[full_name] = storage
 
         # Recurse into nested procedures
-        for d in decl.decls:
-            if isinstance(d, ProcDecl):
-                self._analyze_proc_calls(d, full_name)
-        for stmt in decl.stmts:
-            if isinstance(stmt, DeclareStmt):
-                for inner in stmt.declarations:
-                    if isinstance(inner, ProcDecl):
-                        self._analyze_proc_calls(inner, full_name)
+        for nested in nested_procs:
+            self._analyze_proc_calls(nested, full_name)
 
     def _find_calls_in_stmts(self, stmts: list[Stmt], current_proc: str, calls: set[str]) -> None:
         """Find all procedure calls in a list of statements."""
@@ -1239,43 +1349,55 @@ class CodeGenerator:
         regardless of declaration order.
         """
         for decl in decls:
-            if isinstance(decl, ProcDecl):
+            if isinstance(decl, P.ProcDecl):
                 self._register_procedure(decl, parent_proc)
 
         # Also check statements for DeclareStmt containing procedures
         if stmts:
             for stmt in stmts:
-                if isinstance(stmt, DeclareStmt):
-                    for inner_decl in stmt.declarations:
-                        if isinstance(inner_decl, ProcDecl):
+                if isinstance(stmt, P.DeclareStmt):
+                    for inner_decl in iter_declare_items(stmt):
+                        if isinstance(inner_decl, P.ProcDecl):
                             self._register_procedure(inner_decl, parent_proc)
 
-    def _register_procedure(self, decl: ProcDecl, parent_proc: str | None) -> None:
+    def _register_procedure(self, decl, parent_proc: str | None) -> None:
         """Register a single procedure in the symbol table at module level."""
-        # Compute the asm_name for this procedure
-        if parent_proc and not decl.is_public and not decl.is_external:
-            # Nested procedure - use scoped name
-            proc_asm_name = f"@{parent_proc}${decl.name}"
-            full_proc_name = f"{parent_proc}${decl.name}"
-        else:
-            proc_asm_name = decl.name
-            full_proc_name = decl.name
+        attrs = proc_attrs(decl)
+        name = proc_name(decl)
+        params = proc_param_names(decl)
+        return_type = _legacy_dt(proc_return_type(decl))
 
-        # Extract parameter types from decl.decls
+        # Compute the asm_name for this procedure
+        if parent_proc and not attrs.is_public and not attrs.is_external:
+            # Nested procedure - use scoped name
+            proc_asm_name = f"@{parent_proc}${name}"
+            full_proc_name = f"{parent_proc}${name}"
+        else:
+            proc_asm_name = name
+            full_proc_name = name
+
+        # Extract parameter types from the procedure body's DeclItems
+        # (parameters get a DECLARE inside the body to set their type).
+        body_items = proc_body_items(decl)
+        decl_by_name: dict[str, DataType | None] = {}
+        for item in body_items:
+            if isinstance(item, P.DeclareStmt):
+                for inner in iter_declare_items(item):
+                    if isinstance(inner, P.DeclItem):
+                        d_type, _ = _decl_item_type(inner)
+                        for n in decl_item_names(inner):
+                            decl_by_name[n] = d_type
+
         param_types = []
-        for param in decl.params:
-            param_type = DataType.ADDRESS  # Default
-            for d in decl.decls:
-                if isinstance(d, VarDecl) and d.name == param:
-                    param_type = d.data_type or DataType.ADDRESS
-                    break
+        for param in params:
+            param_type = decl_by_name.get(param) or DataType.ADDRESS
             param_types.append(param_type)
 
         # For non-reentrant procedures with params, pass the LAST param in register
         # Byte params in A, ADDRESS params in HL - saves a store/load pair
-        uses_reg_param = (len(decl.params) >= 1 and
-                         not decl.is_reentrant and
-                         not decl.is_external)
+        uses_reg_param = (len(params) >= 1 and
+                         not attrs.is_reentrant and
+                         not attrs.is_external)
 
         # Register in symbol table at the GLOBAL level so it's always accessible
         # This allows forward references from anywhere in the module
@@ -1284,14 +1406,14 @@ class CodeGenerator:
         sym = Symbol(
             name=full_proc_name,
             kind=SymbolKind.PROCEDURE,
-            return_type=decl.return_type,
-            params=decl.params,
+            return_type=return_type,
+            params=params,
             param_types=param_types,
-            is_public=decl.is_public,
-            is_external=decl.is_external,
-            is_reentrant=decl.is_reentrant,
+            is_public=attrs.is_public,
+            is_external=attrs.is_external,
+            is_reentrant=attrs.is_reentrant,
             uses_reg_param=uses_reg_param,
-            interrupt_num=decl.interrupt_num,
+            interrupt_num=attrs.interrupt_num,
             asm_name=proc_asm_name,
         )
         # Define at module (root) level - walk up to root scope
@@ -1300,15 +1422,29 @@ class CodeGenerator:
             root_scope = root_scope.parent
         root_scope.define(sym)
 
-        # Recursively collect nested procedures from decls and stmts
-        if decl.decls or decl.stmts:
-            self._collect_procedures(decl.decls, full_proc_name, decl.stmts)
+        # Recursively collect nested procedures from the body items.
+        # The new typed AST has a single flat body list mixing
+        # declarations and statements, so split it for the legacy
+        # _collect_procedures (decls, stmts) signature.
+        nested_decls: list = []
+        nested_stmts: list = []
+        for item in body_items:
+            if isinstance(item, P.ProcDecl):
+                nested_decls.append(item)
+            elif isinstance(item, P.DeclareStmt):
+                # Hand DeclareStmts through as-is via the stmts slot so
+                # the recursive call can rescan them for nested ProcDecls.
+                nested_stmts.append(item)
+            else:
+                nested_stmts.append(item)
+        if nested_decls or nested_stmts:
+            self._collect_procedures(nested_decls, full_proc_name, nested_stmts)
 
     # ========================================================================
     # Main Entry Point
     # ========================================================================
 
-    def generate(self, module: Module) -> str:
+    def generate(self, module) -> str:
         """Generate assembly code for a module."""
         self.output = []
         self.data_segment = []
@@ -1318,8 +1454,10 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self.literal_macros = {}
 
+        shape = module_shape(module)
+
         # Header
-        self._emit(comment=f"PL/M-80 Compiler Output - {module.name}")
+        self._emit(comment=f"PL/M-80 Compiler Output - {shape.name}")
         self._emit(comment="Target: Z80")
         self._emit(comment="Generated by uplm80")
         self._emit()
@@ -1329,29 +1467,39 @@ class CodeGenerator:
         self._emit()
 
         # Origin if specified
-        if module.origin is not None:
-            self._emit("org", self._format_number(module.origin))
+        if shape.origin is not None:
+            self._emit("org", self._format_number(shape.origin))
             self._emit()
 
         # First pass: collect LITERALLY macros
-        for decl in module.decls:
-            if isinstance(decl, LiterallyDecl):
-                self.literal_macros[decl.name] = decl.value
+        for decl in shape.decls:
+            if isinstance(decl, P.LiterallyDecl):
+                # LiterallyDecl.value is a Token whose .text retains the
+                # surrounding quotes; strip them for the macro body.
+                lit_name = ident_text(decl.name)
+                lit_text = decl.value.text
+                if lit_text.startswith("'") and lit_text.endswith("'"):
+                    lit_text = lit_text[1:-1]
+                self.literal_macros[lit_name] = lit_text
 
         # Separate procedures from other declarations
-        procedures: list[ProcDecl] = []
-        data_decls: list[VarDecl] = []  # Module-level DATA declarations
-        other_decls: list[Declaration] = []
-        entry_proc: ProcDecl | None = None
+        procedures: list = []
+        data_decls: list = []  # Module-level DATA declarations (typed DeclItems)
+        other_decls: list = []
+        entry_proc = None
+        entry_proc_name: str | None = None
 
-        for decl in module.decls:
-            if isinstance(decl, ProcDecl):
+        for decl in shape.decls:
+            if isinstance(decl, P.ProcDecl):
+                attrs = proc_attrs(decl)
+                pname = proc_name(decl)
                 procedures.append(decl)
                 # First non-external procedure with same name as module, or first procedure
-                if not decl.is_external and entry_proc is None:
-                    if decl.name == module.name or len(procedures) == 1:
+                if not attrs.is_external and entry_proc is None:
+                    if pname == shape.name or len(procedures) == 1:
                         entry_proc = decl
-            elif isinstance(decl, VarDecl) and decl.data_values:
+                        entry_proc_name = pname
+            elif isinstance(decl, P.DeclItem) and _decl_item_has_data(decl):
                 # Module-level DATA declaration - goes at start of code
                 data_decls.append(decl)
             else:
@@ -1359,7 +1507,7 @@ class CodeGenerator:
 
         # Pass 1: Pre-register all procedures in symbol table for forward references
         # This allows procedures to call each other regardless of declaration order
-        self._collect_procedures(module.decls, parent_proc=None)
+        self._collect_procedures(shape.decls, parent_proc=None)
 
         # Pass 2: Build call graph and allocate shared storage for procedure locals
         self._build_call_graph(module)
@@ -1382,22 +1530,22 @@ class CodeGenerator:
             self._gen_declaration(decl)
 
         # If there's an entry procedure, jump to it first
-        if entry_proc and not module.stmts:
+        if entry_proc and not shape.stmts:
             self._emit()
             self._emit(comment="Entry point")
             if self.mode == Mode.CPM:
                 # CP/M: Set stack from BDOS, call main, return to OS
                 self._emit("ld", "hl,(6)")
                 self._emit("ld", "sp,hl")
-                self._emit("call", entry_proc.name)
+                self._emit("call", entry_proc_name)
                 self._emit("jp", "0")  # Warm boot to return to CP/M
             else:
                 # BARE: Use locally-defined stack, jump to entry
                 self._emit("ld", "sp,??STACK")
-                self._emit("jp", entry_proc.name)
+                self._emit("jp", entry_proc_name)
 
         # Generate code for module-level statements
-        if module.stmts:
+        if shape.stmts:
             self._emit()
             self._emit(comment="Module initialization code")
             if self.mode == Mode.CPM:
@@ -1407,7 +1555,7 @@ class CodeGenerator:
             else:
                 # BARE: Use locally-defined stack
                 self._emit("ld", "sp,??STACK")
-            for stmt in module.stmts:
+            for stmt in shape.stmts:
                 self._gen_stmt(stmt)
             # For CPM mode, add warm boot after module statements
             if self.mode == Mode.CPM:
@@ -1491,14 +1639,14 @@ class CodeGenerator:
         # Print register statistics in debug mode
         if self.reg_debug and self.regs.stats:
             import sys
-            print(f"[REG DEBUG] Statistics for {module.name}:", file=sys.stderr)
+            print(f"[REG DEBUG] Statistics for {shape.name}:", file=sys.stderr)
             for key, val in sorted(self.regs.stats.items()):
                 print(f"  {key}: {val}", file=sys.stderr)
 
         # Convert to string
         return "\n".join(str(line) for line in self.output)
 
-    def generate_multi(self, modules: list[Module]) -> str:
+    def generate_multi(self, modules: list) -> str:
         """Generate assembly code for multiple modules with unified call graph.
 
         This allows better local variable storage allocation by analyzing
@@ -1515,8 +1663,11 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self.literal_macros = {}
 
+        # Compute the shape view for each module once.
+        shapes = [module_shape(m) for m in modules]
+
         # Header
-        module_names = ', '.join(m.name for m in modules)
+        module_names = ', '.join(s.name for s in shapes)
         self._emit(comment=f"PL/M-80 Compiler Output - {module_names}")
         self._emit(comment="Target: Z80")
         self._emit(comment="Generated by uplm80")
@@ -1527,19 +1678,23 @@ class CodeGenerator:
         self._emit()
 
         # Use origin from first module if specified
-        if modules[0].origin is not None:
-            self._emit("org", self._format_number(modules[0].origin))
+        if shapes[0].origin is not None:
+            self._emit("org", self._format_number(shapes[0].origin))
             self._emit()
 
         # Collect LITERALLY macros from all modules
-        for module in modules:
-            for decl in module.decls:
-                if isinstance(decl, LiterallyDecl):
-                    self.literal_macros[decl.name] = decl.value
+        for shape in shapes:
+            for decl in shape.decls:
+                if isinstance(decl, P.LiterallyDecl):
+                    lit_name = ident_text(decl.name)
+                    lit_text = decl.value.text
+                    if lit_text.startswith("'") and lit_text.endswith("'"):
+                        lit_text = lit_text[1:-1]
+                    self.literal_macros[lit_name] = lit_text
 
         # Pre-register all procedures from all modules for forward references
-        for module in modules:
-            self._collect_procedures(module.decls, parent_proc=None)
+        for shape in shapes:
+            self._collect_procedures(shape.decls, parent_proc=None)
 
         # Build unified call graph across all modules
         self._build_call_graph_multi(modules)
@@ -1547,22 +1702,28 @@ class CodeGenerator:
         self._allocate_shared_storage()
 
         # First pass: collect all module info
-        all_procedures: list[tuple[Module, ProcDecl]] = []
-        all_data_decls: list[tuple[Module, VarDecl]] = []
-        all_other_decls: list[tuple[Module, Declaration]] = []
-        entry_proc: ProcDecl | None = None
-        first_module_with_stmts: Module | None = None
+        all_procedures: list = []   # list of (module, proc, proc_name)
+        all_data_decls: list = []   # list of (module, DeclItem)
+        all_other_decls: list = []  # list of (module, decl)
+        entry_proc = None
+        entry_proc_name: str | None = None
+        first_module_with_stmts = None
+        first_module_stmts: list = []
 
-        for module in modules:
-            if module.stmts and first_module_with_stmts is None:
+        for module, shape in zip(modules, shapes):
+            if shape.stmts and first_module_with_stmts is None:
                 first_module_with_stmts = module
+                first_module_stmts = shape.stmts
 
-            for decl in module.decls:
-                if isinstance(decl, ProcDecl):
-                    all_procedures.append((module, decl))
-                    if not decl.is_external and entry_proc is None:
+            for decl in shape.decls:
+                if isinstance(decl, P.ProcDecl):
+                    attrs = proc_attrs(decl)
+                    pname = proc_name(decl)
+                    all_procedures.append((module, decl, pname, attrs))
+                    if not attrs.is_external and entry_proc is None:
                         entry_proc = decl
-                elif isinstance(decl, VarDecl) and decl.data_values:
+                        entry_proc_name = pname
+                elif isinstance(decl, P.DeclItem) and _decl_item_has_data(decl):
                     all_data_decls.append((module, decl))
                 else:
                     all_other_decls.append((module, decl))
@@ -1590,7 +1751,7 @@ class CodeGenerator:
                 self._emit("ld", "sp,hl")
             else:
                 self._emit("ld", "sp,??STACK")
-            for stmt in first_module_with_stmts.stmts:
+            for stmt in first_module_stmts:
                 self._gen_stmt(stmt)
             if self.mode == Mode.CPM:
                 self._emit("jp", "0")
@@ -1601,17 +1762,22 @@ class CodeGenerator:
             if self.mode == Mode.CPM:
                 self._emit("ld", "hl,(6)")
                 self._emit("ld", "sp,hl")
-                self._emit("call", entry_proc.name)
+                self._emit("call", entry_proc_name)
                 self._emit("jp", "0")
             else:
                 self._emit("ld", "sp,??STACK")
-                self._emit("call", entry_proc.name)
+                self._emit("call", entry_proc_name)
 
         # Generate code for all procedures
-        for module, proc in all_procedures:
-            if not proc.is_external:
+        for module, proc, pname, attrs in all_procedures:
+            if not attrs.is_external:
                 self._emit()
-                self._emit(comment=f"Module: {module.name}")
+                # Find the matching shape's name for the per-module comment.
+                shape_name = next(
+                    (s.name for m, s in zip(modules, shapes) if m is module),
+                    "<input>",
+                )
+                self._emit(comment=f"Module: {shape_name}")
                 self._gen_proc_decl(proc)
 
         # Emit runtime library if needed
@@ -1678,25 +1844,29 @@ class CodeGenerator:
 
         return "\n".join(str(line) for line in self.output)
 
-    def _build_call_graph_multi(self, modules: list[Module]) -> None:
+    def _build_call_graph_multi(self, modules: list) -> None:
         """Build call graph by analyzing all procedures across multiple modules."""
         self.call_graph = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}
 
+        shapes = [module_shape(m) for m in modules]
+
         # First pass: collect all procedure names from all modules
         all_procs: set[str] = set()
-        for module in modules:
-            self._collect_proc_names(module.decls, None, all_procs)
+        for shape in shapes:
+            self._collect_proc_names(shape.decls, None, all_procs)
 
         # Initialize call graph
         for proc in all_procs:
             self.call_graph[proc] = set()
 
         # Second pass: analyze calls in each procedure across all modules
-        for module in modules:
-            for decl in module.decls:
-                if isinstance(decl, ProcDecl) and not decl.is_external:
-                    self._analyze_proc_calls(decl, None)
+        for shape in shapes:
+            for decl in shape.decls:
+                if isinstance(decl, P.ProcDecl):
+                    attrs = proc_attrs(decl)
+                    if not attrs.is_external:
+                        self._analyze_proc_calls(decl, None)
 
     def _escape_string(self, s: str) -> str:
         """Escape a string for assembly output."""
