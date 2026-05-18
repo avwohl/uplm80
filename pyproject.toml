@@ -45,7 +45,7 @@ where = ["."]
 include = ["uplm80*"]
 
 [tool.setuptools.package-data]
-uplm80 = ["py.typed", "data/*.json"]
+uplm80 = ["py.typed"]
 
 [tool.black]
 line-length = 100
