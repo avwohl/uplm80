@@ -123,7 +123,11 @@ hello: DO;
 END hello;
 ```
 
-See [examples/hello_cpm.plm](examples/hello_cpm.plm) for a complete working example.
+See [examples/hellocpm.plm](examples/hellocpm.plm) for a complete working example.
+A drop-in Makefile that drives the full `uplm80 → um80 → ul80` pipeline (with
+optional `ud80`/`ux80` disassembly targets) is available at
+[docs/example.Makefile](docs/example.Makefile) — contributed by Martin
+Homuth-Rosemann ([@Ho-Ro](https://github.com/Ho-Ro), issue #5).
 
 For more on CP/M BDOS usage, see [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md).
 
@@ -181,28 +185,59 @@ The compiler generates calls to these runtime routines (provide in a separate .r
 
 ## Runtime Modes
 
+The first 100H bytes of a CP/M program's memory are reserved by the operating
+system (zero page, default FCB, default DMA buffer). All CP/M `.COM` programs
+load at address 100H, so a CP/M binary's *contents* start at offset 0 of the
+file — the linker takes care of relocating to 100H. **PL/M source files should
+not declare `100H:` themselves**; doing so causes the assembler to emit a
+`cseg org 100H`, which the linker then honors by padding the binary with 256
+zero bytes from 0–FFH. See the `bare` mode notes below for the one situation
+where a leading address constant is meaningful.
+
 ### CP/M Mode (default: `-m cpm`)
 
-For new PL/M programs. Provides maximum stack space by using the area under BDOS:
+The mode to use for new PL/M-80 programs. The compiler emits a small entry
+preamble that takes maximum stack space under BDOS and returns cleanly to CP/M:
 
-- Program starts with `ORG 100H` (CP/M TPA)
-- Stack is set from BDOS address at location 0006H: `LD HL,(6)` / `LD SP,HL`
-- Maximum available stack (all memory between program end and BDOS)
-- Entry code calls main procedure with `CALL MAIN`
-- Returns to CP/M with `JP 0` (warm boot) when main returns
-- Requires CP/M stubs: `MON1`, `MON2`, `MON3`, `BOOT`
-- System variables: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`
+- The compiler emits the entry code at the start of the `.com` image —
+  **do not write `0100H:` in your source.** The linker (`ul80`) defaults to
+  origin 100H, which is what CP/M wants.
+- Entry preamble (auto-generated):
+
+  ```asm
+  ld   hl,(6)       ; load BDOS base from address 6
+  ld   sp,hl        ; stack grows down from just below BDOS
+  call MAIN         ; run your main procedure
+  jp   0            ; warm-boot return to CP/M when MAIN returns
+  ```
+- Stack: maximum available — everything between program end and BDOS.
+- Requires CP/M stubs in your runtime: `MON1`, `MON2`, `MON3`, `BOOT`.
+- System variables: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`.
 
 ### Bare Metal Mode (`-m bare`)
 
-For original Digital Research PL/M-80 compatibility. Programs begin with a jump to start-3:
+The mode required to rebuild original Digital Research utilities (PIP.PLM,
+ED.PLM, etc.) byte-compatibly. These programs follow the Intel PL/M-80
+convention of jumping to *start − 3* to skip over a local stack area:
 
-- Entry begins with `JP ??START` to jump over local stack buffer
-- Uses locally-defined stack (64 bytes in program image)
-- Entry code at `??START` sets `SP` to `??STACK` label, then calls `MAIN`
-- Compatible with original Digital Research programs (ED.PLM, PIP.PLM, etc.)
-- Program can define custom entry point via DATA declarations
-- No automatic OS return (program controls its own exit behavior)
+- Entry preamble (auto-generated):
+
+  ```asm
+  jp   ??START      ; skip over the stack buffer
+  ds   64           ; 64-byte local stack
+  ??STACK:          ; top of stack
+  ??START:
+  ld   sp,??STACK   ; use the local stack
+  jp   MAIN         ; jump (not call) into MAIN
+  ```
+- The program controls its own exit — no automatic warm boot. Original DR
+  utilities reboot or chain by writing to memory directly.
+- Custom entry points: because the entry preamble lives in the first few bytes
+  of the image, original programs sometimes prepend a `DECLARE … DATA(...)`
+  block to forge a different jump (see PIP.PLM, which fakes a JMP table at
+  page 1). In bare mode the leading address constant (e.g. `0100H:` or
+  `0200H:`) *is* meaningful — it sets the assembler `org` for the bare image.
+- Compatible with original Intel/DR PL/M-80 sources.
 
 ## Project Structure
 

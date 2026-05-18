@@ -5,13 +5,14 @@
  * Prints "Hello, World!" to the console using BDOS function 9.
  *
  * To build and run:
- *   uplm80 hello_cpm.plm -o hello.mac
- *   um80 hello.mac
- *   ul80 -o hello.com hello.rel
- *   cpmemu hello.com
+ *   uplm80 hellocpm.plm -o hellocpm.mac
+ *   um80 hellocpm.mac
+ *   ul80 -o hellocpm.com hellocpm.rel
+ *   cpmemu hellocpm.com
+ *
+ * (The 8.3 filename means the .com runs unmodified under CP/M emulators
+ *  such as cpmemu and tnylpo.)
  */
-
-0100H:  /* CP/M programs start at 100H */
 
 /* CP/M BDOS interface - function call with no return value */
 MON1: PROCEDURE(FUNC, PARM) EXTERNAL;

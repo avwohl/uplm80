@@ -169,4 +169,4 @@ CP/M uses a 128-byte DMA (Direct Memory Access) buffer at address 0080H by defau
 
 - CP/M 2.2 Operating System Manual
 - CP/M BDOS System Interface documentation
-- See `examples/hello_cpm.plm` for a complete working example
+- See `examples/hellocpm.plm` for a complete working example

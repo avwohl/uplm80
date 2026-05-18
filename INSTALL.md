@@ -115,13 +115,17 @@ Features:
 Create a simple test program to verify everything is working:
 
 ```bash
-# Create hello_cpm.plm
-cat > hello_cpm.plm << 'EOF'
+# Create hellocpm.plm  (8.3 filename so the .com runs unchanged under
+# CP/M emulators such as cpmemu and tnylpo)
+cat > hellocpm.plm << 'EOF'
 /*
  * Hello World for CP/M
+ *
+ * Note: in -m cpm mode (the default) DO NOT add a leading
+ * `0100H:` directive — the linker already places the program
+ * at 100H. Writing it in the source produces a .com file with
+ * 256 zero bytes at the front.
  */
-
-0100H:
 
 MON1: PROCEDURE(FUNC, PARM) EXTERNAL;
     DECLARE FUNC BYTE, PARM ADDRESS;
@@ -136,28 +140,28 @@ CALL MAIN;
 EOF
 
 # Compile PL/M to assembly
-uplm80 hello_cpm.plm -o hello.mac
+uplm80 hellocpm.plm -o hellocpm.mac
 
 # Check output
-ls -l hello.mac
+ls -l hellocpm.mac
 
 # Assemble to relocatable object
-um80 hello.mac
+um80 hellocpm.mac
 
 # Check output
-ls -l hello.rel
+ls -l hellocpm.rel
 
 # Link to CP/M executable
-ul80 -o hello.com hello.rel
+ul80 -o hellocpm.com hellocpm.rel
 
 # Check final executable
-ls -l hello.com
+ls -l hellocpm.com
 ```
 
 You should see three output files:
-- `hello.mac` - Assembly language source
-- `hello.rel` - Relocatable object file
-- `hello.com` - CP/M executable
+- `hellocpm.mac` - Assembly language source
+- `hellocpm.rel` - Relocatable object file
+- `hellocpm.com` - CP/M executable
 
 ## Installing the CP/M Emulator (Optional)
 
@@ -191,7 +195,7 @@ https://github.com/avwohl/cpmemu
 If you installed cpmemu, run your compiled program:
 
 ```bash
-cpmemu hello.com
+cpmemu hellocpm.com
 ```
 
 Expected output:
@@ -259,7 +263,7 @@ Options:
 ## Examples
 
 See the `examples/` directory for complete working programs:
-- `hello_cpm.plm` - Simple hello world using BDOS
+- `hellocpm.plm` - Simple hello world using BDOS
 
 ## Runtime Library
 
