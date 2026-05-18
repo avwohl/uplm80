@@ -200,18 +200,21 @@ class ModuleShape:
 def module_shape(m: P.Module, default_name: str = "<input>") -> ModuleShape:
     items = list(m.items)
     name = default_name
+
+    # Origin literal: a leading bare `NUMBER:` becomes the module origin.
+    # Peel it first so a following `NAME: DO; ... END NAME;` still unwraps
+    # into the module body / name.
+    origin: Optional[int] = None
+    if items and isinstance(items[0], P.AddressLiteral):
+        origin = parse_plm_number(items[0].value.text)
+        items = items[1:]
+
     # Unwrap a single top-level labeled DO block.
     if len(items) == 1 and isinstance(items[0], P.LabeledStmt) and isinstance(
         items[0].stmt, P.DoBlock
     ):
         name = ident_text(items[0].label)
         items = list(items[0].stmt.items)
-
-    # Origin literal: a leading bare `NUMBER:` becomes the module origin.
-    origin: Optional[int] = None
-    if items and isinstance(items[0], P.AddressLiteral):
-        origin = parse_plm_number(items[0].value.text)
-        items = items[1:]
 
     # Split body items: declarations vs statements. Declarations are
     # the ones the legacy code carried in Module.decls (ProcDecl,
