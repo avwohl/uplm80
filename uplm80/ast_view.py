@@ -271,6 +271,28 @@ def proc_body_items(proc: P.ProcDecl) -> list:
     return list(proc.body.items)
 
 
+def proc_local_decls_stmts(proc: P.ProcDecl) -> tuple[list, list]:
+    """Split a procedure body into ``(local_decls, statements)``.
+
+    Mirrors :func:`module_shape`'s declaration/statement split for a
+    procedure body. Declarations include nested :class:`P.ProcDecl`
+    nodes plus the flattened contents of any inner ``DECLARE`` statement
+    (:class:`P.DeclItem` / :class:`P.DeclItemBasedGroup` /
+    :class:`P.LiterallyDecl`). Everything else is treated as a
+    statement and returned in source order.
+    """
+    decls: list = []
+    stmts: list = []
+    for it in proc.body.items:
+        if isinstance(it, P.ProcDecl):
+            decls.append(it)
+        elif isinstance(it, P.DeclareStmt):
+            decls.extend(it.declarations)
+        else:
+            stmts.append(it)
+    return decls, stmts
+
+
 def proc_end_label(proc: P.ProcDecl) -> Optional[str]:
     el = proc.body.end_label
     return ident_text(el.name) if el is not None else None

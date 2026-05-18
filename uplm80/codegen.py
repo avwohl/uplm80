@@ -57,6 +57,7 @@ from .ast_view import (
     proc_param_names,
     proc_return_type,
     proc_body_items,
+    proc_local_decls_stmts,
     proc_end_label,
     iter_declare_items,
     decl_item_names,
@@ -393,7 +394,13 @@ class CodeGenerator:
         self.code_data_segment: list[AsmLine] = []  # DATA values emitted inline in code
         self.string_literals: list[tuple[str, str]] = []  # (label, value)
         self.current_proc: str | None = None
-        self.current_proc_decl: ProcDecl | None = None
+        # ``current_proc_decl`` now holds a typed :class:`P.ProcDecl`; its
+        # flattened attribute view (and the legacy-shaped return type) is
+        # cached on the side so unmigrated paths can read them without
+        # walking the typed signature each time.
+        self.current_proc_decl: "P.ProcDecl | None" = None
+        self.current_proc_attrs = None  # type: ignore[var-annotated]
+        self.current_proc_return_type: DataType | None = None
         self.loop_stack: list[tuple[str, str]] = []  # (continue_label, break_label)
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
@@ -2002,8 +2009,8 @@ class CodeGenerator:
         asm_name: str | None = base_name  # Default, may be overridden below
 
         # Check if we're in a reentrant procedure - locals go on stack
-        in_reentrant = (self.current_proc_decl is not None and
-                        self.current_proc_decl.is_reentrant and
+        in_reentrant = (self.current_proc_attrs is not None and
+                        self.current_proc_attrs.is_reentrant and
                         not is_public and not is_external and
                         not based_on and not at_location and
                         not data_values_nodes and not initial_values_nodes)
@@ -2362,23 +2369,41 @@ class CodeGenerator:
                     AsmLine(opcode="db", operands=self._escape_string(string_value(val)))
                 )
 
-    def _gen_proc_decl(self, decl: ProcDecl) -> None:
-        """Generate code for a procedure."""
+    def _gen_proc_decl(self, decl) -> None:
+        """Generate code for a procedure declaration.
+
+        ``decl`` is a typed :class:`P.ProcDecl` from the uplox-generated
+        parser. The signature's attribute clauses (EXTERNAL / PUBLIC /
+        REENTRANT / INTERRUPT) are walked into a :class:`ProcAttrs` view
+        via :func:`ast_view.proc_attrs`; the body's flat item list is
+        split into local declarations and statements via
+        :func:`ast_view.proc_local_decls_stmts`.
+        """
         old_proc = self.current_proc
         old_proc_decl = self.current_proc_decl
+        old_proc_attrs = self.current_proc_attrs
+        old_proc_return_type = self.current_proc_return_type
+
+        attrs = proc_attrs(decl)
+        name = proc_name(decl)
+        params = proc_param_names(decl)
+        return_type = _legacy_dt(proc_return_type(decl))
+        local_decls, body_stmts = proc_local_decls_stmts(decl)
 
         # For nested procedures, create a unique scoped name
-        if old_proc and not decl.is_public and not decl.is_external:
+        if old_proc and not attrs.is_public and not attrs.is_external:
             # Nested procedure - use scoped name
-            proc_asm_name = f"@{old_proc}${decl.name}"
-            full_proc_name = f"{old_proc}${decl.name}"
+            proc_asm_name = f"@{old_proc}${name}"
+            full_proc_name = f"{old_proc}${name}"
             self.current_proc = full_proc_name  # Compound name for further nesting
         else:
-            proc_asm_name = decl.name
-            full_proc_name = decl.name
-            self.current_proc = decl.name
+            proc_asm_name = name
+            full_proc_name = name
+            self.current_proc = name
 
         self.current_proc_decl = decl
+        self.current_proc_attrs = attrs
+        self.current_proc_return_type = return_type
 
         # Look up the procedure (already registered in pass 1)
         # Use full_proc_name to find the correct symbol for nested procs
@@ -2387,12 +2412,12 @@ class CodeGenerator:
             sym = Symbol(
                 name=full_proc_name,
                 kind=SymbolKind.PROCEDURE,
-                return_type=decl.return_type,
-                params=decl.params,
-                is_public=decl.is_public,
-                is_external=decl.is_external,
-                is_reentrant=decl.is_reentrant,
-                interrupt_num=decl.interrupt_num,
+                return_type=return_type,
+                params=params,
+                is_public=attrs.is_public,
+                is_external=attrs.is_external,
+                is_reentrant=attrs.is_reentrant,
+                interrupt_num=attrs.interrupt_num,
                 asm_name=proc_asm_name,
             )
             self.symbols.define(sym)
@@ -2400,40 +2425,55 @@ class CodeGenerator:
             # Use the asm_name from pass 1
             proc_asm_name = sym.asm_name or proc_asm_name
 
-        if decl.is_external:
+        if attrs.is_external:
             self._emit("extrn", proc_asm_name)
             self.current_proc = old_proc
             self.current_proc_decl = old_proc_decl
+            self.current_proc_attrs = old_proc_attrs
+            self.current_proc_return_type = old_proc_return_type
             return
 
         self._emit()
-        if decl.is_public:
-            self._emit("public", decl.name)
+        if attrs.is_public:
+            self._emit("public", name)
 
-        self._emit(comment=f"Procedure {decl.name}")
+        self._emit(comment=f"Procedure {name}")
         self._emit_label(proc_asm_name)
 
         # Enter new scope
-        self.symbols.enter_scope(decl.name)
+        self.symbols.enter_scope(name)
 
         # Procedure prologue
-        if decl.interrupt_num is not None:
+        if attrs.interrupt_num is not None:
             # Interrupt handler - save all registers
             self._emit("push", "af")
             self._emit("push", "bc")
             self._emit("push", "de")
             self._emit("push", "hl")
 
+        # Build a name -> (legacy) DataType map from local DeclItem
+        # nodes so we can resolve parameter types declared inside the
+        # body's DECLARE statements.
+        param_type_by_name: dict[str, DataType] = {}
+        for d in local_decls:
+            if isinstance(d, P.DeclItem):
+                d_view_type, _ = _view_decl_item_type(d)
+                d_legacy_type = _legacy_dt(d_view_type)
+                if d_legacy_type is None:
+                    continue
+                for n in decl_item_names(d):
+                    param_type_by_name[n] = d_legacy_type
+
         # Define parameters as local variables
         # For non-reentrant: use shared automatic storage via storage_labels
         # For reentrant: use IX-relative stack frame
         param_infos: list[tuple[str, str, DataType, int]] = []  # (name, asm_name, type, size)
-        use_shared_storage = not decl.is_reentrant and full_proc_name in self.storage_labels
+        use_shared_storage = not attrs.is_reentrant and full_proc_name in self.storage_labels
 
         # For reentrant procedures, set up IX frame pointer first
         # Stack at entry: [params...][ret_addr] <- SP
         # After PUSH IX: [params...][ret_addr][saved_IX] <- SP, IX
-        if decl.is_reentrant:
+        if attrs.is_reentrant:
             self._emit("push", "ix")
             self._emit("ld", "ix,0")
             self._emit("add", "ix,sp")
@@ -2444,33 +2484,20 @@ class CodeGenerator:
         # Parameters are pushed in order: first arg pushed first, ends up deepest
         # So params[0] is at the highest offset, params[-1] is at IX+4
         reentrant_param_offset = 4  # Start after saved IX (2) and ret addr (2)
-        if decl.is_reentrant:
-            # Calculate total params size to compute offsets
-            # Params are pushed first-to-last, so on stack: [param0][param1]...[paramN][ret][IX]
-            # paramN is at IX+4, param(N-1) is at IX+4+size(paramN), etc.
-            param_sizes = []
-            for param in decl.params:
-                param_type = DataType.ADDRESS  # Default
-                for d in decl.decls:
-                    if isinstance(d, VarDecl) and d.name == param:
-                        param_type = d.data_type or DataType.ADDRESS
-                        break
-                param_sizes.append(2)  # All stack slots are 2 bytes (pushed as 16-bit)
-            # Compute offset for each param (last param is at IX+4)
+        if attrs.is_reentrant:
+            # All stack slots are 2 bytes (pushed as 16-bit) regardless of
+            # the declared parameter type — last param is at IX+4.
+            param_sizes = [2 for _ in params]
             total_params_size = sum(param_sizes)
-            reentrant_param_offset = 4 + total_params_size - param_sizes[-1] if param_sizes else 4
+            reentrant_param_offset = (
+                4 + total_params_size - param_sizes[-1] if param_sizes else 4
+            )
 
-        for i, param in enumerate(decl.params):
-            # Find parameter declaration in decl.decls
-            param_type = DataType.ADDRESS  # Default
-            for d in decl.decls:
-                if isinstance(d, VarDecl) and d.name == param:
-                    param_type = d.data_type or DataType.ADDRESS
-                    break
-
+        for i, param in enumerate(params):
+            param_type = param_type_by_name.get(param) or DataType.ADDRESS
             param_size = 1 if param_type == DataType.BYTE else 2
 
-            if decl.is_reentrant:
+            if attrs.is_reentrant:
                 # Use stack frame - params accessed via IX+offset
                 # First param (params[0]) is at highest offset
                 # Each subsequent param is 2 bytes lower (all pushed as 16-bit)
@@ -2493,7 +2520,7 @@ class CodeGenerator:
                     asm_name = self.storage_labels[full_proc_name][param]
                 else:
                     # Fallback: individual storage
-                    asm_name = f"@{decl.name}${self._mangle_name(param)}"
+                    asm_name = f"@{name}${self._mangle_name(param)}"
                     # Allocate individual storage in data segment
                     self.data_segment.append(
                         AsmLine(label=asm_name, opcode="ds", operands=str(param_size))
@@ -2512,7 +2539,7 @@ class CodeGenerator:
 
         # Generate prologue code for register parameter (last param in A or HL)
         # For non-reentrant procedures, the last param is passed in register and needs to be stored
-        if param_infos and not decl.is_reentrant:
+        if param_infos and not attrs.is_reentrant:
             _, last_asm_name, last_param_type, _ = param_infos[-1]
             if last_param_type == DataType.BYTE:
                 # Last param came in A - store it
@@ -2525,34 +2552,26 @@ class CodeGenerator:
         self._reentrant_local_offset = 0  # Will be decremented as locals are allocated
 
         # Generate code for local declarations (skip parameters and nested procedures)
-        nested_procs: list[ProcDecl] = []
-        for local_decl in decl.decls:
-            if isinstance(local_decl, ProcDecl):
+        nested_procs: list = []
+        for local_decl in local_decls:
+            if isinstance(local_decl, P.ProcDecl):
                 # Defer nested procedures
                 nested_procs.append(local_decl)
-            elif isinstance(local_decl, VarDecl):
-                # Skip if it's a parameter (already defined)
-                if local_decl.name not in decl.params:
-                    self._gen_declaration(local_decl)
+            elif isinstance(local_decl, P.DeclItem):
+                # Skip if every declared name is a parameter (already defined)
+                local_names = decl_item_names(local_decl)
+                non_param_names = [n for n in local_names if n not in params]
+                if not non_param_names:
+                    continue
+                # If the DeclItem declares a mix of params and non-params,
+                # still hand the whole item to _gen_declaration — the
+                # symbol-table side handles already-defined names.
+                self._gen_declaration(local_decl)
             else:
                 self._gen_declaration(local_decl)
 
-        # Process statements, extracting nested procedure declarations
-        statements_to_gen: list[Stmt] = []
-        for stmt in decl.stmts:
-            if isinstance(stmt, DeclareStmt):
-                for inner_decl in stmt.declarations:
-                    if isinstance(inner_decl, ProcDecl):
-                        nested_procs.append(inner_decl)
-                    elif isinstance(inner_decl, VarDecl):
-                        self._gen_declaration(inner_decl)
-                    else:
-                        self._gen_declaration(inner_decl)
-            else:
-                statements_to_gen.append(stmt)
-
         # For reentrant procedures, allocate stack space for locals
-        if decl.is_reentrant and self._reentrant_local_offset < 0:
+        if attrs.is_reentrant and self._reentrant_local_offset < 0:
             # Allocate stack space: SP = SP + offset (offset is negative)
             # ld hl,offset; add hl,sp; ld sp,hl
             self._emit("ld", f"hl,{self._reentrant_local_offset}")
@@ -2561,11 +2580,11 @@ class CodeGenerator:
 
         # Generate code for statements with liveness tracking
         ends_with_return = False
-        for i, stmt in enumerate(statements_to_gen):
+        for i, stmt in enumerate(body_stmts):
             # Track remaining statements for liveness analysis
-            self.pending_stmts = statements_to_gen[i + 1:]
+            self.pending_stmts = body_stmts[i + 1:]
             self._gen_stmt(stmt)
-            ends_with_return = isinstance(stmt, ReturnStmt)
+            ends_with_return = isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue))
         self.pending_stmts = []  # Clear after procedure
 
         # Procedure epilogue (implicit return if no explicit RETURN at end)
@@ -2579,17 +2598,20 @@ class CodeGenerator:
         self.symbols.leave_scope()
         self.current_proc = old_proc
         self.current_proc_decl = old_proc_decl
+        self.current_proc_attrs = old_proc_attrs
+        self.current_proc_return_type = old_proc_return_type
 
-    def _gen_proc_epilogue(self, decl: ProcDecl) -> None:
-        """Generate procedure epilogue."""
-        if decl.interrupt_num is not None:
+    def _gen_proc_epilogue(self, decl) -> None:
+        """Generate procedure epilogue for a typed :class:`P.ProcDecl`."""
+        attrs = proc_attrs(decl)
+        if attrs.interrupt_num is not None:
             self._emit("pop", "hl")
             self._emit("pop", "de")
             self._emit("pop", "bc")
             self._emit("pop", "af")
             self._emit("ei")
             self._emit("ret")
-        elif decl.is_reentrant:
+        elif attrs.is_reentrant:
             # Restore stack pointer and frame pointer for reentrant procedures
             # ld sp,ix restores SP to point to saved IX
             # pop IX restores the old frame pointer
