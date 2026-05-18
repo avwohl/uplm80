@@ -248,5 +248,6 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 - [ucow](https://github.com/avwohl/ucow) - Unix/Linux Cowgol to Z80 compiler
 - [um80_and_friends](https://github.com/avwohl/um80_and_friends) - Microsoft MACRO-80 compatible toolchain for Linux: assembler, linker, librarian, disassembler
 - [upeepz80](https://github.com/avwohl/upeepz80) - Universal peephole optimizer for Z80 compilers
+- [uplox](https://github.com/avwohl/uplox) - Compiler front-end generator (lexer DFA + LR parser + typed auto-AST) that uplm80 uses for PL/M-80 parsing
 - [z80cpmw](https://github.com/avwohl/z80cpmw) - Z80 CP/M emulator for Windows (RomWBW)
 
