@@ -10,45 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Iterator
 
-from .ast_nodes import (
-    DataType,
-    BinaryOp,
-    UnaryOp,
-    Expr,
-    NumberLiteral,
-    StringLiteral,
-    Identifier,
-    SubscriptExpr,
-    MemberExpr,
-    CallExpr,
-    BinaryExpr,
-    UnaryExpr,
-    LocationExpr,
-    ConstListExpr,
-    EmbeddedAssignExpr,
-    Stmt,
-    AssignStmt,
-    CallStmt,
-    ReturnStmt,
-    GotoStmt,
-    HaltStmt,
-    EnableStmt,
-    DisableStmt,
-    NullStmt,
-    LabeledStmt,
-    IfStmt,
-    DoBlock,
-    DoWhileBlock,
-    DoIterBlock,
-    DoCaseBlock,
-    Declaration,
-    VarDecl,
-    LabelDecl,
-    LiterallyDecl,
-    ProcDecl,
-    DeclareStmt,
-    Module,
-)
+from .ast_nodes import DataType
 from . import _plm_parser as P
 from .ast_view import (
     module_shape,
@@ -78,6 +40,7 @@ from .ast_view import (
     number_value,
     string_value,
     string_bytes,
+    unwrap_paren,
     DataType as ViewDataType,
     BinaryOpKind,
     UnaryOpKind,
@@ -104,6 +67,45 @@ def _legacy_dt(dt):
     if dt is None:
         return None
     return _VIEW_DT_TO_LEGACY[dt]
+
+
+class _SynthToken:
+    """Minimal stand-in for a :class:`uplox.Token` carrying just ``.text``.
+
+    The typed AST nodes constructed by codegen during macro expansion
+    don't ever flow back to the parser, so the source-location and
+    token-kind fields on a real :class:`Token` aren't needed; we only
+    need the bits :func:`ast_view.ident_text` and friends read off the
+    token (its ``.text``). Define this with ``__slots__`` so the
+    synthetic nodes have no per-instance dict overhead — codegen
+    creates a fresh one for every LITERALLY substitution.
+    """
+
+    __slots__ = ("text", "name")
+
+    def __init__(self, text: str, name: str = "IDENT") -> None:
+        self.text = text
+        self.name = name
+
+
+def _make_ident(name: str) -> "P.Identifier":
+    """Build a typed :class:`P.Identifier` carrying the given name.
+
+    Used by codegen paths that recurse on the expansion of a LITERALLY
+    macro — the macro's replacement text is a string, not a token, so
+    we wrap it in a synthetic token before re-entering the dispatch.
+    """
+    return P.Identifier(name=_SynthToken(name))
+
+
+def _make_location(operand) -> "P.LocationOf":
+    """Build a typed :class:`P.LocationOf` wrapping the given operand.
+
+    Mirrors :func:`_make_ident` for the ``.expr`` case so codegen can
+    funnel "store via complex lvalue" / "load address of complex
+    expression" paths through the typed dispatch.
+    """
+    return P.LocationOf(operand=operand)
 
 
 def _decl_item_has_data(item):
@@ -415,11 +417,11 @@ class CodeGenerator:
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
         self.proc_params: dict[str, list[tuple[str, str, DataType, int]]] = {}  # proc -> [(name, asm_name, type, size)]
         # For liveness analysis: remaining statements in current scope
-        self.pending_stmts: list[Stmt] = []
+        self.pending_stmts: list = []
         # For tracking embedded assignment target for return optimization
         self.embedded_assign_target: str | None = None  # Variable name of last embedded assignment
         # Current IF statement being processed (for embedded assign optimization)
-        self.current_if_stmt: IfStmt | None = None
+        self.current_if_stmt = None  # P.IfStmt | P.IfStmtElse | None
         # Flag: A register contains L (low byte of HL) - for avoiding redundant ld a,L
         self.a_has_l: bool = False
         # Register allocator for automatic spill/restore
@@ -446,71 +448,78 @@ class CodeGenerator:
             return f"@{name}"
         return name
 
-    def _get_const_byte_value(self, expr: Expr) -> int | None:
+    def _get_const_byte_value(self, expr) -> int | None:
         """Extract a constant byte value from an expression if possible.
 
         Returns the constant value (0-255) or None if not a constant.
         Handles NumberLiteral, StringLiteral (single char), and LITERALLY macros.
         """
-        if isinstance(expr, NumberLiteral):
-            if expr.value <= 255:
-                return expr.value
-        elif isinstance(expr, StringLiteral):
-            if len(expr.value) == 1:
-                return ord(expr.value[0])
-        elif isinstance(expr, Identifier):
-            if expr.name in self.literal_macros:
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
+            val = number_value(expr)
+            if val <= 255:
+                return val
+        elif isinstance(expr, P.StringLiteral):
+            s = string_value(expr)
+            if len(s) == 1:
+                return ord(s[0])
+        elif isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
+            if name in self.literal_macros:
                 try:
-                    val = self._parse_plm_number(self.literal_macros[expr.name])
+                    val = self._parse_plm_number(self.literal_macros[name])
                     if val <= 255:
                         return val
                 except ValueError:
                     pass
         return None
 
-    def _try_eval_const(self, expr: Expr) -> int | None:
+    def _try_eval_const(self, expr) -> int | None:
         """Try to evaluate an expression as a compile-time constant.
 
         Returns the integer value or None if not a constant.
-        Handles NumberLiteral, StringLiteral, LITERALLY macros, and UnaryExpr(NEG).
+        Handles NumberLiteral, StringLiteral, LITERALLY macros, and UnaryOp(NEG).
         Values are returned as-is (may be negative or > 255).
         """
-        if isinstance(expr, NumberLiteral):
-            return expr.value
-        elif isinstance(expr, StringLiteral):
-            if len(expr.value) == 1:
-                return ord(expr.value[0])
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
+            return number_value(expr)
+        elif isinstance(expr, P.StringLiteral):
+            s = string_value(expr)
+            if len(s) == 1:
+                return ord(s[0])
             return None
-        elif isinstance(expr, Identifier):
-            if expr.name in self.literal_macros:
+        elif isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
+            if name in self.literal_macros:
                 try:
-                    return self._parse_plm_number(self.literal_macros[expr.name])
+                    return self._parse_plm_number(self.literal_macros[name])
                 except ValueError:
                     pass
-        elif isinstance(expr, UnaryExpr):
-            if expr.op == UnaryOp.NEG:
+        elif isinstance(expr, P.UnaryOp):
+            kind = unop_kind(expr)
+            if kind == UnaryOpKind.NEG:
                 operand_val = self._try_eval_const(expr.operand)
                 if operand_val is not None:
-                    # Return negative value (may be -1, -255, etc.)
                     return -operand_val
-            elif expr.op == UnaryOp.NOT:
+            elif kind == UnaryOpKind.NOT:
                 operand_val = self._try_eval_const(expr.operand)
                 if operand_val is not None:
-                    # Bitwise NOT - complement within 16 bits
                     return (~operand_val) & 0xFFFF
-        elif isinstance(expr, BinaryExpr):
+        elif isinstance(expr, P.BinaryOp):
             left_val = self._try_eval_const(expr.left)
             right_val = self._try_eval_const(expr.right)
             if left_val is not None and right_val is not None:
-                if expr.op == BinaryOp.ADD:
+                op = binop_kind(expr)
+                if op == BinaryOpKind.ADD:
                     return (left_val + right_val) & 0xFFFF
-                elif expr.op == BinaryOp.SUB:
+                elif op == BinaryOpKind.SUB:
                     return (left_val - right_val) & 0xFFFF
-                elif expr.op == BinaryOp.AND:
+                elif op == BinaryOpKind.AND:
                     return left_val & right_val
-                elif expr.op == BinaryOp.OR:
+                elif op == BinaryOpKind.OR:
                     return left_val | right_val
-                elif expr.op == BinaryOp.XOR:
+                elif op == BinaryOpKind.XOR:
                     return left_val ^ right_val
         return None
 
@@ -573,7 +582,7 @@ class CodeGenerator:
 
                 raise CodeGenError(msg, loc)
 
-    def _check_trivial_condition(self, condition: Expr, context: str = "condition") -> None:
+    def _check_trivial_condition(self, condition, context: str = "condition") -> None:
         """Check for trivial constant conditions and raise an error.
 
         Detects cases like:
@@ -594,7 +603,7 @@ class CodeGenerator:
 
             raise CodeGenError(msg, loc)
 
-    def _warn_trivial_if(self, condition: Expr) -> None:
+    def _warn_trivial_if(self, condition) -> None:
         """Emit a warning for trivial IF conditions (IF 0, IF 1).
 
         Unlike DO WHILE, trivial IF conditions don't cause infinite loops
@@ -625,117 +634,134 @@ class CodeGenerator:
     # Loop Index Usage Analysis
     # ========================================================================
 
-    def _var_used_in_expr(self, var_name: str, expr: Expr) -> bool:
+    def _var_used_in_expr(self, var_name: str, expr) -> bool:
         """Check if variable is referenced in expression."""
-        if isinstance(expr, Identifier):
-            return expr.name == var_name
-        elif isinstance(expr, NumberLiteral) or isinstance(expr, StringLiteral):
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Identifier):
+            return ident_text(expr.name) == var_name
+        elif isinstance(expr, (P.NumberLiteral, P.StringLiteral)):
             return False
-        elif isinstance(expr, BinaryExpr):
-            return self._var_used_in_expr(var_name, expr.left) or self._var_used_in_expr(var_name, expr.right)
-        elif isinstance(expr, UnaryExpr):
+        elif isinstance(expr, P.BinaryOp):
+            return (
+                self._var_used_in_expr(var_name, expr.left)
+                or self._var_used_in_expr(var_name, expr.right)
+            )
+        elif isinstance(expr, P.UnaryOp):
             return self._var_used_in_expr(var_name, expr.operand)
-        elif isinstance(expr, CallExpr):
+        elif isinstance(expr, P.Call):
             for arg in expr.args:
                 if self._var_used_in_expr(var_name, arg):
                     return True
-            if isinstance(expr.callee, Expr):
-                return self._var_used_in_expr(var_name, expr.callee)
-            return False
-        elif isinstance(expr, SubscriptExpr):
-            if self._var_used_in_expr(var_name, expr.index):
-                return True
-            if isinstance(expr.base, Expr):
-                return self._var_used_in_expr(var_name, expr.base)
-            return False
-        elif isinstance(expr, MemberExpr):
-            if isinstance(expr.base, Expr):
-                return self._var_used_in_expr(var_name, expr.base)
-            return False
-        elif isinstance(expr, LocationExpr):
+            return self._var_used_in_expr(var_name, expr.callee)
+        elif isinstance(expr, P.CallNoArgs):
+            return self._var_used_in_expr(var_name, expr.callee)
+        elif isinstance(expr, P.MemberAccess):
+            return self._var_used_in_expr(var_name, expr.base)
+        elif isinstance(expr, P.LocationOf):
             return self._var_used_in_expr(var_name, expr.operand)
-        elif isinstance(expr, EmbeddedAssignExpr):
-            return self._var_used_in_expr(var_name, expr.target) or self._var_used_in_expr(var_name, expr.value)
-        return False
-
-    def _var_used_in_stmt(self, var_name: str, stmt: Stmt) -> bool:
-        """Check if variable is referenced in statement."""
-        if isinstance(stmt, AssignStmt):
-            # Check if var is read (on RHS or in index of LHS)
-            if self._var_used_in_expr(var_name, stmt.value):
-                return True
-            # Check if var is used in index of target (targets is a list)
-            for target in stmt.targets:
-                if isinstance(target, SubscriptExpr):
-                    if self._var_used_in_expr(var_name, target.index):
-                        return True
-            return False
-        elif isinstance(stmt, CallStmt):
-            # Check callee and all arguments for variable usage
-            if isinstance(stmt.callee, Expr) and self._var_used_in_expr(var_name, stmt.callee):
-                return True
-            for arg in stmt.args:
-                if self._var_used_in_expr(var_name, arg):
+        elif isinstance(expr, P.LocationOfList):
+            for v in expr.values or []:
+                if self._var_used_in_expr(var_name, v):
                     return True
             return False
-        elif isinstance(stmt, ReturnStmt):
-            if stmt.value:
-                return self._var_used_in_expr(var_name, stmt.value)
+        elif isinstance(expr, P.LocationOfString):
             return False
-        elif isinstance(stmt, IfStmt):
+        elif isinstance(expr, P.EmbeddedAssign):
+            return (
+                self._var_used_in_expr(var_name, expr.target)
+                or self._var_used_in_expr(var_name, expr.value)
+            )
+        return False
+
+    def _var_used_in_stmt(self, var_name: str, stmt) -> bool:
+        """Check if variable is referenced in a typed statement node."""
+        if isinstance(stmt, P.AssignStmt):
+            if self._var_used_in_expr(var_name, stmt.value):
+                return True
+            for target in stmt.targets:
+                t = unwrap_paren(target)
+                # Subscript-as-Call: var in index counts as use.
+                if isinstance(t, P.Call):
+                    for arg in t.args:
+                        if self._var_used_in_expr(var_name, arg):
+                            return True
+            return False
+        elif isinstance(stmt, P.CallStmt):
+            inner = stmt.callee
+            if isinstance(inner, P.Call):
+                if self._var_used_in_expr(var_name, inner.callee):
+                    return True
+                for arg in inner.args:
+                    if self._var_used_in_expr(var_name, arg):
+                        return True
+                return False
+            if isinstance(inner, P.CallNoArgs):
+                return self._var_used_in_expr(var_name, inner.callee)
+            return self._var_used_in_expr(var_name, inner)
+        elif isinstance(stmt, P.ReturnStmtValue):
+            return self._var_used_in_expr(var_name, stmt.value)
+        elif isinstance(stmt, P.ReturnStmt):
+            return False
+        elif isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             if self._var_used_in_expr(var_name, stmt.condition):
                 return True
             if self._var_used_in_stmt(var_name, stmt.then_stmt):
                 return True
-            if stmt.else_stmt and self._var_used_in_stmt(var_name, stmt.else_stmt):
+            if isinstance(stmt, P.IfStmtElse) and self._var_used_in_stmt(
+                var_name, stmt.else_stmt
+            ):
                 return True
             return False
-        elif isinstance(stmt, DoBlock):
-            for s in stmt.stmts:
+        elif isinstance(stmt, P.DoBlock):
+            _, body_stmts = block_items_split(stmt.items)
+            for s in body_stmts:
                 if self._var_used_in_stmt(var_name, s):
                     return True
             return False
-        elif isinstance(stmt, DoWhileBlock):
+        elif isinstance(stmt, P.DoWhileBlock):
             if self._var_used_in_expr(var_name, stmt.condition):
                 return True
-            for s in stmt.stmts:
+            _, body_stmts = block_items_split(stmt.items)
+            for s in body_stmts:
                 if self._var_used_in_stmt(var_name, s):
                     return True
             return False
-        elif isinstance(stmt, DoIterBlock):
+        elif isinstance(stmt, (P.DoIterBlock, P.DoIterByBlock)):
             # Don't recurse into nested DO-ITER as inner loop var shadows outer
             if self._var_used_in_expr(var_name, stmt.start):
                 return True
             if self._var_used_in_expr(var_name, stmt.bound):
                 return True
-            if stmt.step and self._var_used_in_expr(var_name, stmt.step):
+            if isinstance(stmt, P.DoIterByBlock) and self._var_used_in_expr(
+                var_name, stmt.step
+            ):
                 return True
-            for s in stmt.stmts:
+            _, body_stmts = block_items_split(stmt.items)
+            for s in body_stmts:
                 if self._var_used_in_stmt(var_name, s):
                     return True
             return False
-        elif isinstance(stmt, DoCaseBlock):
+        elif isinstance(stmt, P.DoCaseBlock):
             if self._var_used_in_expr(var_name, stmt.selector):
                 return True
-            for case_stmts in stmt.cases:
-                for s in case_stmts:
-                    if self._var_used_in_stmt(var_name, s):
-                        return True
+            for s in stmt.items or []:
+                if self._var_used_in_stmt(var_name, s):
+                    return True
             return False
-        elif isinstance(stmt, LabeledStmt):
+        elif isinstance(stmt, P.LabeledStmt):
             return self._var_used_in_stmt(var_name, stmt.stmt)
         return False
 
-    def _index_used_in_body(self, index_var: Expr, stmts: list[Stmt]) -> bool:
+    def _index_used_in_body(self, index_var, stmts) -> bool:
         """Check if loop index variable is used in loop body."""
-        if isinstance(index_var, Identifier):
-            var_name = index_var.name
+        if isinstance(index_var, P.Identifier):
+            var_name = ident_text(index_var.name)
             for stmt in stmts:
                 if self._var_used_in_stmt(var_name, stmt):
                     return True
         return False
 
-    def _stmts_contain_goto(self, stmts: list[Stmt]) -> bool:
+    def _stmts_contain_goto(self, stmts) -> bool:
         """Recursively check whether any statement in the tree is a GotoStmt.
 
         Used to disable loop optimizations (DJNZ) that push state onto the
@@ -747,150 +773,128 @@ class CodeGenerator:
                 return True
         return False
 
-    def _stmt_contains_goto(self, stmt: Stmt) -> bool:
-        if isinstance(stmt, GotoStmt):
+    def _stmt_contains_goto(self, stmt) -> bool:
+        if isinstance(stmt, P.GotoStmt):
             return True
-        if isinstance(stmt, LabeledStmt):
+        if isinstance(stmt, P.LabeledStmt):
             return self._stmt_contains_goto(stmt.stmt)
-        if isinstance(stmt, IfStmt):
+        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             if self._stmt_contains_goto(stmt.then_stmt):
                 return True
-            if stmt.else_stmt is not None and self._stmt_contains_goto(stmt.else_stmt):
+            if isinstance(stmt, P.IfStmtElse) and self._stmt_contains_goto(
+                stmt.else_stmt
+            ):
                 return True
             return False
-        if isinstance(stmt, (DoBlock, DoWhileBlock, DoIterBlock)):
-            return self._stmts_contain_goto(stmt.stmts)
-        if isinstance(stmt, DoCaseBlock):
-            return any(self._stmts_contain_goto(case) for case in stmt.cases)
+        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
+            _, body_stmts = block_items_split(stmt.items)
+            return self._stmts_contain_goto(body_stmts)
+        if isinstance(stmt, P.DoCaseBlock):
+            return self._stmts_contain_goto(stmt.items or [])
         return False
 
     # ========================================================================
     # Register Liveness Analysis
     # ========================================================================
 
-    def _expr_clobbers_a(self, expr: Expr) -> bool:
+    def _expr_clobbers_a(self, expr) -> bool:
         """Check if evaluating expression will clobber A register.
 
         Most expressions clobber A because they compute into A (for BYTE) or use A
         as a scratch register. Only certain simple operations preserve A.
         """
-        if isinstance(expr, NumberLiteral):
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
             return False  # ld hl,const doesn't touch A
 
-        if isinstance(expr, Identifier):
-            # Loading a variable clobbers A (for BYTE) or doesn't touch A (for ADDRESS in HL)
-            sym = self._lookup_symbol(expr.name)
+        if isinstance(expr, P.Identifier):
+            sym = self._lookup_symbol(ident_text(expr.name))
             if sym and sym.data_type == DataType.BYTE:
                 return True  # ld a,(addr) clobbers A
             return False  # ld hl,(addr) doesn't clobber A
 
-        if isinstance(expr, BinaryExpr):
-            # Check expression type - ADDRESS operations use HL, not A
+        if isinstance(expr, P.BinaryOp):
             expr_type = self._get_expr_type(expr)
             if expr_type == DataType.ADDRESS:
-                # ADDRESS arithmetic uses add hl,rp which doesn't clobber A
-                # But we need to check if operands clobber A
-                op = expr.op
-                if op == BinaryOp.ADD:
-                    # ld hl,(addr), add hl,rp preserves A
-                    left_clobbers = self._expr_clobbers_a(expr.left)
-                    right_clobbers = self._expr_clobbers_a(expr.right)
-                    return left_clobbers or right_clobbers
-            # BYTE operations and other ADDRESS ops may clobber A
+                if binop_kind(expr) == BinaryOpKind.ADD:
+                    return (
+                        self._expr_clobbers_a(expr.left)
+                        or self._expr_clobbers_a(expr.right)
+                    )
             return True
 
         # Most other expressions clobber A
         return True
 
-    def _stmt_clobbers_a(self, stmt: Stmt) -> bool:
-        """Check if a statement will clobber the A register.
-
-        This is used for liveness analysis to determine if we need to save A
-        across an IF block or other control structure.
-        """
-        if isinstance(stmt, NullStmt):
+    def _stmt_clobbers_a(self, stmt) -> bool:
+        """Check if a statement will clobber the A register."""
+        if isinstance(stmt, P.NullStmt):
             return False
 
-        if isinstance(stmt, LabeledStmt):
+        if isinstance(stmt, P.LabeledStmt):
             return self._stmt_clobbers_a(stmt.stmt)
 
-        if isinstance(stmt, AssignStmt):
-            # Assignment to HL-based variable (ADDRESS type) without touching A
-            # Check if all targets are ADDRESS type
+        if isinstance(stmt, P.AssignStmt):
             for target in stmt.targets:
-                if isinstance(target, Identifier):
-                    sym = self._lookup_symbol(target.name)
+                t = unwrap_paren(target)
+                if isinstance(t, P.Identifier):
+                    sym = self._lookup_symbol(ident_text(t.name))
                     if not sym or sym.data_type == DataType.BYTE:
-                        return True  # BYTE assignment uses LD (addr),A -> doesn't clobber but value changes
+                        return True
                 else:
-                    return True  # Complex target likely clobbers A
-            # Check if value expression clobbers A
+                    return True
             return self._expr_clobbers_a(stmt.value)
 
-        if isinstance(stmt, CallStmt):
-            # Procedure calls clobber A
+        if isinstance(stmt, P.CallStmt):
             return True
 
-        if isinstance(stmt, ReturnStmt):
-            # Return may load a value into A
-            if stmt.value:
-                return True
+        if isinstance(stmt, P.ReturnStmtValue):
+            return True
+        if isinstance(stmt, P.ReturnStmt):
             return False
 
-        if isinstance(stmt, GotoStmt):
-            return False  # jp doesn't clobber A
+        if isinstance(stmt, P.GotoStmt):
+            return False
 
-        if isinstance(stmt, HaltStmt):
-            return False  # halt doesn't clobber A
+        if isinstance(stmt, P.HaltStmt):
+            return False
 
-        if isinstance(stmt, EnableStmt) or isinstance(stmt, DisableStmt):
-            return False  # EI/DI don't clobber A
+        if isinstance(stmt, (P.EnableStmt, P.DisableStmt)):
+            return False
 
-        if isinstance(stmt, IfStmt):
-            # IF condition evaluation may clobber A
-            # But we special-case conditions that don't change A
-
-            # Simple identifier test: or a doesn't change A
-            if isinstance(stmt.condition, Identifier):
-                cond_type = self._get_expr_type(stmt.condition)
-                if cond_type == DataType.BYTE:
-                    # ld a,(x); or a - ld a,(x) clobbers A, so this does clobber
-                    return True
-                # For ADDRESS: ld a,L; or h - this clobbers A
+        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
+            condition = unwrap_paren(stmt.condition)
+            if isinstance(condition, P.Identifier):
                 return True
-
-            # Comparisons: cp n doesn't change A
-            if isinstance(stmt.condition, BinaryExpr):
-                op = stmt.condition.op
-                if op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE):
-                    # Comparison: cp n doesn't clobber A, but we need to check
-                    # if the left side is already in A or requires loading
-                    left_type = self._get_expr_type(stmt.condition.left)
+            if isinstance(condition, P.BinaryOp):
+                op = binop_kind(condition)
+                if op in (
+                    BinaryOpKind.EQ, BinaryOpKind.NE,
+                    BinaryOpKind.LT, BinaryOpKind.GT,
+                    BinaryOpKind.LE, BinaryOpKind.GE,
+                ):
+                    left_type = self._get_expr_type(condition.left)
                     if left_type == DataType.BYTE:
-                        # For byte comparisons, if right is constant, uses cp n which preserves A
-                        if isinstance(stmt.condition.right, NumberLiteral):
-                            # Check if then/else branches clobber A
+                        if isinstance(unwrap_paren(condition.right), P.NumberLiteral):
                             then_clobbers = self._stmt_clobbers_a(stmt.then_stmt)
-                            else_clobbers = stmt.else_stmt and self._stmt_clobbers_a(stmt.else_stmt)
+                            else_clobbers = (
+                                isinstance(stmt, P.IfStmtElse)
+                                and self._stmt_clobbers_a(stmt.else_stmt)
+                            )
                             return then_clobbers or else_clobbers
-
-            return True  # Conservative: condition evaluation clobbers A
-
-        if isinstance(stmt, (DoBlock, DoWhileBlock, DoIterBlock, DoCaseBlock)):
-            # Loop bodies likely clobber A
             return True
 
-        if isinstance(stmt, DeclareStmt):
-            return False  # Declarations don't generate code
+        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock,
+                             P.DoIterByBlock, P.DoCaseBlock)):
+            return True
 
-        # Default: assume clobbers A
+        if isinstance(stmt, P.DeclareStmt):
+            return False
+
         return True
 
-    def _a_survives_stmts(self, stmts: list[Stmt]) -> bool:
-        """Check if A register survives through a list of statements.
-
-        Returns True if A is preserved, False if any statement clobbers A.
-        """
+    def _a_survives_stmts(self, stmts) -> bool:
+        """Check if A register survives through a list of statements."""
         for stmt in stmts:
             if self._stmt_clobbers_a(stmt):
                 return False
@@ -1048,78 +1052,103 @@ class CodeGenerator:
         for nested in nested_procs:
             self._analyze_proc_calls(nested, full_name)
 
-    def _find_calls_in_stmts(self, stmts: list[Stmt], current_proc: str, calls: set[str]) -> None:
-        """Find all procedure calls in a list of statements."""
+    def _find_calls_in_stmts(self, stmts, current_proc: str, calls: set[str]) -> None:
+        """Find all procedure calls in a list of typed statements."""
         for stmt in stmts:
             self._find_calls_in_stmt(stmt, current_proc, calls)
 
-    def _find_calls_in_stmt(self, stmt: Stmt, current_proc: str, calls: set[str]) -> None:
-        """Find procedure calls in a statement."""
-        if isinstance(stmt, CallStmt):
-            if isinstance(stmt.callee, Identifier):
-                callee = self._resolve_proc_name(stmt.callee.name, current_proc)
+    def _find_calls_in_stmt(self, stmt, current_proc: str, calls: set[str]) -> None:
+        """Find procedure calls in a typed statement."""
+        if isinstance(stmt, P.CallStmt):
+            inner = stmt.callee
+            if isinstance(inner, P.Call):
+                callee_expr = inner.callee
+                args = inner.args
+            elif isinstance(inner, P.CallNoArgs):
+                callee_expr = inner.callee
+                args = []
+            else:
+                callee_expr = inner
+                args = []
+            if isinstance(callee_expr, P.Identifier):
+                callee = self._resolve_proc_name(ident_text(callee_expr.name), current_proc)
                 if callee:
                     calls.add(callee)
-            for arg in stmt.args:
+            else:
+                self._find_calls_in_expr(callee_expr, current_proc, calls)
+            for arg in args:
                 self._find_calls_in_expr(arg, current_proc, calls)
-        elif isinstance(stmt, AssignStmt):
+        elif isinstance(stmt, P.AssignStmt):
             for target in stmt.targets:
                 self._find_calls_in_expr(target, current_proc, calls)
             self._find_calls_in_expr(stmt.value, current_proc, calls)
-        elif isinstance(stmt, ReturnStmt):
-            if stmt.value:
-                self._find_calls_in_expr(stmt.value, current_proc, calls)
-        elif isinstance(stmt, IfStmt):
+        elif isinstance(stmt, P.ReturnStmtValue):
+            self._find_calls_in_expr(stmt.value, current_proc, calls)
+        elif isinstance(stmt, P.ReturnStmt):
+            pass
+        elif isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             self._find_calls_in_expr(stmt.condition, current_proc, calls)
             self._find_calls_in_stmt(stmt.then_stmt, current_proc, calls)
-            if stmt.else_stmt:
+            if isinstance(stmt, P.IfStmtElse):
                 self._find_calls_in_stmt(stmt.else_stmt, current_proc, calls)
-        elif isinstance(stmt, DoBlock):
-            self._find_calls_in_stmts(stmt.stmts, current_proc, calls)
-        elif isinstance(stmt, DoWhileBlock):
+        elif isinstance(stmt, P.DoBlock):
+            _, body_stmts = block_items_split(stmt.items)
+            self._find_calls_in_stmts(body_stmts, current_proc, calls)
+        elif isinstance(stmt, P.DoWhileBlock):
             self._find_calls_in_expr(stmt.condition, current_proc, calls)
-            self._find_calls_in_stmts(stmt.stmts, current_proc, calls)
-        elif isinstance(stmt, DoIterBlock):
+            _, body_stmts = block_items_split(stmt.items)
+            self._find_calls_in_stmts(body_stmts, current_proc, calls)
+        elif isinstance(stmt, (P.DoIterBlock, P.DoIterByBlock)):
             self._find_calls_in_expr(stmt.start, current_proc, calls)
             self._find_calls_in_expr(stmt.bound, current_proc, calls)
-            if stmt.step:
+            if isinstance(stmt, P.DoIterByBlock):
                 self._find_calls_in_expr(stmt.step, current_proc, calls)
-            self._find_calls_in_stmts(stmt.stmts, current_proc, calls)
-        elif isinstance(stmt, DoCaseBlock):
+            _, body_stmts = block_items_split(stmt.items)
+            self._find_calls_in_stmts(body_stmts, current_proc, calls)
+        elif isinstance(stmt, P.DoCaseBlock):
             self._find_calls_in_expr(stmt.selector, current_proc, calls)
-            for case_stmts in stmt.cases:
-                self._find_calls_in_stmts(case_stmts, current_proc, calls)
-        elif isinstance(stmt, LabeledStmt):
+            for s in stmt.items or []:
+                self._find_calls_in_stmt(s, current_proc, calls)
+        elif isinstance(stmt, P.LabeledStmt):
             self._find_calls_in_stmt(stmt.stmt, current_proc, calls)
 
-    def _find_calls_in_expr(self, expr: Expr, current_proc: str, calls: set[str]) -> None:
-        """Find procedure calls in an expression."""
-        if isinstance(expr, CallExpr):
-            if isinstance(expr.callee, Identifier):
-                callee = self._resolve_proc_name(expr.callee.name, current_proc)
+    def _find_calls_in_expr(self, expr, current_proc: str, calls: set[str]) -> None:
+        """Find procedure calls in a typed expression."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Call):
+            if isinstance(expr.callee, P.Identifier):
+                callee = self._resolve_proc_name(ident_text(expr.callee.name), current_proc)
                 if callee:
                     calls.add(callee)
+            else:
+                self._find_calls_in_expr(expr.callee, current_proc, calls)
             for arg in expr.args:
                 self._find_calls_in_expr(arg, current_proc, calls)
-        elif isinstance(expr, Identifier):
-            # In PL/M-80, a bare identifier that refers to a typed procedure
-            # is an implicit call (e.g., RESULT = MYFUNC; calls MYFUNC)
-            callee = self._resolve_proc_name(expr.name, current_proc)
+        elif isinstance(expr, P.CallNoArgs):
+            if isinstance(expr.callee, P.Identifier):
+                callee = self._resolve_proc_name(ident_text(expr.callee.name), current_proc)
+                if callee:
+                    calls.add(callee)
+            else:
+                self._find_calls_in_expr(expr.callee, current_proc, calls)
+        elif isinstance(expr, P.Identifier):
+            # Bare identifier referring to a typed procedure is an implicit call.
+            callee = self._resolve_proc_name(ident_text(expr.name), current_proc)
             if callee:
                 calls.add(callee)
-        elif isinstance(expr, BinaryExpr):
+        elif isinstance(expr, P.BinaryOp):
             self._find_calls_in_expr(expr.left, current_proc, calls)
             self._find_calls_in_expr(expr.right, current_proc, calls)
-        elif isinstance(expr, UnaryExpr):
+        elif isinstance(expr, P.UnaryOp):
             self._find_calls_in_expr(expr.operand, current_proc, calls)
-        elif isinstance(expr, SubscriptExpr):
-            self._find_calls_in_expr(expr.array, current_proc, calls)
-            self._find_calls_in_expr(expr.index, current_proc, calls)
-        elif isinstance(expr, MemberExpr):
+        elif isinstance(expr, P.MemberAccess):
             self._find_calls_in_expr(expr.base, current_proc, calls)
-        elif isinstance(expr, LocationExpr):
+        elif isinstance(expr, P.LocationOf):
             self._find_calls_in_expr(expr.operand, current_proc, calls)
-        elif isinstance(expr, EmbeddedAssignExpr):
+        elif isinstance(expr, P.LocationOfList):
+            for v in expr.values or []:
+                self._find_calls_in_expr(v, current_proc, calls)
+        elif isinstance(expr, P.EmbeddedAssign):
             self._find_calls_in_expr(expr.target, current_proc, calls)
             self._find_calls_in_expr(expr.value, current_proc, calls)
 
@@ -3593,58 +3622,46 @@ class CodeGenerator:
 
         self.symbols.leave_scope()
 
-    def _is_byte_counter_loop(self, condition: Expr) -> tuple[str, int] | None:
+    def _is_byte_counter_loop(self, condition) -> tuple[str, int] | None:
         """
         Check if condition matches the pattern (var := var - 1) <> 255.
         Returns (var_asm_name, compare_value) if matched, None otherwise.
 
         This pattern is a countdown loop: decrement and check for wrap-around.
         """
-        if not isinstance(condition, BinaryExpr):
+        condition = unwrap_paren(condition)
+        if not isinstance(condition, P.BinaryOp):
             return None
-        if condition.op != BinaryOp.NE:
+        if binop_kind(condition) != BinaryOpKind.NE:
             return None
-        if not isinstance(condition.right, NumberLiteral):
-            return None
-        if condition.right.value != 255:
+        right = unwrap_paren(condition.right)
+        if not isinstance(right, P.NumberLiteral) or number_value(right) != 255:
             return None
 
         # Left should be (var := var - 1)
-        if not isinstance(condition.left, EmbeddedAssignExpr):
+        embed = unwrap_paren(condition.left)
+        if not isinstance(embed, P.EmbeddedAssign):
             return None
-        embed = condition.left
-        if not isinstance(embed.target, Identifier):
-            return None
-
-        # Value should be var - 1
-        if not isinstance(embed.value, BinaryExpr):
-            return None
-        if embed.value.op != BinaryOp.SUB:
-            return None
-        if not isinstance(embed.value.left, Identifier):
-            return None
-        if embed.value.left.name != embed.target.name:
-            return None
-        if not isinstance(embed.value.right, NumberLiteral):
-            return None
-        if embed.value.right.value != 1:
+        target = unwrap_paren(embed.target)
+        if not isinstance(target, P.Identifier):
             return None
 
-        # Check that it's a BYTE variable
-        var_name = embed.target.name
+        value = unwrap_paren(embed.value)
+        if not isinstance(value, P.BinaryOp):
+            return None
+        if binop_kind(value) != BinaryOpKind.SUB:
+            return None
+        vl = unwrap_paren(value.left)
+        if not isinstance(vl, P.Identifier):
+            return None
+        if ident_text(vl.name) != ident_text(target.name):
+            return None
+        vr = unwrap_paren(value.right)
+        if not isinstance(vr, P.NumberLiteral) or number_value(vr) != 1:
+            return None
 
-        # Look up with scoping like _gen_load does
-        sym = None
-        if self.current_proc:
-            parts = self.current_proc.split('$')
-            for i in range(len(parts), 0, -1):
-                scoped_name = '$'.join(parts[:i]) + '$' + var_name
-                sym = self.symbols.lookup(scoped_name)
-                if sym:
-                    break
-        if sym is None:
-            sym = self.symbols.lookup(var_name)
-
+        var_name = ident_text(target.name)
+        sym = self._lookup_symbol(var_name)
         if not sym or sym.data_type != DataType.BYTE:
             return None
 
@@ -4101,27 +4118,17 @@ class CodeGenerator:
         self._emit_label(end_label)
 
     def _stmt_transfers_control(self, stmt) -> bool:
-        """Check if a statement unconditionally transfers control (no fallthrough).
-
-        Recognises both the legacy ``ast_nodes`` statement classes and
-        the typed :mod:`uplm80._plm_parser` equivalents so the helper
-        works during the in-progress AST migration.
-        """
+        """Check if a typed statement unconditionally transfers control."""
         if stmt is None:
             return False
-        if isinstance(stmt, (GotoStmt, P.GotoStmt)):
+        if isinstance(stmt, P.GotoStmt):
             return True
-        if isinstance(stmt, (ReturnStmt, P.ReturnStmt, P.ReturnStmtValue)):
+        if isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue)):
             return True
-        if isinstance(stmt, (HaltStmt, P.HaltStmt)):
+        if isinstance(stmt, P.HaltStmt):
             return True
-        # A labeled statement transfers if its inner statement does
-        if isinstance(stmt, (LabeledStmt, P.LabeledStmt)):
+        if isinstance(stmt, P.LabeledStmt):
             return self._stmt_transfers_control(stmt.stmt)
-        # A DO block transfers if its last statement does
-        if isinstance(stmt, DoBlock):
-            if stmt.stmts:
-                return self._stmt_transfers_control(stmt.stmts[-1])
         if isinstance(stmt, P.DoBlock):
             _, body_stmts = block_items_split(stmt.items)
             if body_stmts:
@@ -4132,123 +4139,102 @@ class CodeGenerator:
     # Expression Code Generation
     # ========================================================================
 
-    def _get_expr_type(self, expr: Expr) -> DataType:
-        """Determine the type of an expression."""
-        if isinstance(expr, NumberLiteral):
-            return DataType.BYTE if expr.value <= 255 else DataType.ADDRESS
-        elif isinstance(expr, StringLiteral):
-            # Single-character strings are treated as byte values in PL/M-80
-            if len(expr.value) == 1:
-                return DataType.BYTE
-            return DataType.ADDRESS  # Address of string
-        elif isinstance(expr, Identifier):
-            sym = self.symbols.lookup(expr.name)
+    def _get_expr_type(self, expr) -> DataType:
+        """Determine the type of a typed expression."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
+            return DataType.BYTE if number_value(expr) <= 255 else DataType.ADDRESS
+        elif isinstance(expr, P.StringLiteral):
+            s = string_value(expr)
+            return DataType.BYTE if len(s) == 1 else DataType.ADDRESS
+        elif isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
+            sym = self.symbols.lookup(name)
             if sym:
-                # For procedures, return the return type (a bare identifier is a call)
                 if sym.kind == SymbolKind.PROCEDURE:
                     return sym.return_type or DataType.ADDRESS
                 return sym.data_type or DataType.ADDRESS
             return DataType.ADDRESS
-        elif isinstance(expr, EmbeddedAssignExpr):
-            # Type is determined by the target variable
+        elif isinstance(expr, P.EmbeddedAssign):
             return self._get_expr_type(expr.target)
-        elif isinstance(expr, BinaryExpr):
-            # Comparisons return BYTE (0 or 1 in A)
-            if expr.op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT,
-                          BinaryOp.LE, BinaryOp.GE):
+        elif isinstance(expr, P.BinaryOp):
+            op = binop_kind(expr)
+            if op in (
+                BinaryOpKind.EQ, BinaryOpKind.NE,
+                BinaryOpKind.LT, BinaryOpKind.GT,
+                BinaryOpKind.LE, BinaryOpKind.GE,
+            ):
                 return DataType.BYTE
-            # For arithmetic ops, check if both operands are bytes
             left_type = self._get_expr_type(expr.left)
             right_type = self._get_expr_type(expr.right)
             if left_type == DataType.BYTE and right_type == DataType.BYTE:
-                if expr.op in (BinaryOp.ADD, BinaryOp.SUB, BinaryOp.AND, BinaryOp.OR, BinaryOp.XOR):
+                if op in (
+                    BinaryOpKind.ADD, BinaryOpKind.SUB,
+                    BinaryOpKind.AND, BinaryOpKind.OR, BinaryOpKind.XOR,
+                ):
                     return DataType.BYTE
             return DataType.ADDRESS
-        elif isinstance(expr, LocationExpr):
+        elif isinstance(expr, (P.LocationOf, P.LocationOfList, P.LocationOfString)):
             return DataType.ADDRESS
-        elif isinstance(expr, CallExpr):
-            # Check for built-in functions first
-            if isinstance(expr.callee, Identifier):
-                name = expr.callee.name.upper()
-                # Built-ins that return BYTE
+        elif isinstance(expr, (P.Call, P.CallNoArgs)):
+            callee = unwrap_paren(expr.callee)
+            if isinstance(callee, P.Identifier):
+                name = ident_text(callee.name).upper()
                 if name in ('LOW', 'HIGH', 'INPUT', 'ROL', 'ROR'):
                     return DataType.BYTE
-                # MEMORY(addr) returns BYTE - it's a byte array
                 if name == 'MEMORY':
                     return DataType.BYTE
-                # Built-ins that return ADDRESS
                 if name in ('SHL', 'SHR', 'DOUBLE', 'LENGTH', 'LAST', 'SIZE',
-                           'STACKPTR', 'TIME', 'CPUTIME'):
+                            'STACKPTR', 'TIME', 'CPUTIME'):
                     return DataType.ADDRESS
-                # Look up symbol to determine type
-                sym = self.symbols.lookup(expr.callee.name)
+                sym = self.symbols.lookup(ident_text(callee.name))
                 if sym:
                     if sym.kind == SymbolKind.PROCEDURE:
                         return sym.return_type or DataType.ADDRESS
-                    # It's a variable - if it has dimension, this is an array subscript
                     if sym.dimension is not None:
-                        # Array subscript returns element type
                         return sym.data_type or DataType.BYTE
-                    # Non-array variable being "called" - return its type
                     return sym.data_type or DataType.ADDRESS
             return DataType.ADDRESS
-        elif isinstance(expr, UnaryExpr):
-            # Unary operations - check which ones return BYTE
-            if expr.op in (UnaryOp.NOT, UnaryOp.LOW, UnaryOp.HIGH):
-                return DataType.BYTE
-            # MINUS and others preserve operand type
+        elif isinstance(expr, P.UnaryOp):
+            # NEG / NOT preserve operand type (LOW/HIGH are now Calls).
             return self._get_expr_type(expr.operand)
-        elif isinstance(expr, SubscriptExpr):
-            # Array subscript - check the element type of the array
-            if isinstance(expr.base, Identifier):
-                # Check for MEMORY built-in
-                if expr.base.name.upper() == "MEMORY":
-                    return DataType.BYTE  # MEMORY is a BYTE array
-                sym = self.symbols.lookup(expr.base.name)
-                if sym:
-                    return sym.data_type or DataType.BYTE
-            return DataType.BYTE  # Default to BYTE for array elements
+        elif isinstance(expr, P.MemberAccess):
+            return DataType.BYTE
         return DataType.ADDRESS
 
-    def _is_simple_address_expr(self, expr: Expr) -> bool:
-        """
-        Check if expression is simple enough to load directly into DE.
-        Simple expressions are: constants, identifiers (variables), location-of.
-        """
-        if isinstance(expr, NumberLiteral):
+    def _is_simple_address_expr(self, expr) -> bool:
+        """Check if expression is simple enough to load directly into DE."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
             return True
-        if isinstance(expr, Identifier):
-            name = expr.name
-            # Check for LITERALLY macro
+        if isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
             if name in self.literal_macros:
                 return True
-            # Look up symbol - simple variables are fine
             sym = self.symbols.lookup(name)
             if sym and sym.kind != SymbolKind.PROCEDURE:
                 return True
-            # Procedures are not simple - they need to be called
             return False
-        if isinstance(expr, LocationExpr):
-            # .VAR is simple - just loads address, unless it's a stack-based variable
-            if isinstance(expr.operand, Identifier):
-                sym = self.symbols.lookup(expr.operand.name)
+        if isinstance(expr, P.LocationOf):
+            inner = unwrap_paren(expr.operand)
+            if isinstance(inner, P.Identifier):
+                sym = self.symbols.lookup(ident_text(inner.name))
                 if sym and sym.stack_offset is not None:
-                    return False  # Stack-based variables need IX+offset calculation
+                    return False
             return True
         return False
 
-    def _gen_simple_to_de(self, expr: Expr) -> None:
+    def _gen_simple_to_de(self, expr) -> None:
         """Load a simple address expression directly into DE."""
-        if isinstance(expr, NumberLiteral):
-            self._emit("ld", f"de,{self._format_number(expr.value)}")
-        elif isinstance(expr, Identifier):
-            name = expr.name
-            # Handle built-in MEMORY array
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
+            self._emit("ld", f"de,{self._format_number(number_value(expr))}")
+        elif isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
             if name.upper() == "MEMORY":
                 self.needs_end_symbol = True
                 self._emit("ld", "de,__END__")
                 return
-            # Check for LITERALLY macro
             if name in self.literal_macros:
                 macro_val = self.literal_macros[name]
                 try:
@@ -4256,154 +4242,104 @@ class CodeGenerator:
                     self._emit("ld", f"de,{self._format_number(val)}")
                     return
                 except ValueError:
-                    name = macro_val  # Use expanded name
-            # Look up symbol
+                    name = macro_val
             sym = self.symbols.lookup(name)
             asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
             if sym:
-                # Arrays: load address of array (ld de,label)
                 if sym.dimension:
                     self._emit("ld", f"de,{asm_name}")
                 elif sym.data_type == DataType.BYTE:
-                    # Byte variable - load and extend
                     self._emit("ld", f"a,({asm_name})")
                     self._emit("ld", "e,a")
                     self._emit("ld", "d,0")
                 else:
-                    # Address variable - load contents into DE
-                    self._emit("ld", f"de,({asm_name})")  # Z80: ld de,(addr)
+                    self._emit("ld", f"de,({asm_name})")
             else:
-                # Unknown - assume it's a label/address constant
                 self._emit("ld", f"de,{asm_name}")
-        elif isinstance(expr, LocationExpr):
-            # .VAR - load address of variable
-            if isinstance(expr.operand, Identifier):
-                name = expr.operand.name
-                # Handle built-in MEMORY array
+        elif isinstance(expr, P.LocationOf):
+            inner = unwrap_paren(expr.operand)
+            if isinstance(inner, P.Identifier):
+                name = ident_text(inner.name)
                 if name.upper() == "MEMORY":
                     self.needs_end_symbol = True
                     self._emit("ld", "de,__END__")
                     return
                 sym = self.symbols.lookup(name)
-                # Check for stack-based variable (reentrant procedure parameter/local)
                 if sym and sym.stack_offset is not None:
-                    # Fall back to gen_expr which handles IX+offset
                     self._gen_expr(expr)
                     self._emit("ex", "de,hl")
                     return
                 asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
                 self._emit("ld", f"de,{asm_name}")
             else:
-                # Complex location - fall back to gen_expr
                 self._gen_expr(expr)
                 self._emit("ex", "de,hl")
 
-    def _expr_preserves_de(self, expr: Expr) -> bool:
-        """
-        Check if evaluating this expression preserves the DE register.
-        Used to optimize binary expression evaluation order.
-
-        TODO: This ad-hoc approach should be replaced with automatic register
-        tracking. See docs/REGISTER_TRACKING_DESIGN.md for the proposed refactor.
-        """
-        if isinstance(expr, NumberLiteral):
-            return True  # ld hl,n doesn't touch DE
-        if isinstance(expr, StringLiteral):
-            return True  # ld a,n or ld hl,n doesn't touch DE
-        if isinstance(expr, Identifier):
-            name = expr.name
-            # Check for LITERALLY macro
+    def _expr_preserves_de(self, expr) -> bool:
+        """Check if evaluating this expression preserves the DE register."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
+            return True
+        if isinstance(expr, P.StringLiteral):
+            return True
+        if isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
             if name in self.literal_macros:
-                return True  # Expands to constant or simple identifier
-            # Look up symbol
-            sym = None
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
+                return True
+            sym = self._lookup_symbol(name)
             if sym:
-                # Procedure calls can touch any register
                 if sym.kind == SymbolKind.PROCEDURE:
                     return False
-                # BASED variables: ld hl,(addr) then LD - no DE touch
-                if sym.based_on:
-                    return True
-                # Simple variable: ld a,(addr)/ld hl,(addr) - no DE touch
                 return True
-            # Unknown symbol - assume ld hl,(addr)
             return True
-        if isinstance(expr, UnaryExpr):
-            # Unary ops on simple expressions don't touch DE
+        if isinstance(expr, P.UnaryOp):
             return self._expr_preserves_de(expr.operand)
-        # Complex expressions (BinaryExpr, SubscriptExpr, CallExpr, etc.)
-        # may touch DE
+        # Binary / Call / subscript / member etc. may touch DE.
         return False
 
-    def _label_reg_need(self, expr: Expr) -> int:
-        """
-        Label expression with minimum registers needed (Sethi-Ullman algorithm).
-
-        For Z80 with HL as primary and DE as secondary register:
-        - Leaf expressions (literals, identifiers): need 1 register
-        - Unary expressions: same as operand
-        - Binary expressions: if both subtrees need same count, need one more
-          to hold intermediate; otherwise need max(left, right)
-
-        Returns the minimum number of 16-bit registers needed to evaluate this
-        expression without spilling.
-        """
-        if isinstance(expr, (NumberLiteral, StringLiteral)):
-            return 1  # Load constant into register
-
-        if isinstance(expr, Identifier):
-            # Simple variable load needs 1 register
-            # But procedure calls may need more (conservatively 2)
-            sym = self._lookup_symbol(expr.name)
-            if sym and sym.kind == SymbolKind.PROCEDURE:
-                return 2  # Function calls may use both registers
+    def _label_reg_need(self, expr) -> int:
+        """Label expression with minimum registers needed (Sethi-Ullman)."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, (P.NumberLiteral, P.StringLiteral)):
             return 1
 
-        if isinstance(expr, UnaryExpr):
-            # Unary ops don't need extra registers
+        if isinstance(expr, P.Identifier):
+            sym = self._lookup_symbol(ident_text(expr.name))
+            if sym and sym.kind == SymbolKind.PROCEDURE:
+                return 2
+            return 1
+
+        if isinstance(expr, P.UnaryOp):
             return self._label_reg_need(expr.operand)
 
-        if isinstance(expr, BinaryExpr):
+        if isinstance(expr, P.BinaryOp):
             left_need = self._label_reg_need(expr.left)
             right_need = self._label_reg_need(expr.right)
-
             if left_need == right_need:
-                # Both need same - need one more to hold intermediate
                 return left_need + 1
-            else:
-                # Evaluate harder side first, reuse registers
-                return max(left_need, right_need)
+            return max(left_need, right_need)
 
-        if isinstance(expr, SubscriptExpr):
-            # Array subscript: base + index calculation
-            # Needs 2 registers (base in DE, index in HL)
-            base_need = 1  # Base address is typically 1
-            if isinstance(expr.index, (NumberLiteral, Identifier)):
-                return max(base_need, 1)  # Simple index
-            else:
-                index_need = self._label_reg_need(expr.index)
-                if base_need == index_need:
-                    return base_need + 1
-                return max(base_need, index_need)
-
-        if isinstance(expr, CallExpr):
-            # Function calls may clobber registers - conservatively need 2
+        if isinstance(expr, P.Call):
+            # If this is actually a subscript (variable callee), behave like one.
+            callee = unwrap_paren(expr.callee)
+            if isinstance(callee, P.Identifier):
+                sym = self._lookup_symbol(ident_text(callee.name))
+                if sym and sym.kind != SymbolKind.PROCEDURE and len(expr.args) == 1:
+                    idx = unwrap_paren(expr.args[0])
+                    if isinstance(idx, (P.NumberLiteral, P.Identifier)):
+                        return 1
+                    index_need = self._label_reg_need(expr.args[0])
+                    if index_need == 1:
+                        return 2
+                    return max(1, index_need)
             return 2
 
-        if isinstance(expr, MemberExpr):
-            # Structure member access - similar to subscript
+        if isinstance(expr, P.CallNoArgs):
+            return 2
+
+        if isinstance(expr, P.MemberAccess):
             return self._label_reg_need(expr.base)
 
-        # Default: assume 2 registers for safety
         return 2
 
     def _lookup_symbol(self, name: str) -> 'Symbol | None':
@@ -4420,163 +4356,113 @@ class CodeGenerator:
             sym = self.symbols.lookup(name)
         return sym
 
-    def _gen_expr(self, expr: Expr) -> DataType:
-        """
-        Generate code for an expression.
+    def _gen_expr(self, expr) -> DataType:
+        """Generate code for a typed expression.
+
         Result is left in A (for BYTE) or HL (for ADDRESS).
         Returns the type of the expression.
         """
+        expr = unwrap_paren(expr)
         # Clear a_has_l for most expression types (embedded assign sets it)
-        if not isinstance(expr, (EmbeddedAssignExpr, CallExpr)):
+        if not isinstance(expr, (P.EmbeddedAssign, P.Call, P.CallNoArgs)):
             self.a_has_l = False
 
-        if isinstance(expr, NumberLiteral):
-            # Use ld hl,n for all constants - more efficient (3 bytes vs 5 bytes)
-            # Always return ADDRESS since value is in HL, not A
-            self._emit("ld", f"hl,{self._format_number(expr.value)}")
+        if isinstance(expr, P.NumberLiteral):
+            self._emit("ld", f"hl,{self._format_number(number_value(expr))}")
             return DataType.ADDRESS
 
-        elif isinstance(expr, StringLiteral):
-            # Single-character strings are byte values in PL/M-80
-            if len(expr.value) == 1:
-                char_val = ord(expr.value[0])
-                self._emit("ld", f"a,{self._format_number(char_val)}")
+        elif isinstance(expr, P.StringLiteral):
+            s = string_value(expr)
+            if len(s) == 1:
+                self._emit("ld", f"a,{self._format_number(ord(s[0]))}")
                 return DataType.BYTE
-            # Load address of string
             label = self._new_string_label()
-            self.string_literals.append((label, expr.value))
+            self.string_literals.append((label, s))
             self._emit("ld", f"hl,{label}")
             return DataType.ADDRESS
 
-        elif isinstance(expr, Identifier):
+        elif isinstance(expr, P.Identifier):
             return self._gen_load(expr)
 
-        elif isinstance(expr, BinaryExpr):
+        elif isinstance(expr, P.BinaryOp):
             return self._gen_binary(expr)
 
-        elif isinstance(expr, UnaryExpr):
+        elif isinstance(expr, P.UnaryOp):
             return self._gen_unary(expr)
 
-        elif isinstance(expr, SubscriptExpr):
-            return self._gen_subscript(expr)
-
-        elif isinstance(expr, MemberExpr):
+        elif isinstance(expr, P.MemberAccess):
             return self._gen_member(expr)
 
-        elif isinstance(expr, CallExpr):
+        elif isinstance(expr, (P.Call, P.CallNoArgs)):
             return self._gen_call_expr(expr)
 
-        elif isinstance(expr, LocationExpr):
+        elif isinstance(expr, (P.LocationOf, P.LocationOfString, P.LocationOfList)):
             return self._gen_location(expr)
 
-        elif isinstance(expr, ConstListExpr):
-            # .('string') or .(const, const...) - generate inline data and return address
-            # This handles both string literals and constant lists
-            label = self._new_label("DATA")
-            self.data_segment.append(AsmLine(label=label))
-            for val in expr.values:
-                if isinstance(val, NumberLiteral):
-                    self.data_segment.append(
-                        AsmLine(opcode="db", operands=self._format_number(val.value))
-                    )
-                elif isinstance(val, StringLiteral):
-                    self.data_segment.append(
-                        AsmLine(opcode="db", operands=self._escape_string(val.value))
-                    )
-            self._emit("ld", f"hl,{label}")
-            return DataType.ADDRESS
-
-        elif isinstance(expr, EmbeddedAssignExpr):
-            # Evaluate value
+        elif isinstance(expr, P.EmbeddedAssign):
             val_type = self._gen_expr(expr.value)
 
-            # Track embedded assignment target for liveness optimization
-            target_name = None
-            if isinstance(expr.target, Identifier):
-                target_name = expr.target.name
+            target = unwrap_paren(expr.target)
+            target_name = ident_text(target.name) if isinstance(target, P.Identifier) else None
 
-            # Check if we can skip the store because A survives to return
-            # Conditions:
-            # 1. Value is BYTE (in A)
-            # 2. Target is simple identifier
-            # 3. A survives through IF body (if in IF condition) and remaining stmts
-            # 4. Final statement is RETURN of same variable
             skip_store = False
             if val_type == DataType.BYTE and target_name:
-                # Gather all statements that A must survive through
-                stmts_to_check: list[Stmt] = []
-
-                # If we're in an IF condition, include the IF body
+                stmts_to_check: list = []
                 if self.current_if_stmt:
                     stmts_to_check.append(self.current_if_stmt.then_stmt)
-                    if self.current_if_stmt.else_stmt:
+                    if isinstance(self.current_if_stmt, P.IfStmtElse):
                         stmts_to_check.append(self.current_if_stmt.else_stmt)
 
-                # Add remaining statements (after current IF if any)
                 stmts_to_check.extend(self.pending_stmts)
 
-                # Check if all statements except last preserve A, and last is RETURN of target
                 if stmts_to_check:
-                    # All but last must not clobber A
                     last_stmt = stmts_to_check[-1]
                     preceding = stmts_to_check[:-1]
 
                     if self._a_survives_stmts(preceding):
-                        if isinstance(last_stmt, ReturnStmt):
-                            if isinstance(last_stmt.value, Identifier):
-                                if last_stmt.value.name == target_name:
-                                    # A survives to return of same variable - skip store
-                                    skip_store = True
-                                    self.embedded_assign_target = target_name
+                        if isinstance(last_stmt, P.ReturnStmtValue):
+                            val = unwrap_paren(last_stmt.value)
+                            if isinstance(val, P.Identifier) and ident_text(val.name) == target_name:
+                                skip_store = True
+                                self.embedded_assign_target = target_name
 
             if skip_store:
-                # Value is already in A, will be used by return - skip store entirely
                 pass
             elif val_type == DataType.BYTE:
-                # Value is in A - check if store will clobber A
-                # For simple identifier stores to BYTE targets, _gen_store only does
-                # ld (asm_name),a which does NOT clobber A
                 store_clobbers_a = True
-                if isinstance(expr.target, Identifier):
-                    sym = self._lookup_symbol(expr.target.name)
+                if isinstance(target, P.Identifier):
+                    sym = self._lookup_symbol(target_name)
                     if sym and sym.data_type == DataType.BYTE:
-                        # Simple BYTE store - doesn't clobber A
                         if not sym.based_on and sym.stack_offset is None:
                             store_clobbers_a = False
 
                 if store_clobbers_a:
-                    # Need to save A across the store
                     self._emit("ld", "b,a")
-                    self._gen_store(expr.target, val_type)
+                    self._gen_store(target, val_type)
                     self._emit("ld", "a,b")
                 else:
-                    # Store doesn't clobber A - no need to save/restore
-                    self._gen_store(expr.target, val_type)
+                    self._gen_store(target, val_type)
             else:
-                # Value is in HL
-                # Check if target is BYTE - _gen_store only touches A, not HL
                 target_sym = None
-                if isinstance(expr.target, Identifier):
-                    target_sym = self.symbols.lookup(expr.target.name)
+                if isinstance(target, P.Identifier):
+                    target_sym = self.symbols.lookup(target_name)
 
                 if target_sym and target_sym.data_type == DataType.BYTE:
-                    # BYTE target - _gen_store does ld a,L; LD (addr),A - HL preserved
-                    # After this, A contains L
-                    self._gen_store(expr.target, val_type)
-                    self.a_has_l = True  # Signal that A already has L
+                    self._gen_store(target, val_type)
+                    self.a_has_l = True
                 else:
-                    # ADDRESS target - need to preserve HL
                     self._emit("push", "hl")
-                    self._gen_store(expr.target, val_type)
+                    self._gen_store(target, val_type)
                     self._emit("pop", "hl")
             return val_type
 
         return DataType.ADDRESS
 
-    def _gen_load(self, expr: Expr) -> DataType:
+    def _gen_load(self, expr) -> DataType:
         """Load a variable value into A/HL. Returns the type."""
-        if isinstance(expr, Identifier):
-            name = expr.name
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
             upper_name = name.upper()
 
             # Handle built-in STACKPTR variable
@@ -4636,25 +4522,13 @@ class CodeGenerator:
                 macro_val = self.literal_macros[name]
                 try:
                     val = self._parse_plm_number(macro_val)
-                    # Use ld hl,n for all constants - more efficient (3 bytes vs 5 bytes)
-                    # Always return ADDRESS since value is in HL, not A
                     self._emit("ld", f"hl,{self._format_number(val)}")
                     return DataType.ADDRESS
                 except ValueError:
-                    # Non-numeric literal - recursively process as identifier
-                    return self._gen_load(Identifier(name=macro_val))
+                    return self._gen_load(_make_ident(macro_val))
 
             # Look up symbol in scope hierarchy
-            sym = None
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
+            sym = self._lookup_symbol(name)
 
             # Use mangled asm_name if available, otherwise mangle the name
             asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
@@ -4723,31 +4597,26 @@ class CodeGenerator:
 
         else:
             # Complex lvalue - generate address then load
-            self._gen_location(LocationExpr(operand=expr))
+            self._gen_location(_make_location(expr))
             self._emit("ld", "a,(hl)")
-            # Keep BYTE value in A register
             return DataType.BYTE
 
-    def _gen_store(self, expr: Expr, val_type: DataType) -> None:
+    def _gen_store(self, expr, val_type: DataType) -> None:
         """Store A/HL to a variable."""
-        if isinstance(expr, Identifier):
-            name = expr.name
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
 
-            # Handle built-in STACKPTR variable
             if name == "STACKPTR":
-                # Set stack pointer from HL
                 self._emit("ld", "sp,hl")
                 return
 
-            # Check for LITERALLY macro - expand recursively
             if name in self.literal_macros:
                 macro_val = self.literal_macros[name]
                 try:
                     self._parse_plm_number(macro_val)
-                    # Numeric literal can't be stored to
                 except ValueError:
-                    # Non-numeric literal - recursively process as identifier
-                    self._gen_store(Identifier(name=macro_val), val_type)
+                    self._gen_store(_make_ident(macro_val), val_type)
                     return
 
             sym = self.symbols.lookup(name)
@@ -4810,149 +4679,51 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("ld", f"({asm_name}),hl")
 
-        elif isinstance(expr, SubscriptExpr):
-            # Check for MEMORY(addr) = value special case
-            if isinstance(expr.base, Identifier) and expr.base.name.upper() == "MEMORY":
-                # MEMORY(addr) = value - store byte to __END__ + addr
-                # MEMORY is the predeclared byte array starting at end of program
-                self.needs_end_symbol = True
-                self._emit("push", "hl")  # Save value
-                if isinstance(expr.index, NumberLiteral) and expr.index.value == 0:
-                    # MEMORY(0) - just use __END__ directly
-                    self._emit("ld", "hl,__END__")
-                else:
-                    # MEMORY(n) - compute __END__ + n
-                    self._gen_expr(expr.index)  # HL = offset
-                    self._emit("ld", "de,__END__")
-                    self._emit("add", "hl,de")  # HL = __END__ + offset
-                self._emit("ex", "de,hl")  # DE = address
-                self._emit("pop", "hl")  # HL = value
-                self._emit("ld", "a,l")
-                self._emit("ld", "(de),a")
-                return
-
-            # Check for OUTPUT(port) = value special case
-            if isinstance(expr.base, Identifier) and expr.base.name.upper() == "OUTPUT":
-                # OUTPUT(port) = value - output byte to I/O port
-                # Value is in HL (low byte)
-                # Check if port is a constant
-                port_arg = expr.index
-                port_num = None
-                if isinstance(port_arg, NumberLiteral):
-                    port_num = port_arg.value
-                elif isinstance(port_arg, Identifier):
-                    if port_arg.name in self.literal_macros:
-                        try:
-                            port_num = self._parse_plm_number(self.literal_macros[port_arg.name])
-                        except ValueError:
-                            pass
-
-                if port_num is not None:
-                    # Constant port - use OUT instruction directly
-                    self._emit("ld", "a,l")  # Value in A
-                    self._emit("out", f"({self._format_number(port_num)}),a")
-                else:
-                    # Variable port - need runtime support
-                    self._emit("push", "hl")  # Save value
-                    self._gen_expr(port_arg)  # Evaluate port number
-                    self._emit("ld", "c,l")  # Port in C
-                    self._emit("pop", "hl")  # Restore value
-                    self._emit("ld", "a,l")  # Value in A
-                    self._emit("call", "??outp")
-                    self.needs_runtime.add("outp")
-                return
-
-            # Array element store
-            # Check element type
-            elem_type = DataType.BYTE
-            if isinstance(expr.base, Identifier):
-                sym = self.symbols.lookup(expr.base.name)
-                if sym and sym.data_type == DataType.ADDRESS:
-                    elem_type = DataType.ADDRESS
-
-            self._emit("push", "hl")  # Save value
-            self._gen_subscript_addr(expr)  # HL = address
-            self._emit("ex", "de,hl")  # DE = address
-            self._emit("pop", "hl")  # HL = value
-
-            if elem_type == DataType.ADDRESS:
-                # Store 16-bit value
-                self._emit("ex", "de,hl")  # HL = address, DE = value
-                self._emit("ld", "(hl),e")
-                self._emit("inc", "hl")
-                self._emit("ld", "(hl),d")
-            else:
-                # Store BYTE value
-                self._emit("ld", "a,l")
-                self._emit("ld", "(de),a")
-
-        elif isinstance(expr, MemberExpr):
+        elif isinstance(expr, P.MemberAccess):
             # Structure member store
             _, member_type = self._get_member_info(expr)
             self._emit("push", "hl")
             self._gen_member_addr(expr)
-            self._emit("ex", "de,hl")  # DE = member address
-            self._emit("pop", "hl")  # HL = value
+            self._emit("ex", "de,hl")
+            self._emit("pop", "hl")
             if member_type == DataType.ADDRESS:
-                # Store 16-bit value
-                self._emit("ex", "de,hl")  # HL = address, DE = value
+                self._emit("ex", "de,hl")
                 self._emit("ld", "(hl),e")
                 self._emit("inc", "hl")
                 self._emit("ld", "(hl),d")
             else:
-                # Store 8-bit value
                 self._emit("ld", "a,l")
                 self._emit("ld", "(de),a")
 
-        elif isinstance(expr, CallExpr):
+        elif isinstance(expr, P.Call):
+            callee = unwrap_paren(expr.callee)
             # Special built-in assignment targets: OUTPUT(port) = value
-            if isinstance(expr.callee, Identifier) and expr.callee.name.upper() == "OUTPUT":
-                # OUTPUT(port) = value - output byte to I/O port
-                # Value is in HL (low byte)
-                # Check if port is a constant
+            if isinstance(callee, P.Identifier) and ident_text(callee.name).upper() == "OUTPUT":
                 port_arg = expr.args[0]
-                port_num = None
-                if isinstance(port_arg, NumberLiteral):
-                    port_num = port_arg.value
-                elif isinstance(port_arg, Identifier):
-                    if port_arg.name in self.literal_macros:
-                        try:
-                            port_num = self._parse_plm_number(self.literal_macros[port_arg.name])
-                        except ValueError:
-                            pass
-
-                if port_num is not None:
-                    # Constant port - use OUT instruction directly
-                    self._emit("ld", "a,l")  # Value in A
+                port_num = self._try_eval_const(port_arg)
+                if port_num is not None and 0 <= port_num <= 255:
+                    self._emit("ld", "a,l")
                     self._emit("out", f"({self._format_number(port_num)}),a")
                 else:
-                    # Variable port - need runtime support
-                    self._emit("push", "hl")  # Save value
-                    self._gen_expr(port_arg)  # Evaluate port number
-                    self._emit("ld", "c,l")  # Port in C
-                    self._emit("pop", "hl")  # Restore value
-                    self._emit("ld", "a,l")  # Value in A
+                    self._emit("push", "hl")
+                    self._gen_expr(port_arg)
+                    self._emit("ld", "c,l")
+                    self._emit("pop", "hl")
+                    self._emit("ld", "a,l")
                     self._emit("call", "??outp")
                     self.needs_runtime.add("outp")
                 return
 
-            # Check for MEMORY(addr) = value special case (built-in byte array at __END__)
-            if isinstance(expr.callee, Identifier) and expr.callee.name.upper() == "MEMORY" and len(expr.args) == 1:
-                # MEMORY(addr) = value - store byte to __END__ + addr
+            # Special built-in: MEMORY(addr) = value
+            if (
+                isinstance(callee, P.Identifier)
+                and ident_text(callee.name).upper() == "MEMORY"
+                and len(expr.args) == 1
+            ):
                 self.needs_end_symbol = True
                 addr_arg = expr.args[0]
-                # Check for constant address
-                addr_val = None
-                if isinstance(addr_arg, NumberLiteral):
-                    addr_val = addr_arg.value
-                elif isinstance(addr_arg, Identifier) and addr_arg.name in self.literal_macros:
-                    try:
-                        addr_val = self._parse_plm_number(self.literal_macros[addr_arg.name])
-                    except (ValueError, TypeError):
-                        pass
-
+                addr_val = self._try_eval_const(addr_arg)
                 if addr_val is not None:
-                    # Constant offset - use LD (__END__+offset),A
                     if val_type != DataType.BYTE:
                         self._emit("ld", "a,l")
                     if addr_val == 0:
@@ -4960,133 +4731,110 @@ class CodeGenerator:
                     else:
                         self._emit("ld", f"(__END__+{self._format_number(addr_val)}),a")
                 else:
-                    # Variable offset - compute __END__ + offset, then store
                     if val_type == DataType.BYTE:
-                        # Save value on stack - cannot use B as _gen_expr may clobber it
-                        self._emit("push", "af")  # Save value on stack
-                        self._gen_expr(addr_arg)  # HL = offset
+                        self._emit("push", "af")
+                        self._gen_expr(addr_arg)
                         self._emit("ld", "de,__END__")
-                        self._emit("add", "hl,de")  # HL = __END__ + offset
-                        self._emit("pop", "af")  # Restore value to A
-                        self._emit("ld", "(hl),a")  # Store value at (HL)
+                        self._emit("add", "hl,de")
+                        self._emit("pop", "af")
+                        self._emit("ld", "(hl),a")
                     else:
-                        self._emit("push", "hl")  # Save value
-                        self._gen_expr(addr_arg)  # HL = offset
+                        self._emit("push", "hl")
+                        self._gen_expr(addr_arg)
                         self._emit("ld", "de,__END__")
-                        self._emit("add", "hl,de")  # HL = __END__ + offset
-                        self._emit("ex", "de,hl")  # DE = address
-                        self._emit("pop", "hl")  # HL = value
+                        self._emit("add", "hl,de")
+                        self._emit("ex", "de,hl")
+                        self._emit("pop", "hl")
                         self._emit("ld", "a,l")
                         self._emit("ld", "(de),a")
                 return
 
-            # Check if this is actually an array subscript (parser creates CallExpr for arr(idx))
-            if isinstance(expr.callee, Identifier) and len(expr.args) == 1:
-                sym = self.symbols.lookup(expr.callee.name)
+            # Array element store via subscript-as-Call: arr(idx) = value
+            if isinstance(callee, P.Identifier) and len(expr.args) == 1:
+                sym = self.symbols.lookup(ident_text(callee.name))
                 if sym and sym.kind != SymbolKind.PROCEDURE:
-                    # It's an array access - delegate to SubscriptExpr handling
-                    subscript = SubscriptExpr(expr.callee, expr.args[0])
-                    # Check for constant index optimization (but NOT for BASED variables)
-                    if isinstance(expr.args[0], NumberLiteral) and not sym.based_on:
-                        # Constant index - can compute address directly
-                        asm_name = sym.asm_name if sym.asm_name else self._mangle_name(expr.callee.name)
-                        # Check element type
+                    idx_arg = unwrap_paren(expr.args[0])
+                    if isinstance(idx_arg, P.NumberLiteral) and not sym.based_on:
+                        asm_name = sym.asm_name if sym.asm_name else self._mangle_name(ident_text(callee.name))
                         elem_type = sym.data_type if sym else DataType.BYTE
                         elem_size = 2 if elem_type == DataType.ADDRESS else 1
-                        offset = expr.args[0].value * elem_size
+                        offset = number_value(idx_arg) * elem_size
 
                         if elem_type == DataType.ADDRESS:
-                            # Store 16-bit value (value in HL)
                             if val_type == DataType.BYTE:
-                                # Expand BYTE to ADDRESS
                                 self._emit("ld", "l,a")
                                 self._emit("ld", "h,0")
                             if offset == 0:
                                 self._emit("ld", f"({asm_name}),hl")
                             else:
-                                # Need to store at offset - use ld de,addr; then store via DE
                                 self._emit("ld", f"de,{asm_name}+{offset}")
-                                self._emit("ex", "de,hl")  # HL = address, DE = value
+                                self._emit("ex", "de,hl")
                                 self._emit("ld", "(hl),e")
                                 self._emit("inc", "hl")
                                 self._emit("ld", "(hl),d")
                         else:
-                            # Store BYTE value (value in A)
                             if val_type != DataType.BYTE:
-                                self._emit("ld", "a,l")  # Get low byte
+                                self._emit("ld", "a,l")
                             if offset == 0:
                                 self._emit("ld", f"({asm_name}),a")
                             else:
                                 self._emit("ld", f"({asm_name}+{offset}),a")
                     else:
-                        # Variable index - need to compute address
                         elem_type = sym.data_type if sym else DataType.BYTE
                         if elem_type == DataType.ADDRESS:
-                            # ADDRESS array - need to store 16-bit value
                             if val_type == DataType.BYTE:
-                                # Expand BYTE (in A) to ADDRESS (in HL)
                                 self._emit("ld", "l,a")
                                 self._emit("ld", "h,0")
-                            # Value in HL - save it, compute address, store
-                            self._emit("push", "hl")  # Save value
-                            self._gen_subscript_addr(subscript)  # HL = address
-                            self._emit("pop", "de")  # DE = value
-                            self._emit("ld", "(hl),e")  # Store low byte at (HL)
+                            self._emit("push", "hl")
+                            self._gen_subscript_addr(expr)
+                            self._emit("pop", "de")
+                            self._emit("ld", "(hl),e")
                             self._emit("inc", "hl")
-                            self._emit("ld", "(hl),d")  # Store high byte at (HL+1)
+                            self._emit("ld", "(hl),d")
                         else:
-                            # BYTE array - store single byte
                             if val_type != DataType.BYTE:
-                                self._emit("ld", "a,l")  # Get low byte from ADDRESS
-                            # Value in A - save it on stack, compute address, store
-                            # NOTE: Cannot use B register here because _gen_subscript_addr
-                            # may call _gen_byte_binary which uses B for its calculations
-                            self._emit("push", "af")  # Save value on stack
-                            self._gen_subscript_addr(subscript)  # HL = address
-                            self._emit("pop", "af")  # Restore value to A
-                            self._emit("ld", "(hl),a")  # Store value
+                                self._emit("ld", "a,l")
+                            self._emit("push", "af")
+                            self._gen_subscript_addr(expr)
+                            self._emit("pop", "af")
+                            self._emit("ld", "(hl),a")
                     return
 
-            # Check if this is a member array subscript: struct.member(idx)
-            if isinstance(expr.callee, MemberExpr) and len(expr.args) == 1:
-                member_expr = expr.callee
-                idx_expr = expr.args[0]
+            # Member array subscript: struct.member(idx)
+            if isinstance(callee, P.MemberAccess) and len(expr.args) == 1:
+                member_expr = callee
+                idx_expr = unwrap_paren(expr.args[0])
                 _, member_type = self._get_member_info(member_expr)
                 elem_size = 2 if member_type == DataType.ADDRESS else 1
 
-                # Save value, compute address, then store based on ELEMENT type (not value type)
                 if member_type == DataType.ADDRESS:
-                    # ADDRESS array member - store 16-bit
                     if val_type == DataType.BYTE:
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
-                    self._emit("push", "hl")  # Save value
+                    self._emit("push", "hl")
                     self._gen_member_addr(member_expr)
-                    # Add index offset
-                    if isinstance(idx_expr, NumberLiteral):
-                        self._emit_add_hl_const(idx_expr.value * elem_size)
+                    if isinstance(idx_expr, P.NumberLiteral):
+                        self._emit_add_hl_const(number_value(idx_expr) * elem_size)
                     else:
                         self._emit("push", "hl")
                         idx_type = self._gen_expr(idx_expr)
                         if idx_type == DataType.BYTE:
                             self._emit("ld", "l,a")
                             self._emit("ld", "h,0")
-                        self._emit("add", "hl,hl")  # *2 for ADDRESS elements
+                        self._emit("add", "hl,hl")
                         self._emit("pop", "de")
                         self._emit("add", "hl,de")
-                    self._emit("pop", "de")  # DE = value
+                    self._emit("pop", "de")
                     self._emit("ld", "(hl),e")
                     self._emit("inc", "hl")
                     self._emit("ld", "(hl),d")
                 else:
-                    # BYTE array member - store 8-bit only
                     if val_type != DataType.BYTE:
-                        self._emit("ld", "a,l")  # Get low byte from ADDRESS value
-                    self._emit("push", "af")  # Save value on stack
+                        self._emit("ld", "a,l")
+                    self._emit("push", "af")
                     self._gen_member_addr(member_expr)
-                    # Add index offset
-                    if isinstance(idx_expr, NumberLiteral):
-                        self._emit_add_hl_const(idx_expr.value)
+                    if isinstance(idx_expr, P.NumberLiteral):
+                        self._emit_add_hl_const(number_value(idx_expr))
                     else:
                         self._emit("push", "hl")
                         idx_type = self._gen_expr(idx_expr)
@@ -5095,13 +4843,13 @@ class CodeGenerator:
                             self._emit("ld", "h,0")
                         self._emit("pop", "de")
                         self._emit("add", "hl,de")
-                    self._emit("pop", "af")  # Restore value to A
-                    self._emit("ld", "(hl),a")  # Store single byte
+                    self._emit("pop", "af")
+                    self._emit("ld", "(hl),a")
                 return
 
             # Unknown call target - fall through to complex store
             self._emit("push", "hl")
-            self._gen_location(LocationExpr(operand=expr))
+            self._gen_location(_make_location(expr))
             self._emit("ex", "de,hl")
             self._emit("pop", "hl")
             if val_type == DataType.BYTE:
@@ -5115,334 +4863,287 @@ class CodeGenerator:
             return
 
         else:
-            # Complex store
-            self._emit("push", "hl")  # Save value
-            self._gen_location(LocationExpr(operand=expr))  # HL = address
-            self._emit("ex", "de,hl")  # DE = address
-            self._emit("pop", "hl")  # HL = value
-            # Store based on type
+            # Complex store via location-of fallback
+            self._emit("push", "hl")
+            self._gen_location(_make_location(expr))
+            self._emit("ex", "de,hl")
+            self._emit("pop", "hl")
             if val_type == DataType.BYTE:
                 self._emit("ld", "a,l")
                 self._emit("ld", "(de),a")
             else:
-                self._emit("ex", "de,hl")  # HL = address, DE = value
+                self._emit("ex", "de,hl")
                 self._emit("ld", "(hl),e")
                 self._emit("inc", "hl")
                 self._emit("ld", "(hl),d")
 
-    def _match_shl_double_8(self, expr: Expr) -> Expr | None:
-        """
-        Match the pattern SHL(DOUBLE(x), 8) and return x.
+    def _match_shl_double_8(self, expr):
+        """Match the pattern ``SHL(DOUBLE(x), 8)`` and return ``x``.
 
-        This pattern represents: x * 256 (shift byte to high position)
+        This pattern represents ``x * 256`` (shift byte to high position).
         Returns None if pattern doesn't match.
         """
-        # Must be a call to SHL
-        if not isinstance(expr, CallExpr):
+        expr = unwrap_paren(expr)
+        if not isinstance(expr, P.Call):
             return None
-        if not isinstance(expr.callee, Identifier):
+        callee = unwrap_paren(expr.callee)
+        if not isinstance(callee, P.Identifier):
             return None
-        if expr.callee.name.upper() != 'SHL':
+        if ident_text(callee.name).upper() != 'SHL':
             return None
         if len(expr.args) != 2:
             return None
 
-        # Second arg must be 8 (shift count)
-        shift_arg = expr.args[1]
-        shift_count = None
-        if isinstance(shift_arg, NumberLiteral):
-            shift_count = shift_arg.value
-        elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
-            try:
-                shift_count = self._parse_plm_number(self.literal_macros[shift_arg.name])
-            except ValueError:
-                pass
+        shift_count = self._try_eval_const(expr.args[1])
         if shift_count != 8:
             return None
 
-        # First arg must be DOUBLE(x)
-        double_expr = expr.args[0]
-        if not isinstance(double_expr, CallExpr):
+        double_expr = unwrap_paren(expr.args[0])
+        if not isinstance(double_expr, P.Call):
             return None
-        if not isinstance(double_expr.callee, Identifier):
+        d_callee = unwrap_paren(double_expr.callee)
+        if not isinstance(d_callee, P.Identifier):
             return None
-        if double_expr.callee.name.upper() != 'DOUBLE':
+        if ident_text(d_callee.name).upper() != 'DOUBLE':
             return None
         if len(double_expr.args) != 1:
             return None
 
-        # Return the inner expression (the byte value)
         inner = double_expr.args[0]
-        # Verify it's a byte type
         if self._get_expr_type(inner) != DataType.BYTE:
             return None
 
         return inner
 
-    def _gen_binary(self, expr: BinaryExpr) -> DataType:
-        """Generate code for binary expression."""
-        op = expr.op
+    def _gen_binary(self, expr) -> DataType:
+        """Generate code for a typed binary expression."""
+        op = binop_kind(expr)
+        left = unwrap_paren(expr.left)
+        right = unwrap_paren(expr.right)
 
         # Special case: SHL(DOUBLE(hi), 8) OR lo -> combine two bytes into address
-        # Pattern: (hi * 256) OR lo where hi and lo are bytes
-        if op == BinaryOp.OR:
-            hi_expr = self._match_shl_double_8(expr.left)
+        if op == BinaryOpKind.OR:
+            hi_expr = self._match_shl_double_8(left)
             if hi_expr is not None:
-                lo_type = self._get_expr_type(expr.right)
+                lo_type = self._get_expr_type(right)
                 if lo_type == DataType.BYTE:
-                    # Generate optimized: hi -> H, lo -> L
-                    self._gen_expr(hi_expr)  # Result in A
-                    self._emit("ld", "h,a")  # H = high byte
-                    self._gen_expr(expr.right)  # Result in A
-                    self._emit("ld", "l,a")  # L = low byte
-                    # HL now contains combined address
+                    self._gen_expr(hi_expr)
+                    self._emit("ld", "h,a")
+                    self._gen_expr(right)
+                    self._emit("ld", "l,a")
                     return DataType.ADDRESS
 
-        # Determine operand types for optimization
-        left_type = self._get_expr_type(expr.left)
-        right_type = self._get_expr_type(expr.right)
+        left_type = self._get_expr_type(left)
+        right_type = self._get_expr_type(right)
         both_bytes = (left_type == DataType.BYTE and right_type == DataType.BYTE)
 
-        # Special case: ADDRESS comparison with 0 - use OR L,H for zero test
-        if op in (BinaryOp.EQ, BinaryOp.NE) and left_type == DataType.ADDRESS:
-            if isinstance(expr.right, NumberLiteral) and expr.right.value == 0:
-                return self._gen_addr_zero_comparison(expr.left, op)
+        if op in (BinaryOpKind.EQ, BinaryOpKind.NE) and left_type == DataType.ADDRESS:
+            if isinstance(right, P.NumberLiteral) and number_value(right) == 0:
+                return self._gen_addr_zero_comparison(left, op)
 
-        # Check for impossible comparisons (e.g., BYTE compared to -1)
-        if op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT, BinaryOp.LE, BinaryOp.GE):
-            self._check_impossible_comparison(expr.left, expr.right, op)
+        if op in (
+            BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
+            BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
+        ):
+            self._check_impossible_comparison(left, right, op)
 
-        # Special case: byte comparison with constant - use cp n
-        # When comparing BYTE to a constant, truncate constant to byte if valid
-        # (values 0-255 or 0xFF00-0xFFFF for "negative bytes" like -1)
-        if op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT,
-                  BinaryOp.LE, BinaryOp.GE):
+        # Byte comparison with constant: use cp n
+        if op in (
+            BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
+            BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
+        ):
             if left_type == DataType.BYTE:
                 const_val = None
-                if isinstance(expr.right, NumberLiteral):
-                    val = expr.right.value
-                    # Allow direct byte values (0-255) or negative byte values (0xFF00-0xFFFF)
+                if isinstance(right, P.NumberLiteral):
+                    val = number_value(right)
                     if val <= 255 or (val & 0xFF00) == 0xFF00:
                         const_val = val & 0xFF
-                elif isinstance(expr.right, StringLiteral) and len(expr.right.value) == 1:
-                    const_val = ord(expr.right.value[0])
+                elif isinstance(right, P.StringLiteral):
+                    s = string_value(right)
+                    if len(s) == 1:
+                        const_val = ord(s[0])
 
                 if const_val is not None:
-                    return self._gen_byte_comparison_const(expr.left, op, const_val)
+                    return self._gen_byte_comparison_const(left, op, const_val)
                 elif both_bytes:
-                    return self._gen_byte_comparison(expr.left, expr.right, op)
+                    return self._gen_byte_comparison(left, right, op)
 
-        # For byte operations, use efficient byte path
-        if both_bytes and op in (BinaryOp.ADD, BinaryOp.SUB, BinaryOp.AND,
-                                  BinaryOp.OR, BinaryOp.XOR):
-            return self._gen_byte_binary(expr.left, expr.right, op)
+        if both_bytes and op in (
+            BinaryOpKind.ADD, BinaryOpKind.SUB,
+            BinaryOpKind.AND, BinaryOpKind.OR, BinaryOpKind.XOR,
+        ):
+            return self._gen_byte_binary(left, right, op)
 
-        # Optimize BYTE PLUS/MINUS 0: just ADC A,0 or SBC A,0 (preserves carry chain)
-        if op == BinaryOp.PLUS and left_type == DataType.BYTE and isinstance(expr.right, NumberLiteral) and expr.right.value == 0:
-            self._gen_expr(expr.left)  # Result in A
-            self._emit("adc", "a,0")  # add carry
+        if (
+            op == BinaryOpKind.PLUS
+            and left_type == DataType.BYTE
+            and isinstance(right, P.NumberLiteral)
+            and number_value(right) == 0
+        ):
+            self._gen_expr(left)
+            self._emit("adc", "a,0")
             return DataType.BYTE
 
-        if op == BinaryOp.MINUS and left_type == DataType.BYTE and isinstance(expr.right, NumberLiteral) and expr.right.value == 0:
-            self._gen_expr(expr.left)  # Result in A
-            self._emit("sbc", "a,0")  # subtract carry
+        if (
+            op == BinaryOpKind.MINUS
+            and left_type == DataType.BYTE
+            and isinstance(right, P.NumberLiteral)
+            and number_value(right) == 0
+        ):
+            self._gen_expr(left)
+            self._emit("sbc", "a,0")
             return DataType.BYTE
 
-        # Optimize ADDRESS +/- constant: use inc hl/dec hl for small, LD DE + add hl,DE for larger
-        # Only apply if left operand actually ends up in HL (ADDRESS type)
-        if op == BinaryOp.ADD and isinstance(expr.right, NumberLiteral) and left_type == DataType.ADDRESS:
-            const_val = expr.right.value
-            if 1 <= const_val <= 4:  # Small constants: use repeated inc hl
-                self._gen_expr(expr.left)
+        if (
+            op == BinaryOpKind.ADD
+            and isinstance(right, P.NumberLiteral)
+            and left_type == DataType.ADDRESS
+        ):
+            const_val = number_value(right)
+            if 1 <= const_val <= 4:
+                self._gen_expr(left)
                 for _ in range(const_val):
                     self._emit("inc", "hl")
                 return DataType.ADDRESS
             else:
-                # Larger constants: use ld de,const; add hl,DE (no PUSH/POP needed)
-                self._gen_expr(expr.left)  # HL = left
+                self._gen_expr(left)
                 self._emit("ld", f"de,{self._format_number(const_val)}")
-                self._emit("add", "hl,de")  # HL = HL + DE
+                self._emit("add", "hl,de")
                 return DataType.ADDRESS
-        elif op == BinaryOp.SUB and isinstance(expr.right, NumberLiteral) and left_type == DataType.ADDRESS:
-            const_val = expr.right.value
-            if 1 <= const_val <= 4:  # Small constants: use repeated dec hl
-                self._gen_expr(expr.left)
+        elif (
+            op == BinaryOpKind.SUB
+            and isinstance(right, P.NumberLiteral)
+            and left_type == DataType.ADDRESS
+        ):
+            const_val = number_value(right)
+            if 1 <= const_val <= 4:
+                self._gen_expr(left)
                 for _ in range(const_val):
                     self._emit("dec", "hl")
                 return DataType.ADDRESS
             else:
-                # Larger constants: use subtraction without PUSH/POP
-                self._gen_expr(expr.left)  # HL = left
+                self._gen_expr(left)
                 self._emit("ld", f"de,{self._format_number(const_val)}")
-                # HL = HL - DE
                 self._emit_sub16()
                 return DataType.ADDRESS
 
-        # Optimize MUL by constant power of 2: use shifts instead of runtime call
-        if op == BinaryOp.MUL:
+        # Optimize MUL by constant power of 2: shifts instead of runtime call.
+        if op == BinaryOpKind.MUL:
             const_val = None
             other_expr = None
-            if isinstance(expr.right, NumberLiteral):
-                const_val = expr.right.value
-                other_expr = expr.left
-            elif isinstance(expr.left, NumberLiteral):
-                const_val = expr.left.value
-                other_expr = expr.right
+            if isinstance(right, P.NumberLiteral):
+                const_val = number_value(right)
+                other_expr = left
+            elif isinstance(left, P.NumberLiteral):
+                const_val = number_value(left)
+                other_expr = right
 
             if const_val is not None and const_val > 0:
-                # Check if power of 2: x & (x-1) == 0 for powers of 2
                 if (const_val & (const_val - 1)) == 0:
-                    # Count shifts needed (log2)
                     shift_count = 0
                     temp = const_val
                     while temp > 1:
                         temp >>= 1
                         shift_count += 1
 
-                    # Generate the non-constant operand
                     other_type = self._gen_expr(other_expr)
                     if other_type == DataType.BYTE:
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
 
-                    # Apply shifts
                     for _ in range(shift_count):
-                        self._emit("add", "hl,hl")  # HL *= 2
+                        self._emit("add", "hl,hl")
 
                     return DataType.ADDRESS
 
         # Fall through to 16-bit operations
-        # Use register allocator to manage DE for holding one operand
-        # This automatically handles nested expressions via spill/restore
+        left_need = self._label_reg_need(left)
+        right_need = self._label_reg_need(right)
 
-        # Sethi-Ullman optimization: evaluate the subtree needing more registers first
-        # This minimizes spills by freeing registers before the simpler subtree needs them
-        left_need = self._label_reg_need(expr.left)
-        right_need = self._label_reg_need(expr.right)
-
-        # Path 1: Simple left optimization - if left is simple AND DE is free,
-        # evaluate right first to avoid the extra ex de,hl
-        if self._expr_preserves_de(expr.left) and self.regs.is_free('de'):
-            # Evaluate right first -> HL, then move to DE
-            right_result = self._gen_expr(expr.right)
+        # Path 1: left is simple AND DE is free
+        if self._expr_preserves_de(left) and self.regs.is_free('de'):
+            right_result = self._gen_expr(right)
             if right_result == DataType.BYTE:
                 self._emit("ld", "e,a")
                 self._emit("ld", "d,0")
             else:
-                self._emit("ex", "de,hl")  # DE = right
-            # Mark DE as busy (it holds right operand)
+                self._emit("ex", "de,hl")
             self.regs.mark_busy('de', 'binary_right_simple')
-            # Now evaluate left - DE is preserved since left is simple
-            left_result = self._gen_expr(expr.left)
+            left_result = self._gen_expr(left)
             if left_result == DataType.BYTE:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
-            # Now: HL = left, DE = right
             self.regs.mark_free('de')
             used_general_path = False
 
-        # Path 2: Sethi-Ullman - right needs more registers, evaluate it first
-        # This minimizes spills by computing the harder subtree before claiming DE
+        # Path 2: Sethi-Ullman - right needs more registers.
         elif right_need > left_need:
-            # Evaluate right first (harder subtree) -> HL
-            right_result = self._gen_expr(expr.right)
+            right_result = self._gen_expr(right)
             if right_result == DataType.BYTE:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
-            # If left contains an opaque DE-clobberer (procedure call etc.),
-            # the register allocator's nested-spill trick won't save us — the
-            # callee mutates DE without going through the allocator. Spill to
-            # the SP stack instead.
-            if not self._expr_preserves_de(expr.left):
-                self._emit("push", "hl")  # save right on the SP stack
-                left_result = self._gen_expr(expr.left)
+            if not self._expr_preserves_de(left):
+                self._emit("push", "hl")
+                left_result = self._gen_expr(left)
                 if left_result == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
-                self._emit("pop", "de")  # DE = right (recovered)
+                self._emit("pop", "de")
             else:
-                # Claim DE to hold right operand while we evaluate left
                 self.regs.need_reg('de', 'binary_right_sethi', self._emit)
-                self._emit("ex", "de,hl")  # DE = right
-
-                # Evaluate left operand (simpler subtree) -> HL
-                # This may recursively need DE, causing spill of our right value
-                left_result = self._gen_expr(expr.left)
+                self._emit("ex", "de,hl")
+                left_result = self._gen_expr(left)
                 if left_result == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
-
-            # Now: HL = left, DE = right (restored from spill if inner expr used DE)
-            # This is already in the correct order for HL op DE
             used_general_path = True
 
         else:
-            # Path 3: General case - left needs >= registers, evaluate it first
-            # Evaluate left operand -> HL
-            left_result = self._gen_expr(expr.left)
+            # Path 3: General - left first.
+            left_result = self._gen_expr(left)
             if left_result == DataType.BYTE:
-                # Extend A to HL
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
-            # If right contains an opaque DE-clobberer (procedure call etc.),
-            # the allocator's nested-spill trick won't save us — the callee
-            # mutates DE behind its back. Save left on the SP stack instead.
-            if not self._expr_preserves_de(expr.right):
-                self._emit("push", "hl")  # save left on the SP stack
-                right_result = self._gen_expr(expr.right)
+            if not self._expr_preserves_de(right):
+                self._emit("push", "hl")
+                right_result = self._gen_expr(right)
                 if right_result == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
-                # HL = right; want HL = left, DE = right
-                self._emit("ex", "de,hl")  # DE = right (HL is junk)
-                self._emit("pop", "hl")    # HL = left (recovered)
+                self._emit("ex", "de,hl")
+                self._emit("pop", "hl")
             else:
-                # Claim DE to hold left operand while we evaluate right
-                # If DE is already busy (nested binary expr), it will be spilled
                 self.regs.need_reg('de', 'binary_left', self._emit)
-                self._emit("ex", "de,hl")  # DE = left
-
-                # Evaluate right operand -> HL
-                # This may recursively need DE, causing spill of our left value.
-                # When inner expr releases DE, our left value is restored.
-                right_result = self._gen_expr(expr.right)
+                self._emit("ex", "de,hl")
+                right_result = self._gen_expr(right)
                 if right_result == DataType.BYTE:
-                    # Extend A to HL
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
-
-                # Now: HL = right, DE = left (restored from spill if inner expr used DE)
-                # Swap so HL = left, DE = right (standard order for operations)
                 self._emit("ex", "de,hl")
 
-            # NOTE: Don't release DE yet - we still need it for the operation!
-            # Will release after the operation below.
             used_general_path = True
 
-        if op == BinaryOp.ADD:
-            self._emit("add", "hl,de")  # HL = HL + DE
+        if op == BinaryOpKind.ADD:
+            self._emit("add", "hl,de")
 
-        elif op == BinaryOp.SUB:
-            # HL = HL - DE
+        elif op == BinaryOpKind.SUB:
             self._emit_sub16()
 
-        elif op == BinaryOp.MUL:
-            # Power of 2 cases handled above with early return
-            # This handles non-power-of-2 multiplies
+        elif op == BinaryOpKind.MUL:
             self.needs_runtime.add("mul16")
             self._emit("call", "??mul16")
 
-        elif op == BinaryOp.DIV:
+        elif op == BinaryOpKind.DIV:
             self.needs_runtime.add("div16")
             self._emit("call", "??div16")
 
-        elif op == BinaryOp.MOD:
+        elif op == BinaryOpKind.MOD:
             self.needs_runtime.add("mod16")
             self._emit("call", "??mod16")
 
-        elif op == BinaryOp.AND:
+        elif op == BinaryOpKind.AND:
             self._emit("ld", "a,l")
             self._emit("and", "e")
             self._emit("ld", "l,a")
@@ -5450,7 +5151,7 @@ class CodeGenerator:
             self._emit("and", "d")
             self._emit("ld", "h,a")
 
-        elif op == BinaryOp.OR:
+        elif op == BinaryOpKind.OR:
             self._emit("ld", "a,l")
             self._emit("or", "e")
             self._emit("ld", "l,a")
@@ -5458,7 +5159,7 @@ class CodeGenerator:
             self._emit("or", "d")
             self._emit("ld", "h,a")
 
-        elif op == BinaryOp.XOR:
+        elif op == BinaryOpKind.XOR:
             self._emit("ld", "a,l")
             self._emit("xor", "e")
             self._emit("ld", "l,a")
@@ -5466,16 +5167,15 @@ class CodeGenerator:
             self._emit("xor", "d")
             self._emit("ld", "h,a")
 
-        elif op in (BinaryOp.EQ, BinaryOp.NE, BinaryOp.LT, BinaryOp.GT,
-                   BinaryOp.LE, BinaryOp.GE):
-            # Comparison returns result in A (BYTE), not HL
-            # Release DE before returning if we used the general path
+        elif op in (
+            BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
+            BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
+        ):
             if used_general_path:
                 self.regs.release_reg('de', self._emit)
             return self._gen_comparison(op)
 
-        elif op == BinaryOp.PLUS:
-            # PLUS: add with carry from previous operation
+        elif op == BinaryOpKind.PLUS:
             self._emit("ld", "a,l")
             self._emit("adc", "a,e")
             self._emit("ld", "l,a")
@@ -5483,8 +5183,7 @@ class CodeGenerator:
             self._emit("adc", "a,d")
             self._emit("ld", "h,a")
 
-        elif op == BinaryOp.MINUS:
-            # MINUS: subtract with borrow from previous operation
+        elif op == BinaryOpKind.MINUS:
             self._emit("ld", "a,l")
             self._emit("sbc", "a,e")
             self._emit("ld", "l,a")
@@ -5492,271 +5191,224 @@ class CodeGenerator:
             self._emit("sbc", "a,d")
             self._emit("ld", "h,a")
 
-        # Release DE after operation if we used the general path
         if used_general_path:
             self.regs.release_reg('de', self._emit)
 
         return DataType.ADDRESS
 
-    def _gen_comparison(self, op: BinaryOp) -> DataType:
+    def _gen_comparison(self, op: BinaryOpKind) -> DataType:
         """Generate code for comparison. HL=left, DE=right. Result in A (0 or 0FFH)."""
         true_label = self._new_label("TRUE")
         false_label = self._new_label("FALSE")
         end_label = self._new_label("CMP")
 
-        # Subtract: HL = HL - DE, flags set from high byte subtraction
         self._emit_sub16()
-        # Now: HL = left - right, flags set from SBB D (carry = borrow)
 
-        if op == BinaryOp.EQ:
+        if op == BinaryOpKind.EQ:
             self._emit("ld", "a,l")
-            self._emit("or", "h")  # or high and low
+            self._emit("or", "h")
             self._emit("jp", f"z,{true_label}")
-        elif op == BinaryOp.NE:
+        elif op == BinaryOpKind.NE:
             self._emit("ld", "a,l")
             self._emit("or", "h")
             self._emit("jp", f"nz,{true_label}")
-        elif op == BinaryOp.LT:
-            # left < right if borrow occurred
+        elif op == BinaryOpKind.LT:
             self._emit("jp", f"c,{true_label}")
-        elif op == BinaryOp.GE:
+        elif op == BinaryOpKind.GE:
             self._emit("jp", f"nc,{true_label}")
-        elif op == BinaryOp.GT:
-            # left > right: no borrow AND not equal
-            self._emit("jp", f"c,{false_label}")  # If left < right, false
+        elif op == BinaryOpKind.GT:
+            self._emit("jp", f"c,{false_label}")
             self._emit("ld", "a,l")
             self._emit("or", "h")
-            self._emit("jp", f"nz,{true_label}")  # If not equal, left > right
-        elif op == BinaryOp.LE:
-            self._emit("jp", f"c,{true_label}")  # left < right
+            self._emit("jp", f"nz,{true_label}")
+        elif op == BinaryOpKind.LE:
+            self._emit("jp", f"c,{true_label}")
             self._emit("ld", "a,l")
             self._emit("or", "h")
-            self._emit("jp", f"z,{true_label}")  # left == right
+            self._emit("jp", f"z,{true_label}")
 
-        # False case - return 0 in A
         self._emit_label(false_label)
         self._emit("xor", "a")
         self._emit("jp", end_label)
 
-        # True case - return 0FFH in A (PL/M TRUE = 0FFH)
         self._emit_label(true_label)
         self._emit("ld", "a,0ffh")
 
         self._emit_label(end_label)
         return DataType.BYTE
 
-    def _gen_addr_zero_comparison(self, left: Expr, op: BinaryOp) -> DataType:
-        """Generate optimized ADDRESS comparison with 0 using OR.
-
-        For N = 0 or N <> 0 where N is ADDRESS, use:
-            ld a,L
-            or h
-            jp z/jp nz label
-        instead of full 16-bit subtraction.
-        """
-        # Load left operand into HL
+    def _gen_addr_zero_comparison(self, left, op: BinaryOpKind) -> DataType:
+        """Generate optimized ADDRESS comparison with 0 using OR."""
         self._gen_expr(left)
-
-        # Test if HL is zero: A = L | H
         self._emit("ld", "a,l")
         self._emit("or", "h")
 
-        # Generate result based on comparison type
         true_label = self._new_label("TRUE")
         end_label = self._new_label("CMP")
 
-        if op == BinaryOp.EQ:
-            self._emit("jp", f"z,{true_label}")  # If zero, equal
-        elif op == BinaryOp.NE:
-            self._emit("jp", f"nz,{true_label}")  # If not zero, not equal
+        if op == BinaryOpKind.EQ:
+            self._emit("jp", f"z,{true_label}")
+        elif op == BinaryOpKind.NE:
+            self._emit("jp", f"nz,{true_label}")
 
-        # False case - return 0 in A
         self._emit("xor", "a")
         self._emit("jp", end_label)
 
-        # True case - return 0FFH in A (PL/M TRUE = 0FFH)
         self._emit_label(true_label)
         self._emit("ld", "a,0ffh")
 
         self._emit_label(end_label)
         return DataType.BYTE
 
-    def _gen_byte_comparison_const(self, left: Expr, op: BinaryOp, const_val: int) -> DataType:
+    def _gen_byte_comparison_const(self, left, op: BinaryOpKind, const_val: int) -> DataType:
         """Generate optimized byte comparison with constant using cp n."""
-        # Load left operand into A
         left_type = self._gen_expr(left)
         if left_type != DataType.BYTE:
-            # If not already a byte, take low byte
             self._emit("ld", "a,l")
 
-        # Compare with constant
         self._emit("cp", self._format_number(const_val))
 
-        # Generate result based on comparison type
         true_label = self._new_label("TRUE")
         end_label = self._new_label("CMP")
 
-        if op == BinaryOp.EQ:
+        if op == BinaryOpKind.EQ:
             self._emit("jp", f"z,{true_label}")
-        elif op == BinaryOp.NE:
+        elif op == BinaryOpKind.NE:
             self._emit("jp", f"nz,{true_label}")
-        elif op == BinaryOp.LT:
+        elif op == BinaryOpKind.LT:
             self._emit("jp", f"c,{true_label}")
-        elif op == BinaryOp.GE:
+        elif op == BinaryOpKind.GE:
             self._emit("jp", f"nc,{true_label}")
-        elif op == BinaryOp.GT:
-            # A > const: not equal AND not less (jp nc and jp nz)
-            self._emit("jp", f"c,{end_label}")  # If less, false
-            self._emit("jp", f"z,{end_label}")  # If equal, false
-            self._emit("jp", true_label)  # Otherwise true
-        elif op == BinaryOp.LE:
-            self._emit("jp", f"c,{true_label}")  # Less than -> true
-            self._emit("jp", f"z,{true_label}")  # Equal -> true
-
-        # False case - return 0 in A
-        self._emit("xor", "a")
-        self._emit("jp", end_label)
-
-        # True case - return 0FFH in A (PL/M TRUE = 0FFH)
-        self._emit_label(true_label)
-        self._emit("ld", "a,0ffh")
-
-        self._emit_label(end_label)
-        return DataType.BYTE  # Comparisons return BYTE (0 or 0FFH)
-
-    def _gen_byte_comparison(self, left: Expr, right: Expr, op: BinaryOp) -> DataType:
-        """Generate optimized byte comparison between two byte values."""
-        # Load right first, then left, so we can SUB B directly
-        self._gen_expr(right)  # Result in A
-        self._emit("ld", "b,a")  # Save right in B
-
-        self._gen_expr(left)  # Result in A (left)
-        self._emit("sub", "b")    # A = left - right, flags set
-
-        # Generate result
-        true_label = self._new_label("TRUE")
-        end_label = self._new_label("CMP")
-
-        if op == BinaryOp.EQ:
-            self._emit("jp", f"z,{true_label}")
-        elif op == BinaryOp.NE:
-            self._emit("jp", f"nz,{true_label}")
-        elif op == BinaryOp.LT:
-            self._emit("jp", f"c,{true_label}")
-        elif op == BinaryOp.GE:
-            self._emit("jp", f"nc,{true_label}")
-        elif op == BinaryOp.GT:
+        elif op == BinaryOpKind.GT:
             self._emit("jp", f"c,{end_label}")
             self._emit("jp", f"z,{end_label}")
             self._emit("jp", true_label)
-        elif op == BinaryOp.LE:
+        elif op == BinaryOpKind.LE:
             self._emit("jp", f"c,{true_label}")
             self._emit("jp", f"z,{true_label}")
 
-        # False case - return 0 in A
         self._emit("xor", "a")
         self._emit("jp", end_label)
 
-        # True case - return 0FFH in A (PL/M TRUE = 0FFH)
         self._emit_label(true_label)
         self._emit("ld", "a,0ffh")
 
         self._emit_label(end_label)
-        return DataType.BYTE  # Comparisons return BYTE (0 or 0FFH)
+        return DataType.BYTE
 
-    def _gen_byte_binary(self, left: Expr, right: Expr, op: BinaryOp) -> DataType:
+    def _gen_byte_comparison(self, left, right, op: BinaryOpKind) -> DataType:
+        """Generate optimized byte comparison between two byte values."""
+        self._gen_expr(right)
+        self._emit("ld", "b,a")
+
+        self._gen_expr(left)
+        self._emit("sub", "b")
+
+        true_label = self._new_label("TRUE")
+        end_label = self._new_label("CMP")
+
+        if op == BinaryOpKind.EQ:
+            self._emit("jp", f"z,{true_label}")
+        elif op == BinaryOpKind.NE:
+            self._emit("jp", f"nz,{true_label}")
+        elif op == BinaryOpKind.LT:
+            self._emit("jp", f"c,{true_label}")
+        elif op == BinaryOpKind.GE:
+            self._emit("jp", f"nc,{true_label}")
+        elif op == BinaryOpKind.GT:
+            self._emit("jp", f"c,{end_label}")
+            self._emit("jp", f"z,{end_label}")
+            self._emit("jp", true_label)
+        elif op == BinaryOpKind.LE:
+            self._emit("jp", f"c,{true_label}")
+            self._emit("jp", f"z,{true_label}")
+
+        self._emit("xor", "a")
+        self._emit("jp", end_label)
+
+        self._emit_label(true_label)
+        self._emit("ld", "a,0ffh")
+
+        self._emit_label(end_label)
+        return DataType.BYTE
+
+    def _gen_byte_binary(self, left, right, op: BinaryOpKind) -> DataType:
         """Generate optimized byte arithmetic/logical operation."""
-        # Special case: right is constant - use immediate instructions
         right_const = self._get_const_byte_value(right)
         if right_const is not None:
-            self._gen_expr_to_a(left)  # Load left into A
+            self._gen_expr_to_a(left)
             const = self._format_number(right_const)
-            if op == BinaryOp.ADD:
-                self._emit("add", f"a,{const}")  # A = A + const
-            elif op == BinaryOp.SUB:
-                self._emit("sub", const)  # A = A - const
-            elif op == BinaryOp.AND:
-                self._emit("and", const)  # A = A AND const
-            elif op == BinaryOp.OR:
-                self._emit("or", const)  # A = A OR const
-            elif op == BinaryOp.XOR:
-                self._emit("xor", const)  # A = A XOR const
+            if op == BinaryOpKind.ADD:
+                self._emit("add", f"a,{const}")
+            elif op == BinaryOpKind.SUB:
+                self._emit("sub", const)
+            elif op == BinaryOpKind.AND:
+                self._emit("and", const)
+            elif op == BinaryOpKind.OR:
+                self._emit("or", const)
+            elif op == BinaryOpKind.XOR:
+                self._emit("xor", const)
             return DataType.BYTE
 
-        # Special case: const - var (left is constant, subtraction)
         left_const = self._get_const_byte_value(left)
-        if op == BinaryOp.SUB and left_const is not None:
+        if op == BinaryOpKind.SUB and left_const is not None:
             if left_const == 1:
-                # 1 - x is a boolean toggle: use XOR 1
                 self._gen_expr_to_a(right)
                 self._emit("xor", "1")
             else:
-                # const - x: negate x then add const
-                # -x = NOT(x) + 1, so const - x = NOT(x) + 1 + const = NOT(x) + (const+1)
-                # But we need to handle overflow: use CPL; ADD A,const; INC A for (const-x)
-                # Actually: A = right; CPL; INC A gives -right; then ADD A,const
                 self._gen_expr_to_a(right)
-                self._emit("cpl")  # A = NOT(right)
-                self._emit("inc", "a")  # A = -right (two's complement)
-                self._emit("add", f"a,{self._format_number(left_const)}")  # A = const - right
+                self._emit("cpl")
+                self._emit("inc", "a")
+                self._emit("add", f"a,{self._format_number(left_const)}")
             return DataType.BYTE
 
-        # For subtraction, load right first so we can do SUB B directly
-        if op == BinaryOp.SUB:
+        if op == BinaryOpKind.SUB:
             self._gen_expr_to_a(right)
-            self._emit("ld", "b,a")  # Save right in B
+            self._emit("ld", "b,a")
             self._gen_expr_to_a(left)
-            self._emit("sub", "b")    # A = left - right
+            self._emit("sub", "b")
             return DataType.BYTE
 
-        # General case: load left into A, save to B
         self._gen_expr_to_a(left)
-        self._emit("ld", "b,a")  # Save left in B
+        self._emit("ld", "b,a")
 
-        # Load right into A
         self._gen_expr_to_a(right)
-        # Now B = left, A = right
 
-        # Perform operation: result = left op right
-        if op == BinaryOp.ADD:
-            self._emit("add", "a,b")  # A = A + B = right + left
-        elif op == BinaryOp.AND:
-            self._emit("and", "b")  # A = A AND B
-        elif op == BinaryOp.OR:
-            self._emit("or", "b")  # A = A OR B
-        elif op == BinaryOp.XOR:
-            self._emit("xor", "b")  # A = A XOR B
+        if op == BinaryOpKind.ADD:
+            self._emit("add", "a,b")
+        elif op == BinaryOpKind.AND:
+            self._emit("and", "b")
+        elif op == BinaryOpKind.OR:
+            self._emit("or", "b")
+        elif op == BinaryOpKind.XOR:
+            self._emit("xor", "b")
 
-        # Result is in A, return BYTE
         return DataType.BYTE
 
-    def _gen_expr_to_a(self, expr: Expr) -> None:
+    def _gen_expr_to_a(self, expr) -> None:
         """Generate code to load an expression into A (for byte operations)."""
-        # Check for constant value (NumberLiteral, StringLiteral, or LITERALLY macro)
+        expr = unwrap_paren(expr)
         const_val = self._get_const_byte_value(expr)
         if const_val is not None:
             self._emit("ld", f"a,{self._format_number(const_val)}")
-        elif isinstance(expr, NumberLiteral):
-            # Large constant - load low byte
-            self._emit("ld", f"a,{self._format_number(expr.value & 0xFF)}")
+        elif isinstance(expr, P.NumberLiteral):
+            self._emit("ld", f"a,{self._format_number(number_value(expr) & 0xFF)}")
         else:
             result_type = self._gen_expr(expr)
             if result_type == DataType.ADDRESS:
-                # Value is in HL, get low byte into A
                 self._emit("ld", "a,l")
 
-    def _gen_unary(self, expr: UnaryExpr) -> DataType:
-        """Generate code for unary expression."""
+    def _gen_unary(self, expr) -> DataType:
+        """Generate code for a typed unary expression."""
+        kind = unop_kind(expr)
         operand_type = self._gen_expr(expr.operand)
 
-        if expr.op == UnaryOp.NEG:
+        if kind == UnaryOpKind.NEG:
             if operand_type == DataType.BYTE:
-                # Negate A: A = 0 - A
                 self._emit("cpl")
                 self._emit("inc", "a")
                 return DataType.BYTE
             else:
-                # Negate HL: HL = 0 - HL
                 self._emit("ld", "a,l")
                 self._emit("cpl")
                 self._emit("ld", "l,a")
@@ -5766,7 +5418,7 @@ class CodeGenerator:
                 self._emit("inc", "hl")
                 return DataType.ADDRESS
 
-        elif expr.op == UnaryOp.NOT:
+        elif kind == UnaryOpKind.NOT:
             if operand_type == DataType.BYTE:
                 # Bitwise NOT: complement all bits
                 # A contains the byte value
@@ -5782,21 +5434,6 @@ class CodeGenerator:
                 self._emit("ld", "h,a")
                 return DataType.ADDRESS
 
-        elif expr.op == UnaryOp.LOW:
-            # Value is in HL (ADDRESS) or A (BYTE from operand)
-            if operand_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")  # Get low byte into A
-            # else: already in A from BYTE operand
-            return DataType.BYTE
-
-        elif expr.op == UnaryOp.HIGH:
-            # Value is in HL (ADDRESS) or A (BYTE from operand)
-            if operand_type == DataType.ADDRESS:
-                self._emit("ld", "a,h")  # Get high byte into A
-            else:
-                self._emit("xor", "a")  # BYTE has no high byte, return 0
-            return DataType.BYTE
-
         return DataType.ADDRESS
 
     # Built-in functions that might be parsed as subscripts
@@ -5804,51 +5441,51 @@ class CodeGenerator:
                      'SHL', 'SHR', 'SCL', 'SCR', 'INPUT', 'OUTPUT', 'TIME', 'MOVE',
                      'CPUTIME', 'MEMORY', 'STACKPTR', 'DEC'}
 
-    def _gen_subscript(self, expr: SubscriptExpr) -> DataType:
-        """Generate code for array subscript - load value."""
-        # Check if this is actually a built-in function call
-        if isinstance(expr.base, Identifier) and expr.base.name.upper() in self.BUILTIN_FUNCS:
-            # Treat as function call
-            call = CallExpr(callee=expr.base, args=[expr.index])
-            return self._gen_call_expr(call)
+    def _gen_subscript(self, expr) -> DataType:
+        """Generate code for array subscript (typed ``P.Call`` form) — load value."""
+        base = unwrap_paren(expr.callee)
+        index = expr.args[0]
 
-        # Check element type
+        if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
+            return self._gen_call_expr(expr)
+
         elem_type = DataType.BYTE
-        if isinstance(expr.base, Identifier):
-            sym = self.symbols.lookup(expr.base.name)
+        if isinstance(base, P.Identifier):
+            sym = self.symbols.lookup(ident_text(base.name))
             if sym and sym.data_type == DataType.ADDRESS:
                 elem_type = DataType.ADDRESS
 
         self._gen_subscript_addr(expr)
 
         if elem_type == DataType.ADDRESS:
-            # Load 16-bit value: low byte first, then high byte
             self._emit("ld", "e,(hl)")
             self._emit("inc", "hl")
             self._emit("ld", "d,(hl)")
-            self._emit("ex", "de,hl")  # HL = value
+            self._emit("ex", "de,hl")
             return DataType.ADDRESS
         else:
-            # Load BYTE value into A
             self._emit("ld", "a,(hl)")
             return DataType.BYTE
 
-    def _gen_subscript_addr(self, expr: SubscriptExpr) -> None:
-        """Generate code to compute address of array element."""
-        # Check if this is actually a built-in function call (in a .func(arg) context)
-        if isinstance(expr.base, Identifier) and expr.base.name.upper() in self.BUILTIN_FUNCS:
-            # Generate the function call - result in HL
-            call = CallExpr(callee=expr.base, args=[expr.index])
-            self._gen_call_expr(call)
+    def _gen_subscript_addr(self, expr) -> None:
+        """Generate code to compute address of an array element.
+
+        Accepts a typed :class:`P.Call` (which is how the grammar
+        models ``arr(idx)``). The callee is the array reference and
+        ``args[0]`` is the index expression.
+        """
+        base = unwrap_paren(expr.callee)
+        index = unwrap_paren(expr.args[0])
+
+        if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
+            self._gen_call_expr(expr)
             return
 
-        # Check element size
-        elem_size = 1  # Default BYTE
-        if isinstance(expr.base, Identifier):
-            sym = self.symbols.lookup(expr.base.name)
+        elem_size = 1
+        if isinstance(base, P.Identifier):
+            sym = self.symbols.lookup(ident_text(base.name))
             if sym:
                 if sym.struct_members:
-                    # Structure array - element size is sum of all member sizes
                     elem_size = 0
                     for member in sym.struct_members:
                         member_size = 2 if member.data_type == DataType.ADDRESS else 1
@@ -5858,125 +5495,99 @@ class CodeGenerator:
                 elif sym.data_type == DataType.ADDRESS:
                     elem_size = 2
 
-        # OPTIMIZATION: Constant folding for label+constant
-        # If base is a simple identifier (label) and index is constant, fold them
-        if isinstance(expr.base, Identifier) and isinstance(expr.index, NumberLiteral):
-            sym = self.symbols.lookup(expr.base.name)
+        # Constant folding: label + constant.
+        if isinstance(base, P.Identifier) and isinstance(index, P.NumberLiteral):
+            sym = self.symbols.lookup(ident_text(base.name))
             if sym and not sym.based_on:
-                # Regular array with constant index - can fold: ld hl,label+offset
-                asm_name = sym.asm_name if sym.asm_name else self._mangle_name(expr.base.name)
-                offset = expr.index.value * elem_size
+                asm_name = sym.asm_name if sym.asm_name else self._mangle_name(ident_text(base.name))
+                offset = number_value(index) * elem_size
                 if offset == 0:
                     self._emit("ld", f"hl,{asm_name}")
                 else:
                     self._emit("ld", f"hl,{asm_name}+{offset}")
                 return
 
-        # Check for optimized BYTE index path first (avoids loading base into HL)
-        if not isinstance(expr.index, NumberLiteral):
-            idx_type = self._get_expr_type(expr.index)
-            if idx_type == DataType.BYTE and elem_size == 1 and isinstance(expr.base, Identifier):
-                # Optimized byte index with identifier base
-                # Evaluate index first (before loading base), then load base into DE
-                self._gen_expr(expr.index)  # A = index (byte)
+        # Optimised BYTE-index path with identifier base.
+        if not isinstance(index, P.NumberLiteral):
+            idx_type = self._get_expr_type(index)
+            if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
+                self._gen_expr(index)
                 self._emit("ld", "l,a")
-                self._emit("ld", "h,0")  # HL = index (zero-extended)
-                # Load base directly into DE
-                sym = self.symbols.lookup(expr.base.name)
+                self._emit("ld", "h,0")
+                sym = self.symbols.lookup(ident_text(base.name))
                 if sym and sym.based_on:
                     base_sym = self.symbols.lookup(sym.based_on)
                     base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
-                    self._emit("ld", f"de,({base_asm_name})")  # Z80: ld de,(addr)
+                    self._emit("ld", f"de,({base_asm_name})")
                 else:
-                    asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(expr.base.name)
+                    asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(ident_text(base.name))
                     self._emit("ld", f"de,{asm_name}")
-                self._emit("add", "hl,de")  # HL = index + base
+                self._emit("add", "hl,de")
                 return
 
-        # Get base address (non-constant or BASED variable case)
-        if isinstance(expr.base, Identifier):
-            sym = self.symbols.lookup(expr.base.name)
+        # Get base address.
+        if isinstance(base, P.Identifier):
+            sym = self.symbols.lookup(ident_text(base.name))
             if sym and sym.based_on:
-                # BASED variable - load the base pointer from the based_on variable
                 base_sym = self.symbols.lookup(sym.based_on)
                 base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
                 self._emit("ld", f"hl,({base_asm_name})")
             else:
-                # Regular array - use address of array
-                asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(expr.base.name)
+                asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(ident_text(base.name))
                 self._emit("ld", f"hl,{asm_name}")
         else:
-            self._gen_expr(expr.base)
+            self._gen_expr(base)
 
-        # Optimize for constant index (only reached for BASED or computed base)
-        if isinstance(expr.index, NumberLiteral):
-            offset = expr.index.value * elem_size
+        if isinstance(index, P.NumberLiteral):
+            offset = number_value(index) * elem_size
             self._emit_add_hl_const(offset)
         else:
-            # Variable index with complex base or ADDRESS index
-            # Use register allocator for DE to hold base while evaluating index
-            # This integrates with binary expression spill/restore mechanism
-            idx_type = self._get_expr_type(expr.index)
-
-            # Claim DE to hold base address while evaluating index
-            # If DE is already busy (e.g., from outer binary expression), it will be spilled
             self.regs.need_reg('de', 'subscript_base', self._emit)
-            self._emit("ex", "de,hl")  # DE = base
+            self._emit("ex", "de,hl")
 
-            # Get index - may recursively use DE (triggers spill/restore)
-            result_type = self._gen_expr(expr.index)
+            result_type = self._gen_expr(index)
 
-            # If index was BYTE (in A), extend to HL
             if result_type == DataType.BYTE:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
             if elem_size > 1:
-                # Multiply index by element size
-                # Check if elem_size is a power of 2: x & (x-1) == 0
                 if (elem_size & (elem_size - 1)) == 0:
-                    # Power of 2: use repeated add hl,hl
                     temp = elem_size
                     while temp > 1:
-                        self._emit("add", "hl,hl")  # HL *= 2
+                        self._emit("add", "hl,hl")
                         temp >>= 1
                 else:
-                    # General case: HL = HL * elem_size using multiply routine
-                    # Need to save DE (base) across multiply call
                     self._emit("push", "de")
                     self._emit("ld", f"de,{elem_size}")
                     self._emit("call", "??mul16")
                     self._emit("pop", "de")
                     self.needs_runtime.add("mul16")
 
-            # Add index to base - DE holds base (possibly restored from spill)
             self._emit("add", "hl,de")
-
-            # Release DE after operation
             self.regs.release_reg('de', self._emit)
 
-    def _get_member_info(self, expr: MemberExpr) -> tuple[int, DataType]:
-        """Get offset and type for a structure member."""
+    def _get_member_info(self, expr) -> tuple[int, DataType]:
+        """Get offset and type for a typed ``MemberAccess`` node."""
         offset = 0
         member_type = DataType.BYTE
 
-        # Get the base variable's symbol to find struct_members
+        base = unwrap_paren(expr.base)
+        member_name = ident_text(expr.member)
+
         sym = None
-        if isinstance(expr.base, Identifier):
-            sym = self.symbols.lookup(expr.base.name)
-        elif isinstance(expr.base, CallExpr) and isinstance(expr.base.callee, Identifier):
-            # Array of structures: POINTS(0).X - look up array's struct_members
-            sym = self.symbols.lookup(expr.base.callee.name)
-        elif isinstance(expr.base, SubscriptExpr) and isinstance(expr.base.base, Identifier):
-            # Subscript form: look up array's struct_members
-            sym = self.symbols.lookup(expr.base.base.name)
+        if isinstance(base, P.Identifier):
+            sym = self.symbols.lookup(ident_text(base.name))
+        elif isinstance(base, P.Call):
+            callee = unwrap_paren(base.callee)
+            if isinstance(callee, P.Identifier):
+                sym = self.symbols.lookup(ident_text(callee.name))
 
         if sym and sym.struct_members:
             for member in sym.struct_members:
-                if member.name == expr.member:
+                if member.name == member_name:
                     member_type = member.data_type
                     break
-                # Add size of this member
                 member_size = 2 if member.data_type == DataType.ADDRESS else 1
                 if member.dimension:
                     member_size *= member.dimension
@@ -5984,156 +5595,118 @@ class CodeGenerator:
 
         return offset, member_type
 
-    def _gen_member(self, expr: MemberExpr) -> DataType:
-        """Generate code for structure member access - load value."""
+    def _gen_member(self, expr) -> DataType:
+        """Generate code for structure member access — load value."""
         _, member_type = self._get_member_info(expr)
         self._gen_member_addr(expr)
 
         if member_type == DataType.ADDRESS:
-            # Load 16-bit value
             self._emit("ld", "e,(hl)")
             self._emit("inc", "hl")
             self._emit("ld", "d,(hl)")
-            self._emit("ex", "de,hl")  # HL = value
+            self._emit("ex", "de,hl")
             return DataType.ADDRESS
         else:
-            # Load 8-bit value
             self._emit("ld", "a,(hl)")
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
             return DataType.BYTE
 
-    def _gen_member_addr(self, expr: MemberExpr) -> None:
+    def _gen_member_addr(self, expr) -> None:
         """Generate code to compute address of structure member."""
-        # Handle base expression - need ADDRESS, not value
-        base = expr.base
-        if isinstance(base, Identifier):
-            # Simple identifier - look it up to determine if it's a structure
-            name = base.name
-            sym = None
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
+        base = unwrap_paren(expr.base)
+        if isinstance(base, P.Identifier):
+            name = ident_text(base.name)
+            sym = self._lookup_symbol(name)
 
             if sym and sym.struct_members:
-                # This is a structure variable - we need its ADDRESS, not its value
                 if sym.based_on:
-                    # BASED structure - load the pointer from the base variable
                     base_sym = self.symbols.lookup(sym.based_on)
                     base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
                     self._emit("ld", f"hl,({base_asm_name})")
                 else:
-                    # Regular structure - generate the address directly
                     asm_name = sym.asm_name or name
                     self._emit("ld", f"hl,{asm_name}")
             elif sym and sym.based_on:
-                # BASED variable without struct_members - load the pointer
                 base_sym = self.symbols.lookup(sym.based_on)
                 base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
                 self._emit("ld", f"hl,({base_asm_name})")
             else:
-                # Not a structure, load as expression (pointer to structure)
                 self._gen_expr(base)
-        elif isinstance(base, CallExpr) and isinstance(base.callee, Identifier):
-            # Check if this is actually an array subscript (variable, not procedure)
-            name = base.callee.name
-            sym = None
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
-
-            if sym and sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER) and len(base.args) == 1:
-                # This is an array subscript - we need its ADDRESS, not value
-                subscript = SubscriptExpr(base.callee, base.args[0])
-                self._gen_subscript_addr(subscript)
+        elif isinstance(base, P.Call):
+            callee = unwrap_paren(base.callee)
+            if isinstance(callee, P.Identifier):
+                name = ident_text(callee.name)
+                sym = self._lookup_symbol(name)
+                if sym and sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER) and len(base.args) == 1:
+                    self._gen_subscript_addr(base)
+                else:
+                    self._gen_expr(base)
             else:
-                # Regular expression
                 self._gen_expr(base)
         else:
             self._gen_expr(base)
 
         offset, _ = self._get_member_info(expr)
-
-        # Add offset to base address (in HL)
         self._emit_add_hl_const(offset)
 
-    def _gen_call_expr(self, expr: CallExpr) -> DataType:
-        """Generate code for function call expression or array subscript.
+    def _gen_call_expr(self, expr) -> DataType:
+        """Generate code for a call expression or array subscript.
 
-        Since the parser can't distinguish array(index) from func(arg), this is
-        determined here by looking up the symbol type.
+        ``expr`` is a typed :class:`P.Call` (callee + args) or
+        :class:`P.CallNoArgs` (parameterless). Since the grammar can't
+        distinguish ``arr(idx)`` from ``func(arg)`` syntactically, we
+        decide here by looking up the callee's symbol kind:
+
+        * unresolved or :data:`SymbolKind.PROCEDURE` -> a procedure call;
+        * :data:`SymbolKind.VARIABLE` / :data:`SymbolKind.PARAMETER`
+          with a single arg -> array subscript (delegate to
+          :meth:`_gen_subscript`).
         """
+        callee = unwrap_paren(expr.callee)
+        args = list(expr.args) if isinstance(expr, P.Call) else []
+
         # Handle built-in functions
-        if isinstance(expr.callee, Identifier):
-            name = expr.callee.name
-            result = self._gen_builtin(name, expr.args)
+        if isinstance(callee, P.Identifier):
+            name = ident_text(callee.name)
+            result = self._gen_builtin(name, args)
             if result is not None:
                 return result
 
-            # Check if this is actually an array subscript (variable, not procedure)
-            # Try each level of the scope hierarchy (innermost to outermost)
-            sym = None
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
+            sym = self._lookup_symbol(name)
 
-            # If it's DEFINITELY a variable (not procedure, not unknown) with single arg,
-            # treat as subscript. If unknown, assume it's a procedure call.
-            if sym and sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER) and len(expr.args) == 1:
-                # This is an array subscript expression
-                subscript = SubscriptExpr(expr.callee, expr.args[0])
-                return self._gen_subscript(subscript)
+            # Variable callee with a single arg -> array subscript.
+            if (
+                sym
+                and sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER)
+                and len(args) == 1
+            ):
+                return self._gen_subscript(expr)
 
-        # Handle member array subscript: struct.member(idx) or struct(idx).member(idx2)
-        if isinstance(expr.callee, MemberExpr) and len(expr.args) == 1:
-            # This is subscripting a structure member array, not a function call
-            # First get the address of the member, then subscript it
-            member_expr = expr.callee
-            idx_expr = expr.args[0]
+        # Member array subscript: struct.member(idx)
+        if isinstance(callee, P.MemberAccess) and len(args) == 1:
+            member_expr = callee
+            idx_expr = unwrap_paren(args[0])
 
-            # Generate the member address
             self._gen_member_addr(member_expr)
-
-            # Get the member element type
             _, member_type = self._get_member_info(member_expr)
             elem_size = 2 if member_type == DataType.ADDRESS else 1
 
-            # Add the subscript offset
-            if isinstance(idx_expr, NumberLiteral):
-                offset = idx_expr.value * elem_size
+            if isinstance(idx_expr, P.NumberLiteral):
+                offset = number_value(idx_expr) * elem_size
                 self._emit_add_hl_const(offset)
             else:
-                # Variable index - use allocator for DE
                 self.regs.need_reg('de', 'member_subscript_base', self._emit)
-                self._emit("ex", "de,hl")  # DE = member addr
+                self._emit("ex", "de,hl")
                 idx_type = self._gen_expr(idx_expr)
                 if idx_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
                 if elem_size == 2:
-                    self._emit("add", "hl,hl")  # HL *= 2
-                self._emit("add", "hl,de")  # HL = addr + offset
+                    self._emit("add", "hl,hl")
+                self._emit("add", "hl,de")
                 self.regs.release_reg('de', self._emit)
 
-            # Load the value from the computed address
             if member_type == DataType.ADDRESS:
                 self._emit("ld", "e,(hl)")
                 self._emit("inc", "hl")
@@ -6145,89 +5718,58 @@ class CodeGenerator:
                 return DataType.BYTE
 
         # Regular function call
-        # Look up procedure symbol first to determine calling convention
         sym = None
         call_name = None
         full_callee_name = None
-        if isinstance(expr.callee, Identifier):
-            name = expr.callee.name
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
+        name = None
+        if isinstance(callee, P.Identifier):
+            name = ident_text(callee.name)
+            sym = self._lookup_symbol(name)
             call_name = sym.asm_name if sym and sym.asm_name else name
             if sym:
                 full_callee_name = sym.name
 
-            # Optimize CP/M BDOS calls: MON1(func, arg) and MON2(func, arg)
-            # These are the standard PL/M wrappers for BDOS calls
-            if name.upper() in ('MON1', 'MON2') and len(expr.args) == 2:
-                func_arg, addr_arg = expr.args
-                # Check if function number is a constant
-                func_num = None
-                if isinstance(func_arg, NumberLiteral):
-                    func_num = func_arg.value
-                elif isinstance(func_arg, Identifier) and func_arg.name in self.literal_macros:
-                    try:
-                        func_num = self._parse_plm_number(self.literal_macros[func_arg.name])
-                    except (ValueError, TypeError):
-                        pass
-
+            # CP/M BDOS optimisation: MON1/MON2(func, arg).
+            if name.upper() in ('MON1', 'MON2') and len(args) == 2:
+                func_arg, addr_arg = args
+                func_num = self._get_const_byte_value(func_arg)
                 if func_num is not None and func_num <= 255:
-                    # Generate direct BDOS call: ld c,func; ld de,addr; CALL 5
                     self._emit("ld", f"c,{self._format_number(func_num)}")
                     addr_type = self._gen_expr(addr_arg)
                     if addr_type == DataType.BYTE:
-                        # BYTE arg goes in E; BDOS ignores D for byte-only functions
                         self._emit("ld", "e,a")
                     else:
-                        self._emit("ex", "de,hl")  # DE = addr
-                    self._emit("call", "5")  # BDOS entry point
-                    # Result in A for MON2 (BYTE), HL for MON3 (ADDRESS)
-                    # MON1 is void but returns whatever was in registers
+                        self._emit("ex", "de,hl")
+                    self._emit("call", "5")
                     return DataType.BYTE if name.upper() == 'MON2' else DataType.ADDRESS
 
-        # For non-reentrant LOCAL procedures, store args directly to parameter memory
         use_stack = True
         if sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant and not sym.is_external:
             use_stack = False
 
         if use_stack:
-            # Stack-based parameter passing
-            for arg in expr.args:
+            for arg in args:
                 arg_type = self._gen_expr(arg)
                 if arg_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
                 self._emit("push", "hl")
         else:
-            # Direct memory parameter passing (non-reentrant)
-            # Last param is passed in register (A for BYTE, HL for ADDRESS)
-            last_param_idx = len(expr.args) - 1
-            uses_reg = sym.uses_reg_param and len(expr.args) > 0
+            last_param_idx = len(args) - 1
+            uses_reg = sym.uses_reg_param and len(args) > 0
 
-            for i, arg in enumerate(expr.args):
+            for i, arg in enumerate(args):
                 if sym and i < len(sym.params):
                     param_name = sym.params[i]
                     param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
                     is_last = (i == last_param_idx)
 
-                    # Last param passed in register - just evaluate it
                     if is_last and uses_reg:
-                        # Optimize constants for BYTE
                         if param_type == DataType.BYTE:
-                            if isinstance(arg, NumberLiteral) and arg.value <= 255:
-                                self._emit("ld", f"a,{self._format_number(arg.value)}")
+                            const = self._get_const_byte_value(arg)
+                            if const is not None:
+                                self._emit("ld", f"a,{self._format_number(const)}")
                                 continue
-                            elif isinstance(arg, StringLiteral) and len(arg.value) == 1:
-                                self._emit("ld", f"a,{self._format_number(ord(arg.value[0]))}")
-                                continue
-                        # Evaluate arg - result in A (BYTE) or HL (ADDRESS)
                         arg_type = self._gen_expr(arg)
                         if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
                             self._emit("ld", "a,l")
@@ -6236,75 +5778,60 @@ class CodeGenerator:
                             self._emit("ld", "h,0")
                         continue
 
-                    # Non-last params: store to memory
                     param_asm = None
                     if (hasattr(self, 'storage_labels')
                         and full_callee_name in self.storage_labels
                         and param_name in self.storage_labels[full_callee_name]):
                         param_asm = self.storage_labels[full_callee_name][param_name]
                     else:
-                        proc_base = sym.asm_name if sym.asm_name else name
+                        proc_base = sym.asm_name if sym.asm_name else name or ""
                         if proc_base.startswith('@'):
                             proc_base = proc_base[1:]
                         param_asm = f"@{proc_base}${self._mangle_name(param_name)}"
 
-                    # Optimize: for BYTE parameter with constant, use ld a,n directly
                     if param_type == DataType.BYTE:
-                        if isinstance(arg, NumberLiteral) and arg.value <= 255:
-                            self._emit("ld", f"a,{self._format_number(arg.value)}")
-                            self._emit("ld", f"({param_asm}),a")
-                            continue
-                        elif isinstance(arg, StringLiteral) and len(arg.value) == 1:
-                            self._emit("ld", f"a,{self._format_number(ord(arg.value[0]))}")
+                        const = self._get_const_byte_value(arg)
+                        if const is not None:
+                            self._emit("ld", f"a,{self._format_number(const)}")
                             self._emit("ld", f"({param_asm}),a")
                             continue
 
                     arg_type = self._gen_expr(arg)
                     if param_type == DataType.BYTE or arg_type == DataType.BYTE:
-                        # For BYTE param, ensure we have result in A
                         if arg_type == DataType.ADDRESS:
                             self._emit("ld", "a,l")
                         self._emit("ld", f"({param_asm}),a")
                     else:
                         self._emit("ld", f"({param_asm}),hl")
 
-        if isinstance(expr.callee, Identifier):
+        if isinstance(callee, P.Identifier):
             self._emit("call", call_name)
         else:
-            self._gen_expr(expr.callee)
+            self._gen_expr(callee)
             self._emit("jp", "(hl)")
 
-        # Clean up stack - only for stack-based calls
-        if use_stack and expr.args:
-            for _ in expr.args:
-                self._emit("pop", "de")  # Dummy pop
+        if use_stack and args:
+            for _ in args:
+                self._emit("pop", "de")
 
-        # Result is in HL (or A for BYTE)
         return sym.return_type if sym and sym.return_type else DataType.ADDRESS
 
-    def _gen_builtin(self, name: str, args: list[Expr]) -> DataType | None:
-        """Generate code for built-in function. Returns type if handled, None otherwise."""
+    def _gen_builtin(self, name: str, args) -> DataType | None:
+        """Generate code for built-in function. Returns type if handled, None otherwise.
+
+        ``name`` is the un-mangled identifier text; built-in names are
+        matched case-insensitively. ``args`` is the raw typed argument
+        list from the call expression.
+        """
+        name = name.upper()
 
         if name == "INPUT":
             if args:
-                # IN instruction requires an immediate port number — try to
-                # resolve to a constant (number or LITERALLY macro).
                 arg = args[0]
-                port_num = None
-                if isinstance(arg, NumberLiteral):
-                    port_num = arg.value
-                elif isinstance(arg, Identifier):
-                    # Check if it's a LITERALLY macro
-                    if arg.name in self.literal_macros:
-                        try:
-                            port_num = self._parse_plm_number(self.literal_macros[arg.name])
-                        except ValueError:
-                            pass
-
+                port_num = self._try_eval_const(arg)
                 if port_num is not None:
                     self._emit("in", f"a,({self._format_number(port_num)})")
                 else:
-                    # Variable port - need runtime support (rare in practice)
                     self._gen_expr(arg)
                     self._emit("call", "??inp")
                     self.needs_runtime.add("inp")
@@ -6344,16 +5871,7 @@ class CodeGenerator:
             return DataType.ADDRESS
 
         if name == "SHL":
-            # Check for constant shift amount
-            shift_arg = args[1]
-            shift_count = None
-            if isinstance(shift_arg, NumberLiteral):
-                shift_count = shift_arg.value
-            elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
-                try:
-                    shift_count = self._parse_plm_number(self.literal_macros[shift_arg.name])
-                except ValueError:
-                    pass
+            shift_count = self._try_eval_const(args[1])
 
             if shift_count is not None and 0 <= shift_count <= 15:
                 arg_type = self._gen_expr(args[0])  # Value in HL (or A if BYTE)
@@ -6405,16 +5923,7 @@ class CodeGenerator:
             return DataType.ADDRESS
 
         if name == "SHR":
-            # Check for constant shift amount
-            shift_arg = args[1]
-            shift_count = None
-            if isinstance(shift_arg, NumberLiteral):
-                shift_count = shift_arg.value
-            elif isinstance(shift_arg, Identifier) and shift_arg.name in self.literal_macros:
-                try:
-                    shift_count = self._parse_plm_number(self.literal_macros[shift_arg.name])
-                except ValueError:
-                    pass
+            shift_count = self._try_eval_const(args[1])
 
             if shift_count is not None and 0 <= shift_count <= 15:
                 arg_type = self._gen_expr(args[0])  # Value in HL (or A if BYTE)
@@ -6551,61 +6060,53 @@ class CodeGenerator:
             return DataType.BYTE
 
         if name == "LENGTH":
-            # Returns array dimension
-            if args and isinstance(args[0], Identifier):
-                sym = self.symbols.lookup(args[0].name)
-                if sym and sym.dimension:
-                    self._emit("ld", f"hl,{sym.dimension}")
-                    return DataType.ADDRESS
+            if args:
+                arg0 = unwrap_paren(args[0])
+                if isinstance(arg0, P.Identifier):
+                    sym = self.symbols.lookup(ident_text(arg0.name))
+                    if sym and sym.dimension:
+                        self._emit("ld", f"hl,{sym.dimension}")
+                        return DataType.ADDRESS
             self._emit("ld", "hl,0")
             return DataType.ADDRESS
 
         if name == "LAST":
-            # Returns array dimension - 1
-            if args and isinstance(args[0], Identifier):
-                sym = self.symbols.lookup(args[0].name)
-                if sym and sym.dimension:
-                    self._emit("ld", f"hl,{sym.dimension - 1}")
-                    return DataType.ADDRESS
+            if args:
+                arg0 = unwrap_paren(args[0])
+                if isinstance(arg0, P.Identifier):
+                    sym = self.symbols.lookup(ident_text(arg0.name))
+                    if sym and sym.dimension:
+                        self._emit("ld", f"hl,{sym.dimension - 1}")
+                        return DataType.ADDRESS
             self._emit("ld", "hl,0")
             return DataType.ADDRESS
 
         if name == "SIZE":
-            # Returns size in bytes
-            if args and isinstance(args[0], Identifier):
-                sym = self.symbols.lookup(args[0].name)
-                if sym:
-                    self._emit("ld", f"hl,{sym.size}")
-                    return DataType.ADDRESS
+            if args:
+                arg0 = unwrap_paren(args[0])
+                if isinstance(arg0, P.Identifier):
+                    sym = self.symbols.lookup(ident_text(arg0.name))
+                    if sym:
+                        self._emit("ld", f"hl,{sym.size}")
+                        return DataType.ADDRESS
             self._emit("ld", "hl,0")
             return DataType.ADDRESS
 
         if name == "MEMORY":
-            # MEMORY(addr) - direct memory access as byte array starting at __END__
-            # Generate __END__ + offset into HL
             self.needs_end_symbol = True
-            if isinstance(args[0], NumberLiteral) and args[0].value == 0:
-                # MEMORY(0) - just use __END__ directly
+            arg0 = unwrap_paren(args[0])
+            if isinstance(arg0, P.NumberLiteral) and number_value(arg0) == 0:
                 self._emit("ld", "hl,__END__")
             else:
-                # MEMORY(n) - compute __END__ + n
-                self._gen_expr(args[0])  # HL = offset
+                self._gen_expr(args[0])
                 self._emit("ld", "de,__END__")
-                self._emit("add", "hl,de")  # HL = __END__ + offset
-            # Load byte from (HL)
+                self._emit("add", "hl,de")
             self._emit("ld", "a,(hl)")
             return DataType.BYTE
 
         if name == "MOVE":
-            # MOVE(count, source, dest) - use Z80 LDIR for efficiency
-            # Generate inline code to avoid calling convention issues
-            # LDIR: (DE) <- (HL), HL++, DE++, BC-- until BC=0
-            # PL/M MOVE order: count, source, dest
-
-            # Check if count is a constant
-            count_const = None
-            if isinstance(args[0], NumberLiteral):
-                count_const = args[0].value
+            arg0 = unwrap_paren(args[0])
+            count_const = number_value(arg0) if isinstance(arg0, P.NumberLiteral) else None
 
             if count_const is not None:
                 # Optimized path for constant count
@@ -6774,123 +6275,122 @@ class CodeGenerator:
         # Not a built-in we handle inline
         return None
 
-    def _gen_location(self, expr: LocationExpr) -> DataType:
-        """Generate code to load address of expression."""
-        operand = expr.operand
-        if isinstance(operand, Identifier):
-            name = operand.name
+    def _gen_location(self, expr) -> DataType:
+        """Generate code to load address of a typed location expression.
 
-            # Check for built-in MEMORY - its address is the end of program data
-            # In PL/M-80, .MEMORY gives the first free byte after all variables
+        ``expr`` is one of:
+
+        * :class:`P.LocationOf` — ``.expr``,
+        * :class:`P.LocationOfString` — ``.'string literal'``,
+        * :class:`P.LocationOfList` — ``.(a, b, c)`` const list.
+
+        The :class:`P.LocationOf` operand may itself be a typed
+        :class:`P.Identifier`, :class:`P.MemberAccess`, or a
+        :class:`P.Call` (which in PL/M's grammar covers both array
+        subscripts and procedure calls; we disambiguate via the symbol
+        table).
+        """
+        if isinstance(expr, P.LocationOfString):
+            # ``expr.value`` is a ``STRING`` Token whose text retains the
+            # surrounding quotes; strip them and decode ``''`` escapes.
+            raw = expr.value.text
+            if raw.startswith("'") and raw.endswith("'"):
+                raw = raw[1:-1]
+            s = raw.replace("''", "'")
+            label = self._new_string_label()
+            self.string_literals.append((label, s))
+            self._emit("ld", f"hl,{label}")
+            return DataType.ADDRESS
+
+        if isinstance(expr, P.LocationOfList):
+            label = self._new_label("DATA")
+            self.data_segment.append(AsmLine(label=label))
+            for val in expr.values or []:
+                v = unwrap_paren(val)
+                if isinstance(v, P.NumberLiteral):
+                    self.data_segment.append(
+                        AsmLine(opcode="db", operands=self._format_number(number_value(v)))
+                    )
+                elif isinstance(v, P.StringLiteral):
+                    self.data_segment.append(
+                        AsmLine(opcode="db", operands=self._escape_string(string_value(v)))
+                    )
+            self._emit("ld", f"hl,{label}")
+            return DataType.ADDRESS
+
+        # P.LocationOf
+        operand = unwrap_paren(expr.operand)
+        if isinstance(operand, P.Identifier):
+            name = ident_text(operand.name)
+
             if name.upper() == "MEMORY":
                 self.needs_end_symbol = True
                 self._emit("ld", "hl,__END__")
                 return DataType.ADDRESS
 
-            # Check for LITERALLY macro - expand recursively
             if name in self.literal_macros:
                 macro_val = self.literal_macros[name]
                 try:
-                    # Numeric literal - load as immediate address
                     val = self._parse_plm_number(macro_val)
                     self._emit("ld", f"hl,{self._format_number(val)}")
                     return DataType.ADDRESS
                 except ValueError:
-                    # Non-numeric literal - recursively process
-                    return self._gen_location(LocationExpr(operand=Identifier(name=macro_val)))
-            # Mangle name if needed
+                    return self._gen_location(_make_location(_make_ident(macro_val)))
+
             sym = self.symbols.lookup(name)
 
-            # Handle reentrant procedure parameters/locals (IX-relative)
             if sym and sym.stack_offset is not None:
-                # Compute address: HL = IX + offset
-                # push IX; POP HL; ld de,offset; add hl,DE
                 self._emit("push", "ix")
                 self._emit("pop", "hl")
                 if sym.stack_offset != 0:
                     self._emit("ld", f"de,{sym.stack_offset}")
                     self._emit("add", "hl,de")
             elif sym and sym.based_on:
-                # BASED variable - its "address" is the value of the base pointer
-                # e.g., if fcbv BASED fcbp, then .fcbv returns the value of fcbp
                 base_sym = self.symbols.lookup(sym.based_on)
                 base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
                 self._emit("ld", f"hl,({base_asm_name})")
             else:
                 asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
                 self._emit("ld", f"hl,{asm_name}")
-        elif isinstance(operand, SubscriptExpr):
-            self._gen_subscript_addr(operand)
-        elif isinstance(operand, MemberExpr):
+        elif isinstance(operand, P.MemberAccess):
             self._gen_member_addr(operand)
-        elif isinstance(operand, StringLiteral):
-            # .('string') - address of inline string
-            label = self._new_string_label()
-            self.string_literals.append((label, operand.value))
-            self._emit("ld", f"hl,{label}")
-        elif isinstance(operand, ConstListExpr):
-            # .(const, const, ...) - address of inline data
-            label = self._new_label("DATA")
-            self.data_segment.append(AsmLine(label=label))
-            for val in operand.values:
-                if isinstance(val, NumberLiteral):
-                    self.data_segment.append(
-                        AsmLine(opcode="db", operands=self._format_number(val.value))
-                    )
-                elif isinstance(val, StringLiteral):
-                    self.data_segment.append(
-                        AsmLine(opcode="db", operands=self._escape_string(val.value))
-                    )
-            self._emit("ld", f"hl,{label}")
-        elif isinstance(operand, CallExpr):
-            # Check if this is actually an array subscript (parser creates CallExpr for arr(idx))
-            if isinstance(operand.callee, Identifier) and len(operand.args) == 1:
-                sym = self.symbols.lookup(operand.callee.name)
+        elif isinstance(operand, P.Call):
+            callee = unwrap_paren(operand.callee)
+            if isinstance(callee, P.Identifier) and len(operand.args) == 1:
+                sym = self.symbols.lookup(ident_text(callee.name))
                 if sym and sym.kind != SymbolKind.PROCEDURE:
-                    # It's an array access, not a function call - treat as subscript
-                    subscript = SubscriptExpr(operand.callee, operand.args[0])
-                    self._gen_subscript_addr(subscript)
+                    self._gen_subscript_addr(operand)
                     return DataType.ADDRESS
-            elif isinstance(operand.callee, MemberExpr) and len(operand.args) == 1:
-                # Subscripting a structure member array: struct.member(idx)
-                # This is NOT a function call - it's array access on a member
-                # Generate: member_addr + idx * elem_size
-                member_expr = operand.callee
-                idx_expr = operand.args[0]
+            if isinstance(callee, P.MemberAccess) and len(operand.args) == 1:
+                member_expr = callee
+                idx_expr = unwrap_paren(operand.args[0])
 
-                # Generate the member address
                 self._gen_member_addr(member_expr)
-
-                # Get the member element type (BYTE arrays have size 1, ADDRESS arrays size 2)
                 _, member_type = self._get_member_info(member_expr)
                 elem_size = 2 if member_type == DataType.ADDRESS else 1
 
-                # Add the subscript offset
-                if isinstance(idx_expr, NumberLiteral):
-                    offset = idx_expr.value * elem_size
+                if isinstance(idx_expr, P.NumberLiteral):
+                    offset = number_value(idx_expr) * elem_size
                     self._emit_add_hl_const(offset)
                 else:
-                    # Variable index - use allocator for DE
                     self.regs.need_reg('de', 'member_subscript_addr', self._emit)
-                    self._emit("ex", "de,hl")  # DE = member addr
+                    self._emit("ex", "de,hl")
                     idx_type = self._gen_expr(idx_expr)
                     if idx_type == DataType.BYTE:
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
                     if elem_size == 2:
-                        self._emit("add", "hl,hl")  # HL *= 2
-                    self._emit("add", "hl,de")  # HL = addr + offset
+                        self._emit("add", "hl,hl")
+                    self._emit("add", "hl,de")
                     self.regs.release_reg('de', self._emit)
                 return DataType.ADDRESS
-            # Otherwise evaluate as expression
             self._gen_expr(operand)
         else:
-            # Just evaluate the expression
             self._gen_expr(operand)
         return DataType.ADDRESS
 
 
-def generate(module: Module) -> str:
-    """Convenience function to generate code from a module."""
+def generate(module) -> str:
+    """Convenience function to generate code from a typed :class:`P.Module`."""
     gen = CodeGenerator()
     return gen.generate(module)

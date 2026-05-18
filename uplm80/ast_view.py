@@ -163,6 +163,22 @@ def string_bytes(node: P.StringLiteral) -> list[int]:
     return [ord(c) for c in string_value(node)]
 
 
+# ---- expression unwrapping ------------------------------------------------
+
+
+def unwrap_paren(expr):
+    """Strip any number of :class:`P.ParenExpr` wrappers from ``expr``.
+
+    PL/M lets writers parenthesise an expression for clarity; the
+    grammar models this as a ``ParenExpr`` node carrying ``inner``.
+    Codegen always wants to dispatch on the underlying expression
+    shape, so this helper transparently peels them off.
+    """
+    while isinstance(expr, P.ParenExpr):
+        expr = expr.inner
+    return expr
+
+
 # ---- module shape ----------------------------------------------------------
 
 
