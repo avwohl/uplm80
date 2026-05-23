@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uplm80"
-version = "0.2.31"
+version = "0.2.32"
 description = "Highly optimizing PL/M-80 compiler targeting Z80"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -25,8 +25,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "upeepz80>=0.2.0",
-    "uplox>=3.0.0",
+    "upeepz80>=0.2.3",
+    "uplox>=3.1.1",
 ]
 
 [project.optional-dependencies]
