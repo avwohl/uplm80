@@ -534,7 +534,7 @@ def literally_value(decl: P.LiterallyDecl) -> str:
 
 
 class _SynthToken:
-    """Minimal stand-in for a :class:`uplox.Token` carrying ``.text`` / ``.name``.
+    """Minimal stand-in for a :class:`uplox.Token` carrying ``.text`` / ``.name`` / ``.kind``.
 
     Optimizer / codegen passes that rewrite the typed AST occasionally need
     to fabricate new identifier-shaped or number-shaped nodes (constant
@@ -542,15 +542,18 @@ class _SynthToken:
     synthetic nodes never flow back to the parser, so the source-location
     and file-id fields on a real :class:`uplox.Token` aren't needed — we
     only need the bits that :func:`ident_text` / :func:`parse_plm_number`
-    read off the token. ``__slots__`` keeps the per-instance overhead low
-    since fold-heavy passes can mint many of these.
+    read off the token, plus a ``kind`` so the round-trip through
+    :func:`binop_kind` / :func:`unop_kind` (which key off ``tok.kind``)
+    still works. ``__slots__`` keeps the per-instance overhead low since
+    fold-heavy passes can mint many of these.
     """
 
-    __slots__ = ("text", "name")
+    __slots__ = ("text", "name", "kind")
 
-    def __init__(self, text: str, name: str = "IDENT") -> None:
+    def __init__(self, text: str, name: str = "IDENT", kind: int = K.UNKNOWN) -> None:
         self.text = text
         self.name = name
+        self.kind = kind
 
 
 def make_number_literal(value: int, pos=None) -> P.NumberLiteral:
@@ -561,7 +564,7 @@ def make_number_literal(value: int, pos=None) -> P.NumberLiteral:
     is copied verbatim — pass the original expression's ``.pos`` when
     folding so error messages keep pointing at the source span.
     """
-    tok = _SynthToken(f"{value}", "NUMBER")
+    tok = _SynthToken(f"{value}", "NUMBER", K.NUMBER)
     if pos is None:
         return P.NumberLiteral(value=tok)
     return P.NumberLiteral(value=tok, pos=pos)
@@ -569,32 +572,39 @@ def make_number_literal(value: int, pos=None) -> P.NumberLiteral:
 
 def make_identifier(name: str, pos=None) -> P.Identifier:
     """Build a :class:`P.Identifier` carrying ``name`` as its token text."""
-    tok = _SynthToken(name, "IDENT")
+    tok = _SynthToken(name, "IDENT", K.IDENT)
     if pos is None:
         return P.Identifier(name=tok)
     return P.Identifier(name=tok, pos=pos)
 
 
-_BINOP_KIND_TO_TOKEN_NAME = {v: k for k, v in _BINOP_TOKEN_TO_KIND.items()}
-# Canonical lexeme for each operator token so the synthetic Token.text
+# Reverse of _BINOP_TOKEN_TO_KIND: BinaryOpKind -> TokenKind. Used to
+# synthesise a fresh operator token when the optimizer builds a new
+# BinaryOp node (constant fold, algebraic rewrite, etc.). The synthetic
+# token carries the same kind a real-parsed one would, so the new node
+# round-trips through :func:`binop_kind`.
+_BINOP_KIND_TO_TOKEN_KIND: dict[BinaryOpKind, int] = {
+    v: k for k, v in _BINOP_TOKEN_TO_KIND.items()
+}
+# Canonical lexeme for each operator TokenKind so the synthetic Token.text
 # round-trips through any code that displays it.
-_BINOP_TOKEN_NAME_TO_LEXEME = {
-    "OP_PLUS": "+",
-    "OP_MINUS": "-",
-    "STAR": "*",
-    "SLASH": "/",
-    "KW_MOD": "MOD",
-    "KW_AND": "AND",
-    "KW_OR": "OR",
-    "KW_XOR": "XOR",
-    "EQ": "=",
-    "NE": "<>",
-    "LT": "<",
-    "GT": ">",
-    "LE": "<=",
-    "GE": ">=",
-    "KW_PLUS": "PLUS",
-    "KW_MINUS": "MINUS",
+_BINOP_KIND_TO_LEXEME: dict[int, str] = {
+    K.OP_PLUS: "+",
+    K.OP_MINUS: "-",
+    K.STAR: "*",
+    K.SLASH: "/",
+    K.KW_MOD: "MOD",
+    K.KW_AND: "AND",
+    K.KW_OR: "OR",
+    K.KW_XOR: "XOR",
+    K.EQ: "=",
+    K.NE: "<>",
+    K.LT: "<",
+    K.GT: ">",
+    K.LE: "<=",
+    K.GE: ">=",
+    K.KW_PLUS: "PLUS",
+    K.KW_MINUS: "MINUS",
 }
 
 
@@ -605,8 +615,8 @@ def make_binary(kind: BinaryOpKind, left, right, pos=None) -> P.BinaryOp:
     node round-trips through :func:`binop_kind`. The operator token's
     ``.text`` is the canonical PL/M-80 lexeme for the operator.
     """
-    tok_name = _BINOP_KIND_TO_TOKEN_NAME[kind]
-    tok = _SynthToken(_BINOP_TOKEN_NAME_TO_LEXEME[tok_name], tok_name)
+    tok_kind = _BINOP_KIND_TO_TOKEN_KIND[kind]
+    tok = _SynthToken(_BINOP_KIND_TO_LEXEME[tok_kind], tok_kind.name, tok_kind)
     if pos is None:
         return P.BinaryOp(left=left, op=tok, right=right)
     return P.BinaryOp(left=left, op=tok, right=right, pos=pos)
@@ -615,9 +625,9 @@ def make_binary(kind: BinaryOpKind, left, right, pos=None) -> P.BinaryOp:
 def make_unary(kind: UnaryOpKind, operand, pos=None) -> P.UnaryOp:
     """Build a :class:`P.UnaryOp` with a synthetic operator token."""
     if kind == UnaryOpKind.NEG:
-        tok = _SynthToken("-", "OP_MINUS")
+        tok = _SynthToken("-", "OP_MINUS", K.OP_MINUS)
     elif kind == UnaryOpKind.NOT:
-        tok = _SynthToken("NOT", "KW_NOT")
+        tok = _SynthToken("NOT", "KW_NOT", K.KW_NOT)
     else:
         raise ValueError(f"unknown unary op kind: {kind}")
     if pos is None:

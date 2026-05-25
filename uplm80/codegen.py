@@ -76,22 +76,24 @@ def _legacy_dt(dt):
 
 
 class _SynthToken:
-    """Minimal stand-in for a :class:`uplox.Token` carrying just ``.text``.
+    """Minimal stand-in for a :class:`uplox.Token` carrying ``.text`` / ``.name`` / ``.kind``.
 
     The typed AST nodes constructed by codegen during macro expansion
     don't ever flow back to the parser, so the source-location and
-    token-kind fields on a real :class:`Token` aren't needed; we only
-    need the bits :func:`ast_view.ident_text` and friends read off the
-    token (its ``.text``). Define this with ``__slots__`` so the
-    synthetic nodes have no per-instance dict overhead — codegen
-    creates a fresh one for every LITERALLY substitution.
+    file-id fields on a real :class:`Token` aren't needed; we only need
+    the bits :func:`ast_view.ident_text` and friends read off the token
+    (its ``.text`` plus a ``.kind`` for any K-based dispatch downstream).
+    Define this with ``__slots__`` so the synthetic nodes have no
+    per-instance dict overhead — codegen creates a fresh one for every
+    LITERALLY substitution.
     """
 
-    __slots__ = ("text", "name")
+    __slots__ = ("text", "name", "kind")
 
-    def __init__(self, text: str, name: str = "IDENT") -> None:
+    def __init__(self, text: str, name: str = "IDENT", kind: int = K.IDENT) -> None:
         self.text = text
         self.name = name
+        self.kind = kind
 
 
 def _make_ident(name: str) -> "P.Identifier":
