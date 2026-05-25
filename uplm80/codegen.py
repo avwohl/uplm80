@@ -12,6 +12,7 @@ from typing import Callable, Iterator
 
 from .ast_nodes import DataType
 from . import _plm_parser as P
+from ._plm_parser import K
 from .ast_view import (
     module_shape,
     proc_attrs,
@@ -60,6 +61,11 @@ _VIEW_DT_TO_LEGACY = {
     ViewDataType.LABEL: DataType.LABEL,
     ViewDataType.PROCEDURE: DataType.PROCEDURE,
 }
+
+# Equality-operator TokenKinds — the comparison ops that allow
+# negative-byte truncation (`BYTE = -1`, `BYTE <> -1`) in the
+# BYTE-range diagnostic below.
+_BYTE_EQ_KINDS = frozenset({K.EQ, K.NE})
 
 
 def _legacy_dt(dt):
@@ -553,29 +559,29 @@ class CodeGenerator:
                 if hasattr(right, 'span') and right.span:
                     loc = SourceLocation(right.span.start_line, right.span.start_col)
 
-                op_name = op.name
+                op_kind = op.kind
 
                 # For = and <>, allow truncation only for "negative byte" values (high byte is 0xFF)
                 # This handles BYTE <> -1 (0xFFFF -> 0xFF) but catches BYTE <> 0x123
-                if op_name in ("EQ", "NE"):
+                if op_kind in _BYTE_EQ_KINDS:
                     if (unsigned_val & 0xFF00) == 0xFF00:
                         return  # Valid: -256 to -1 range, will truncate to byte
                     # Otherwise, error - constant like 256 or 0x123 shouldn't be compared to BYTE
                     byte_val = unsigned_val & 0xFF
-                    if op_name == "EQ":
+                    if op_kind is K.EQ:
                         msg = f"comparison BYTE = {unsigned_val} is always false (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
                     else:
                         msg = f"comparison BYTE <> {unsigned_val} is always true (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
                     raise CodeGenError(msg, loc)
 
                 # For ordering comparisons, values outside 0-255 give always true/false
-                if op_name == "LT":
+                if op_kind is K.LT:
                     msg = f"comparison BYTE < {right_val} is always true (BYTE can only hold 0-255)"
-                elif op_name == "LE":
+                elif op_kind is K.LE:
                     msg = f"comparison BYTE <= {right_val} is always true (BYTE can only hold 0-255)"
-                elif op_name == "GT":
+                elif op_kind is K.GT:
                     msg = f"comparison BYTE > {right_val} is always false (BYTE can only hold 0-255)"
-                elif op_name == "GE":
+                elif op_kind is K.GE:
                     msg = f"comparison BYTE >= {right_val} is always false (BYTE can only hold 0-255)"
                 else:
                     return  # Unknown comparison operator

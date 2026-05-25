@@ -20,6 +20,7 @@ from enum import Enum, auto
 from typing import Iterator, Optional
 
 from . import _plm_parser as P
+from ._plm_parser import K
 
 
 # ---- value enums (mirror the legacy ast_nodes shape) -----------------------
@@ -66,39 +67,39 @@ class UnaryOpKind(Enum):
     NOT = auto()
 
 
-_BINOP_TOKEN_TO_KIND = {
-    "OP_PLUS": BinaryOpKind.ADD,
-    "OP_MINUS": BinaryOpKind.SUB,
-    "STAR": BinaryOpKind.MUL,
-    "SLASH": BinaryOpKind.DIV,
-    "KW_MOD": BinaryOpKind.MOD,
-    "KW_AND": BinaryOpKind.AND,
-    "KW_OR": BinaryOpKind.OR,
-    "KW_XOR": BinaryOpKind.XOR,
-    "EQ": BinaryOpKind.EQ,
-    "NE": BinaryOpKind.NE,
-    "LT": BinaryOpKind.LT,
-    "GT": BinaryOpKind.GT,
-    "LE": BinaryOpKind.LE,
-    "GE": BinaryOpKind.GE,
-    "KW_PLUS": BinaryOpKind.PLUS,
-    "KW_MINUS": BinaryOpKind.MINUS,
+_BINOP_TOKEN_TO_KIND: dict[int, BinaryOpKind] = {
+    K.OP_PLUS: BinaryOpKind.ADD,
+    K.OP_MINUS: BinaryOpKind.SUB,
+    K.STAR: BinaryOpKind.MUL,
+    K.SLASH: BinaryOpKind.DIV,
+    K.KW_MOD: BinaryOpKind.MOD,
+    K.KW_AND: BinaryOpKind.AND,
+    K.KW_OR: BinaryOpKind.OR,
+    K.KW_XOR: BinaryOpKind.XOR,
+    K.EQ: BinaryOpKind.EQ,
+    K.NE: BinaryOpKind.NE,
+    K.LT: BinaryOpKind.LT,
+    K.GT: BinaryOpKind.GT,
+    K.LE: BinaryOpKind.LE,
+    K.GE: BinaryOpKind.GE,
+    K.KW_PLUS: BinaryOpKind.PLUS,
+    K.KW_MINUS: BinaryOpKind.MINUS,
 }
 
 
 def binop_kind(expr: P.BinaryOp) -> BinaryOpKind:
     """Map a ``BinaryOp`` node's operator token to its enum kind."""
-    return _BINOP_TOKEN_TO_KIND[expr.op.name]
+    return _BINOP_TOKEN_TO_KIND[expr.op.kind]
 
 
 def unop_kind(expr: P.UnaryOp) -> UnaryOpKind:
     """Map a ``UnaryOp`` node's operator token to its enum kind."""
-    name = expr.op.name
-    if name == "OP_MINUS":
+    kind = expr.op.kind
+    if kind is K.OP_MINUS:
         return UnaryOpKind.NEG
-    if name == "KW_NOT":
+    if kind is K.KW_NOT:
         return UnaryOpKind.NOT
-    raise ValueError(f"unknown unary operator token: {name}")
+    raise ValueError(f"unknown unary operator token: {expr.op.name}")
 
 
 # ---- identifier text normalisation ----------------------------------------
@@ -277,10 +278,10 @@ def proc_return_type(proc: P.ProcDecl) -> Optional[DataType]:
     rt = proc.signature.return_type
     if rt is None:
         return None
-    kw = rt.kw.name
-    if kw == "KW_BYTE":
+    kw = rt.kw.kind
+    if kw is K.KW_BYTE:
         return DataType.BYTE
-    if kw == "KW_ADDRESS":
+    if kw is K.KW_ADDRESS:
         return DataType.ADDRESS
     return None
 
