@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional, Union
 
-from uplox.lex.scanner import FileTable, Scanner, Token
+from uplox.lex.scanner import FileTable, Scanner, Token, build_token_kind
 from uplox.parse.runtime import (
     HookRegistry,
     ParseContext,
@@ -22085,10 +22085,17 @@ BUNDLE: dict[str, Any] = json.loads(r"""
 
 _dfa, _tokens, _skip = dfa_from_json(BUNDLE["lex"])
 _table = table_from_json(BUNDLE["parse"])
+# Per-grammar TokenKind IntEnum: K.KW_FOO has the dense int id
+# of the FOO terminal. ``Token.kind`` carries this value so hot
+# ``tok.kind is K.FOO`` checks are single int compares (much
+# faster than ``tok.name == "FOO"`` even with interned strings).
+K = build_token_kind(_tokens)
+_KIND_MAP: dict[str, int] = dict(K.__members__)
 _scanner = Scanner(
     dfa=_dfa,
     skip_tokens=frozenset(_skip),
     balanced=balanced_from_json(BUNDLE["lex"]),
+    kind_map=_KIND_MAP,
 )
 # Module-level FileTable: maps each filename passed to parse() to
 # a small integer file_id stamped on every emitted Token and on
@@ -22914,6 +22921,7 @@ __all__ = [
     'SKIP',
     'GRAMMAR_NAME',
     'FILE_TABLE',
+    'K',
     'parse',
     'parse_cst',
     'scan',
