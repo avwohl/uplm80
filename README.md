@@ -133,31 +133,32 @@ For more on CP/M BDOS usage, see [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md
 
 ## Conditional Compilation
 
-Later versions of PL/M-80 added conditional compilation directives embedded in comments. This allows the same source to be compiled for different configurations (e.g., CP/M 2.2 vs CP/M 3, single-user vs MP/M).
+PL/M-80 v4.0 added conditional compilation. The directives are **control lines** — a leading `$` at the left margin (column 1), exactly like `$INCLUDE` and `$TITLE` — so the same source can target different configurations (e.g., CP/M 2.2 vs CP/M 3, single-user vs MP/M). No enabling directive is required.
 
 ### Directives
 
 | Directive | Description |
 |-----------|-------------|
-| `/** $set (NAME) **/` | Define a symbol |
-| `/** $reset (NAME) **/` | Undefine a symbol |
-| `/** $cond **/` | Enable conditional compilation |
-| `/** $if NAME **/` | Include following code if NAME is defined |
-| `/** $else **/` | Else branch |
-| `/** $endif **/` | End conditional block |
+| `$SET (NAME)` | Define a symbol |
+| `$RESET (NAME)` | Undefine a symbol |
+| `$IF NAME` | Compile following code if NAME is defined |
+| `$ELSEIF NAME` | Else-if branch |
+| `$ELSE` | Else branch |
+| `$ENDIF` | End conditional block |
+| `$COND` / `$NOCOND` | Listing controls only (accepted as no-ops) |
+
+A comment-wrapped form (`/** $if NAME **/`) is also accepted for CP/M-3-style sources that embed the same directives in comment syntax.
 
 ### Example
 
 ```plm
-/** $set (CPM3) **/
-/** $cond **/
-
+$set (CPM3)
 DECLARE
-/** $if CPM3 **/
+$if CPM3
     VERSION LITERALLY '30H',
-/** $else **/
+$else
     VERSION LITERALLY '22H',
-/** $endif **/
+$endif
     MAXFILES BYTE;
 ```
 

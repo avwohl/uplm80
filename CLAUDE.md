@@ -115,19 +115,32 @@ call main             ; Call main procedure
 
 ## Conditional Compilation
 
-Supports conditional compilation directives embedded in comments (as used in CP/M 3 sources):
+PL/M-80 v4.0 conditional compilation. The native form is a **control
+line**: a leading `$` at the left margin (column 1), exactly like
+`$INCLUDE` / `$TITLE` / `$LIST`. No enabling directive is required.
 
 ```plm
-/** $set (MPM) **/      /* Define symbol */
-/** $reset (CPM3) **/   /* Undefine symbol */
-/** $cond **/           /* Enable conditional compilation */
-
-/** $if MPM **/
+$set (MPM)
+$if MPM
     /* Code for MP/M */
-/** $else **/
-    /* Code for single-user CP/M */
-/** $endif **/
+$elseif CPM3
+    /* Code for CP/M 3 */
+$else
+    /* Code for single-user CP/M 2.2 */
+$endif
 ```
+
+Directives: `$SET (name)`, `$RESET (name)`, `$IF name`, `$ELSEIF name`,
+`$ELSE`, `$ENDIF`. `$COND` / `$NOCOND` are *listing* controls only
+(whether skipped lines appear in the listing) and are accepted as
+no-ops.
+
+A comment-wrapped form `/** $if NAME **/` is also honoured for
+CP/M-3-style sources that embed the same directives in comment syntax.
+
+Because the `$` must be at the left margin, a control line is disabled
+simply by indenting it into a comment — e.g. MP/M's `GENSYS.PLM` ships
+`/* $include (copyrt.lit) */`, which stays a comment.
 
 Command line: `python -m uplm80.compiler input.plm -D MPM -D CPM3`
 

@@ -62,10 +62,10 @@ _VIEW_DT_TO_LEGACY = {
     ViewDataType.PROCEDURE: DataType.PROCEDURE,
 }
 
-# Equality-operator TokenKinds — the comparison ops that allow
+# Equality-operator BinaryOpKinds — the comparison ops that allow
 # negative-byte truncation (`BYTE = -1`, `BYTE <> -1`) in the
 # BYTE-range diagnostic below.
-_BYTE_EQ_KINDS = frozenset({K.EQ, K.NE})
+_BYTE_EQ_KINDS = frozenset({BinaryOpKind.EQ, BinaryOpKind.NE})
 
 
 def _legacy_dt(dt):
@@ -534,11 +534,10 @@ class CodeGenerator:
     def _check_impossible_comparison(self, left, right, op) -> None:
         """Check for comparisons that can never or always be true and raise an error.
 
-        ``op`` is either the legacy :class:`BinaryOp` enum or the
-        typed-AST :class:`ast_view.BinaryOpKind`; both flavours share
-        member names (``EQ``/``NE``/``LT``/``LE``/``GT``/``GE``) so
-        we dispatch on ``op.name`` to stay agnostic during the AST
-        migration. For BYTE compared to constant outside 0-255:
+        ``op`` is the typed-AST :class:`ast_view.BinaryOpKind` decoded
+        by :func:`binop_kind` at every call site (``EQ``/``NE``/``LT``/
+        ``LE``/``GT``/``GE``). For BYTE compared to constant outside
+        0-255:
 
         - For ``=`` and ``<>``, allow truncation only for "negative byte"
           values (``0xFF00`` - ``0xFFFF``, i.e. -256 to -1).
@@ -561,7 +560,7 @@ class CodeGenerator:
                 if hasattr(right, 'span') and right.span:
                     loc = SourceLocation(right.span.start_line, right.span.start_col)
 
-                op_kind = op.kind
+                op_kind = op
 
                 # For = and <>, allow truncation only for "negative byte" values (high byte is 0xFF)
                 # This handles BYTE <> -1 (0xFFFF -> 0xFF) but catches BYTE <> 0x123
@@ -570,20 +569,20 @@ class CodeGenerator:
                         return  # Valid: -256 to -1 range, will truncate to byte
                     # Otherwise, error - constant like 256 or 0x123 shouldn't be compared to BYTE
                     byte_val = unsigned_val & 0xFF
-                    if op_kind is K.EQ:
+                    if op_kind is BinaryOpKind.EQ:
                         msg = f"comparison BYTE = {unsigned_val} is always false (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
                     else:
                         msg = f"comparison BYTE <> {unsigned_val} is always true (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
                     raise CodeGenError(msg, loc)
 
                 # For ordering comparisons, values outside 0-255 give always true/false
-                if op_kind is K.LT:
+                if op_kind is BinaryOpKind.LT:
                     msg = f"comparison BYTE < {right_val} is always true (BYTE can only hold 0-255)"
-                elif op_kind is K.LE:
+                elif op_kind is BinaryOpKind.LE:
                     msg = f"comparison BYTE <= {right_val} is always true (BYTE can only hold 0-255)"
-                elif op_kind is K.GT:
+                elif op_kind is BinaryOpKind.GT:
                     msg = f"comparison BYTE > {right_val} is always false (BYTE can only hold 0-255)"
-                elif op_kind is K.GE:
+                elif op_kind is BinaryOpKind.GE:
                     msg = f"comparison BYTE >= {right_val} is always false (BYTE can only hold 0-255)"
                 else:
                     return  # Unknown comparison operator
@@ -4207,7 +4206,13 @@ class CodeGenerator:
             # NEG / NOT preserve operand type (LOW/HIGH are now Calls).
             return self._get_expr_type(expr.operand)
         elif isinstance(expr, P.MemberAccess):
-            return DataType.BYTE
+            # Resolve the member's declared type from the structure
+            # layout rather than assuming BYTE — a STRUCTURE member can
+            # be ADDRESS (e.g. ``rec.len`` where ``len ADDRESS``), and
+            # mis-typing it as BYTE makes range checks like
+            # ``rec.len <= 1025`` look impossible.
+            _, member_type = self._get_member_info(expr)
+            return member_type
         return DataType.ADDRESS
 
     def _is_simple_address_expr(self, expr) -> bool:

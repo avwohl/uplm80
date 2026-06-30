@@ -7,9 +7,13 @@ Per-compiler preprocessor — uplox does not host one. uplm80's surface:
 
 * High-bit / Ctrl-Z source cleaning (CP/M editor artifacts).
 * Recursive ``$INCLUDE(name)`` expansion, with .LIT extension fallback.
-* ``$cond`` / ``$if`` / ``$else`` / ``$endif`` / ``$set`` / ``$reset``
-  conditional compilation, written either as a line-start directive
-  (``$IF NAME``) or inside a ``/** $... **/`` comment marker.
+* ``$if`` / ``$elseif`` / ``$else`` / ``$endif`` / ``$set`` / ``$reset``
+  conditional compilation. The PL/M-80 v4.0 native form is a line-start
+  control line (leading ``$`` at the left margin, e.g. ``$IF NAME``) and
+  needs no enabling directive; ``$COND`` / ``$NOCOND`` only affect the
+  listing and are accepted as no-ops. A ``/** $... **/`` comment marker
+  is also honoured for the CP/M-3-style sources that wrap the same
+  directives in comment syntax.
 * ``-D SYMBOL`` defines from the command line.
 * Case folding to upper outside string literals + comments.
 * Block-scoped ``LITERALLY`` macro substitution. PL/M-80 LITERALLYs are
@@ -36,8 +40,9 @@ _DIRECTIVE_COMMENT_RE = re.compile(
 )
 _LINE_DEFINE_RE = re.compile(r"\$(?:DEFINE|SET)\s*\(?(\w+)\)?", re.IGNORECASE)
 _LINE_RESET_RE = re.compile(r"\$RESET\s*\((\w+)\)", re.IGNORECASE)
-_LINE_COND_RE = re.compile(r"\$COND\b", re.IGNORECASE)
+_LINE_COND_RE = re.compile(r"\$(?:NO)?COND\b", re.IGNORECASE)
 _LINE_IF_RE = re.compile(r"\$IF\s+(\w+)", re.IGNORECASE)
+_LINE_ELSEIF_RE = re.compile(r"\$ELSEIF\s+(\w+)", re.IGNORECASE)
 _LINE_ELSE_RE = re.compile(r"\$ELSE\b", re.IGNORECASE)
 _LINE_ENDIF_RE = re.compile(r"\$ENDIF\b", re.IGNORECASE)
 _LINE_INCLUDE_RE = re.compile(r"\$INCLUDE\s*\(([^)]+)\)", re.IGNORECASE)
@@ -48,19 +53,47 @@ class _State:
     """Conditional-compilation state shared across nested includes."""
 
     symbols: set[str] = field(default_factory=set)
-    cond_enabled: bool = False
-    # Stack of (branch_taken, in_else) — same encoding as the legacy lexer.
+    # PL/M-80 v4.0 conditional compilation is always active — the
+    # $IF/$ELSEIF/$ELSE/$ENDIF controls don't need to be "switched on".
+    # $COND/$NOCOND only govern whether skipped lines show up in the
+    # listing, so we accept them as harmless no-ops. (Earlier uplm80
+    # required a leading $COND to enable the whole family, which silently
+    # dropped real PL/M-80 conditionals that omit it — see issue #6.)
+    cond_enabled: bool = True
+    # Stack of (any_taken, active) — one entry per open $IF. ``active``
+    # is whether the arm we're currently inside emits code; ``any_taken``
+    # records whether any earlier arm of this $IF was already selected,
+    # so a later $ELSEIF/$ELSE knows to stay inactive.
     stack: list[tuple[bool, bool]] = field(default_factory=list)
 
     def skipping(self) -> bool:
-        if not self.cond_enabled or not self.stack:
-            return False
-        for branch_taken, in_else in self.stack:
-            if branch_taken and in_else:
-                return True
-            if not branch_taken and not in_else:
-                return True
-        return False
+        # We're skipping if we sit inside any inactive arm. Checking every
+        # frame handles nesting: an inner $IF inside a dead outer arm is
+        # dead no matter how its own condition evaluates.
+        return any(not active for _taken, active in self.stack)
+
+    def open_if(self, taken: bool) -> None:
+        self.stack.append((taken, taken))
+
+    def elseif(self, taken: bool) -> None:
+        if not self.stack:
+            return
+        any_taken, _ = self.stack[-1]
+        # If an earlier arm already won, this one stays dead and the chain
+        # stays resolved. Otherwise this arm wins iff its own condition is
+        # true — and only then is the chain resolved, so a false $ELSEIF
+        # must leave any_taken False for a later $ELSEIF/$ELSE to match.
+        self.stack[-1] = (True, False) if any_taken else (taken, taken)
+
+    def open_else(self) -> None:
+        if not self.stack:
+            return
+        any_taken, _ = self.stack[-1]
+        self.stack[-1] = (True, not any_taken)
+
+    def close_if(self) -> None:
+        if self.stack:
+            self.stack.pop()
 
 
 def preprocess(
@@ -223,25 +256,25 @@ def _apply_directive(name: str, arg: str, state: _State) -> None:
     """Process a ``/** $... **/`` directive body."""
     name = name.lower()
     if name == "set":
-        m = re.match(r"\((\w+)\)", arg)
-        if m:
-            state.symbols.add(m.group(1).upper())
+        if not state.skipping():
+            m = re.match(r"\((\w+)\)", arg)
+            if m:
+                state.symbols.add(m.group(1).upper())
     elif name == "reset":
-        m = re.match(r"\((\w+)\)", arg)
-        if m:
-            state.symbols.discard(m.group(1).upper())
-    elif name == "cond":
-        state.cond_enabled = True
+        if not state.skipping():
+            m = re.match(r"\((\w+)\)", arg)
+            if m:
+                state.symbols.discard(m.group(1).upper())
+    elif name in ("cond", "nocond"):
+        pass  # listing control only — accepted, no effect on compilation
     elif name == "if":
-        if state.cond_enabled:
-            state.stack.append((arg.upper() in state.symbols, False))
+        state.open_if(arg.upper() in state.symbols)
+    elif name == "elseif":
+        state.elseif(arg.upper() in state.symbols)
     elif name == "else":
-        if state.cond_enabled and state.stack:
-            taken, _ = state.stack[-1]
-            state.stack[-1] = (taken, True)
+        state.open_else()
     elif name == "endif":
-        if state.cond_enabled and state.stack:
-            state.stack.pop()
+        state.close_if()
     # Other directives (title, eject, list, ...) drop silently.
 
 
@@ -265,21 +298,18 @@ def _apply_line_directive(
             state.symbols.discard(m.group(1).upper())
         return True
     if _LINE_COND_RE.match(line):
-        if not state.skipping():
-            state.cond_enabled = True
-        return True
+        return True  # $COND/$NOCOND are listing controls — accepted, no effect
     if (m := _LINE_IF_RE.match(line)):
-        if state.cond_enabled:
-            state.stack.append((m.group(1).upper() in state.symbols, False))
+        state.open_if(m.group(1).upper() in state.symbols)
+        return True
+    if (m := _LINE_ELSEIF_RE.match(line)):
+        state.elseif(m.group(1).upper() in state.symbols)
         return True
     if _LINE_ELSE_RE.match(line):
-        if state.cond_enabled and state.stack:
-            taken, _ = state.stack[-1]
-            state.stack[-1] = (taken, True)
+        state.open_else()
         return True
     if _LINE_ENDIF_RE.match(line):
-        if state.cond_enabled and state.stack:
-            state.stack.pop()
+        state.close_if()
         return True
     if (m := _LINE_INCLUDE_RE.match(line)):
         if state.skipping():
