@@ -1,0 +1,12 @@
+2026-08-19 - the upeepz80 floor declared here cannot be met by the checkout
+next door, so pip silently substitutes the published wheel.
+
+pyproject.toml declares upeepz80>=0.2.3.  ../upeepz80/pyproject.toml says
+version = "0.2.2".  Installing uplm80 therefore makes pip discard the local
+editable upeepz80 and pull 0.2.3 from PyPI over the top of it - so edits in
+~/src/upeepz80 stop reaching uplm80, with no error to say so.
+
+Same note is in ../upeepz80/todo.txt and ../uc80/todo.txt; the fix belongs
+on one side or the other, not three times.  Either upeepz80 bumps its
+version, or this floor comes down to >=0.2.2 if 0.2.3 added nothing uplm80
+uses.  Verify with:  sync-repos.sh --audit
