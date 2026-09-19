@@ -1,0 +1,41 @@
+2026-09-19 - a backslash inside a PL/M character literal has no test of its own,
+and the fix for it lives in a grammar this repo only vendors.
+
+PL/M-80 has no backslash escape: a quote inside a string is written '' and a
+backslash is an ordinary character, so '\' is a valid one-character string.
+0.3.2 rejected it outright with
+
+    src/plm/bas.plm:1:1: error: <input>:185:55: lexical error at byte 0x5c
+
+a regression from 6d92986 "Replace hand-written front-end with plox-driven
+pipeline", whose generated lexer declared STRING as /'([^'\\]|\\.|'')*'/ and so
+read the backslash as an escape introducer.  Found compiling the BASIC
+detokeniser of ../80un, whose bas.plm emits MBASIC's integer-divide token.
+
+Fixed in uplox 3.3.1 - examples/plm_full.uplox and examples/plm_pre.uplox now
+declare /'([^']|'')*'/ - and picked up here in 0.3.4 by raising the floor to
+uplox>=3.3.1 and rerunning scripts/regen_parser.sh.
+
+What is still owed: uplm80 has no test covering it.  The fix is in the upstream
+grammar and uplm80/_plm_parser.py is generated, so a future regen against a
+grammar that reintroduces C escape semantics would break the lexer again with
+nothing in this suite to notice.  Add a case to tests/test_parser.py that
+compiles a character literal holding a backslash, and while there one holding a
+doubled quote, since both are the same class of PL/M-80-is-not-C mistake.
+
+Two related loose ends, neither owned by this repo:
+
+  * ../uplox examples/plm_subset.uplox still declares /'([^'\n]|'')*'/, which is
+    wrong in the other direction.  Real PL/M source does carry a string across a
+    line break - the LITERALLY bodies in the MP/M 2 corpus do, and
+    UTIL2/MSBRS.PLM holds a six-line one.  Only its own tests consume that
+    grammar, so it was left alone.
+  * ../80un src/plm/bas.plm still writes the token as 5CH rather than '\', the
+    workaround from when the lexer refused the literal.  Reverting it is safe
+    now, but 5CH also builds against an older uplox, so it is a judgement call
+    rather than a defect.
+
+Verify the lexer accepts the literal:
+
+    printf "t: do;\ndeclare c byte;\np: procedure; c = '\\\\'; end p;\ncall p;\nend t;\n" > /tmp/bs.plm
+    uplm80 /tmp/bs.plm -o /tmp/bs.mac && echo ok
