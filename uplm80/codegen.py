@@ -5282,6 +5282,7 @@ class CodeGenerator:
         self._emit("cp", self._format_number(const_val))
 
         true_label = self._new_label("TRUE")
+        false_label = self._new_label("FALSE")
         end_label = self._new_label("CMP")
 
         if op == BinaryOpKind.EQ:
@@ -5293,13 +5294,17 @@ class CodeGenerator:
         elif op == BinaryOpKind.GE:
             self._emit("jp", f"nc,{true_label}")
         elif op == BinaryOpKind.GT:
-            self._emit("jp", f"c,{end_label}")
-            self._emit("jp", f"z,{end_label}")
+            # Both false paths have to reach the "xor a" below.  Jumping to
+            # end_label instead skips it, so the comparison yields whatever the
+            # cp/sub left in A and a false ">" reads as true.
+            self._emit("jp", f"c,{false_label}")
+            self._emit("jp", f"z,{false_label}")
             self._emit("jp", true_label)
         elif op == BinaryOpKind.LE:
             self._emit("jp", f"c,{true_label}")
             self._emit("jp", f"z,{true_label}")
 
+        self._emit_label(false_label)
         self._emit("xor", "a")
         self._emit("jp", end_label)
 
@@ -5311,13 +5316,22 @@ class CodeGenerator:
 
     def _gen_byte_comparison(self, left, right, op: BinaryOpKind) -> DataType:
         """Generate optimized byte comparison between two byte values."""
+        self._gen_expr(left)
+        # B is not safe across the other operand: a nested byte comparison uses
+        # "ld b,a" as its own scratch move, and any procedure call clobbers B.
+        # So spill A through the stack and load B only after the other operand
+        # has been generated.  "pop bc" would be shorter than "ld b,a" + "pop
+        # af", but "pop bc" also overwrites C, and the CP/M call convention
+        # keeps a live argument there.
+        self._emit("push", "af")
+
         self._gen_expr(right)
         self._emit("ld", "b,a")
-
-        self._gen_expr(left)
+        self._emit("pop", "af")
         self._emit("sub", "b")
 
         true_label = self._new_label("TRUE")
+        false_label = self._new_label("FALSE")
         end_label = self._new_label("CMP")
 
         if op == BinaryOpKind.EQ:
@@ -5329,13 +5343,17 @@ class CodeGenerator:
         elif op == BinaryOpKind.GE:
             self._emit("jp", f"nc,{true_label}")
         elif op == BinaryOpKind.GT:
-            self._emit("jp", f"c,{end_label}")
-            self._emit("jp", f"z,{end_label}")
+            # Both false paths have to reach the "xor a" below.  Jumping to
+            # end_label instead skips it, so the comparison yields whatever the
+            # cp/sub left in A and a false ">" reads as true.
+            self._emit("jp", f"c,{false_label}")
+            self._emit("jp", f"z,{false_label}")
             self._emit("jp", true_label)
         elif op == BinaryOpKind.LE:
             self._emit("jp", f"c,{true_label}")
             self._emit("jp", f"z,{true_label}")
 
+        self._emit_label(false_label)
         self._emit("xor", "a")
         self._emit("jp", end_label)
 
@@ -5376,16 +5394,26 @@ class CodeGenerator:
             return DataType.BYTE
 
         if op == BinaryOpKind.SUB:
+            self._gen_expr_to_a(left)
+            self._emit("push", "af")          # B is not safe; see below
             self._gen_expr_to_a(right)
             self._emit("ld", "b,a")
-            self._gen_expr_to_a(left)
+            self._emit("pop", "af")
             self._emit("sub", "b")
             return DataType.BYTE
 
         self._gen_expr_to_a(left)
-        self._emit("ld", "b,a")
+        # B is not safe across the other operand: a nested byte comparison uses
+        # "ld b,a" as its own scratch move, and any procedure call clobbers B.
+        # So spill A through the stack and load B only after the other operand
+        # has been generated.  "pop bc" would be shorter than "ld b,a" + "pop
+        # af", but "pop bc" also overwrites C, and the CP/M call convention
+        # keeps a live argument there.
+        self._emit("push", "af")
 
         self._gen_expr_to_a(right)
+        self._emit("ld", "b,a")
+        self._emit("pop", "af")
 
         if op == BinaryOpKind.ADD:
             self._emit("add", "a,b")
