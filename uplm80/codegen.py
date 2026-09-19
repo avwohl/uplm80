@@ -5583,8 +5583,14 @@ class CodeGenerator:
             offset = number_value(index) * elem_size
             self._emit_add_hl_const(offset)
         else:
+            # The base address must survive generation of the index, and DE is
+            # not safe for that: the index expression can use DE itself - a
+            # 16-bit add against a constant emits "ld de,nn" - which silently
+            # overwrote the base and made every element address wrong.  PRNT(I +
+            # LZH$T) = I wrote to (I + 629) * 2 + 629 instead of PRNT + (I +
+            # 629) * 2.  Keep the base on the stack instead.
             self.regs.need_reg('de', 'subscript_base', self._emit)
-            self._emit("ex", "de,hl")
+            self._emit("push", "hl")
 
             result_type = self._gen_expr(index)
 
@@ -5599,12 +5605,11 @@ class CodeGenerator:
                         self._emit("add", "hl,hl")
                         temp >>= 1
                 else:
-                    self._emit("push", "de")
                     self._emit("ld", f"de,{elem_size}")
                     self._emit("call", "??mul16")
-                    self._emit("pop", "de")
                     self.needs_runtime.add("mul16")
 
+            self._emit("pop", "de")
             self._emit("add", "hl,de")
             self.regs.release_reg('de', self._emit)
 
@@ -5737,14 +5742,16 @@ class CodeGenerator:
                 offset = number_value(idx_expr) * elem_size
                 self._emit_add_hl_const(offset)
             else:
+                # Same reason as in _gen_subscript_addr: the index may use DE.
                 self.regs.need_reg('de', 'member_subscript_base', self._emit)
-                self._emit("ex", "de,hl")
+                self._emit("push", "hl")
                 idx_type = self._gen_expr(idx_expr)
                 if idx_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
                 if elem_size == 2:
                     self._emit("add", "hl,hl")
+                self._emit("pop", "de")
                 self._emit("add", "hl,de")
                 self.regs.release_reg('de', self._emit)
 
@@ -6414,14 +6421,16 @@ class CodeGenerator:
                     offset = number_value(idx_expr) * elem_size
                     self._emit_add_hl_const(offset)
                 else:
+                    # Same reason as in _gen_subscript_addr: the index may use DE.
                     self.regs.need_reg('de', 'member_subscript_addr', self._emit)
-                    self._emit("ex", "de,hl")
+                    self._emit("push", "hl")
                     idx_type = self._gen_expr(idx_expr)
                     if idx_type == DataType.BYTE:
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
                     if elem_size == 2:
                         self._emit("add", "hl,hl")
+                    self._emit("pop", "de")
                     self._emit("add", "hl,de")
                     self.regs.release_reg('de', self._emit)
                 return DataType.ADDRESS
