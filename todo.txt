@@ -17,10 +17,9 @@ What is still owed, elsewhere:
     grammar, so it was left alone.  plm_full.uplox and plm_pre.uplox were
     fixed in uplox 3.3.1 and are what this repo vendors.
 
-  * ../80un src/plm/bas.plm still writes MBASIC's integer-divide token as 5CH
-    rather than '\', the workaround from when the lexer refused the literal.
-    Reverting it is safe now, but 5CH also builds against an older uplox, so
-    it is a judgement call rather than a defect.
+  * ../80un src/plm/bas.plm wrote MBASIC's integer-divide token as 5CH rather
+    than '\'.  Done: reverted on branch rebuild/uplm80-0.3.5, and 80unbas.com
+    came out byte-identical, which is the proof that '\' lexes to 5CH.
 
 Also note, for whoever rebuilds the committed binaries:
 
@@ -28,6 +27,6 @@ Also note, for whoever rebuilds the committed binaries:
     The vendored uplm80/_plm_parser.py matches uplox 3.3.1, which is the
     declared floor.
 
-  * The 0.3.5 code-generation fixes change the emitted code for ../80un.  Its
-    output is byte-identical on all 21 corpus samples, but the committed
-    80un.com and 80unbas.com need a rebuild to stay reproducible.
+  * The 0.3.5 code-generation fixes change the emitted code for ../80un.  Done:
+    rebuilt on branch rebuild/uplm80-0.3.5; output is byte-identical on all 21
+    corpus samples and on the BASIC detokeniser.
