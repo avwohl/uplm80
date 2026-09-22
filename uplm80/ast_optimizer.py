@@ -331,6 +331,92 @@ class ASTOptimizer:
                 stack.append(getattr(n, f, None))
         return False
 
+    def _contains_call(self, node) -> bool:
+        """Whether anything in ``node`` can call out.
+
+        A PL/M call may assign any global, so no fact about any variable
+        survives it. A bare identifier naming a procedure is a call too.
+        """
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.CallStmt):
+                return True
+            if isinstance(n, P.Identifier):
+                if ident_text(n.name) in self.proc_names:
+                    return True
+                continue
+            if isinstance(n, P.Call):
+                callee = unwrap_paren(n.callee)
+                if isinstance(callee, P.Identifier):
+                    raw = ident_text(callee.name)
+                    if raw in self.proc_names or raw.upper() in _IMPURE_BUILTINS:
+                        return True
+                stack.extend(n.args)
+                stack.append(n.callee)
+                continue
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+        return False
+
+    def _snapshot_flow_state(self):
+        """Copy the flow-sensitive state so a branch can be optimized from it."""
+        return (
+            dict(self.constants),
+            dict(self.copies),
+            dict(self.cse_cache),
+            {k: set(v) for k, v in self.expr_vars.items()},
+            set(self.modified_vars),
+        )
+
+    def _restore_flow_state(self, snap) -> None:
+        constants, copies, cse, expr_vars, modified = snap
+        self.constants = dict(constants)
+        self.copies = dict(copies)
+        self.cse_cache = dict(cse)
+        self.expr_vars = {k: set(v) for k, v in expr_vars.items()}
+        self.modified_vars = set(modified)
+
+    def _invalidate_modified(self, items) -> None:
+        """Drop every fact the given statements can falsify.
+
+        Used at a loop, where the body's assignments are visible on the
+        back edge, and after an IF, where only one arm runs but either
+        may have assigned.
+
+        Constant and copy propagation are flow-insensitive: a fact
+        established before the loop is still in scope while the condition
+        and the body are optimized, but control re-enters the top with the
+        body's assignments applied. Without this,
+
+            n = 0;
+            do while n < 3; call pc('0' + n); n = n + 1; end;
+
+        folded the condition to always-true and pinned ``n`` at 0 through
+        the whole body, so the loop printed `0` forever.
+
+        A call can assign any global, so a body containing one clears
+        everything; otherwise only what the body assigns is dropped.
+        """
+        if self._contains_call(items):
+            self._reset_flow_state()
+            return
+        _, stmts = block_items_split(items)
+        for name in self._get_modified_vars_in_stmts(stmts):
+            self.constants.pop(name, None)
+            self.copies.pop(name, None)
+            self._invalidate_cse_for_var(name)
+            self._invalidate_copies_for_var(name)
+            self.modified_vars.add(name)
+
     def _reset_flow_state(self) -> None:
         """Drop everything learned about values along one flow of control.
 
@@ -1052,7 +1138,10 @@ class ASTOptimizer:
                     tname = ident_text(t.name)
                     if isinstance(v, P.NumberLiteral):
                         self.constants[tname] = number_value(v)
-                    elif isinstance(v, P.Identifier):
+                    elif isinstance(v, P.Identifier) and self._is_side_effect_free(v):
+                        # Not when the source names a procedure: `k = rd`
+                        # is a call, and propagating `k` into a later use
+                        # would call RD a second time.
                         self.copies[tname] = ident_text(v.name)
 
             return P.AssignStmt(targets=opt_targets, value=opt_value, pos=stmt.pos)
@@ -1126,9 +1215,20 @@ class ASTOptimizer:
             return self._optimize_do_case(stmt)
 
         if isinstance(stmt, P.LabeledStmt):
+            # A label is a join point: a GOTO anywhere in the procedure can
+            # land here, including one that closes a loop, so nothing
+            # learned along the fall-through path survives it. Without this,
+            #   n = 0;
+            #   lp: if n >= 3 then go to fin;
+            #       call pc('0' + n); n = n + 1; go to lp;
+            # folded the test with n pinned at 0 and looped forever at -O 3.
+            self._reset_flow_state()
             opt_inner = self._optimize_stmt(stmt.stmt)
             if opt_inner is None:
                 opt_inner = P.NullStmt(pos=stmt.pos)
+            # And nothing learned inside the labelled statement holds for
+            # code that reaches it by the same back edge.
+            self._reset_flow_state()
             return P.LabeledStmt(label=stmt.label, stmt=opt_inner, pos=stmt.pos)
 
         if isinstance(stmt, P.DeclareStmt):
@@ -1166,12 +1266,20 @@ class ASTOptimizer:
                 return self._optimize_stmt(stmt.else_stmt)
             return P.NullStmt(pos=stmt.pos)
 
+        # Each arm starts from the state at the IF, not from whatever the
+        # other arm established: only one of them runs. Facts either arm
+        # invalidates do not survive the join, because the compiler cannot
+        # know which way control went.
+        entry = self._snapshot_flow_state()
         opt_then = self._optimize_stmt(stmt.then_stmt)
         if opt_then is None:
             opt_then = P.NullStmt(pos=stmt.pos)
+        self._restore_flow_state(entry)
 
         if isinstance(stmt, P.IfStmtElse):
             opt_else = self._optimize_stmt(stmt.else_stmt)
+            self._restore_flow_state(entry)
+            self._invalidate_modified([stmt.then_stmt, stmt.else_stmt])
             if opt_else is None:
                 return P.IfStmt(condition=opt_cond, then_stmt=opt_then, pos=stmt.pos)
             return P.IfStmtElse(
@@ -1180,6 +1288,7 @@ class ASTOptimizer:
                 else_stmt=opt_else,
                 pos=stmt.pos,
             )
+        self._invalidate_modified([stmt.then_stmt])
         return P.IfStmt(condition=opt_cond, then_stmt=opt_then, pos=stmt.pos)
 
     def _optimize_block_items(self, items: list) -> list:
@@ -1274,6 +1383,9 @@ class ASTOptimizer:
 
     def _optimize_do_while(self, stmt: P.DoWhileBlock):
         """Optimize a ``DO WHILE cond ... END`` block."""
+        # Before anything is folded: the condition is re-evaluated on every
+        # back edge, so it cannot use a fact the body invalidates.
+        self._invalidate_modified(stmt.items)
         opt_cond = self._optimize_expr(stmt.condition)
 
         # A DO WHILE whose condition has bit 0 clear never executes -- but
@@ -1311,6 +1423,11 @@ class ASTOptimizer:
         of ``stmt.step``.
         """
         is_by = isinstance(stmt, P.DoIterByBlock)
+        # The bound is re-tested on every iteration; the index and whatever
+        # the body assigns are not constants inside it.
+        self._invalidate_modified(stmt.items)
+        self.constants.pop(ident_text(stmt.index), None)
+        self.copies.pop(ident_text(stmt.index), None)
         opt_start = self._optimize_expr(stmt.start)
         opt_bound = self._optimize_expr(stmt.bound)
         opt_step = self._optimize_expr(stmt.step) if is_by else None
@@ -1397,14 +1514,27 @@ class ASTOptimizer:
         """Optimize a ``DO CASE selector ... END`` block."""
         opt_selector = self._optimize_expr(stmt.selector)
 
-        # If selector is constant, keep only that case (level 2+).
-        if self.opt_level >= 2 and isinstance(unwrap_paren(opt_selector), P.NumberLiteral):
+        # If selector is constant, keep only that case (level 2+) -- unless
+        # a discarded case declares a label a GOTO still names.
+        if (
+            self.opt_level >= 2
+            and isinstance(unwrap_paren(opt_selector), P.NumberLiteral)
+            and not any(self._contains_label(c) for c in stmt.items)
+        ):
             case_idx = number_value(unwrap_paren(opt_selector))
             if 0 <= case_idx < len(stmt.items):
                 self.stats.dead_code_eliminated += 1
                 return self._optimize_stmt(stmt.items[case_idx])
 
-        new_cases: list = [self._optimize_stmt(c) for c in stmt.items]
+        # Exactly one case runs, so each is optimized from the state at the
+        # DO CASE and nothing any of them establishes survives the join.
+        entry = self._snapshot_flow_state()
+        new_cases: list = []
+        for c in stmt.items:
+            self._restore_flow_state(entry)
+            new_cases.append(self._optimize_stmt(c))
+        self._restore_flow_state(entry)
+        self._invalidate_modified(list(stmt.items))
         # Drop None survivors by replacing with NullStmt so positional
         # case indices stay aligned with the source.
         new_cases = [c if c is not None else P.NullStmt(pos=stmt.pos) for c in new_cases]

@@ -1025,3 +1025,108 @@ class TestRemainingRegisterParkingFixes:
         assert "ld\ta,0ffh" not in body, (
             f"the comparison was materialised as a value first: {body}"
         )
+
+
+class TestConstantPropagationIsFlowSensitive:
+    """
+    Constant and copy propagation were flow-insensitive, so a fact
+    established on one path was reused on another that cannot reach it.
+    At `-O 3` this miscompiled the most ordinary loop there is:
+
+        n = 0;
+        do while n < 3; call pc('0' + n); n = n + 1; end;
+
+    folded the condition to always-true and pinned `n` at 0 through the
+    body, so the loop printed `0` for ever. The same flow-insensitivity
+    reached a GOTO-formed loop, an IF arm and a DO CASE arm.
+    """
+
+    def _o3(self, body: str) -> list:
+        asm = Compiler(opt_level=3).compile(f"""
+            t: do;
+            declare (n, k, x, r) byte;
+            rd: procedure byte; return 1; end rd;
+            p: procedure;
+                {body}
+            end p;
+            call p;
+            end t;
+        """, "<test>")
+        assert asm is not None
+        instrs = _instructions(asm)
+        return instrs[instrs.index("P:"):]
+
+    def test_do_while_condition_is_not_folded_from_before_the_loop(self) -> None:
+        body = self._o3("n = 0; do while n < 3; r = n; n = n + 1; end;")
+        assert any(i == "ld\ta,(N)" for i in body), (
+            f"the loop never reloads n, so the condition was pinned: {body}"
+        )
+
+    def test_a_label_ends_the_region(self) -> None:
+        # A GOTO can close a loop through any label.
+        body = self._o3(
+            "n = 0;"
+            "lp: if n >= 3 then go to fin;"
+            "    r = n; n = n + 1; go to lp;"
+            "fin: r = 0;"
+        )
+        # With the label treated as fall-through, `n` stayed pinned at 0
+        # and the whole `n >= 3` test folded away, leaving a bare backward
+        # jump -- an infinite loop.
+        assert "cp\t3" in body, (
+            f"the loop test was folded away using a pre-label constant: {body}"
+        )
+
+    def test_a_then_arm_constant_does_not_survive_the_join(self) -> None:
+        body = self._o3("n = 0; k = rd; if k = 1 then n = 5; r = n;")
+        i = max(idx for idx, ins in enumerate(body) if ins == "ld\ta,5")
+        after = body[i + 1:]
+        assert "ld\ta,(N)" in after, (
+            f"n was folded to the THEN arm's 5 after the join: {body}"
+        )
+
+    def test_a_case_arm_constant_does_not_reach_the_next_case(self) -> None:
+        body = self._o3(
+            "n = 0; k = rd;"
+            "do case k;"
+            "  do; n = 7; r = n; end;"
+            "  do; r = n; end;"
+            "end;"
+        )
+        # Case 1 may legitimately use the value n had BEFORE the DO CASE
+        # (0); what it must not use is the 7 that case 0 assigns.
+        labels = [i for i, ins in enumerate(body) if ins.startswith("??CASE1")]
+        assert labels, f"no second case was emitted: {body}"
+        second = body[labels[0]:]
+        upto = second[:second.index("??CASEND0001:")] if "??CASEND0001:" in second else second
+        assert "ld\ta,7" not in upto, (
+            f"the second case reused the first case's constant: {body}"
+        )
+
+
+class TestCopyPropagationDoesNotDuplicateACall:
+    """
+    `k = rd;` recorded a copy of the identifier `rd`, and propagating `k`
+    into a later use turned it into a second call. A PL/M parameterless
+    procedure reference is a call, not a variable read.
+    """
+
+    def test_the_procedure_is_called_once(self) -> None:
+        asm = Compiler(opt_level=3).compile("""
+            t: do;
+            declare (k, n) byte;
+            rd: procedure byte; n = n + 1; return 1; end rd;
+            p: procedure;
+                k = rd;
+                if k = 1 then n = 2;
+            end p;
+            call p;
+            end t;
+        """, "<test>")
+        assert asm is not None
+        instrs = _instructions(asm)
+        body = instrs[instrs.index("P:"):]
+        calls = [i for i in body if i == "call\tRD"]
+        assert len(calls) == 1, (
+            f"RD is called {len(calls)} times, not once: {body}"
+        )

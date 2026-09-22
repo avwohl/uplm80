@@ -8,7 +8,7 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 An audit prompted by the 80un report. The three defects 0.3.3 and 0.3.4 fixed
 turned out to be members of a family that was never swept, and the audit also
 found the language defect underneath the `AND`/`OR` story: PL/M-80 tests bit 0
-of a condition, not whether the condition is non-zero. Twenty-five fixes, each with a
+of a condition, not whether the condition is non-zero. Twenty-seven fixes, each with a
 regression test; see Added for what that was and was not verified to mean.
 
 ### Fixed
@@ -105,6 +105,34 @@ regression test; see Added for what that was and was not verified to mean.
   operand.** Any low operand that computes in `HL` — a call, a subscript —
   destroyed it. The four-instruction form is kept when the low operand is a
   plain byte load and spilled otherwise.
+
+- **Constant and copy propagation were flow-insensitive.** A fact
+  established on one path was reused on another that cannot reach it, which
+  at `-O 3` miscompiled the most ordinary loop there is:
+
+  ```plm
+  n = 0;
+  do while n < 3; call pc('0' + n); n = n + 1; end;
+  ```
+
+  `n = 0` was still in scope when the condition was folded, so `n < 3` became
+  always-true, `'0' + n` became the literal `'0'` and `n = n + 1` became
+  `n = 1`. The loop printed `0` for ever. The same flow-insensitivity reached
+  four shapes in all: a `DO WHILE`, an iterative `DO`, a loop closed by a
+  backward `GOTO`, and the arms of an `IF` or `DO CASE`, where a value
+  assigned in one arm was folded into code after the join that the other arm
+  reaches. A loop now drops whatever its body can assign before its condition
+  is touched — everything, if the body can call out — a label is treated as
+  the join point it is, and each branch arm is optimized from the state at
+  the branch rather than from whatever the previous arm left behind.
+
+  Costs nothing at the default `-O 2`: the output is byte-identical. `-O 3`
+  grows, because much of what it used to fold away it had no right to.
+
+- **Copy propagation duplicated a procedure call.** `k = rd;` recorded a copy
+  of the identifier `rd`, so a later use of `k` was rewritten back into `rd`
+  — a second call. In PL/M a parameterless procedure reference is a call, not
+  a variable read.
 
 - **A dead IF arm was discarded along with any label inside it.** A `GOTO`
   elsewhere in the procedure still named the label, so codegen emitted a jump
@@ -216,9 +244,6 @@ regression test; see Added for what that was and was not verified to mean.
   `-(0FFFFH)` = 1, `0FFFFH + 1` = 0) and 0FFH is not, so narrowing the value
   without also narrowing `_eval_unary_const` and the arithmetic arms made
   `NOT (1 = 1)` fold to 0FF00H. A correct fix needs a width-aware folder.
-
-- `-O 3` still propagates an assignment made before a `DO WHILE` into the loop
-  condition, deleting the test. Pre-existing, and not addressed here.
 
 ### Added
 
