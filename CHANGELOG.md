@@ -8,8 +8,8 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 An audit prompted by the 80un report. The three defects 0.3.3 and 0.3.4 fixed
 turned out to be members of a family that was never swept, and the audit also
 found the language defect underneath the `AND`/`OR` story: PL/M-80 tests bit 0
-of a condition, not whether the condition is non-zero. Twenty-four fixes, each with a
-regression test that fails against the generator with that fix reverted.
+of a condition, not whether the condition is non-zero. Twenty-five fixes, each with a
+regression test; see Added for what that was and was not verified to mean.
 
 ### Fixed
 
@@ -106,9 +106,19 @@ regression test that fails against the generator with that fix reverted.
   destroyed it. The four-instruction form is kept when the low operand is a
   plain byte load and spilled otherwise.
 
-- **A folded relational had the value 0FFFFH; the runtime paths give 0FFH.** A
-  PL/M-80 relational yields a BYTE, so `x = 1 > 0` and `x = a > b` disagreed as
-  values depending on whether the comparison folded.
+- **A dead IF arm was discarded along with any label inside it.** A `GOTO`
+  elsewhere in the procedure still named the label, so codegen emitted a jump
+  to a symbol nothing defined and the program failed to assemble at `-O 2`
+  while building and running correctly at `-O 0`. The arm is now kept when it
+  declares a label, and `DO WHILE` got the same guard. Reachable before this
+  release only for `IF 0`; the bit-0 constant rule widened it to every even
+  constant, which is how it was found.
+
+- **`ZERO`, `SIGN` and `PARITY` declared a BYTE result but left it in `HL`**,
+  so every byte consumer read the wrong register: `IF ZERO` tested `A`, and
+  `x = ZERO` overwrote `L` with `A`. They now produce their value in `A`, via
+  `ld a,0ffh` / `jp cc` / `inc a` — which, unlike loading zero, cannot be
+  strength-reduced into something that writes `CARRY` before a later read.
 
 - **Algebraic identities discarded side-effecting operands.** `x AND 0`,
   `x * 0`, `x OR 0FFFFH`, `x - x` and `x XOR x` dropped an operand that
@@ -196,11 +206,27 @@ regression test that fails against the generator with that fix reverted.
   reached the optimised compare and materialised a value instead. Generated
   code was correct; it was one instruction pair longer than it needed to be.
 
+### Known issues
+
+- The AST constant folder is untyped: it masks every result to 16 bits, so a
+  folded relational is 0FFFFH where the runtime paths produce a BYTE 0FFH.
+  Storing a folded comparison into an ADDRESS therefore reads 0FFFFH rather
+  than 00FFH. Narrowing the fold to 0FFH was tried and reverted: 0FFFFH is a
+  fixed point of the operators that consume a boolean (`NOT 0FFFFH` = 0,
+  `-(0FFFFH)` = 1, `0FFFFH + 1` = 0) and 0FFH is not, so narrowing the value
+  without also narrowing `_eval_unary_const` and the arithmetic arms made
+  `NOT (1 = 1)` fold to 0FF00H. A correct fix needs a width-aware folder.
+
+- `-O 3` still propagates an assignment made before a `DO WHILE` into the loop
+  condition, deleting the test. Pre-existing, and not addressed here.
+
 ### Added
 
-- Regression tests for all twenty-four fixes, written as invariants over the
-  generated assembly rather than golden output. Each fails against a copy of
-  the generator with the corresponding fix reverted.
+- Regression tests for the fixes above, written as invariants over the
+  generated assembly rather than golden output. All of them fail against the
+  baseline generator, and nine fixes were reverted individually to confirm the
+  suite catches each on its own. The per-fix property has not been verified
+  exhaustively for every fix in the list.
 - String-literal tests, which settles the debt `todo.txt` recorded against
   0.3.4: a backslash is an ordinary character in PL/M-80, `''` is one quote,
   and a string may cross a line break. `uplm80/_plm_parser.py` is generated, so

@@ -576,21 +576,38 @@ class TestSideEffectingOperandIsNotDropped:
 
 class TestFoldedRelationalMatchesTheRuntimeValue:
     """
-    A PL/M-80 relational yields a BYTE 0FFH. The folder produced 0FFFFH,
-    so a folded and an unfolded comparison disagreed as values.
+    A folded relational has to agree with the one the generator computes at
+    runtime, under every operator that consumes it. The folder is untyped
+    and masks to 16 bits, so the folded value must be a fixed point of
+    NOT / unary minus / +1 the way the runtime's 0FFH is: an attempt to
+    narrow it to 0FFH made `NOT (1 = 1)` fold to 0FF00H, where -O 0 and
+    PL/M-80 both give 0.
     """
 
-    def test_folded_true_is_0ffh(self) -> None:
-        instrs = _instructions(_compile("""
-            t: do;
-            declare r address;
-            p: procedure;
-                r = 1 > 0;
-            end p;
-            call p;
-            end t;
-        """))
-        assert "ld\thl,0FFH" in instrs, f"folded relational is not 0FFH: {instrs}"
+    # `w = NOT (1 = 1)` is zero: NOT of true is false. -O 0 computes it and
+    # gets 0; the folder must reach the same answer.
+    SRC = """
+        t: do;
+        declare w address;
+        p: procedure;
+            w = not (1 = 1);
+        end p;
+        call p;
+        end t;
+    """
+
+    def test_not_of_a_folded_true_is_zero(self) -> None:
+        for level in (1, 2, 3):
+            asm = Compiler(opt_level=level).compile(self.SRC, "<test>")
+            assert asm is not None
+            instrs = _instructions(asm)
+            body = instrs[instrs.index("P:"):]
+            loads = [i for i in body if i.startswith("ld\thl,")]
+            assert loads, f"-O {level}: nothing loaded: {body}"
+            assert loads[-1] in ("ld\thl,0", "ld\thl,0H"), (
+                f"-O {level} folded NOT (1 = 1) to {loads[-1]}, not zero; "
+                "-O 0 computes 0"
+            )
 
 
 class TestBdosFunctionNumberSurvivesTheArgument:
@@ -919,3 +936,92 @@ class TestCarrySensitiveScanNumeric:
             assert any(i.startswith("add\t") for i in body), (
                 f"-O {level} folded the carry-setting add away: {body}"
             )
+
+
+class TestRemainingRegisterParkingFixes:
+    """
+    The rest of the "park a value in a register, then generate arbitrary
+    code, then read it" family. Each of these had a fix but no test of its
+    own, so reverting one left the suite green.
+    """
+
+    def test_iterative_do_index_survives_the_bound(self) -> None:
+        # The 16-bit iterative DO parked the index in DE with `ex de,hl`
+        # and then generated a bound free to emit `ld de,nn` or call out.
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (i, n) address;
+            f: procedure address; return 10; end f;
+            p: procedure;
+                do i = 1 to f;
+                    n = n + 1;
+                end;
+            end p;
+            call p;
+            end t;
+        """))
+        bad = _clobbered_before_use(instrs, "ex\tde,hl",
+                                    ("call\t??subde",), ("ld de,", "ld\tde,", "call\t"))
+        assert not bad, (
+            f"the loop index parked in DE is destroyed by the bound: "
+            f"{[instrs[j] for j in bad]}"
+        )
+
+    def test_embedded_assignment_value_survives_the_store(self) -> None:
+        # The value was parked in B across _gen_store, which generates the
+        # index expression of a subscripted target.
+        instrs = _instructions(_compile("""
+            t: do;
+            declare arr(8) byte, i byte, v byte;
+            f: procedure byte; return 3; end f;
+            p: procedure;
+                arr(f), v = i;
+            end p;
+            call p;
+            end t;
+        """))
+        bad = _clobbered_before_use(instrs, "ld\tb,a", _B_CONSUMERS, _B_WRITES)
+        assert not bad, (
+            f"a multi-target byte value is destroyed before the second store: "
+            f"{[instrs[j] for j in bad]}"
+        )
+
+    def test_shl_or_high_byte_survives_a_call(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare hi byte, r address;
+            f: procedure byte; return 7; end f;
+            p: procedure;
+                r = shl(double(hi),8) or f;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        # `ld h,a` must not sit before a call that can return in HL.
+        for i, ins in enumerate(body):
+            if ins != "ld\th,a":
+                continue
+            rest = body[i + 1:]
+            upto = rest[:rest.index("ld\tl,a")] if "ld\tl,a" in rest else rest
+            assert not [x for x in upto if x.startswith("call\t")], (
+                f"the high byte is parked in H across a call: {body}"
+            )
+
+    def test_not_of_a_parenthesised_comparison_uses_the_compare(self) -> None:
+        # `IF NOT (a = b)` must reach the optimised compare rather than
+        # materialising a value and testing it.
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (a, b, r) byte;
+            p: procedure;
+                if not (a = b) then r = 1;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "sub\tb" in body, f"the comparison was not used directly: {body}"
+        assert "ld\ta,0ffh" not in body, (
+            f"the comparison was materialised as a value first: {body}"
+        )

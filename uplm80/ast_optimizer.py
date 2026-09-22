@@ -306,6 +306,31 @@ class ASTOptimizer:
                 stack.append(getattr(n, f, None))
         return False
 
+    def _contains_label(self, node) -> bool:
+        """Whether ``node`` holds a labelled statement anywhere inside it.
+
+        Dropping a dead IF arm drops its labels with it, but a GOTO from
+        elsewhere in the procedure still names them, and codegen then emits
+        a jump to a symbol nothing defines. PL/M-80 labels are procedure
+        scoped, so the arm cannot be discarded when it declares one.
+        """
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.LabeledStmt):
+                return True
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+        return False
+
     def _reset_flow_state(self) -> None:
         """Drop everything learned about values along one flow of control.
 
@@ -1122,8 +1147,15 @@ class ASTOptimizer:
         """
         opt_cond = self._optimize_expr(stmt.condition)
 
-        # Constant condition elimination (level 2+).
-        if self.opt_level >= 2 and isinstance(unwrap_paren(opt_cond), P.NumberLiteral):
+        # Constant condition elimination (level 2+). Not when either arm
+        # declares a label: a GOTO elsewhere in the procedure still names it.
+        else_stmt = stmt.else_stmt if isinstance(stmt, P.IfStmtElse) else None
+        if (
+            self.opt_level >= 2
+            and isinstance(unwrap_paren(opt_cond), P.NumberLiteral)
+            and not self._contains_label(stmt.then_stmt)
+            and not (else_stmt is not None and self._contains_label(else_stmt))
+        ):
             self.stats.dead_code_eliminated += 1
             # PL/M-80 truth is bit 0 of the value, not non-zero: `IF 4` is
             # false, and `IF NOT TRUE` with `TRUE LITERALLY '1'` folds to
@@ -1244,8 +1276,13 @@ class ASTOptimizer:
         """Optimize a ``DO WHILE cond ... END`` block."""
         opt_cond = self._optimize_expr(stmt.condition)
 
-        # A DO WHILE whose condition has bit 0 clear never executes.
-        if self.opt_level >= 2 and isinstance(unwrap_paren(opt_cond), P.NumberLiteral):
+        # A DO WHILE whose condition has bit 0 clear never executes -- but
+        # only drop the loop when its body declares no label.
+        if (
+            self.opt_level >= 2
+            and isinstance(unwrap_paren(opt_cond), P.NumberLiteral)
+            and not any(self._contains_label(i) for i in stmt.items)
+        ):
             if number_value(unwrap_paren(opt_cond)) & 1 == 0:
                 self.stats.dead_code_eliminated += 1
                 return P.NullStmt(pos=stmt.pos)
@@ -1574,23 +1611,28 @@ class ASTOptimizer:
                 return left | right
             elif kind == BinaryOpKind.XOR:
                 return left ^ right
-            # A PL/M-80 relational yields a BYTE: 0FFH true, 00H false.
-            # The runtime paths materialise exactly that (`ld a,0ffh` /
-            # `xor a`), so folding must not invent a 16-bit 0FFFFH -
-            # a folded and an unfolded comparison would then disagree
-            # as values.
+            # A PL/M-80 relational yields a BYTE 0FFH, and that is what the
+            # runtime paths materialise. This folder is untyped, though:
+            # _eval_unary_const and the arithmetic arms above all mask to
+            # 16 bits, and 0FFFFH is a fixed point for exactly the operators
+            # that consume a boolean -- NOT 0FFFFH = 0, -(0FFFFH) = 1,
+            # 0FFFFH + 1 = 0 -- where 0FFH is not: NOT 0FFH would fold to
+            # 0FF00H. Folding to 0FFFFH keeps NOT / NEG / + right; the cost
+            # is that a folded relational stored into an ADDRESS reads
+            # 0FFFFH where the runtime gives 00FFH. Narrowing this properly
+            # needs a width-aware folder; see todo.txt.
             elif kind == BinaryOpKind.EQ:
-                return 0xFF if left == right else 0
+                return 0xFFFF if left == right else 0
             elif kind == BinaryOpKind.NE:
-                return 0xFF if left != right else 0
+                return 0xFFFF if left != right else 0
             elif kind == BinaryOpKind.LT:
-                return 0xFF if left < right else 0
+                return 0xFFFF if left < right else 0
             elif kind == BinaryOpKind.GT:
-                return 0xFF if left > right else 0
+                return 0xFFFF if left > right else 0
             elif kind == BinaryOpKind.LE:
-                return 0xFF if left <= right else 0
+                return 0xFFFF if left <= right else 0
             elif kind == BinaryOpKind.GE:
-                return 0xFF if left >= right else 0
+                return 0xFFFF if left >= right else 0
             # PLUS / MINUS (carry-aware) — don't fold at AST level; the
             # codegen lowering depends on the runtime carry chain.
         except (ZeroDivisionError, OverflowError):
@@ -1834,14 +1876,13 @@ class ASTOptimizer:
                    and _ident_name(left) == _ident_name(right)
                    and self._is_side_effect_free(left))
 
-        # A PL/M-80 relational yields a BYTE 0FFH, matching _eval_binary_const
-        # and the runtime paths.
+        # 0FFFFH, not 0FFH: see the note in _eval_binary_const.
         if kind == BinaryOpKind.EQ:
             if same_id:
-                return make_number_literal(0xFF, pos=pos)
+                return make_number_literal(0xFFFF, pos=pos)
             if _is_number(left) and _is_number(right):
                 return make_number_literal(
-                    0xFF if _num_value(left) == _num_value(right) else 0,
+                    0xFFFF if _num_value(left) == _num_value(right) else 0,
                     pos=pos,
                 )
 
@@ -1852,9 +1893,9 @@ class ASTOptimizer:
         if kind == BinaryOpKind.GT and same_id:
             return make_number_literal(0, pos=pos)
         if kind == BinaryOpKind.LE and same_id:
-            return make_number_literal(0xFF, pos=pos)
+            return make_number_literal(0xFFFF, pos=pos)
         if kind == BinaryOpKind.GE and same_id:
-            return make_number_literal(0xFF, pos=pos)
+            return make_number_literal(0xFFFF, pos=pos)
 
         # (a AND b) AND b -> a AND b (idempotent). Dropping the repeated
         # operand is only sound when evaluating it has no side effect.

@@ -4637,37 +4637,70 @@ class CodeGenerator:
 
             if upper_name == "ZERO":
                 # Return zero flag value
-                true_label = self._new_label("ZF")
                 end_label = self._new_label("ZFE")
-                self._emit("jp", f"z,{true_label}")
-                self._emit("ld", "hl,0")
-                self._emit("jp", end_label)
-                self._emit_label(true_label)
-                self._emit("ld", "hl,0ffh")
+
+                # `ld a,0ffh` sets no flags, so the condition survives to the
+
+                # branch; the false path turns it into 0 with `inc a`, which
+
+                # leaves CARRY alone. Loading zero directly would be rewritten
+
+                # by the peephole into `xor a`, and that clears carry for any
+
+                # later CARRY read.
+
+                self._emit("ld", "a,0ffh")
+
+                self._emit("jp", f"z,{end_label}")
+
+                self._emit("inc", "a")
+
                 self._emit_label(end_label)
                 return DataType.BYTE
 
             if upper_name == "SIGN":
                 # Return sign flag value
-                true_label = self._new_label("SF")
                 end_label = self._new_label("SFE")
-                self._emit("jp", f"m,{true_label}")
-                self._emit("ld", "hl,0")
-                self._emit("jp", end_label)
-                self._emit_label(true_label)
-                self._emit("ld", "hl,0ffh")
+
+                # `ld a,0ffh` sets no flags, so the condition survives to the
+
+                # branch; the false path turns it into 0 with `inc a`, which
+
+                # leaves CARRY alone. Loading zero directly would be rewritten
+
+                # by the peephole into `xor a`, and that clears carry for any
+
+                # later CARRY read.
+
+                self._emit("ld", "a,0ffh")
+
+                self._emit("jp", f"m,{end_label}")
+
+                self._emit("inc", "a")
+
                 self._emit_label(end_label)
                 return DataType.BYTE
 
             if upper_name == "PARITY":
                 # Return parity flag value
-                true_label = self._new_label("PF")
                 end_label = self._new_label("PFE")
-                self._emit("jp", f"pe,{true_label}")
-                self._emit("ld", "hl,0")
-                self._emit("jp", end_label)
-                self._emit_label(true_label)
-                self._emit("ld", "hl,0ffh")
+
+                # `ld a,0ffh` sets no flags, so the condition survives to the
+
+                # branch; the false path turns it into 0 with `inc a`, which
+
+                # leaves CARRY alone. Loading zero directly would be rewritten
+
+                # by the peephole into `xor a`, and that clears carry for any
+
+                # later CARRY read.
+
+                self._emit("ld", "a,0ffh")
+
+                self._emit("jp", f"pe,{end_label}")
+
+                self._emit("inc", "a")
+
                 self._emit_label(end_label)
                 return DataType.BYTE
 
@@ -6400,37 +6433,70 @@ class CodeGenerator:
 
         if name == "ZERO":
             # Return zero flag value
-            true_label = self._new_label("ZF")
             end_label = self._new_label("ZFE")
-            self._emit("jp", f"z,{true_label}")
-            self._emit("ld", "hl,0")
-            self._emit("jp", end_label)
-            self._emit_label(true_label)
-            self._emit("ld", "hl,0ffh")
+
+            # `ld a,0ffh` sets no flags, so the condition survives to the
+
+            # branch; the false path turns it into 0 with `inc a`, which
+
+            # leaves CARRY alone. Loading zero directly would be rewritten
+
+            # by the peephole into `xor a`, and that clears carry for any
+
+            # later CARRY read.
+
+            self._emit("ld", "a,0ffh")
+
+            self._emit("jp", f"z,{end_label}")
+
+            self._emit("inc", "a")
+
             self._emit_label(end_label)
             return DataType.BYTE
 
         if name == "SIGN":
             # Return sign flag value
-            true_label = self._new_label("SF")
             end_label = self._new_label("SFE")
-            self._emit("jp", f"m,{true_label}")
-            self._emit("ld", "hl,0")
-            self._emit("jp", end_label)
-            self._emit_label(true_label)
-            self._emit("ld", "hl,0ffh")
+
+            # `ld a,0ffh` sets no flags, so the condition survives to the
+
+            # branch; the false path turns it into 0 with `inc a`, which
+
+            # leaves CARRY alone. Loading zero directly would be rewritten
+
+            # by the peephole into `xor a`, and that clears carry for any
+
+            # later CARRY read.
+
+            self._emit("ld", "a,0ffh")
+
+            self._emit("jp", f"m,{end_label}")
+
+            self._emit("inc", "a")
+
             self._emit_label(end_label)
             return DataType.BYTE
 
         if name == "PARITY":
             # Return parity flag value
-            true_label = self._new_label("PF")
             end_label = self._new_label("PFE")
-            self._emit("jp", f"pe,{true_label}")
-            self._emit("ld", "hl,0")
-            self._emit("jp", end_label)
-            self._emit_label(true_label)
-            self._emit("ld", "hl,0ffh")
+
+            # `ld a,0ffh` sets no flags, so the condition survives to the
+
+            # branch; the false path turns it into 0 with `inc a`, which
+
+            # leaves CARRY alone. Loading zero directly would be rewritten
+
+            # by the peephole into `xor a`, and that clears carry for any
+
+            # later CARRY read.
+
+            self._emit("ld", "a,0ffh")
+
+            self._emit("jp", f"pe,{end_label}")
+
+            self._emit("inc", "a")
+
             self._emit_label(end_label)
             return DataType.BYTE
 
