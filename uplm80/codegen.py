@@ -2762,9 +2762,12 @@ class CodeGenerator:
         # instead of ``ld hl,n``.
         if isinstance(stmt.value, P.NumberLiteral):
             const_val = number_value(stmt.value)
-            if const_val <= 255 and all(
-                self._is_byte_target(t) for t in targets
-            ):
+            if all(self._is_byte_target(t) for t in targets):
+                # PL/M-80 narrows to the target's width, so truncate here
+                # rather than emitting `ld hl,nn` and leaving the peephole
+                # to collapse `ld hl,nn / ld a,l` into an `ld a,nn` that
+                # keeps all sixteen bits.
+                const_val &= 0xFF
                 # Generate efficient byte constant
                 if const_val == 0:
                     self._emit("xor", "a")
@@ -4620,9 +4623,14 @@ class CodeGenerator:
 
             # Handle flag-testing builtins (can be used without parentheses)
             if upper_name == "CARRY":
-                # Return carry flag value
-                self._emit("ld", "a,0")
-                self._emit("rla")  # Rotate carry into A
+                # Return carry flag value. `sbc a,a` reads carry in one
+                # instruction (A := -carry, so 0FFH or 00H) and does not
+                # depend on A's previous contents. The obvious
+                # `ld a,0 / rla` cannot be used: the peephole rewrites
+                # `ld a,0` into the one-byte `xor a`, which CLEARS the
+                # very flag being read, and CARRY then always reads 0.
+                self._emit("sbc", "a,a")
+                self._emit("and", "1")
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
                 return DataType.BYTE
@@ -6382,9 +6390,10 @@ class CodeGenerator:
             return None
 
         if name == "CARRY":
-            # Return carry flag value
-            self._emit("ld", "a,0")
-            self._emit("rla")  # Rotate carry into A
+            # Return carry flag value; see the other CARRY site for why
+            # `ld a,0 / rla` cannot be used.
+            self._emit("sbc", "a,a")
+            self._emit("and", "1")
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
             return DataType.BYTE

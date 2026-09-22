@@ -8,7 +8,7 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 An audit prompted by the 80un report. The three defects 0.3.3 and 0.3.4 fixed
 turned out to be members of a family that was never swept, and the audit also
 found the language defect underneath the `AND`/`OR` story: PL/M-80 tests bit 0
-of a condition, not whether the condition is non-zero. Twenty-one fixes, each with a
+of a condition, not whether the condition is non-zero. Twenty-four fixes, each with a
 regression test that fails against the generator with that fix reverted.
 
 ### Fixed
@@ -116,6 +116,28 @@ regression test that fails against the generator with that fix reverted.
   is a parameterless call, not a variable read. The identities now apply only
   when the discarded operand is side-effect free.
 
+- **`IF CARRY` always read false at `-O 1` and above.** The built-in emitted
+  `ld a,0` / `rla` — correct in itself, because `ld a,0` does not touch the
+  flags — but the peephole rewrites `ld a,0` into the one-byte `xor a`, which
+  CLEARS the carry the `rla` is there to read. It now uses `sbc a,a`, which
+  reads carry in one instruction and does not depend on `A`. MP/M II's
+  `scan$numeric` — shared by `SHOW.PLM`, `MSCHD.PLM` and `TOD.PLM` — guards
+  its `b * 10` and `b + digit` steps with `IF CARRY THEN`, so every overflow
+  check in those three was dead.
+
+- **Constant folding removed the operation whose carry was about to be
+  read.** At `-O 3`, constant propagation folded `s = a + b` to a literal, so
+  the `add` that set carry no longer existed and the following `IF CARRY` read
+  a stale flag. Arithmetic is no longer folded inside a procedure or module
+  body that reads `CARRY`, `ZERO`, `SIGN` or `PARITY`; elsewhere folding is
+  unchanged.
+
+- **A BYTE assignment of a constant above 255 emitted a 16-bit load.**
+  `_gen_assign` took its byte path only for values that already fit, so a
+  folded `200 + 100` went out as `ld hl,012CH` / `ld a,l` — which the peephole
+  then collapsed into `ld a,012CH`, keeping all sixteen bits. PL/M-80 narrows
+  to the target's width, so the constant is truncated in the generator.
+
 - **The truth-rule fix initially missed the CONSTANT paths**, so the same
   source got different answers at different optimisation levels: `IF NOT TRUE`
   with `TRUE LITERALLY '1'` folds to 0FEH and was true at `-O 0` but false
@@ -176,7 +198,7 @@ regression test that fails against the generator with that fix reverted.
 
 ### Added
 
-- Regression tests for all twenty-one fixes, written as invariants over the
+- Regression tests for all twenty-four fixes, written as invariants over the
   generated assembly rather than golden output. Each fails against a copy of
   the generator with the corresponding fix reverted.
 - String-literal tests, which settles the debt `todo.txt` recorded against

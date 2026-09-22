@@ -233,6 +233,10 @@ class ASTOptimizer:
         # Every procedure name in the module. A bare identifier that
         # names one is a PL/M parameterless call, not a variable read.
         self.proc_names: set[str] = set()
+        # True while optimizing a region that reads CARRY / ZERO /
+        # SIGN / PARITY, where an arithmetic operation's flag side
+        # effect is observable and must not be folded away.
+        self.flag_sensitive: bool = False
 
     def _parse_plm_number(self, s: str) -> int | None:
         """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
@@ -272,6 +276,35 @@ class ASTOptimizer:
                     self._collect_proc_names([it.else_stmt])
             elif isinstance(it, P.LabeledStmt):
                 self._collect_proc_names([it.stmt])
+
+    _FLAG_BUILTINS = frozenset({"CARRY", "ZERO", "SIGN", "PARITY"})
+
+    def _reads_a_flag(self, node) -> bool:
+        """Whether anything in ``node`` reads a condition-flag built-in.
+
+        PL/M-80's CARRY / ZERO / SIGN / PARITY read the flags left by the
+        preceding operation, so in a region that uses them an arithmetic
+        expression is not a pure value: folding `A + B` to a constant
+        removes the `add` whose carry the next statement reads.
+        """
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.Identifier):
+                if ident_text(n.name).upper() in self._FLAG_BUILTINS:
+                    return True
+                continue
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+        return False
 
     def _reset_flow_state(self) -> None:
         """Drop everything learned about values along one flow of control.
@@ -337,6 +370,7 @@ class ASTOptimizer:
             changed = False
             passes += 1
             self._reset_flow_state()
+            self.flag_sensitive = any(self._reads_a_flag(x) for x in module.items)
 
             new_items: list = []
             for item in module.items:
@@ -385,6 +419,8 @@ class ASTOptimizer:
 
         # A procedure body is its own flow region.
         self._reset_flow_state()
+        outer_flag_sensitive = self.flag_sensitive
+        self.flag_sensitive = any(self._reads_a_flag(x) for x in body_stmts)
 
         new_decls: list = []
         for d in local_decls:
@@ -405,6 +441,7 @@ class ASTOptimizer:
 
         # Nothing learned inside this body is valid outside it.
         self._reset_flow_state()
+        self.flag_sensitive = outer_flag_sensitive
 
         # Rebuild body items: keep nested ProcDecls and LiterallyDecls as
         # standalone items; group the rest into a DeclareStmt as the
@@ -1427,11 +1464,17 @@ class ASTOptimizer:
         left = self._optimize_expr(expr.left)
         right = self._optimize_expr(expr.right)
 
-        # Constant folding (level 1+).
+        # Constant folding (level 1+). Arithmetic is skipped in a region
+        # that reads a flag built-in: the operation's carry is observable
+        # there, so the `add` has to survive.
+        _ARITH = (BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.MUL,
+                  BinaryOpKind.DIV, BinaryOpKind.MOD,
+                  BinaryOpKind.PLUS, BinaryOpKind.MINUS)
         if (
             self.opt_level >= 1
             and _is_number(left)
             and _is_number(right)
+            and not (self.flag_sensitive and kind in _ARITH)
         ):
             result = self._eval_binary_const(kind, _num_value(left), _num_value(right))
             if result is not None:

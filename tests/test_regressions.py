@@ -852,3 +852,70 @@ class TestOptimizerStateDoesNotLeakBetweenProcedures:
         assert "ld\ta,(V)" in body, (
             f"TWO folded V to ONE's constant instead of loading it: {body}"
         )
+
+
+class TestCarrySensitiveScanNumeric:
+    """
+    The `scan$numeric` shape that MP/M II's SHOW, MSCHD and TOD all share:
+
+        b = shl(b,3) + shl(b,1);   /* b * 10, may carry */
+        if carry then call terminate;
+        b = b + (chr - '0');
+        if carry then call terminate;
+
+    It exercises the byte-add carry, the CARRY built-in and the condition
+    truth test together. `bit 0,x` leaves carry alone where `or a` cleared
+    it, so the sequence between the add and the CARRY read has to stay free
+    of anything that disturbs the flag.
+    """
+
+    def test_nothing_disturbs_carry_between_the_add_and_the_read(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (b, d, r) byte;
+            p: procedure;
+                b = shl(b,3) + shl(b,1);
+                if carry then r = 1;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        # The CARRY built-in reads the flag with `sbc a,a`. Between the add
+        # that sets carry and that read, nothing may write flags. `ld a,0`
+        # would be safe in itself, but the peephole rewrites it to `xor a`,
+        # which clears carry -- so the generator must not emit it here.
+        reads = [i for i, ins in enumerate(body) if ins == "sbc\ta,a"]
+        assert reads, f"the CARRY built-in did not emit a flag read: {body}"
+        read = min(reads)
+        adds = [i for i, ins in enumerate(body[:read]) if ins.startswith("add\t")]
+        assert adds, f"the add that sets carry was optimised away: {body}"
+        between = [ins for ins in body[max(adds) + 1:read] if not ins.endswith(':')]
+        clobbers = [ins for ins in between
+                    if ins.split()[0] in ("or", "and", "xor", "sub", "cp",
+                                          "inc", "dec", "add", "adc", "sbc",
+                                          "rlca", "rrca", "rla", "rra", "scf", "ccf")]
+        assert not clobbers, (
+            f"carry is destroyed between the add and the CARRY read by {clobbers}"
+        )
+
+    def test_the_add_survives_constant_folding(self) -> None:
+        # At -O 3 constant propagation folded `a + b` to a literal, so the
+        # `add` whose carry the next statement reads no longer existed.
+        for level in (0, 1, 2, 3):
+            asm = Compiler(opt_level=level).compile("""
+                t: do;
+                declare (a, b, s, r) byte;
+                p: procedure;
+                    a = 200; b = 100;
+                    s = a + b;
+                    if carry then r = 1;
+                end p;
+                call p;
+                end t;
+            """, "<test>")
+            assert asm is not None
+            body = _instructions(asm)
+            assert any(i.startswith("add\t") for i in body), (
+                f"-O {level} folded the carry-setting add away: {body}"
+            )
