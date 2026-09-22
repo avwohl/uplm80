@@ -346,3 +346,60 @@ class TestParser:
         decl = shape.decls[0]
         assert isinstance(decl, DeclItem)
         assert V.decl_item_names(decl) == ["MSG"]
+
+
+class TestStringLiterals:
+    """PL/M-80 string literals are not C string literals.
+
+    There is no backslash escape: a backslash is an ordinary character,
+    a quote inside a string is written ``''``, and a string may carry
+    across a line break. A generated lexer that declares STRING as
+    ``/'([^'\\]|\\.|'')*'/`` reads the backslash as an escape introducer
+    and rejects ``'\'`` with ``lexical error at byte 0x5c``; uplox 3.3.1
+    declares ``/'([^']|'')*'/`` instead. ``uplm80/_plm_parser.py`` is
+    generated, so nothing else in this suite would notice a regen
+    against a grammar that brought the C rule back.
+    """
+
+    def _only_value(self, source: str):
+        m = parse(source)
+        proc = V.module_shape(m).decls[0]
+        assert isinstance(proc, ProcDecl)
+        stmt = _proc_stmts(proc)[0]
+        assert isinstance(stmt, AssignStmt)
+        return stmt.value
+
+    def test_backslash_is_an_ordinary_character(self) -> None:
+        # MBASIC's integer-divide token, which is what found this.
+        value = self._only_value(
+            "P: PROCEDURE; DECLARE C BYTE; C = '\\'; END P;"
+        )
+        assert V.string_value(value) == "\\"
+        assert V.string_bytes(value) == [0x5C]
+
+    def test_doubled_quote_is_one_quote(self) -> None:
+        value = self._only_value(
+            "P: PROCEDURE; DECLARE C BYTE; C = ''''; END P;"
+        )
+        assert V.string_value(value) == "'"
+        assert V.string_bytes(value) == [0x27]
+
+    def test_string_may_span_a_line_break(self) -> None:
+        # The LITERALLY bodies in the MP/M II corpus do this;
+        # UTIL2/MSBRS.PLM holds a six-line one.
+        m = parse("DECLARE MSG DATA ('one\ntwo$');")
+        decl = V.module_shape(m).decls[0]
+        assert isinstance(decl, DeclItem)
+        assert V.decl_item_names(decl) == ["MSG"]
+
+    def test_backslash_survives_code_generation(self) -> None:
+        from uplm80.compiler import Compiler
+
+        asm = Compiler().compile(
+            "T: DO; DECLARE C BYTE;\n"
+            "P: PROCEDURE; C = '\\'; END P;\n"
+            "CALL P;\nEND T;\n",
+            "<test>",
+        )
+        assert asm is not None
+        assert "5CH" in asm.upper()

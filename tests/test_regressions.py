@@ -294,3 +294,561 @@ class TestByteGreaterThanAsAValue:
                     f"the `xor a` at {i} sits behind {label}, which nothing "
                     "jumps to, so the false path never loads zero"
                 )
+
+
+_TRANSFERS = ("ret", "jp", "jr")
+
+
+def _labels(instrs) -> set:
+    return {ins[:-1] for ins in instrs if ins.endswith(':')}
+
+
+def _called(instrs) -> set:
+    return {
+        ins.split(None, 1)[1].strip()
+        for ins in instrs
+        if ins.split(None, 1)[0] == "call" and len(ins.split(None, 1)) == 2
+    }
+
+
+class TestProcedureDeclaredInADoBlock:
+    """
+    PL/M-80 lets a PROCEDURE be declared at the head of any ``DO ... END``
+    block, not only a procedure body — MP/M II's ``ED.PLM`` declares
+    ``DIGIT`` / ``NUMBER`` / ``RELDISTANCE`` that way, inside a ``DO`` block in
+    the middle of an IF/ELSE chain.
+
+    Such a procedure was emitted where the block sits, with nothing jumping
+    over it, so the enclosing code ran straight into the procedure body and
+    took its ``RET``; everything after the block was unreachable.  The label
+    also carried the block scope (``@B24$DIGIT``) while the call sites did
+    not, because the collection passes never descended into blocks, so the
+    call named a symbol that was never defined.
+    """
+
+    MODULE_LEVEL = """
+        t: do;
+        declare (ch, result) byte;
+        do;
+            declare n byte;
+            digit: procedure byte;
+                return (n := ch - '0') <= 9;
+                end digit;
+            if digit then result = n;
+        end;
+        result = result + 1;
+        end t;
+    """
+
+    IN_PROCEDURE = """
+        t: do;
+        declare (ch, result) byte;
+        outer: procedure;
+            do;
+                declare n byte;
+                mark: procedure;
+                    result = n;
+                    end mark;
+                n = ch;
+                call mark;
+            end;
+            result = result + 1;
+            end outer;
+        call outer;
+        end t;
+    """
+
+    def test_module_level_block_procedure_is_not_fallen_into(self) -> None:
+        self._assert_out_of_line(self.MODULE_LEVEL, "DIGIT")
+
+    def test_procedure_level_block_procedure_is_not_fallen_into(self) -> None:
+        self._assert_out_of_line(self.IN_PROCEDURE, "@OUTER$MARK")
+
+    def test_module_level_call_names_a_defined_label(self) -> None:
+        self._assert_calls_resolve(self.MODULE_LEVEL)
+
+    def test_procedure_level_call_names_a_defined_label(self) -> None:
+        self._assert_calls_resolve(self.IN_PROCEDURE)
+
+    def test_block_local_is_still_reachable_from_the_hoisted_body(self) -> None:
+        # The procedure is emitted after the block has been left, but it
+        # still reads the block's own local, so the load must name the
+        # block-scoped storage rather than an undefined bare symbol.
+        instrs = _instructions(_compile(self.IN_PROCEDURE))
+        loads = [ins for ins in instrs if ins.startswith("ld\ta,(") and "N" in ins]
+        assert loads, "the hoisted procedure never loads the block local at all"
+        for ins in loads:
+            assert ins != "ld\ta,(N)", (
+                "the hoisted procedure reads a bare `N`, which no label "
+                f"defines: {ins}"
+            )
+        # The storage line is `@OUTER$B1$N:\tds\t1`, so match the label
+        # token rather than a bare label line.
+        assert any(ins.split(':')[0].endswith("$N") for ins in instrs if ':' in ins), (
+            "the block local has no block-scoped storage label"
+        )
+
+    def _assert_out_of_line(self, src: str, label: str) -> None:
+        instrs = _instructions(_compile(src))
+        assert f"{label}:" in instrs, f"{label} is never defined"
+        i = instrs.index(f"{label}:")
+        preceding = [ins for ins in instrs[:i] if not ins.endswith(':')]
+        assert preceding, f"{label} is the first thing emitted"
+        last = preceding[-1].split()[0]
+        assert last in _TRANSFERS, (
+            f"control reaches {label} by falling through `{preceding[-1]}`: the "
+            "procedure body is emitted inline in the enclosing code"
+        )
+
+    def _assert_calls_resolve(self, src: str) -> None:
+        """Every symbol the code names must be one some label defines.
+
+        Not just call targets: when the block-scoped procedure name fails
+        to resolve, a typed procedure used as a value degrades into
+        `ld hl,(NAME)` — a load from a symbol nothing defines.
+        """
+        instrs = _instructions(_compile(src))
+        defined = {ins.split(':')[0] for ins in instrs if ':' in ins}
+        referenced = set()
+        for ins in instrs:
+            if ins.endswith(':'):
+                continue
+            parts = ins.split(None, 1)
+            if len(parts) != 2:
+                continue
+            op, operand = parts[0], parts[1].strip()
+            if op == "call":
+                referenced.add(operand)
+            elif op == "ld" and operand.endswith(")") and "(" in operand:
+                inner = operand[operand.index("(") + 1:-1]
+                if inner[:1].isalpha() or inner.startswith("@"):
+                    referenced.add(inner)
+        for target in referenced:
+            if target.startswith("??") or target in ("hl", "de", "bc", "sp"):
+                continue  # runtime helper / register indirect
+            assert target in defined, (
+                f"`{target}` is referenced but no label defines it"
+            )
+
+
+class TestConditionTestsBitZero:
+    """
+    PL/M-80 tests bit 0 of a condition value, not whether it is non-zero.
+    DRI's binaries settle it: PIP.PRL's code segment holds 70 `RAR;JNC` and
+    14 `RAR;JC` truth tests against a single `ORA A;JZ`. The two rules agree
+    on a relational (0FFH / 00H) and part company on `NOT` -- `NOT 1` is
+    0FEH -- and on the ROL/ROR bit-extraction idiom DRI writes throughout.
+    """
+
+    def test_byte_condition_tests_bit_zero(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (f, r) byte;
+            p: procedure;
+                if rol(f,1) then r = 1;
+            end p;
+            call p;
+            end t;
+        """))
+        assert "bit\t0,a" in instrs, (
+            "a BYTE condition is not tested with a bit-0 test: " f"{instrs}"
+        )
+        assert "or\ta" not in instrs, "the non-zero truth test is still emitted"
+
+    def test_address_condition_tests_bit_zero_of_l(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (v, r) address;
+            f: procedure address; return 4; end f;
+            p: procedure;
+                if f then r = 1;
+            end p;
+            call p;
+            end t;
+        """))
+        assert "bit\t0,l" in instrs, (
+            f"a 16-bit condition is not tested with a bit-0 test: {instrs}"
+        )
+
+    def test_not_of_a_one_flag_is_false(self) -> None:
+        # `do while f$i$adr <> 0 and not found;` with `true literally '1'`
+        # is SDIR's hash-chain scan (DSE.PLM:340). Under a non-zero test
+        # 0FFH AND (NOT 1) = 0FEH reads as true and the loop never ends.
+        instrs = _instructions(_compile("""
+            t: do;
+            declare true literally '1';
+            declare (adr) address;
+            declare found byte;
+            p: procedure;
+                do while adr <> 0 and not found;
+                    found = true;
+                end;
+            end p;
+            call p;
+            end t;
+        """))
+        assert any(i.startswith("bit\t0,") for i in instrs), (
+            "the loop condition is not a bit-0 test, so NOT 1 reads as true"
+        )
+
+
+class TestBasedAddressDoesNotPreserveDE:
+    """
+    A BASED ADDRESS load is `ld hl,(base) / ld e,(hl) / inc hl / ld d,(hl) /
+    ex de,hl`: it writes DE and leaves base+1 there. `_expr_preserves_de`
+    claimed otherwise, so `baccum = baccum + bpb` in MP/M II's SHOW.PLM
+    computed `baccum + (ab+1)`.
+    """
+
+    SRC = """
+        t: do;
+        declare ab address;
+        declare bpb address;
+        declare baccum based ab address;
+        p: procedure;
+            baccum = baccum + bpb;
+        end p;
+        call p;
+        end t;
+    """
+
+    def test_the_other_operand_is_not_parked_in_de(self) -> None:
+        instrs = _instructions(_compile(self.SRC))
+        based = [i for i, ins in enumerate(instrs) if ins == "ld\te,(hl)"]
+        loads_bpb = [i for i, ins in enumerate(instrs) if ins == "ld\thl,(BPB)"]
+        adds = [i for i, ins in enumerate(instrs) if ins == "add\thl,de"]
+        assert based and loads_bpb and adds, f"unexpected shape: {instrs}"
+        # BPB is the operand that has to reach `add hl,de`. It must be
+        # fetched AFTER the BASED load, which writes E and D.
+        assert max(loads_bpb) > max(based), (
+            "BPB is fetched before the BASED ADDRESS load destroys DE, so "
+            f"the add uses the base pointer instead: {instrs}"
+        )
+
+
+class TestAssignmentTargetIsNotConstantFolded:
+    """
+    `-O 3` ran assignment targets through the value optimizer, so `a = 5`
+    with `a` known-constant became a store *through address 5* -- on CP/M,
+    into the BDOS entry vector at 0005H.
+    """
+
+    def test_o3_stores_to_the_variable_not_through_it(self) -> None:
+        asm = Compiler(opt_level=3).compile("""
+            t: do;
+            declare (a, b) byte;
+            p: procedure;
+                a = 5;
+                b = a + 1;
+            end p;
+            call p;
+            end t;
+        """, "<test>")
+        assert asm is not None
+        instrs = _instructions(asm)
+        assert "ld\t(@A),a" in instrs, f"the store lost its target: {instrs}"
+        assert "ld\t(hl),e" not in instrs, (
+            f"the assignment became a store through an address: {instrs}"
+        )
+
+
+class TestSideEffectingOperandIsNotDropped:
+    """
+    PL/M-80 evaluates both operands of every operator, so `x AND 0` must
+    still evaluate `x`. The algebraic identities discarded it.
+    """
+
+    def test_and_zero_still_calls_the_operand(self) -> None:
+        asm = _compile("""
+            t: do;
+            declare r byte;
+            bump: procedure byte; return 7; end bump;
+            p: procedure;
+                r = bump and 0;
+            end p;
+            call p;
+            end t;
+        """)
+        assert "call\tBUMP" in _instructions(asm), (
+            "the AND-with-zero identity optimised the call away"
+        )
+
+
+class TestFoldedRelationalMatchesTheRuntimeValue:
+    """
+    A PL/M-80 relational yields a BYTE 0FFH. The folder produced 0FFFFH,
+    so a folded and an unfolded comparison disagreed as values.
+    """
+
+    def test_folded_true_is_0ffh(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare r address;
+            p: procedure;
+                r = 1 > 0;
+            end p;
+            call p;
+            end t;
+        """))
+        assert "ld\thl,0FFH" in instrs, f"folded relational is not 0FFH: {instrs}"
+
+
+class TestBdosFunctionNumberSurvivesTheArgument:
+    """
+    MON1/MON2 loaded the BDOS function number into C and then generated the
+    argument. C is not callee-saved, so an argument containing a call left a
+    different function number in C.
+    """
+
+    def test_c_is_loaded_after_the_argument(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            mon1: procedure (f,a) external; declare (f,a) address; end mon1;
+            mon2: procedure (f,a) byte external; declare (f,a) address; end mon2;
+            getc: procedure byte; return mon2(1,0); end getc;
+            p: procedure;
+                call mon1(2, getc);
+            end p;
+            call p;
+            end t;
+        """))
+        # Look only inside P: GETC's own body legitimately loads C first.
+        # P is emitted last and tail-calls the BDOS, so it runs to the end.
+        body = instrs[instrs.index("P:"):]
+        c_load = [i for i, ins in enumerate(body) if ins.startswith("ld\tc,")]
+        calls = [i for i, ins in enumerate(body)
+                 if ins.startswith("call\t") and "GETC" in ins]
+        assert c_load and calls, f"expected both a `ld c,` and a call: {body}"
+        assert min(c_load) > max(calls), (
+            f"the function number is parked in C across a call: {body}"
+        )
+
+
+class TestConditionByteCompareOperandSurvives:
+    """
+    The 0.3.3 spill was applied to the byte binary/comparison VALUE paths but
+    not to the condition paths, so `IF f > x` still parked x in B across the
+    call to f. With f = 100 and x = 200 the comparison read true.
+    """
+
+    def test_b_is_not_held_across_the_other_operand_in_a_condition(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (x, y, z, r) byte;
+            f: procedure byte; return y and z; end f;
+            p: procedure;
+                if f > x then r = 1;
+                if x > f then r = 2;
+            end p;
+            call p;
+            end t;
+        """))
+        bad = _clobbered_before_use(instrs, "ld\tb,a", _B_CONSUMERS, _B_WRITES)
+        assert not bad, (
+            "a byte operand parked in B for a condition is destroyed before "
+            f"the compare reads it, by: {[instrs[j] for j in bad]}"
+        )
+
+
+class TestByteReturnTruncatesAnAddress:
+    """
+    PL/M-80 narrows ADDRESS to BYTE by truncation, like LOW(). A BYTE
+    procedure returning an ADDRESS expression normalised it to a 0FFH/00H
+    boolean instead, so `P: PROCEDURE BYTE; RETURN N + 1; END P;` with
+    N = 64 returned 0FFH rather than 65.
+    """
+
+    def test_return_takes_the_low_byte(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare n address;
+            declare r byte;
+            p: procedure byte;
+                return n + 1;
+            end p;
+            q: procedure;
+                r = p;
+            end q;
+            call q;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "ld\ta,l" in body, f"the return does not take the low byte: {body}"
+        assert "ld\ta,0ffh" not in body, (
+            f"the return still normalises to a boolean: {body}"
+        )
+
+
+class TestConstantConditionsUseBitZero:
+    """
+    The bit-0 truth rule has to hold for a constant condition too, or the
+    same source gets different answers at different -O levels. `IF NOT TRUE`
+    with `TRUE LITERALLY '1'` folds to 0FEH, which is false.
+    """
+
+    SRC = """
+        t: do;
+        declare true literally '1';
+        declare r byte;
+        if not true then r = 1; else r = 2;
+        end t;
+    """
+
+    def test_every_level_agrees(self) -> None:
+        seen = set()
+        for level in (0, 1, 2, 3):
+            asm = Compiler(opt_level=level).compile(self.SRC, "<test>")
+            assert asm is not None
+            instrs = _instructions(asm)
+            # r = 2 (the ELSE arm) is the correct answer.
+            took_else = "ld\ta,2" in instrs
+            seen.add(took_else)
+            assert took_else, f"-O {level} took the THEN arm: {instrs}"
+        assert seen == {True}
+
+    def test_do_while_even_constant_never_runs(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare n byte;
+            do while 2;
+                n = n + 1;
+            end;
+            end t;
+        """))
+        assert "inc\ta" not in instrs and "add\ta,1" not in instrs, (
+            f"DO WHILE 2 emitted a loop body; bit 0 of 2 is clear: {instrs}"
+        )
+
+
+class TestByteOperandsReachA:
+    """
+    A byte operand generated with `_gen_expr` lands in HL when it is a
+    NumberLiteral (`ld hl,n`), so `IF 5 > X` compared an undefined A and
+    `SHL(DOUBLE(hi),8) OR 5` destroyed the high byte with `ld hl,5`.
+    """
+
+    def test_constant_left_operand_reaches_a(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (x, r) byte;
+            p: procedure;
+                if 5 > x then r = 1;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "ld\thl,5" not in body, (
+            f"the constant operand loaded into HL, not A: {body}"
+        )
+
+    def test_shl_or_with_a_constant_keeps_the_high_byte(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare hi byte, r address;
+            p: procedure;
+                r = shl(double(hi),8) or 5;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "ld\thl,5" not in body, (
+            f"`ld hl,5` destroys the high byte parked in H: {body}"
+        )
+        assert "ld\th,a" in body and "ld\tl,a" in body, body
+
+
+class TestIterativeDoBlockProcedure:
+    """An iterative DO is a block: a PROCEDURE declared in it must be emitted."""
+
+    def test_the_procedure_is_emitted(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (i, r) byte;
+            p: procedure;
+                do i = 1 to 3;
+                    declare n byte;
+                    bump: procedure; r = r + 1; end bump;
+                    n = i;
+                    call bump;
+                end;
+            end p;
+            call p;
+            end t;
+        """))
+        defined = {ins.split(':')[0] for ins in instrs if ':' in ins}
+        called = {ins.split(None, 1)[1].strip() for ins in instrs
+                  if ins.split(None, 1)[0] == "call"}
+        for target in called:
+            if not target.startswith("??"):
+                assert target in defined, f"`call {target}` has no label: {instrs}"
+
+
+class TestByteStoreToAStructureMember:
+    """`rec.f = ch` stored from L while the BYTE value was in A."""
+
+    def test_the_value_comes_from_a(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare rec structure (f byte, g address);
+            declare ch byte;
+            p: procedure;
+                rec.f = ch;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "ld\t(hl),a" in body, f"the member store does not use A: {body}"
+        assert "ld\ta,l" not in body, (
+            f"the member store still reads the value out of L: {body}"
+        )
+
+
+class TestMoveCountReachesBC:
+    """A non-constant BYTE count landed in A, so BC took the source address."""
+
+    def test_count_is_widened_before_going_to_bc(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare src(4) byte, dst(4) byte, n byte;
+            p: procedure;
+                call move(n, .src, .dst);
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        i = body.index("ld\tb,h")
+        # The instruction feeding HL just before must be the widened count,
+        # not a pointer load.
+        assert "ld\th,0" in body[:i], (
+            f"the BYTE count was never widened into HL: {body}"
+        )
+
+
+class TestOptimizerStateDoesNotLeakBetweenProcedures:
+    """`constants` / `copies` / `cse_cache` were never reset, so one
+    procedure's constant was folded into another's body."""
+
+    def test_a_read_is_not_folded_to_another_procedures_constant(self) -> None:
+        asm = Compiler(opt_level=3).compile("""
+            t: do;
+            declare (v, r) byte;
+            one: procedure;
+                v = 1;
+            end one;
+            two: procedure;
+                r = v;
+            end two;
+            call one;
+            call two;
+            end t;
+        """, "<test>")
+        assert asm is not None
+        instrs = _instructions(asm)
+        body = instrs[instrs.index("TWO:"):]
+        assert "ld\ta,(V)" in body, (
+            f"TWO folded V to ONE's constant instead of loading it: {body}"
+        )

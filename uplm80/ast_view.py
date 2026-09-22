@@ -316,6 +316,42 @@ def block_items_split(items) -> tuple[list, list]:
     return decls, stmts
 
 
+def iter_block_proc_decls(items) -> Iterator:
+    """Yield every ``ProcDecl`` that belongs to the *enclosing* name scope.
+
+    PL/M-80 lets a procedure be declared at the head of any
+    ``DO ... END`` block, not only a procedure body -- ``ED.PLM`` of
+    MP/M II declares ``DIGIT`` / ``NUMBER`` / ``RELDISTANCE`` inside a
+    ``DO`` block in the middle of an IF/ELSE chain.  A block is not a
+    call scope, so such a procedure belongs to the enclosing procedure
+    (or to the module) exactly as if it had been written at the top of
+    that procedure's body.
+
+    The walk descends through the DO-family blocks, IF branches and
+    labelled statements that can hold a block, but never into a
+    ``ProcDecl`` body: a nested procedure owns its own declarations and
+    is collected under its own name.
+    """
+    for it in items:
+        if isinstance(it, P.ProcDecl):
+            yield it
+        elif isinstance(it, P.DeclareStmt):
+            for inner in it.declarations:
+                if isinstance(inner, P.ProcDecl):
+                    yield inner
+        elif isinstance(
+            it,
+            (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock),
+        ):
+            yield from iter_block_proc_decls(it.items)
+        elif isinstance(it, (P.IfStmt, P.IfStmtElse)):
+            yield from iter_block_proc_decls([it.then_stmt])
+            if isinstance(it, P.IfStmtElse):
+                yield from iter_block_proc_decls([it.else_stmt])
+        elif isinstance(it, P.LabeledStmt):
+            yield from iter_block_proc_decls([it.stmt])
+
+
 def proc_local_decls_stmts(proc: P.ProcDecl) -> tuple[list, list]:
     """Split a procedure body into ``(local_decls, statements)``.
 

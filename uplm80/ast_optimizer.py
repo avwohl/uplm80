@@ -51,6 +51,18 @@ _PURE_BUILTINS = {
     "LENGTH", "LAST", "SIZE",
 }
 
+# Built-ins that DO something: reading a port, writing one, moving memory,
+# or consuming time. Dropping a call to one of these changes the program
+# even when its value is unused.
+_IMPURE_BUILTINS = {
+    "INPUT", "OUTPUT", "MOVE", "TIME",
+    # flag reads are not side-effecting but they are not values of the
+    # surrounding expression either; treat them as unsafe to discard.
+    "CARRY", "ZERO", "SIGN", "PARITY", "STACKPTR", "MEMORY",
+    # SCL/SCR rotate through carry, so they depend on and set it.
+    "SCL", "SCR",
+}
+
 
 def _is_number(expr) -> bool:
     return isinstance(unwrap_paren(expr), P.NumberLiteral)
@@ -218,6 +230,9 @@ class ASTOptimizer:
         self.copies: dict[str, str] = {}
         # Procedure inlining: track small procedures that can be inlined
         self.inlinable_procs: dict[str, P.ProcDecl] = {}
+        # Every procedure name in the module. A bare identifier that
+        # names one is a PL/M parameterless call, not a variable read.
+        self.proc_names: set[str] = set()
 
     def _parse_plm_number(self, s: str) -> int | None:
         """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
@@ -240,10 +255,78 @@ class ASTOptimizer:
 
     # ---- module-level driver ----------------------------------------------
 
+    def _collect_proc_names(self, items) -> None:
+        """Record every procedure name reachable from ``items``."""
+        for it in items:
+            if isinstance(it, P.ProcDecl):
+                self.proc_names.add(proc_name(it))
+                self._collect_proc_names(proc_body_items(it))
+            elif isinstance(it, P.DeclareStmt):
+                self._collect_proc_names(it.declarations)
+            elif isinstance(it, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock,
+                                 P.DoIterByBlock, P.DoCaseBlock)):
+                self._collect_proc_names(it.items)
+            elif isinstance(it, (P.IfStmt, P.IfStmtElse)):
+                self._collect_proc_names([it.then_stmt])
+                if isinstance(it, P.IfStmtElse):
+                    self._collect_proc_names([it.else_stmt])
+            elif isinstance(it, P.LabeledStmt):
+                self._collect_proc_names([it.stmt])
+
+    def _reset_flow_state(self) -> None:
+        """Drop everything learned about values along one flow of control.
+
+        `constants`, `copies`, `cse_cache`, `expr_vars` and `modified_vars`
+        all describe one straight-line region. Carrying them across a
+        procedure boundary propagates one procedure's constant into
+        another's body, and carrying them across a pass lets a fact
+        derived from already-rewritten code feed back in.
+        """
+        self.constants.clear()
+        self.copies.clear()
+        self.cse_cache.clear()
+        self.expr_vars.clear()
+        self.modified_vars.clear()
+
+    def _is_side_effect_free(self, expr) -> bool:
+        """Whether ``expr`` can be dropped without changing behaviour.
+
+        PL/M-80 evaluates both operands of every operator, so an
+        algebraic identity that discards one (``x AND 0``, ``x XOR x``)
+        is only valid when that operand does nothing observable. A bare
+        identifier naming a procedure is a parameterless call, so it is
+        not free.
+        """
+        expr = unwrap_paren(expr)
+        if isinstance(expr, (P.NumberLiteral, P.StringLiteral)):
+            return True
+        if isinstance(expr, P.Identifier):
+            return ident_text(expr.name) not in self.proc_names
+        if isinstance(expr, P.UnaryOp):
+            return self._is_side_effect_free(expr.operand)
+        if isinstance(expr, P.BinaryOp):
+            return (self._is_side_effect_free(expr.left)
+                    and self._is_side_effect_free(expr.right))
+        if isinstance(expr, P.Call):
+            callee = unwrap_paren(expr.callee)
+            if isinstance(callee, P.Identifier):
+                raw = ident_text(callee.name)
+                name = raw.upper()
+                if name in _IMPURE_BUILTINS or raw in self.proc_names:
+                    return False
+                # What is left is a pure built-in or an array subscript;
+                # both are free when their arguments are.
+                return all(self._is_side_effect_free(a) for a in expr.args)
+            return False
+        return False
+
     def optimize(self, module: P.Module) -> P.Module:
         """Optimize an entire typed :class:`P.Module`."""
         if self.opt_level == 0:
             return module
+
+        self.proc_names.clear()
+        self._collect_proc_names(module.items)
 
         # Multiple passes for iterative improvement
         changed = True
@@ -253,6 +336,7 @@ class ASTOptimizer:
         while changed and passes < max_passes:
             changed = False
             passes += 1
+            self._reset_flow_state()
 
             new_items: list = []
             for item in module.items:
@@ -299,6 +383,9 @@ class ASTOptimizer:
         attrs = proc_attrs(decl)
         local_decls, body_stmts = proc_local_decls_stmts(decl)
 
+        # A procedure body is its own flow region.
+        self._reset_flow_state()
+
         new_decls: list = []
         for d in local_decls:
             opt_d = self._optimize_decl_in_body(d)
@@ -315,6 +402,9 @@ class ASTOptimizer:
         new_stmts = self._eliminate_unreachable(new_stmts)
         # Eliminate dead stores
         new_stmts = self._eliminate_dead_stores(new_stmts)
+
+        # Nothing learned inside this body is valid outside it.
+        self._reset_flow_state()
 
         # Rebuild body items: keep nested ProcDecls and LiterallyDecls as
         # standalone items; group the rest into a DeclareStmt as the
@@ -856,6 +946,23 @@ class ASTOptimizer:
 
     # ---- statement optimization -------------------------------------------
 
+    def _optimize_target(self, target):
+        """Optimize inside an assignment target without rewriting the lvalue.
+
+        A target names a place to store to, not a value, so constant and
+        copy propagation must not reach it: rewriting the ``A`` of
+        ``A = 5`` into the literal ``5`` turns the assignment into a
+        store *through address 5* — on CP/M, straight into the BDOS
+        entry vector. Only an array element's subscript is a value, and
+        only that is optimized here.
+        """
+        inner = unwrap_paren(target)
+        if isinstance(inner, P.Call) and inner.args:
+            opt_args = [self._optimize_expr(a) for a in inner.args]
+            if any(a is not b for a, b in zip(opt_args, inner.args)):
+                return P.Call(callee=inner.callee, args=opt_args, pos=inner.pos)
+        return target
+
     def _optimize_stmt(self, stmt):
         """Optimize a typed statement. Returns ``None`` to remove it."""
         if stmt is None:
@@ -863,7 +970,7 @@ class ASTOptimizer:
 
         if isinstance(stmt, P.AssignStmt):
             opt_value = self._optimize_expr(stmt.value)
-            opt_targets = [self._optimize_expr(t) for t in stmt.targets]
+            opt_targets = [self._optimize_target(t) for t in stmt.targets]
 
             # Track modified variables and invalidate caches
             for target in opt_targets:
@@ -981,7 +1088,10 @@ class ASTOptimizer:
         # Constant condition elimination (level 2+).
         if self.opt_level >= 2 and isinstance(unwrap_paren(opt_cond), P.NumberLiteral):
             self.stats.dead_code_eliminated += 1
-            if number_value(unwrap_paren(opt_cond)) != 0:
+            # PL/M-80 truth is bit 0 of the value, not non-zero: `IF 4` is
+            # false, and `IF NOT TRUE` with `TRUE LITERALLY '1'` folds to
+            # 0FEH, which is false.
+            if number_value(unwrap_paren(opt_cond)) & 1:
                 return self._optimize_stmt(stmt.then_stmt)
             if isinstance(stmt, P.IfStmtElse):
                 return self._optimize_stmt(stmt.else_stmt)
@@ -1097,9 +1207,9 @@ class ASTOptimizer:
         """Optimize a ``DO WHILE cond ... END`` block."""
         opt_cond = self._optimize_expr(stmt.condition)
 
-        # DO WHILE 0 never executes.
+        # A DO WHILE whose condition has bit 0 clear never executes.
         if self.opt_level >= 2 and isinstance(unwrap_paren(opt_cond), P.NumberLiteral):
-            if number_value(unwrap_paren(opt_cond)) == 0:
+            if number_value(unwrap_paren(opt_cond)) & 1 == 0:
                 self.stats.dead_code_eliminated += 1
                 return P.NullStmt(pos=stmt.pos)
 
@@ -1421,18 +1531,23 @@ class ASTOptimizer:
                 return left | right
             elif kind == BinaryOpKind.XOR:
                 return left ^ right
+            # A PL/M-80 relational yields a BYTE: 0FFH true, 00H false.
+            # The runtime paths materialise exactly that (`ld a,0ffh` /
+            # `xor a`), so folding must not invent a 16-bit 0FFFFH -
+            # a folded and an unfolded comparison would then disagree
+            # as values.
             elif kind == BinaryOpKind.EQ:
-                return 0xFFFF if left == right else 0
+                return 0xFF if left == right else 0
             elif kind == BinaryOpKind.NE:
-                return 0xFFFF if left != right else 0
+                return 0xFF if left != right else 0
             elif kind == BinaryOpKind.LT:
-                return 0xFFFF if left < right else 0
+                return 0xFF if left < right else 0
             elif kind == BinaryOpKind.GT:
-                return 0xFFFF if left > right else 0
+                return 0xFF if left > right else 0
             elif kind == BinaryOpKind.LE:
-                return 0xFFFF if left <= right else 0
+                return 0xFF if left <= right else 0
             elif kind == BinaryOpKind.GE:
-                return 0xFFFF if left >= right else 0
+                return 0xFF if left >= right else 0
             # PLUS / MINUS (carry-aware) — don't fold at AST level; the
             # codegen lowering depends on the runtime carry chain.
         except (ZeroDivisionError, OverflowError):
@@ -1525,7 +1640,9 @@ class ASTOptimizer:
         if kind == BinaryOpKind.SUB:
             if _is_number(right) and _num_value(right) == 0:
                 return left
-            if _is_ident(left) and _is_ident(right) and _ident_name(left) == _ident_name(right):
+            if (_is_ident(left) and _is_ident(right)
+                    and _ident_name(left) == _ident_name(right)
+                    and self._is_side_effect_free(left)):
                 return make_number_literal(0, pos=pos)
 
         # x * 1 = x, 1 * x = x; x * 0 = 0
@@ -1534,9 +1651,9 @@ class ASTOptimizer:
                 return left
             if _is_number(left) and _num_value(left) == 1:
                 return right
-            if _is_number(right) and _num_value(right) == 0:
+            if _is_number(right) and _num_value(right) == 0 and self._is_side_effect_free(left):
                 return make_number_literal(0, pos=pos)
-            if _is_number(left) and _num_value(left) == 0:
+            if _is_number(left) and _num_value(left) == 0 and self._is_side_effect_free(right):
                 return make_number_literal(0, pos=pos)
 
         # x / 1 = x
@@ -1548,13 +1665,13 @@ class ASTOptimizer:
         if kind == BinaryOpKind.AND:
             if _is_number(right):
                 rv = _num_value(right)
-                if rv == 0:
+                if rv == 0 and self._is_side_effect_free(left):
                     return make_number_literal(0, pos=pos)
                 if rv == 0xFFFF:
                     return left
             if _is_number(left):
                 lv = _num_value(left)
-                if lv == 0:
+                if lv == 0 and self._is_side_effect_free(right):
                     return make_number_literal(0, pos=pos)
                 if lv == 0xFFFF:
                     return right
@@ -1565,13 +1682,13 @@ class ASTOptimizer:
                 rv = _num_value(right)
                 if rv == 0:
                     return left
-                if rv == 0xFFFF:
+                if rv == 0xFFFF and self._is_side_effect_free(left):
                     return make_number_literal(0xFFFF, pos=pos)
             if _is_number(left):
                 lv = _num_value(left)
                 if lv == 0:
                     return right
-                if lv == 0xFFFF:
+                if lv == 0xFFFF and self._is_side_effect_free(right):
                     return make_number_literal(0xFFFF, pos=pos)
 
         # x XOR 0 = x; x XOR x = 0; x XOR FFFF = NOT x
@@ -1580,7 +1697,9 @@ class ASTOptimizer:
                 return left
             if _is_number(left) and _num_value(left) == 0:
                 return right
-            if _is_ident(left) and _is_ident(right) and _ident_name(left) == _ident_name(right):
+            if (_is_ident(left) and _is_ident(right)
+                    and _ident_name(left) == _ident_name(right)
+                    and self._is_side_effect_free(left)):
                 return make_number_literal(0, pos=pos)
             if _is_number(right) and _num_value(right) == 0xFFFF:
                 return make_unary(UnaryOpKind.NOT, left, pos=pos)
@@ -1666,14 +1785,20 @@ class ASTOptimizer:
         """Apply boolean and comparison simplifications."""
         l_is_id = _is_ident(left)
         r_is_id = _is_ident(right)
-        same_id = l_is_id and r_is_id and _ident_name(left) == _ident_name(right)
+        # `x REL x` folds only when evaluating x twice is unobservable: a
+        # bare identifier naming a procedure is a parameterless call.
+        same_id = (l_is_id and r_is_id
+                   and _ident_name(left) == _ident_name(right)
+                   and self._is_side_effect_free(left))
 
+        # A PL/M-80 relational yields a BYTE 0FFH, matching _eval_binary_const
+        # and the runtime paths.
         if kind == BinaryOpKind.EQ:
             if same_id:
-                return make_number_literal(0xFFFF, pos=pos)
+                return make_number_literal(0xFF, pos=pos)
             if _is_number(left) and _is_number(right):
                 return make_number_literal(
-                    0xFFFF if _num_value(left) == _num_value(right) else 0,
+                    0xFF if _num_value(left) == _num_value(right) else 0,
                     pos=pos,
                 )
 
@@ -1684,26 +1809,27 @@ class ASTOptimizer:
         if kind == BinaryOpKind.GT and same_id:
             return make_number_literal(0, pos=pos)
         if kind == BinaryOpKind.LE and same_id:
-            return make_number_literal(0xFFFF, pos=pos)
+            return make_number_literal(0xFF, pos=pos)
         if kind == BinaryOpKind.GE and same_id:
-            return make_number_literal(0xFFFF, pos=pos)
+            return make_number_literal(0xFF, pos=pos)
 
-        # (a AND b) AND b -> a AND b (idempotent)
+        # (a AND b) AND b -> a AND b (idempotent). Dropping the repeated
+        # operand is only sound when evaluating it has no side effect.
         if kind == BinaryOpKind.AND:
             inner = unwrap_paren(left)
             if isinstance(inner, P.BinaryOp) and binop_kind(inner) == BinaryOpKind.AND:
-                if r_is_id:
+                if r_is_id and self._is_side_effect_free(right):
                     rn = _ident_name(right)
                     if _is_ident(inner.right) and _ident_name(inner.right) == rn:
                         return left
                     if _is_ident(inner.left) and _ident_name(inner.left) == rn:
                         return left
 
-        # (a OR b) OR b -> a OR b (idempotent)
+        # (a OR b) OR b -> a OR b (idempotent); same side-effect rule.
         if kind == BinaryOpKind.OR:
             inner = unwrap_paren(left)
             if isinstance(inner, P.BinaryOp) and binop_kind(inner) == BinaryOpKind.OR:
-                if r_is_id:
+                if r_is_id and self._is_side_effect_free(right):
                     rn = _ident_name(right)
                     if _is_ident(inner.right) and _ident_name(inner.right) == rn:
                         return left
