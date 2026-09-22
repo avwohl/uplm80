@@ -28,6 +28,9 @@ from .ast_view import (
     UnaryOpKind,
     binop_kind,
     block_items_split,
+    DataType,
+    decl_item_names,
+    decl_item_type,
     ident_text,
     make_binary,
     make_identifier,
@@ -237,6 +240,14 @@ class ASTOptimizer:
         # SIGN / PARITY, where an arithmetic operation's flag side
         # effect is observable and must not be folded away.
         self.flag_sensitive: bool = False
+        # Names declared BYTE, and names declared as anything else. A
+        # constant cached for a BYTE variable has to be narrowed: the
+        # store truncates, so `b = 300` leaves 44 behind, not 300.
+        # True while optimizing an IF / DO WHILE condition, where only
+        # bit 0 of the value is observable.
+        self.in_condition: bool = False
+        self.byte_vars: set[str] = set()
+        self.nonbyte_vars: set[str] = set()
 
     def _parse_plm_number(self, s: str) -> int | None:
         """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
@@ -330,6 +341,50 @@ class ASTOptimizer:
                     continue
                 stack.append(getattr(n, f, None))
         return False
+
+    def _collect_declared_widths(self, node) -> None:
+        """Record which names are declared BYTE and which are not."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.DeclItem):
+                dt, dim = decl_item_type(n)
+                target = self.byte_vars if (dt == DataType.BYTE and not dim) else self.nonbyte_vars
+                for name in decl_item_names(n):
+                    target.add(name)
+                continue
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+
+    def _optimize_condition(self, expr):
+        """Optimize an expression that is only ever tested for truth.
+
+        Folding a relational is safe here because only bit 0 of the result
+        is observable. As a VALUE it is not: a PL/M-80 relational yields a
+        BYTE 0FFH, and this folder masks to 16 bits, so a folded `x = (1 = 1)`
+        would store 0FFFFH where the generator stores 00FFH. Outside a
+        condition the comparison is left for the generator to emit.
+        """
+        outer = self.in_condition
+        self.in_condition = True
+        try:
+            return self._optimize_expr(expr)
+        finally:
+            self.in_condition = outer
+
+    def _narrow_to_declared_width(self, name: str, value: int) -> int:
+        """Truncate a cached constant to the width its variable is declared."""
+        if name in self.byte_vars and name not in self.nonbyte_vars:
+            return value & 0xFF
+        return value
 
     def _contains_call(self, node) -> bool:
         """Whether anything in ``node`` can call out.
@@ -471,6 +526,9 @@ class ASTOptimizer:
 
         self.proc_names.clear()
         self._collect_proc_names(module.items)
+        self.byte_vars.clear()
+        self.nonbyte_vars.clear()
+        self._collect_declared_widths(module.items)
 
         # Multiple passes for iterative improvement
         changed = True
@@ -1137,7 +1195,8 @@ class ASTOptimizer:
                 if isinstance(t, P.Identifier):
                     tname = ident_text(t.name)
                     if isinstance(v, P.NumberLiteral):
-                        self.constants[tname] = number_value(v)
+                        self.constants[tname] = self._narrow_to_declared_width(
+                            tname, number_value(v))
                     elif isinstance(v, P.Identifier) and self._is_side_effect_free(v):
                         # Not when the source names a procedure: `k = rd`
                         # is a call, and propagating `k` into a later use
@@ -1245,7 +1304,7 @@ class ASTOptimizer:
         (or a :class:`P.NullStmt`). Also collapses :class:`P.IfStmtElse`
         whose else-branch optimizes away into :class:`P.IfStmt`.
         """
-        opt_cond = self._optimize_expr(stmt.condition)
+        opt_cond = self._optimize_condition(stmt.condition)
 
         # Constant condition elimination (level 2+). Not when either arm
         # declares a label: a GOTO elsewhere in the procedure still names it.
@@ -1386,7 +1445,7 @@ class ASTOptimizer:
         # Before anything is folded: the condition is re-evaluated on every
         # back edge, so it cannot use a fact the body invalidates.
         self._invalidate_modified(stmt.items)
-        opt_cond = self._optimize_expr(stmt.condition)
+        opt_cond = self._optimize_condition(stmt.condition)
 
         # A DO WHILE whose condition has bit 0 clear never executes -- but
         # only drop the loop when its body declares no label.
@@ -1741,8 +1800,9 @@ class ASTOptimizer:
                 return left | right
             elif kind == BinaryOpKind.XOR:
                 return left ^ right
-            # A PL/M-80 relational yields a BYTE 0FFH, and that is what the
-            # runtime paths materialise. This folder is untyped, though:
+            # Only reached in a condition (see _optimize_condition): as a
+            # value a relational is a BYTE 0FFH and this folder is untyped.
+            # 0FFFFH is used rather than 0FFH because
             # _eval_unary_const and the arithmetic arms above all mask to
             # 16 bits, and 0FFFFH is a fixed point for exactly the operators
             # that consume a boolean -- NOT 0FFFFH = 0, -(0FFFFH) = 1,
@@ -1752,16 +1812,28 @@ class ASTOptimizer:
             # 0FFFFH where the runtime gives 00FFH. Narrowing this properly
             # needs a width-aware folder; see todo.txt.
             elif kind == BinaryOpKind.EQ:
+                if not self.in_condition:
+                    return None
                 return 0xFFFF if left == right else 0
             elif kind == BinaryOpKind.NE:
+                if not self.in_condition:
+                    return None
                 return 0xFFFF if left != right else 0
             elif kind == BinaryOpKind.LT:
+                if not self.in_condition:
+                    return None
                 return 0xFFFF if left < right else 0
             elif kind == BinaryOpKind.GT:
+                if not self.in_condition:
+                    return None
                 return 0xFFFF if left > right else 0
             elif kind == BinaryOpKind.LE:
+                if not self.in_condition:
+                    return None
                 return 0xFFFF if left <= right else 0
             elif kind == BinaryOpKind.GE:
+                if not self.in_condition:
+                    return None
                 return 0xFFFF if left >= right else 0
             # PLUS / MINUS (carry-aware) — don't fold at AST level; the
             # codegen lowering depends on the runtime carry chain.
@@ -2005,6 +2077,12 @@ class ASTOptimizer:
         same_id = (l_is_id and r_is_id
                    and _ident_name(left) == _ident_name(right)
                    and self._is_side_effect_free(left))
+
+        if not self.in_condition and kind in (
+            BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
+            BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
+        ):
+            return None
 
         # 0FFFFH, not 0FFH: see the note in _eval_binary_const.
         if kind == BinaryOpKind.EQ:

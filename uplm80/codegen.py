@@ -632,10 +632,15 @@ class CodeGenerator:
             if hasattr(condition, 'span') and condition.span:
                 loc = SourceLocation(condition.span.start_line, condition.span.start_col)
 
-            if const_val == 0:
-                msg = f"IF condition is always false (constant 0)"
-            else:
+            # Truth is bit 0, not non-zero (see _emit_truth_test), so the
+            # diagnostic has to agree with the code the generator emits:
+            # `IF 2` is always FALSE.
+            if const_val & 1:
                 msg = f"IF condition is always true (constant {const_val})"
+            else:
+                msg = (f"IF condition is always false (constant {const_val}: "
+                       "PL/M-80 tests bit 0)" if const_val
+                       else "IF condition is always false (constant 0)")
 
             if loc:
                 warning = f"{loc}: warning: {msg}"
@@ -3316,9 +3321,13 @@ class CodeGenerator:
             right_simple = self._expr_preserves_de(condition.right)
 
             if left_simple and not right_simple:
-                # Evaluate complex right first, save to DE, then simple left
-                self._gen_expr(condition.right)
-                if right_type == DataType.BYTE:
+                # Evaluate complex right first, save to DE, then simple left.
+                # Key off the type _gen_expr actually returned, not the
+                # statically inferred one: an embedded assignment into an
+                # ADDRESS element is typed BYTE by _get_expr_type but lands
+                # in HL, and widening that with `ld e,a` spliced in a stale A.
+                actual_right_type = self._gen_expr(condition.right)
+                if actual_right_type == DataType.BYTE:
                     self._emit("ld", "e,a")
                     self._emit("ld", "d,0")
                 else:
@@ -5511,7 +5520,10 @@ class CodeGenerator:
 
     def _gen_byte_comparison(self, left, right, op: BinaryOpKind) -> DataType:
         """Generate optimized byte comparison between two byte values."""
-        self._gen_expr(left)
+        # _gen_expr_to_a, not _gen_expr: a NumberLiteral operand loads as
+        # `ld hl,n` and would leave A undefined under the `sub b`, so
+        # `r = 5 > x` compared garbage.
+        self._gen_expr_to_a(left)
         # B is not safe across the other operand: a nested byte comparison uses
         # "ld b,a" as its own scratch move, and any procedure call clobbers B.
         # So spill A through the stack and load B only after the other operand
@@ -5520,7 +5532,7 @@ class CodeGenerator:
         # keeps a live argument there.
         self._emit("push", "af")
 
-        self._gen_expr(right)
+        self._gen_expr_to_a(right)
         self._emit("ld", "b,a")
         self._emit("pop", "af")
         self._emit("sub", "b")

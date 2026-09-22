@@ -8,7 +8,7 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 An audit prompted by the 80un report. The three defects 0.3.3 and 0.3.4 fixed
 turned out to be members of a family that was never swept, and the audit also
 found the language defect underneath the `AND`/`OR` story: PL/M-80 tests bit 0
-of a condition, not whether the condition is non-zero. Twenty-seven fixes, each with a
+of a condition, not whether the condition is non-zero. Thirty-two fixes, each with a
 regression test; see Added for what that was and was not verified to mean.
 
 ### Fixed
@@ -105,6 +105,36 @@ regression test; see Added for what that was and was not verified to mean.
   operand.** Any low operand that computes in `HL` — a call, a subscript —
   destroyed it. The four-instruction form is kept when the low operand is a
   plain byte load and spilled otherwise.
+
+- **A byte comparison used as a VALUE did not get its left operand into
+  `A`.** The condition paths were repaired earlier in this release;
+  `_gen_byte_comparison`, the value-producing twin, still opened with
+  `_gen_expr(left)`, so a NumberLiteral loaded as `ld hl,n` and the closing
+  `sub b` compared an undefined `A`. `r = 5 > x` with `x` = 3 gave 0 rather
+  than 0FFH, at the default optimisation level.
+
+- **A cached constant was not narrowed to its variable's declared width.**
+  The store truncates — `b = 300` leaves 44 in a BYTE — but the optimizer
+  remembered 300, so at `-O 3` the following `IF b = 44` folded to false.
+
+- **A folded relational disagreed with the computed one.** A PL/M-80
+  relational yields a BYTE 0FFH; the folder masks to 16 bits, so
+  `w = (1 = 1)` stored 0FFFFH at `-O 2` and 00FFH at `-O 0`. Relationals are
+  now folded only in a condition, where nothing but bit 0 is observable. As
+  a value the comparison is left to the generator, and all four optimisation
+  levels emit the same code. This closes the Known issue the previous
+  release note carried.
+
+- **The last statically-typed widening in the comparison code.** In the
+  branch that parks a complex right operand in `DE`, the widening keyed off
+  `_get_expr_type` rather than the type `_gen_expr` returned. They disagree
+  for an embedded assignment: `ar(i) := b1` with `ar` an ADDRESS array is
+  typed ADDRESS but leaves a BYTE in `A`, so `ex de,hl` took `DE` from
+  whatever was in `HL`. Both arms of
+  `IF a1 > (ar(i) := b1)` came out false.
+
+- **`IF 2` was reported as "always true"** while the generator made it
+  false. The diagnostic now follows the bit-0 rule like the code does.
 
 - **Constant and copy propagation were flow-insensitive.** A fact
   established on one path was reused on another that cannot reach it, which
@@ -236,14 +266,17 @@ regression test; see Added for what that was and was not verified to mean.
 
 ### Known issues
 
-- The AST constant folder is untyped: it masks every result to 16 bits, so a
-  folded relational is 0FFFFH where the runtime paths produce a BYTE 0FFH.
-  Storing a folded comparison into an ADDRESS therefore reads 0FFFFH rather
-  than 00FFH. Narrowing the fold to 0FFH was tried and reverted: 0FFFFH is a
-  fixed point of the operators that consume a boolean (`NOT 0FFFFH` = 0,
-  `-(0FFFFH)` = 1, `0FFFFH + 1` = 0) and 0FFH is not, so narrowing the value
-  without also narrowing `_eval_unary_const` and the arithmetic arms made
-  `NOT (1 = 1)` fold to 0FF00H. A correct fix needs a width-aware folder.
+- In `-m bare`, a module body that runs off its end falls into the first
+  procedure emitted after it rather than stopping. This is long-standing and
+  unchanged here. The only bare-mode program in the corpora, MP/M II's
+  `MPMLDR`, ends its body in a `di` / `halt` loop, so the fall-through is
+  unreachable; giving the mode an explicit terminator would change semantics
+  the mode documents as the program's own business, so it is left alone.
+
+- Two sibling `DO` blocks in one procedure that each declare a procedure of
+  the same name collide on one assembly label. The assembler rejects that
+  outright, so it cannot go unnoticed, and no PL/M-80 source in the CP/M or
+  MP/M II corpora writes it.
 
 ### Added
 

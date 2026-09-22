@@ -596,18 +596,28 @@ class TestFoldedRelationalMatchesTheRuntimeValue:
         end t;
     """
 
-    def test_not_of_a_folded_true_is_zero(self) -> None:
-        for level in (1, 2, 3):
+    def test_every_level_computes_it_the_same_way(self) -> None:
+        # Folding a relational is only safe where just bit 0 is observable,
+        # so as a value it is left to the generator at every level. All four
+        # then emit the same opcode sequence, which is what guarantees they
+        # agree on the value.
+        shapes = {}
+        for level in (0, 1, 2, 3):
             asm = Compiler(opt_level=level).compile(self.SRC, "<test>")
             assert asm is not None
             instrs = _instructions(asm)
             body = instrs[instrs.index("P:"):]
-            loads = [i for i in body if i.startswith("ld\thl,")]
-            assert loads, f"-O {level}: nothing loaded: {body}"
-            assert loads[-1] in ("ld\thl,0", "ld\thl,0H"), (
-                f"-O {level} folded NOT (1 = 1) to {loads[-1]}, not zero; "
-                "-O 0 computes 0"
-            )
+            body = body[:body.index("ret") + 1]
+            # Opcodes only: label names and jp/jr selection are not the point.
+            ops = [i.split()[0].replace("jr", "jp") for i in body
+                   if not i.endswith(":")]
+            shapes[level] = ops
+        assert len(set(map(tuple, shapes.values()))) == 1, (
+            f"the levels disagree on how NOT (1 = 1) is evaluated: {shapes}"
+        )
+        assert "cpl" in shapes[2], (
+            f"-O 2 did not compute the NOT at all: {shapes[2]}"
+        )
 
 
 class TestBdosFunctionNumberSurvivesTheArgument:
@@ -1130,3 +1140,91 @@ class TestCopyPropagationDoesNotDuplicateACall:
         assert len(calls) == 1, (
             f"RD is called {len(calls)} times, not once: {body}"
         )
+
+
+class TestByteValueOperandsReachA:
+    """
+    The value-producing twin of the condition-path repair.
+    `_gen_byte_comparison` still opened with `_gen_expr(left)`, so a
+    NumberLiteral left operand loaded as `ld hl,n` and the `sub b` compared
+    an undefined A: `r = 5 > x` with x = 3 gave 0, not 0FFH.
+    """
+
+    def test_constant_left_operand_of_a_value_comparison(self) -> None:
+        instrs = _instructions(_compile("""
+            t: do;
+            declare (x, r) byte;
+            p: procedure;
+                r = 5 > x;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "ld\thl,5" not in body, (
+            f"the constant operand loaded into HL, not A: {body}"
+        )
+        assert "ld\ta,5" in body, f"the constant never reached A: {body}"
+
+
+class TestCachedConstantIsNarrowedToItsDeclaredWidth:
+    """
+    `b = 300` stores 44 in a BYTE, but the optimizer cached 300, so at
+    `-O 3` the following `IF b = 44` folded to false.
+    """
+
+    def test_byte_variable_caches_the_truncated_value(self) -> None:
+        asm = Compiler(opt_level=3).compile("""
+            t: do;
+            declare (b, r) byte;
+            p: procedure;
+                b = 300;
+                if b = 44 then r = 1; else r = 2;
+            end p;
+            call p;
+            end t;
+        """, "<test>")
+        assert asm is not None
+        body = _instructions(asm)
+        body = body[body.index("P:"):]
+        assert "ld\ta,1" in body, (
+            f"`b = 300; if b = 44` took the false arm: {body}"
+        )
+        assert "ld\ta,2" not in body, f"the true arm was not selected: {body}"
+
+
+class TestEmbeddedAssignmentWidensOnTheActualType:
+    """
+    `IF a1 > (ar(i) := b1)` — an embedded assignment into an ADDRESS element
+    is typed BYTE by `_get_expr_type` but produced in HL, and the branch that
+    parks the right operand in DE widened on the static type, splicing in a
+    stale A. Both comparisons came out false.
+    """
+
+    def test_the_right_operand_is_widened_from_the_register_it_is_in(self) -> None:
+        # `ar` is an ADDRESS array, so `_get_expr_type` types the embedded
+        # assignment ADDRESS, but the assigned value is a BYTE and stays in
+        # A. Widening on the static type emitted `ex de,hl`, swapping in
+        # whatever HL held; both comparisons then came out false.
+        instrs = _instructions(_compile("""
+            t: do;
+            declare a1 address;
+            declare ar(8) address;
+            declare (b1, i, r) byte;
+            p: procedure;
+                b1 = 7; i = 2;
+                a1 = 300;
+                if a1 > (ar(i) := b1) then r = 1; else r = 2;
+            end p;
+            call p;
+            end t;
+        """))
+        body = instrs[instrs.index("P:"):]
+        assert "pop\taf" in body, f"the byte value was not spilled: {body}"
+        i = body.index("pop\taf")
+        nxt = [x for x in body[i + 1:] if not x.endswith(":")][0]
+        assert nxt != "ex\tde,hl", (
+            "a byte value restored into A was widened with `ex de,hl`, "
+            f"which takes DE from HL instead: {body}"
+        )
+        assert nxt == "ld\te,a", f"unexpected widening of the operand: {body}"
