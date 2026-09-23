@@ -2193,6 +2193,19 @@ class CodeGenerator:
         data_values_nodes = attrs.data_values
         initial_values_nodes = attrs.initial_values
 
+        # `DECLARE x (*) BYTE DATA (...)' takes its extent from the data.  The
+        # parser marks (*) as -1 and that was left on the symbol, so LAST(x)
+        # came out as -2.  UTIL6/PIP.PLM declares its delimiter table that way,
+        #     DECLARE DEL(*) BYTE DATA (' =.:;,<>',CR,LA,LB,RB);
+        #     DO I = 0 TO LAST(DEL);
+        # so PIP recognised no delimiter at all and answered "INVALID FORMAT"
+        # to every command it was given.
+        if dimension == -1:
+            values = data_values_nodes or initial_values_nodes
+            if values:
+                dimension = self._data_element_count(
+                    values, data_type or DataType.BYTE)
+
         # Build the legacy StructMember list the symbol table expects.
         struct_members = None
         if members_nodes is not None:
@@ -2644,6 +2657,12 @@ class CodeGenerator:
             return f"({left}{op}{right})"
         else:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
+
+    def _data_element_count(self, values, dtype: DataType) -> int:
+        """How many elements a DATA/INITIAL list supplies."""
+        total = sum(self._initial_value_width(v, dtype) for v in values)
+        width = 1 if dtype == DataType.BYTE else 2
+        return max(1, total // width)
 
     def _initial_member_widths(self, struct_members, dimension):
         """Byte width of each slot a STRUCTURE initialiser fills, in order."""

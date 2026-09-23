@@ -240,3 +240,41 @@ def test_the_flag_builtin_still_works_when_nothing_declares_it():
     asm = _asm("t: do; declare r byte; r = zero; end t;", opt=0)
     lines = [l.strip() for l in asm.splitlines()]
     assert "ld\ta,0ffh" in lines, asm
+
+
+def test_an_implicitly_dimensioned_data_array_knows_its_extent():
+    """`DECLARE x (*) BYTE DATA (...)' takes its extent from the data.
+
+    The parser marks `(*)' as -1 and that was left on the symbol, so LAST(x)
+    came out as -2. UTIL6/PIP.PLM declares its delimiter table that way:
+
+        DECLARE DEL(*) BYTE DATA (' =.:;,<>',CR,LA,LB,RB);
+        DO I = 0 TO LAST(DEL);
+
+    so PIP recognised no delimiter at all and answered "INVALID FORMAT" to
+    every command.
+    """
+    asm = _asm("""
+t: do;
+d: procedure (c) byte;
+   declare (i,c) byte;
+   declare del(*) byte data (' =.:;,<>',13,10,91,93);
+   do i = 0 to last(del);
+     if c = del(i) then return 0ffh;
+     end;
+   return 0;
+   end d;
+declare r byte;
+r = d('=');
+end t;
+""", opt=0)
+    lines = [l.strip() for l in asm.splitlines()]
+    # 8 characters plus 4 bytes = 12 elements, so LAST is 11.
+    assert "ld\thl,11" in lines, asm
+    assert "ld\thl,-2" not in lines, asm
+
+
+def test_last_of_a_fixed_array_is_unchanged():
+    asm = _asm("t: do; declare a (15) byte, i byte, n byte; n=0; "
+               "do i = 0 to last(a); n=n+1; end; end t;", opt=0)
+    assert "ld\thl,14" in [l.strip() for l in asm.splitlines()], asm
