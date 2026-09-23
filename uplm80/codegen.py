@@ -1026,6 +1026,8 @@ class CodeGenerator:
     def _build_call_graph(self, module) -> None:
         """Build call graph by analyzing all procedure bodies."""
         self.call_graph = {}
+        # callee -> procedures called while evaluating that callee's arguments
+        self.arg_overlaps: dict[str, set[str]] = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}  # proc -> [(var_name, size, type)]
 
         shape = module_shape(module)
@@ -1065,6 +1067,19 @@ class CodeGenerator:
                 nested = list(iter_block_proc_decls(body_items))
                 if nested:
                     self._collect_proc_names(nested, full_name, all_procs)
+
+    def _struct_item_size(self, item) -> int | None:
+        """Bytes one STRUCTURE element of ``item`` occupies, or None if it is
+        not a structure."""
+        members = decl_item_struct_members(item)
+        if not members:
+            return None
+        total = 0
+        for m in members:
+            width = 1 if _legacy_dt(struct_member_type(m)) == DataType.BYTE else 2
+            m_dim = struct_member_dim(m)
+            total += width * (m_dim or 1) * len(list(struct_member_names(m)))
+        return total
 
     def _analyze_proc_calls(self, decl, parent_proc: str | None) -> None:
         """Analyze a procedure to find all calls it makes."""
@@ -1131,10 +1146,20 @@ class CodeGenerator:
                 continue
             d_type, d_dim = _decl_item_type(d)
             var_type = d_type or DataType.ADDRESS
+            # A STRUCTURE has no data type of its own - ast_view returns None
+            # and expects the caller to consult its members.  Falling back to
+            # ADDRESS gave every structure two bytes however many members it
+            # had, so a procedure's frame was short and the next procedure's
+            # frame, overlaid on the strength of that figure, landed inside it.
+            # Member arithmetic elsewhere uses the true size, so a store to a
+            # late member could also run off the end of ??AUTO altogether.
+            struct_size = self._struct_item_size(d)
             for n in decl_item_names(d):
                 if n in params:
                     continue
-                if d_dim and d_dim > 0:
+                if struct_size is not None:
+                    size = struct_size * (d_dim or 1)
+                elif d_dim and d_dim > 0:
                     elem_size = 1 if var_type == DataType.BYTE else 2
                     size = d_dim * elem_size
                 else:
@@ -1151,6 +1176,20 @@ class CodeGenerator:
         """Find all procedure calls in a list of typed statements."""
         for stmt in stmts:
             self._find_calls_in_stmt(stmt, current_proc, calls)
+
+    def _note_arg_overlap(self, callee: str | None, arg_calls: set[str]) -> None:
+        """Record that ``callee``'s frame is live while ``arg_calls`` run.
+
+        A non-reentrant local procedure takes its arguments in its own shared
+        slots, and the caller writes them there one at a time, so the callee's
+        frame holds live data from the first store - before the call, and
+        therefore while every later argument is still being evaluated.  If one
+        of those arguments calls a procedure whose frame is overlaid on this
+        one's, it lands on an argument already stored.
+        """
+        if not callee or not arg_calls:
+            return
+        self.arg_overlaps.setdefault(callee, set()).update(arg_calls)
 
     def _find_calls_in_stmt(self, stmt, current_proc: str, calls: set[str]) -> None:
         """Find procedure calls in a typed statement."""
@@ -1170,9 +1209,13 @@ class CodeGenerator:
                 if callee:
                     calls.add(callee)
             else:
+                callee = None
                 self._find_calls_in_expr(callee_expr, current_proc, calls)
+            arg_calls: set[str] = set()
             for arg in args:
-                self._find_calls_in_expr(arg, current_proc, calls)
+                self._find_calls_in_expr(arg, current_proc, arg_calls)
+            self._note_arg_overlap(callee, arg_calls)
+            calls.update(arg_calls)
         elif isinstance(stmt, P.AssignStmt):
             for target in stmt.targets:
                 self._find_calls_in_expr(target, current_proc, calls)
@@ -1216,9 +1259,13 @@ class CodeGenerator:
                 if callee:
                     calls.add(callee)
             else:
+                callee = None
                 self._find_calls_in_expr(expr.callee, current_proc, calls)
+            arg_calls: set[str] = set()
             for arg in expr.args:
-                self._find_calls_in_expr(arg, current_proc, calls)
+                self._find_calls_in_expr(arg, current_proc, arg_calls)
+            self._note_arg_overlap(callee, arg_calls)
+            calls.update(arg_calls)
         elif isinstance(expr, P.CallNoArgs):
             if isinstance(expr.callee, P.Identifier):
                 callee = self._resolve_proc_name(ident_text(expr.callee.name), current_proc)
@@ -1285,6 +1332,21 @@ class CodeGenerator:
             # Add this proc to all procs it can reach
             for callee in reachable[proc]:
                 self.can_be_active_together[callee].add(proc)
+
+        # A callee's frame is live from the moment the caller stores its first
+        # argument, which is before the call and so before the later arguments
+        # have even been evaluated.  Anything reached while evaluating them is
+        # therefore active at the same time as the callee.
+        for callee, during in self.arg_overlaps.items():
+            if callee not in self.can_be_active_together:
+                continue
+            live = set(during)
+            for g in list(during):
+                live.update(reachable.get(g, set()))
+            for g in live:
+                if g in self.can_be_active_together:
+                    self.can_be_active_together[callee].add(g)
+                    self.can_be_active_together[g].add(callee)
 
         # Now handle the "common ancestor" case - if A calls B and A calls C,
         # then B and C can be active together (B returns, then A calls C)
@@ -1996,6 +2058,7 @@ class CodeGenerator:
     def _build_call_graph_multi(self, modules: list) -> None:
         """Build call graph by analyzing all procedures across multiple modules."""
         self.call_graph = {}
+        self.arg_overlaps = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}
 
         shapes = [module_shape(m) for m in modules]
@@ -6201,7 +6264,7 @@ class CodeGenerator:
                     else:
                         self._emit("ex", "de,hl")
                     self._emit("ld", f"c,{self._format_number(func_num)}")
-                    self._emit("call", "5")
+                    self._emit("call", self._pz(0x0005))
                     return DataType.BYTE if name.upper() == 'MON2' else DataType.ADDRESS
 
         use_stack = True

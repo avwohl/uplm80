@@ -120,3 +120,54 @@ def test_an_unplaceable_initial_value_is_reported_not_dropped():
         "t: do; declare buf (4) byte; declare p address data (buf(0)); end t;",
         "<test>")
     assert out is None, out
+
+
+def test_structure_local_gets_its_real_size_in_shared_storage():
+    """A procedure-local STRUCTURE is sized from its members.
+
+    A STRUCTURE has no data type of its own, and the shared-storage allocator
+    fell back to ADDRESS — two bytes, however many members it had. The frame
+    was then short, the next procedure's frame was overlaid inside it, and
+    member arithmetic (which uses the true size) could store past the end of
+    the shared block entirely.
+    """
+    asm = _asm("""
+t6: do;
+  declare r address;
+  q: procedure; declare (v,w,x,y) address; v=1;w=2;x=3;y=4; r=v+w+x+y; end q;
+  p: procedure;
+     declare arr (6) structure (a address, b address);
+     arr(5).b = 99;
+     call q;
+  end p;
+  call p;
+end t6;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    # arr is 6 * (2+2) = 24 bytes, so q's frame cannot start below 24.
+    assert "ds\t32" in lines, [l for l in lines if l.startswith("ds")]
+    assert "ld\t(??AUTO+24),hl" in lines, "q's frame overlaps arr"
+    # and the highest member store stays inside the block
+    assert "ld\thl,??AUTO+0+20" in lines, asm
+
+
+def test_mpm_bdos_call_is_relocatable_in_an_expression_too():
+    """Both the statement and the expression form of a BDOS call.
+
+    The expression form kept a literal `call 5', which is not relocatable: it
+    only works where the process's memory segment happens to start at zero.
+    """
+    src = """
+t: do;
+mon2: procedure (f,a) byte external; declare f byte; declare a address; end mon2;
+declare c byte, r byte;
+r = mon2(2,c) + 1;
+call mon2(2,c);
+end t;
+"""
+    mpm = _asm(src, Mode.MPM)
+    assert "call\t5" not in mpm and "jp 5" not in mpm, mpm
+    assert mpm.count("call\t??BDOS") == 2, mpm
+    # CP/M keeps the literal, which is right for a .COM.
+    cpm = _asm(src, Mode.CPM)
+    assert "??BDOS" not in cpm, cpm

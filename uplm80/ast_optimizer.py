@@ -810,6 +810,13 @@ class ASTOptimizer:
                         c = unwrap_paren(t.callee)
                         if isinstance(c, P.Identifier):
                             modified.add(ident_text(c.name))
+                        # The subscript is an expression and may assign to
+                        # something: `arr(i := i + 1) = x' modifies i as well
+                        # as arr.  Missing that left a loop whose only
+                        # induction step is in a subscript looking invariant,
+                        # and its exit test was folded away.
+                        for a in t.args or []:
+                            visit_expr(a)
                 visit_expr(s.value)
             elif isinstance(s, P.DoBlock):
                 _, body = block_items_split(s.items)
@@ -1678,8 +1685,27 @@ class ASTOptimizer:
             return P.LocationOfList(values=opt_values, pos=expr.pos)
 
         if isinstance(expr, P.EmbeddedAssign):
-            opt_target = self._optimize_expr(expr.target)
+            # The target of an embedded assignment is a place, not a value, so
+            # it goes through _optimize_target like any other lvalue.  Folding
+            # it rewrote `(k := 7)' after `k = 5' into a store through the
+            # literal 5 - on CP/M that is the BDOS entry vector.
+            opt_target = self._optimize_target(expr.target)
             opt_value = self._optimize_expr(expr.value)
+            # An embedded assignment changes its target just as a statement
+            # assignment does, so the facts recorded about it stop being true
+            # here.  Without this, `q = (k := 7)' left the table still saying
+            # k is 5, and a later `pc(k)' was handed the stale 5.
+            t = unwrap_paren(opt_target)
+            if isinstance(t, P.Identifier):
+                name = ident_text(t.name)
+                self.modified_vars.add(name)
+                self.constants.pop(name, None)
+                self._invalidate_cse_for_var(name)
+                self._invalidate_copies_for_var(name)
+                v = unwrap_paren(opt_value)
+                if self.opt_level >= 3 and isinstance(v, P.NumberLiteral):
+                    self.constants[name] = self._narrow_to_declared_width(
+                        name, number_value(v))
             return P.EmbeddedAssign(target=opt_target, value=opt_value, pos=expr.pos)
 
         return expr
