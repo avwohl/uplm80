@@ -119,3 +119,38 @@ def test_a_plain_based_variable_is_unchanged():
     asm = _asm("t: do; declare p address; declare v based p (4) byte; "
                "declare r byte; r = v(1); v(2) = 3; end t;")
     assert "ld\thl,(P)" in [l.strip() for l in asm.splitlines()], asm
+
+
+def test_a_nested_procedures_return_type_is_known_at_its_use_site():
+    """A bare procedure name is a CALL in PL/M-80, and its result has a type.
+
+    A nested procedure's symbol is filed under its scoped name, and the type
+    lookup searched only the top level, so everything a nested procedure
+    returned was typed ADDRESS. A BYTE result was then read out of L instead of
+    A: `if inner then' tested the wrong register, and `inner + 1' did its
+    arithmetic on a stale HL.
+    """
+    asm = _asm("""
+t: do;
+declare g byte;
+outer: procedure;
+  declare r byte;
+  inner: procedure byte; return 7; end inner;
+  if inner then r = 1; else r = 2;
+  g = inner + 1;
+  end outer;
+call outer;
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    i = lines.index("OUTER:")
+    body = lines[i:i + 20]
+    assert "bit\t0,a" in body, f"the condition reads the wrong register:\n{asm}"
+    assert "bit\t0,l" not in body, asm
+    assert "add\ta,1" in body, f"the arithmetic is not on the BYTE result:\n{asm}"
+
+
+def test_a_top_level_procedures_return_type_is_unchanged():
+    asm = _asm("t: do; declare h byte; top: procedure byte; return 7; end top; "
+               "if top then h = 1; else h = 2; end t;")
+    assert "bit\t0,a" in [l.strip() for l in asm.splitlines()], asm

@@ -4612,7 +4612,13 @@ class CodeGenerator:
             return DataType.BYTE if len(s) == 1 else DataType.ADDRESS
         elif isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
-            sym = self.symbols.lookup(name)
+            # Search the enclosing scopes: a nested procedure's symbol is filed
+            # under its scoped name, so a plain lookup misses it and everything
+            # it returns was typed ADDRESS.  A bare name in an expression is a
+            # CALL in PL/M-80, so a BYTE result was then read out of L instead
+            # of A - UTIL4/STAT.PLM's getfile calls its own nested
+            # `setfilestatus' that way.
+            sym = self._lookup_symbol(name)
             if sym:
                 if sym.kind == SymbolKind.PROCEDURE:
                     return sym.return_type or DataType.ADDRESS
@@ -4650,7 +4656,7 @@ class CodeGenerator:
                 if name in ('SHL', 'SHR', 'DOUBLE', 'LENGTH', 'LAST', 'SIZE',
                             'STACKPTR', 'TIME', 'CPUTIME'):
                     return DataType.ADDRESS
-                sym = self.symbols.lookup(ident_text(callee.name))
+                sym = self._lookup_symbol(ident_text(callee.name))
                 if sym:
                     if sym.kind == SymbolKind.PROCEDURE:
                         return sym.return_type or DataType.ADDRESS
@@ -6747,34 +6753,34 @@ class CodeGenerator:
             if args:
                 arg0 = unwrap_paren(args[0])
                 if isinstance(arg0, P.Identifier):
-                    sym = self.symbols.lookup(ident_text(arg0.name))
+                    sym = self._lookup_scoped(ident_text(arg0.name))
                     if sym and sym.dimension:
                         self._emit("ld", f"hl,{sym.dimension}")
                         return DataType.ADDRESS
-            self._emit("ld", "hl,0")
-            return DataType.ADDRESS
+            raise CodeGenError(
+                "LENGTH() needs an array whose extent is known")
 
         if name == "LAST":
             if args:
                 arg0 = unwrap_paren(args[0])
                 if isinstance(arg0, P.Identifier):
-                    sym = self.symbols.lookup(ident_text(arg0.name))
+                    sym = self._lookup_scoped(ident_text(arg0.name))
                     if sym and sym.dimension:
                         self._emit("ld", f"hl,{sym.dimension - 1}")
                         return DataType.ADDRESS
-            self._emit("ld", "hl,0")
-            return DataType.ADDRESS
+            raise CodeGenError(
+                "LAST() needs an array whose extent is known")
 
         if name == "SIZE":
             if args:
                 arg0 = unwrap_paren(args[0])
                 if isinstance(arg0, P.Identifier):
-                    sym = self.symbols.lookup(ident_text(arg0.name))
+                    sym = self._lookup_scoped(ident_text(arg0.name))
                     if sym:
                         self._emit("ld", f"hl,{sym.size}")
                         return DataType.ADDRESS
-            self._emit("ld", "hl,0")
-            return DataType.ADDRESS
+            raise CodeGenError(
+                "SIZE() needs a declared variable")
 
         if name == "MEMORY":
             self.needs_end_symbol = True
