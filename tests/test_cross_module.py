@@ -89,3 +89,33 @@ end t;
 def test_a_constant_by_step_is_unchanged():
     asm = _asm("t: do; declare j byte, n byte; n=0; do j = 0 to 7 by 2; n=n+1; end; end t;")
     assert "add\ta,2" in [l.strip() for l in asm.splitlines()], asm
+
+
+def test_a_based_variable_over_a_structure_member_uses_that_member():
+    """`x BASED s.m' keeps its pointer in a MEMBER of s, not at s.
+
+    The member was parsed and then dropped, so every access read the pointer
+    from the start of the structure. MP/M II's UTIL7/DM.PLM declares
+    `token BASED pcb.token$adr (12) byte'; reading `pcb.state' in its place
+    gave it zero, so SDIR matched its command-line file specification against
+    whatever sat at address 0 and answered "File Not Found." to every
+    argument it was given.
+    """
+    asm = _asm("""
+t: do;
+declare pcb structure (aa address, bb address);
+declare tok based pcb.bb (12) byte;
+declare r byte;
+r = tok(1);
+tok(2) = 5;
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    assert "ld\thl,(PCB+2)" in lines, asm
+    assert "ld\thl,(PCB)" not in lines, asm
+
+
+def test_a_plain_based_variable_is_unchanged():
+    asm = _asm("t: do; declare p address; declare v based p (4) byte; "
+               "declare r byte; r = v(1); v(2) = 3; end t;")
+    assert "ld\thl,(P)" in [l.strip() for l in asm.splitlines()], asm

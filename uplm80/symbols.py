@@ -31,6 +31,10 @@ class Symbol:
     dimension: int | None = None  # Array dimension
     struct_members: list[StructMember] | None = None
     based_on: str | None = None
+    # For `x BASED s.m', the member of `based_on' that holds the
+    # pointer.  The pointer is then at based_on + that member's
+    # offset, not at based_on itself.
+    based_member: str | None = None
     at_address: int | None = None
     is_public: bool = False
     is_external: bool = False
