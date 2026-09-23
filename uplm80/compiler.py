@@ -296,9 +296,10 @@ def main() -> None:
 
     parser.add_argument(
         "-m", "--mode",
-        choices=["cpm", "bare"],
+        choices=["cpm", "bare", "mpm"],
         default="cpm",
-        help="Runtime mode: cpm=CP/M program, bare=bare metal (default: cpm)",
+        help="Runtime mode: cpm=CP/M program, bare=bare metal, "
+             "mpm=MP/M relocatable (.PRL/.SPR/.RSP) (default: cpm)",
     )
 
     parser.add_argument(
@@ -336,7 +337,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Select mode
-    mode = Mode.CPM if args.mode == "cpm" else Mode.BARE
+    mode = {"cpm": Mode.CPM, "bare": Mode.BARE, "mpm": Mode.MPM}[args.mode]
 
     compiler = Compiler(
         mode=mode,

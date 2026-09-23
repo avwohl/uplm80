@@ -149,6 +149,7 @@ class Mode(Enum):
 
     CPM = auto()   # CP/M program (ORG 100H, stack from BDOS, return to OS)
     BARE = auto()  # Bare metal program (original Intel PL/M style)
+    MPM = auto()   # MP/M relocatable program (.PRL/.SPR/.RSP)
 
 
 class RegState(Enum):
@@ -393,6 +394,28 @@ class CodeGenerator:
     RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
                       'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
 
+    # Page-zero addresses a hosted program reaches directly.  Under CP/M they
+    # are fixed locations and the literal is emitted.  Under MP/M page zero
+    # belongs to the memory segment the process was loaded into, so the same
+    # address has to reach the linker as a symbol: only a resolved symbol
+    # reference ends up in the .PRL relocation bitmap, and an unrelocated
+    # "call 5" would call into whatever happens to live at absolute 0005H.
+    # The names match DRI's X0100.ASM, which is how PL/M-80 itself got these
+    # relocated.
+    _PAGE_ZERO = {
+        0x0000: "BOOT",
+        0x0005: "BDOS",
+        0x0006: "MAXB",
+    }
+
+    def _pz(self, addr: int) -> str:
+        """Render a page-zero address: a literal, or an extern under MP/M."""
+        if self.mode != Mode.MPM:
+            return self._format_number(addr)
+        name = self._PAGE_ZERO[addr]
+        self._page_zero_refs.add(name)
+        return name
+
     def __init__(self, mode: Mode = Mode.CPM, warn_trivial_if: bool = True, reg_debug: bool = False) -> None:
         self.mode = mode
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
@@ -416,6 +439,8 @@ class CodeGenerator:
         self.loop_stack: list[tuple[str, str]] = []  # (continue_label, break_label)
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
+        # Page-zero symbols referenced under MP/M; emitted as extrn.
+        self._page_zero_refs: set[str] = set()
         self.literal_macros: dict[str, str] = {}  # LITERALLY macro expansions
         self.block_scope_counter = 0  # Counter for unique DO block scopes
         # Procedures declared at the head of a DO block.  They are
@@ -1496,6 +1521,7 @@ class CodeGenerator:
         self.string_literals = []
         self.needs_runtime = set()
         self.needs_end_symbol = False
+        self._page_zero_refs = set()
         self.literal_macros = {}
 
         shape = module_shape(module)
@@ -1577,12 +1603,12 @@ class CodeGenerator:
         if entry_proc and not shape.stmts:
             self._emit()
             self._emit(comment="Entry point")
-            if self.mode == Mode.CPM:
+            if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS, call main, return to OS
-                self._emit("ld", "hl,(6)")
+                self._emit("ld", f"hl,({self._pz(0x0006)})")
                 self._emit("ld", "sp,hl")
                 self._emit("call", entry_proc_name)
-                self._emit("jp", "0")  # Warm boot to return to CP/M
+                self._emit("jp", self._pz(0x0000))  # Warm boot to return to CP/M
             else:
                 # BARE: Use locally-defined stack, jump to entry
                 self._emit("ld", "sp,??STACK")
@@ -1592,9 +1618,9 @@ class CodeGenerator:
         if shape.stmts:
             self._emit()
             self._emit(comment="Module initialization code")
-            if self.mode == Mode.CPM:
+            if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS address at 0006H
-                self._emit("ld", "hl,(6)")
+                self._emit("ld", f"hl,({self._pz(0x0006)})")
                 self._emit("ld", "sp,hl")
             else:
                 # BARE: Use locally-defined stack
@@ -1602,8 +1628,8 @@ class CodeGenerator:
             for stmt in shape.stmts:
                 self._gen_stmt(stmt)
             # For CPM mode, add warm boot after module statements
-            if self.mode == Mode.CPM:
-                self._emit("jp", "0")  # Warm boot to return to CP/M
+            if self.mode in (Mode.CPM, Mode.MPM):
+                self._emit("jp", self._pz(0x0000))  # Warm boot to return to CP/M
 
         # Procedures hoisted out of DO blocks in the module body, then
         # the module's own procedures.
@@ -1680,6 +1706,13 @@ class CodeGenerator:
             self._emit()
             self._emit_label("__END__")
 
+        # Page-zero references have to be declared so the linker resolves them
+        # and, for MP/M relocatable output, records them in the bitmap.
+        if self._page_zero_refs:
+            self._emit()
+            for name in sorted(self._page_zero_refs):
+                self._emit("extrn", name)
+
         # End directive
         self._emit()
         self._emit("end")
@@ -1709,6 +1742,7 @@ class CodeGenerator:
         self.string_literals = []
         self.needs_runtime = set()
         self.needs_end_symbol = False
+        self._page_zero_refs = set()
         self.literal_macros = {}
 
         # Compute the shape view for each module once.
@@ -1794,24 +1828,24 @@ class CodeGenerator:
             # Has module-level statements - emit init + statements
             self._emit()
             self._emit(comment="Module initialization")
-            if self.mode == Mode.CPM:
-                self._emit("ld", "hl,(6)")
+            if self.mode in (Mode.CPM, Mode.MPM):
+                self._emit("ld", f"hl,({self._pz(0x0006)})")
                 self._emit("ld", "sp,hl")
             else:
                 self._emit("ld", "sp,??STACK")
             for stmt in first_module_stmts:
                 self._gen_stmt(stmt)
-            if self.mode == Mode.CPM:
-                self._emit("jp", "0")
+            if self.mode in (Mode.CPM, Mode.MPM):
+                self._emit("jp", self._pz(0x0000))
         elif entry_proc:
             # No statements - call entry procedure
             self._emit()
             self._emit(comment="Entry point")
-            if self.mode == Mode.CPM:
-                self._emit("ld", "hl,(6)")
+            if self.mode in (Mode.CPM, Mode.MPM):
+                self._emit("ld", f"hl,({self._pz(0x0006)})")
                 self._emit("ld", "sp,hl")
                 self._emit("call", entry_proc_name)
-                self._emit("jp", "0")
+                self._emit("jp", self._pz(0x0000))
             else:
                 self._emit("ld", "sp,??STACK")
                 self._emit("call", entry_proc_name)
@@ -1888,6 +1922,13 @@ class CodeGenerator:
         if self.needs_end_symbol:
             self._emit()
             self._emit_label("__END__")
+
+        # Page-zero references have to be declared so the linker resolves them
+        # and, for MP/M relocatable output, records them in the bitmap.
+        if self._page_zero_refs:
+            self._emit()
+            for name in sorted(self._page_zero_refs):
+                self._emit("extrn", name)
 
         # End directive
         self._emit()
@@ -2934,7 +2975,7 @@ class CodeGenerator:
                     else:
                         self._emit("ex", "de,hl")  # DE = addr
                     self._emit("ld", f"c,{self._format_number(func_num)}")
-                    self._emit("call", "5")  # BDOS entry point
+                    self._emit("call", self._pz(0x0005))  # BDOS entry point
                     return  # Done - no stack cleanup needed
 
         # For non-reentrant LOCAL procedures, store args directly to parameter memory
