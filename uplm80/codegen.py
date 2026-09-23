@@ -2346,6 +2346,53 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
+    def _at_designator(self, expr):
+        """Resolve a constant `.designator' to (base symbol, name, offset, elem).
+
+        Handles NAME, NAME(const), STRUCT.MEMBER and any chain of those, which
+        is what DRI's sources put in an AT clause: UTIL6/PIP.PLM declares
+        ``DESTR ADDRESS AT(.DEST.FCB(33))`` and UTIL5/PRLCM.PLM
+        ``code$size ADDRESS AT (.buffer(0).sector(1))``.  ``elem`` is the width
+        of one element of whatever a further subscript would index.
+
+        Returns None when any part is not a compile-time constant.
+        """
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Identifier):
+            name = ident_text(expr.name)
+            base_sym = self._lookup_scoped(name)
+            asm = (base_sym.asm_name if base_sym and base_sym.asm_name
+                   else self._mangle_name(name))
+            if base_sym is not None and base_sym.struct_members:
+                elem = sum((m.dimension or 1)
+                           * (1 if m.data_type == DataType.BYTE else 2)
+                           for m in base_sym.struct_members)
+            elif base_sym is not None and base_sym.data_type != DataType.BYTE:
+                elem = 2
+            else:
+                elem = 1
+            return base_sym, asm, 0, elem
+        if isinstance(expr, P.MemberAccess):
+            base = self._at_designator(expr.base)
+            if base is None:
+                return None
+            base_sym, asm, off, _ = base
+            m_off, m_type = self._get_member_info(expr)
+            return base_sym, asm, off + m_off, (1 if m_type == DataType.BYTE else 2)
+        if isinstance(expr, P.Call):
+            args = list(expr.args or [])
+            if len(args) != 1:
+                return None
+            index = self._try_eval_const(args[0])
+            if index is None:
+                return None
+            base = self._at_designator(expr.callee)
+            if base is None:
+                return None
+            base_sym, asm, off, elem = base
+            return base_sym, asm, off + index * elem, elem
+        return None
+
     def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol) -> None:
         """Emit the EQU/SET line(s) for a ``DECLARE ... AT(addr)`` clause.
 
@@ -2420,61 +2467,35 @@ class CodeGenerator:
                         )
                 return
 
-            # AT(.ARR(i)) — the subscript parses as a Call in the typed AST.
-            if isinstance(loc_operand, P.Call):
-                base_expr = loc_operand.callee
-                index_expr = loc_operand.args[0] if loc_operand.args else None
-                if isinstance(base_expr, P.Identifier):
-                    base_name_text = ident_text(base_expr.name)
-                    base_sym = self.symbols.lookup(base_name_text)
-                    base_asm = (
-                        base_sym.asm_name if base_sym and base_sym.asm_name
-                        else self._mangle_name(base_name_text)
-                    )
-                    elem_size = 1
-                    if base_sym and base_sym.data_type == DataType.ADDRESS:
-                        elem_size = 2
-                    # External-base detection (direct or through an AT alias).
-                    is_base_external = bool(base_sym and base_sym.is_external)
-                    if not is_base_external and base_sym and base_sym.asm_name:
-                        asm_base = base_sym.asm_name.split('+')[0].strip()
-                        ref_sym = self.symbols.lookup(asm_base)
-                        if ref_sym and ref_sym.is_external:
-                            is_base_external = True
-                    if isinstance(index_expr, P.NumberLiteral):
-                        offset = parse_plm_number(index_expr.value.text) * elem_size
-                        if is_base_external:
-                            # External base — store the expression as asm_name.
-                            sym.asm_name = (
-                                base_asm if offset == 0 else f"{base_asm}+{offset}"
-                            )
-                        elif offset == 0:
-                            self.data_segment.append(
-                                AsmLine(label=asm_name, opcode="EQU", operands=base_asm)
-                            )
-                        else:
-                            self.data_segment.append(
-                                AsmLine(
-                                    label=asm_name, opcode="EQU",
-                                    operands=f"{base_asm}+{offset}",
-                                )
-                            )
-                    else:
-                        # Non-constant index - can't resolve at compile time.
-                        self.data_segment.append(
-                            AsmLine(label=asm_name, opcode="EQU", operands="$")
-                        )
-                else:
-                    # Complex base expression
-                    self.data_segment.append(
-                        AsmLine(label=asm_name, opcode="EQU", operands="$")
-                    )
-                return
-
-            # Other LocationOf forms (string-of, etc.) — fall back.
-            self.data_segment.append(
-                AsmLine(label=asm_name, opcode="EQU", operands="$")
-            )
+            # Anything else: a constant designator - NAME(i), STRUCT.MEMBER,
+            # or a chain of them.  Previously only a bare NAME(<literal>) was
+            # understood and everything else silently became `EQU $', the
+            # assembler's location counter, which pointed the variable at a
+            # arbitrary spot: UTIL4/STAT.PLM's
+            #     dolla literally '.fcb(6dh-5ch)',  doll byte at (dolla),
+            # read a stray byte as its `$' parameter, so `stat <file>' was
+            # taken for a request to change the file's attributes.
+            resolved = self._at_designator(loc_operand)
+            if resolved is None:
+                raise CodeGenError(
+                    f"AT(...) needs a constant address expression; got "
+                    f"{type(loc_operand).__name__}")
+            base_sym, base_asm, offset, _ = resolved
+            operand = base_asm if offset == 0 else f"{base_asm}+{offset}"
+            # An external base is aliased rather than defined, so that
+            # references name the external and the linker resolves them.
+            is_base_external = bool(base_sym and base_sym.is_external)
+            if not is_base_external and base_sym and base_sym.asm_name:
+                root = base_sym.asm_name.split('+')[0].strip()
+                root_sym = self.symbols.lookup(root)
+                if root_sym and root_sym.is_external:
+                    is_base_external = True
+            if is_base_external:
+                sym.asm_name = operand
+            else:
+                self.data_segment.append(
+                    AsmLine(label=asm_name, opcode="EQU", operands=operand)
+                )
             return
 
         # Catch-all: evaluate at assembly time.
@@ -4408,7 +4429,18 @@ class CodeGenerator:
             self.loop_stack.pop()
             return
 
-        # General case: 16-bit loop (original code)
+        # General case: 16-bit loop.  The index still has its own declared
+        # width: _gen_load brings a BYTE back in A, not HL, and the arithmetic
+        # below is all 16-bit, so it has to be widened.  Without that the
+        # increment did `inc hl' on whatever the body had left in HL and the
+        # test compared against it - UTIL4/SHOW.PLM's `do i = 0 to last(user)'
+        # never terminated, and `show users:' printed until the session died.
+        def _index_to_hl() -> None:
+            self._gen_load(index_var)
+            if index_type == DataType.BYTE:
+                self._emit("ld", "l,a")
+                self._emit("ld", "h,0")
+
         # Initialize index variable
         self._gen_expr(stmt.start)
         self._gen_store(index_var, DataType.ADDRESS)
@@ -4423,7 +4455,7 @@ class CodeGenerator:
 
         # Increment
         self._emit_label(incr_label)
-        self._gen_load(index_var)
+        _index_to_hl()
         if not step_is_const:
             self._emit("push", "hl")
             self._gen_expr_to_hl(step_expr)
@@ -4441,7 +4473,7 @@ class CodeGenerator:
 
         # Test condition
         self._emit_label(test_label)
-        self._gen_load(index_var)
+        _index_to_hl()
         if self._expr_preserves_de(stmt.bound):
             self._emit("ex", "de,hl")        # DE = index
             self._gen_expr_to_hl(stmt.bound)  # HL = bound, DE untouched
@@ -4944,6 +4976,21 @@ class CodeGenerator:
             name = ident_text(expr.name)
             upper_name = name.upper()
 
+            # A variable of the same name shadows a CONDITION-FLAG built-in.
+            # CARRY, ZERO, SIGN and PARITY are ordinary words that a program
+            # may well use for something of its own: MP/M II's UTIL4/STAT.PLM
+            # has `declare (d,zero) byte' for its zero-suppression flag, and
+            # reading the Z flag in its place made every number print with
+            # leading zeros - `(00001 file, 00001-1k blocks)'.
+            #
+            # STACKPTR is deliberately not in this list.  A program assigns to
+            # it to SET the stack pointer - UTIL3/LOAD.PLM has `STACKPTR = SP'
+            # - which registers a variable of that name as a side effect, so
+            # shadowing on it would break every later read.
+            _shadow_sym = self._lookup_symbol(name)
+            shadowed = (_shadow_sym is not None
+                        and _shadow_sym.kind != SymbolKind.BUILTIN)
+
             # Handle built-in STACKPTR variable
             if upper_name == "STACKPTR":
                 # Read stack pointer into HL
@@ -4952,7 +4999,7 @@ class CodeGenerator:
                 return DataType.ADDRESS
 
             # Handle flag-testing builtins (can be used without parentheses)
-            if upper_name == "CARRY":
+            if upper_name == "CARRY" and not shadowed:
                 # Return carry flag value. `sbc a,a` reads carry in one
                 # instruction (A := -carry, so 0FFH or 00H) and does not
                 # depend on A's previous contents. The obvious
@@ -4965,7 +5012,7 @@ class CodeGenerator:
                 self._emit("ld", "h,0")
                 return DataType.BYTE
 
-            if upper_name == "ZERO":
+            if upper_name == "ZERO" and not shadowed:
                 # Return zero flag value
                 end_label = self._new_label("ZFE")
 
@@ -4988,7 +5035,7 @@ class CodeGenerator:
                 self._emit_label(end_label)
                 return DataType.BYTE
 
-            if upper_name == "SIGN":
+            if upper_name == "SIGN" and not shadowed:
                 # Return sign flag value
                 end_label = self._new_label("SFE")
 
@@ -5011,7 +5058,7 @@ class CodeGenerator:
                 self._emit_label(end_label)
                 return DataType.BYTE
 
-            if upper_name == "PARITY":
+            if upper_name == "PARITY" and not shadowed:
                 # Return parity flag value
                 end_label = self._new_label("PFE")
 

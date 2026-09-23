@@ -11,8 +11,8 @@ from uplm80.codegen import Mode
 from uplm80.compiler import Compiler
 
 
-def _asm(src: str, mode: Mode = Mode.CPM) -> str:
-    out = Compiler(mode=mode).compile(src, "<test>")
+def _asm(src: str, mode: Mode = Mode.CPM, opt: int = 2) -> str:
+    out = Compiler(mode=mode, opt_level=opt).compile(src, "<test>")
     assert out is not None, "compilation failed"
     return out
 
@@ -173,3 +173,70 @@ end t;
     # CP/M keeps the literal, which is right for a .COM.
     cpm = _asm(src, Mode.CPM)
     assert "??BDOS" not in cpm, cpm
+
+
+def test_at_accepts_a_constant_expression_subscript():
+    """`AT(.arr(6dh-5ch))' is a constant, just not a bare literal.
+
+    Only a NumberLiteral was understood; anything else fell through to an
+    `EQU $' - the assembler's location counter - which pointed the variable at
+    whatever happened to be there. MP/M II's UTIL4/STAT.PLM declares
+
+        dolla literally '.fcb(6dh-5ch)',
+        doll byte at (dolla),
+
+    to reach the second FCB, read a stray byte as its `$' parameter and so took
+    every `stat <file>' for a request to change the file's attributes.
+    """
+    # `fcb' is declared after `doll', exactly as in STAT.PLM.
+    asm = _asm("""
+t: do;
+declare
+    dolla literally '.fcb(6dh-5ch)',
+    doll byte at(dolla),
+    z byte;
+declare fcb (1) byte external;
+z = doll;
+end t;
+""", opt=0)
+    lines = [l.strip() for l in asm.splitlines()]
+    assert "DOLL:\tEQU\tFCB+17" in lines, asm
+    assert not any("EQU\t$" in l for l in lines), asm
+
+
+def test_at_accepts_a_structure_member_designator():
+    """`AT(.DEST.FCB(33))' and `AT(.buffer(0).sector(1))'.
+
+    Both are in DRI's sources - UTIL6/PIP.PLM and UTIL5/PRLCM.PLM - and both
+    used to become `EQU $'.
+    """
+    asm = _asm("""
+t: do;
+declare dest structure (fcb (36) byte, user byte);
+declare destr address at (.dest.fcb(33));
+declare z address;
+z = destr;
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    assert "DESTR:\tEQU\tDEST+33" in lines, asm
+
+
+def test_a_variable_shadows_a_condition_flag_builtin():
+    """CARRY, ZERO, SIGN and PARITY are ordinary words.
+
+    UTIL4/STAT.PLM declares `(d,zero) byte' for its zero-suppression flag.
+    Reading the Z flag in its place made every number print with leading
+    zeros.
+    """
+    asm = _asm("t: do; declare (d,zero) byte; declare r byte; zero = 0; r = zero; end t;",
+               opt=0)
+    lines = [l.strip() for l in asm.splitlines()]
+    assert "ld\ta,(ZERO)" in lines, asm
+    assert "ld\ta,0ffh" not in lines, asm
+
+
+def test_the_flag_builtin_still_works_when_nothing_declares_it():
+    asm = _asm("t: do; declare r byte; r = zero; end t;", opt=0)
+    lines = [l.strip() for l in asm.splitlines()]
+    assert "ld\ta,0ffh" in lines, asm
