@@ -74,12 +74,15 @@ def test_subscripted_address_of_in_data(expr, want):
     assert want in [l.strip() for l in asm.splitlines()], asm
 
 
-def test_at_memory_is_a_label_not_an_equ():
-    """AT(.MEMORY) must resolve for references ABOVE the declaration.
+def test_at_memory_names_the_linker_symbol_not_a_local_label():
+    """AT(.MEMORY) is the first free byte after the whole PROGRAM.
 
-    Its address is only known at the end of the file. A forward label
-    reference resolves on the assembler's second pass; a forward EQU reads as
-    zero, which is what UTIL7/DSE.PLM's hash table did.
+    A label at the end of this module marks the end of the MODULE, which in a
+    program linked from several of them is somewhere in the middle. MP/M II's
+    SDIR is eight modules, and its 128-entry hash table — declared
+    `AT (.MEMORY)` in UTIL7/DSE.PLM — landed on top of another module's
+    strings and cleared them, so the directory header printed as NULs.
+    __END__ is the linker's own symbol, so it is named as an external.
     """
     asm = _asm("""
 t: do;
@@ -89,10 +92,9 @@ tbl(0) = 1;
 end t;
 """)
     lines = [l.strip() for l in asm.splitlines()]
-    assert "TBL:" in lines, asm
-    assert not any(l.startswith("TBL:") and "EQU" in l for l in lines), asm
-    # and it sits at __END__
-    assert lines.index("TBL:") == lines.index("__END__:") + 1, asm
+    assert "extrn\t__END__" in lines, asm
+    assert "__END__:" not in lines, "a local label makes this the module end, not the program end"
+    assert "TBL:\tEQU\t__END__" in lines, asm
 
 
 def test_at_external_can_be_referenced_before_it_is_declared():

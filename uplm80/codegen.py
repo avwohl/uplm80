@@ -496,8 +496,6 @@ class CodeGenerator:
         self._page_zero_refs: set[str] = set()
         # Whether this module sets SP and so needs the ??STACK buffer.
         self._needs_stack = False
-        # Names declared AT(.MEMORY); emitted as labels beside __END__.
-        self._memory_aliases: list[str] = []
         self.literal_macros: dict[str, str] = {}  # LITERALLY macro expansions
         self.block_scope_counter = 0  # Counter for unique DO block scopes
         # Procedures declared at the head of a DO block.  They are
@@ -1642,7 +1640,6 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self._page_zero_refs = set()
         self._needs_stack = False
-        self._memory_aliases = []
         self.literal_macros = {}
 
         shape = module_shape(module)
@@ -1819,11 +1816,11 @@ class CodeGenerator:
 
         # Define __END__ label if program uses .MEMORY built-in
         # __END__ marks the first free byte after all code/data
-        if self.needs_end_symbol:
+        if self.needs_end_symbol and not any(
+                l.opcode == "extrn" and l.operands == "__END__"
+                for l in self.data_segment):
             self._emit()
-            self._emit_label("__END__")
-            for alias in self._memory_aliases:
-                self._emit_label(alias)
+            self._emit("extrn", "__END__")
 
         # Page-zero references have to be declared so the linker resolves them
         # and, for MP/M relocatable output, records them in the bitmap.
@@ -1863,7 +1860,6 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self._page_zero_refs = set()
         self._needs_stack = False
-        self._memory_aliases = []
         self.literal_macros = {}
 
         # Compute the shape view for each module once.
@@ -2036,11 +2032,11 @@ class CodeGenerator:
 
         # Define __END__ label if program uses .MEMORY built-in
         # __END__ marks the first free byte after all code/data
-        if self.needs_end_symbol:
+        if self.needs_end_symbol and not any(
+                l.opcode == "extrn" and l.operands == "__END__"
+                for l in self.data_segment):
             self._emit()
-            self._emit_label("__END__")
-            for alias in self._memory_aliases:
-                self._emit_label(alias)
+            self._emit("extrn", "__END__")
 
         # Page-zero references have to be declared so the linker resolves them
         # and, for MP/M relocatable output, records them in the bitmap.
@@ -2372,19 +2368,25 @@ class CodeGenerator:
             if isinstance(loc_operand, P.Identifier):
                 ref_name_text = ident_text(loc_operand.name)
                 if ref_name_text.upper() == "MEMORY":
-                    # AT(.MEMORY) is the first free byte after the program, so
-                    # the name has to carry the address of __END__ - which is
-                    # only known at the end of the file.  Emit it as a LABEL
-                    # beside __END__ rather than an EQU here: a forward label
-                    # reference resolves on the assembler's second pass, and a
-                    # forward EQU does not.  UTIL7/DSE.PLM declares its hash
-                    # table this way and indexes it from three places above the
-                    # declaration; as an EQU all three read zero, so SDIR
-                    # cleared 128 entries over page zero and took out the BDOS
-                    # entry with them.
+                    # .MEMORY is the first free byte after the whole PROGRAM,
+                    # and only the linker knows where that is.  A label at the
+                    # end of this module marks the end of the MODULE, which in
+                    # a program linked from several of them is somewhere in the
+                    # middle: SDIR is eight modules, and its 128-entry hash
+                    # table, declared AT (.MEMORY) in UTIL7/DSE.PLM, landed on
+                    # top of another module's strings and cleared them.
+                    # __END__ is the linker's own symbol, so name it as one.
+                    # The EXTRN has to come first: an EQU is evaluated where
+                    # it stands, and if __END__ is not known to be external by
+                    # then the symbol silently takes the value zero.
+                    if not self.needs_end_symbol:
+                        self.data_segment.append(
+                            AsmLine(opcode="extrn", operands="__END__")
+                        )
                     self.needs_end_symbol = True
-                    if asm_name and asm_name not in self._memory_aliases:
-                        self._memory_aliases.append(asm_name)
+                    self.data_segment.append(
+                        AsmLine(label=asm_name, opcode="EQU", operands="__END__")
+                    )
                 else:
                     ref_sym = self.symbols.lookup(ref_name_text)
                     if ref_sym and ref_sym.is_external:
@@ -2846,16 +2848,45 @@ class CodeGenerator:
                 )
                 param_infos.append((param, asm_name, param_type, param_size))
 
-        # Generate prologue code for register parameter (last param in A or HL)
-        # For non-reentrant procedures, the last param is passed in register and needs to be stored
+        # Generate prologue code for parameters.
+        #
+        # A procedure private to this module is called with its earlier
+        # arguments already written into its own storage by the caller, and
+        # only the last one arrives in a register.  A PUBLIC procedure cannot
+        # be: a caller in another module has no way to name those slots, so it
+        # pushes every argument and pops them again.  The two conventions have
+        # to agree, so a public procedure takes all of its arguments off the
+        # stack here.  (MP/M II's SDIR is eight modules and calls a public
+        # `pdecimal(v, prec, zerosup)' across them: the callee was reading two
+        # of the three from slots nobody had written, so every number it
+        # printed was wrong or missing.)
         if param_infos and not attrs.is_reentrant:
-            _, last_asm_name, last_param_type, _ = param_infos[-1]
-            if last_param_type == DataType.BYTE:
-                # Last param came in A - store it
-                self._emit("ld", f"({last_asm_name}),a")
+            if attrs.is_public:
+                # Pushed left to right, so the last argument is nearest the
+                # return address: parameter i sits at SP+2+2*(n-1-i).
+                n_params = len(param_infos)
+                for idx, (_, p_asm, p_type, _) in enumerate(param_infos):
+                    off = 2 + 2 * (n_params - 1 - idx)
+                    self._emit("ld", f"hl,{off}")
+                    self._emit("add", "hl,sp")
+                    if p_type == DataType.BYTE:
+                        # A BYTE argument is widened to a word when pushed.
+                        self._emit("ld", "a,(hl)")
+                        self._emit("ld", f"({p_asm}),a")
+                    else:
+                        self._emit("ld", "e,(hl)")
+                        self._emit("inc", "hl")
+                        self._emit("ld", "d,(hl)")
+                        self._emit("ex", "de,hl")
+                        self._emit("ld", f"({p_asm}),hl")
             else:
-                # Last param came in HL - store it
-                self._emit("ld", f"({last_asm_name}),hl")
+                _, last_asm_name, last_param_type, _ = param_infos[-1]
+                if last_param_type == DataType.BYTE:
+                    # Last param came in A - store it
+                    self._emit("ld", f"({last_asm_name}),a")
+                else:
+                    # Last param came in HL - store it
+                    self._emit("ld", f"({last_asm_name}),hl")
 
         # Track locals offset for reentrant procedures (negative from IX)
         self._reentrant_local_offset = 0  # Will be decremented as locals are allocated
@@ -3196,7 +3227,8 @@ class CodeGenerator:
         # For reentrant procedures, external procedures, or indirect calls, use stack
         use_stack = True
         full_callee_name = None
-        if sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant and not sym.is_external:
+        if (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
+                and not sym.is_external and not sym.is_public):
             use_stack = False
             # Get the full procedure name (needed for storage_labels lookup)
             full_callee_name = sym.name
@@ -4126,9 +4158,19 @@ class CodeGenerator:
 
         # Get step value (default +1 when no BY clause; only constant
         # NumberLiteral steps drive the byte-loop optimisations).
+        # A BY clause whose step is not a constant has to be evaluated each
+        # time round.  Defaulting step_val to 1 for it silently turned
+        # `DO J = A TO B BY I' into `BY 1': MP/M II's UTIL7/DSE.PLM walks an
+        # FCB disk map `BY i', where i is 1 or 2 according to whether the disk
+        # uses byte or word block numbers, and counted every allocated block
+        # twice on a disk with word numbers.
         step_val = 1
-        if step_expr is not None and isinstance(step_expr, P.NumberLiteral):
-            step_val = number_value(step_expr)
+        step_is_const = True
+        if step_expr is not None:
+            if isinstance(step_expr, P.NumberLiteral):
+                step_val = number_value(step_expr)
+            else:
+                step_is_const = False
 
         # Check if loop index is used in body - if not, we can use DJNZ on Z80.
         # _index_used_in_body / _stmts_contain_goto still walk the
@@ -4146,6 +4188,7 @@ class CodeGenerator:
         # Convert to: B = N+1; do { body } while (--B != 0)
         if (
             both_bytes
+            and step_is_const
             and step_val == 1
             and not index_used
             and not body_has_goto
@@ -4221,6 +4264,7 @@ class CodeGenerator:
         # When start is variable, bound is 0, and step is -1 (or default counting down)
         is_downcount_to_zero = (
             both_bytes
+            and step_is_const
             and isinstance(stmt.bound, P.NumberLiteral)
             and number_value(stmt.bound) == 0
             and (step_val == -1 or step_val == 0xFF)
@@ -4280,7 +4324,15 @@ class CodeGenerator:
             # Increment/Decrement
             self._emit_label(incr_label)
             self._gen_load(index_var)  # A = index
-            if step_val == 1:
+            if not step_is_const:
+                # The step is an expression: keep the index while it runs.
+                self._emit("push", "af")
+                if self._gen_expr(step_expr) == DataType.ADDRESS:
+                    self._emit("ld", "a,l")
+                self._emit("ld", "b,a")
+                self._emit("pop", "af")
+                self._emit("add", "a,b")
+            elif step_val == 1:
                 self._emit("inc", "a")
             elif step_val == -1 or step_val == 0xFF:
                 self._emit("dec", "a")
@@ -4323,7 +4375,15 @@ class CodeGenerator:
             # Increment/Decrement
             self._emit_label(incr_label)
             self._gen_load(index_var)  # A = index
-            if step_val == 1:
+            if not step_is_const:
+                # The step is an expression: keep the index while it runs.
+                self._emit("push", "af")
+                if self._gen_expr(step_expr) == DataType.ADDRESS:
+                    self._emit("ld", "a,l")
+                self._emit("ld", "b,a")
+                self._emit("pop", "af")
+                self._emit("add", "a,b")
+            elif step_val == 1:
                 self._emit("inc", "a")
             elif step_val == -1 or step_val == 0xFF:
                 self._emit("dec", "a")
@@ -4364,7 +4424,13 @@ class CodeGenerator:
         # Increment
         self._emit_label(incr_label)
         self._gen_load(index_var)
-        if step_val == 1:
+        if not step_is_const:
+            self._emit("push", "hl")
+            self._gen_expr_to_hl(step_expr)
+            self._emit("ex", "de,hl")
+            self._emit("pop", "hl")
+            self._emit("add", "hl,de")
+        elif step_val == 1:
             self._emit("inc", "hl")
         elif step_val == -1 or step_val == 0xFFFF:
             self._emit("dec", "hl")
@@ -6268,7 +6334,8 @@ class CodeGenerator:
                     return DataType.BYTE if name.upper() == 'MON2' else DataType.ADDRESS
 
         use_stack = True
-        if sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant and not sym.is_external:
+        if (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
+                and not sym.is_external and not sym.is_public):
             use_stack = False
 
         if use_stack:
