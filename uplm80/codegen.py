@@ -402,11 +402,64 @@ class CodeGenerator:
     # "call 5" would call into whatever happens to live at absolute 0005H.
     # The names match DRI's X0100.ASM, which is how PL/M-80 itself got these
     # relocated.
+    # The names carry the compiler's own ``??`` prefix.  A PL/M-80 identifier
+    # cannot contain a question mark, so nothing the programmer writes can
+    # collide with them - and something does: UTIL7/DM.PLM declares a variable
+    # called ``bdos``, and a plain ``BDOS`` extern resolved to that variable
+    # instead of the BDOS entry, turning every ``call 5`` into a call into the
+    # data segment.
     _PAGE_ZERO = {
-        0x0000: "BOOT",
-        0x0005: "BDOS",
-        0x0006: "MAXB",
+        0x0000: "??BOOT",
+        0x0005: "??BDOS",
+        0x0006: "??MAXB",
     }
+
+    # Bytes of stack a mode carves out of the program image.  CP/M mode is
+    # absent because it takes the stack from the BDOS pointer instead.
+    _STACK_BYTES = {Mode.BARE: 64, Mode.MPM: 512}
+
+    def _emit_entry_stack(self) -> None:
+        """Emit the stack setup that runs before the module's first statement.
+
+        Under CP/M the stack comes from the BDOS pointer at 0006H, which hands
+        the program everything between its end and the BDOS.  That takes two
+        instructions and four bytes.  DRI's PL/M-80 emitted one instruction and
+        three bytes, ``LXI SP,stack``, and its sources depend on that width:
+        they reach their own entry point through
+
+            declare jump byte data (0c3h),
+                    jadr address data (.start-3);
+
+        so the program is entered by a jump to three bytes in front of the first
+        statement.  With a four-byte prologue that jump lands one byte inside
+        the ``LHLD 0006H`` operand: the program runs on whatever SP it was given
+        and eventually walks the stack out of its own memory segment.  MP/M mode
+        therefore emits the three-byte form, over a stack inside the image, the
+        way DRI did - ``ld sp,nn`` also cannot be shortened by the peephole, the
+        way a jump to nearby code would be.
+        """
+        if self.mode == Mode.MPM:
+            self._emit("ld", "sp,??STACK")
+            self._needs_stack = True
+        else:
+            self._emit("ld", f"hl,({self._pz(0x0006)})")
+            self._emit("ld", "sp,hl")
+
+    def _emit_stack_storage(self) -> None:
+        """Emit the stack buffer, for the modes that carry their own.
+
+        Only the module that sets SP needs one.  A program linked from several
+        PL/M modules compiles each separately, and giving every one its own
+        buffer would waste the space in all but the module holding the entry
+        code.
+        """
+        size = self._STACK_BYTES.get(self.mode)
+        if not size or not self._needs_stack:
+            return
+        self._emit()
+        self._emit(comment=f"Stack storage ({size} bytes)")
+        self._emit("ds", str(size))
+        self._emit_label("??STACK")   # label above the buffer: SP starts here
 
     def _pz(self, addr: int) -> str:
         """Render a page-zero address: a literal, or an extern under MP/M."""
@@ -441,6 +494,10 @@ class CodeGenerator:
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
         self._page_zero_refs: set[str] = set()
+        # Whether this module sets SP and so needs the ??STACK buffer.
+        self._needs_stack = False
+        # Names declared AT(.MEMORY); emitted as labels beside __END__.
+        self._memory_aliases: list[str] = []
         self.literal_macros: dict[str, str] = {}  # LITERALLY macro expansions
         self.block_scope_counter = 0  # Counter for unique DO block scopes
         # Procedures declared at the head of a DO block.  They are
@@ -1522,6 +1579,8 @@ class CodeGenerator:
         self.needs_runtime = set()
         self.needs_end_symbol = False
         self._page_zero_refs = set()
+        self._needs_stack = False
+        self._memory_aliases = []
         self.literal_macros = {}
 
         shape = module_shape(module)
@@ -1605,13 +1664,13 @@ class CodeGenerator:
             self._emit(comment="Entry point")
             if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS, call main, return to OS
-                self._emit("ld", f"hl,({self._pz(0x0006)})")
-                self._emit("ld", "sp,hl")
+                self._emit_entry_stack()
                 self._emit("call", entry_proc_name)
                 self._emit("jp", self._pz(0x0000))  # Warm boot to return to CP/M
             else:
                 # BARE: Use locally-defined stack, jump to entry
                 self._emit("ld", "sp,??STACK")
+                self._needs_stack = True
                 self._emit("jp", entry_proc_name)
 
         # Generate code for module-level statements
@@ -1620,11 +1679,11 @@ class CodeGenerator:
             self._emit(comment="Module initialization code")
             if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS address at 0006H
-                self._emit("ld", f"hl,({self._pz(0x0006)})")
-                self._emit("ld", "sp,hl")
+                self._emit_entry_stack()
             else:
                 # BARE: Use locally-defined stack
                 self._emit("ld", "sp,??STACK")
+                self._needs_stack = True
             for stmt in shape.stmts:
                 self._gen_stmt(stmt)
             # For CPM mode, add warm boot after module statements
@@ -1690,12 +1749,8 @@ class CodeGenerator:
             self._emit_label("??AUTO")
             self._emit("ds", str(self.total_auto_storage))
 
-        # Emit stack storage for BARE mode
-        if self.mode == Mode.BARE:
-            self._emit()
-            self._emit(comment="Stack storage (64 bytes)")
-            self._emit("ds", "64")
-            self._emit_label("??STACK")  # Label after buffer (top of stack)
+        # Emit stack storage for the modes that carry their own
+        self._emit_stack_storage()
 
         # Note: For CPM mode, stack is provided by CP/M (set from BDOS address at 0006H).
         # For BARE mode, stack storage (??STACK) is emitted above.
@@ -1705,6 +1760,8 @@ class CodeGenerator:
         if self.needs_end_symbol:
             self._emit()
             self._emit_label("__END__")
+            for alias in self._memory_aliases:
+                self._emit_label(alias)
 
         # Page-zero references have to be declared so the linker resolves them
         # and, for MP/M relocatable output, records them in the bitmap.
@@ -1743,6 +1800,8 @@ class CodeGenerator:
         self.needs_runtime = set()
         self.needs_end_symbol = False
         self._page_zero_refs = set()
+        self._needs_stack = False
+        self._memory_aliases = []
         self.literal_macros = {}
 
         # Compute the shape view for each module once.
@@ -1829,10 +1888,10 @@ class CodeGenerator:
             self._emit()
             self._emit(comment="Module initialization")
             if self.mode in (Mode.CPM, Mode.MPM):
-                self._emit("ld", f"hl,({self._pz(0x0006)})")
-                self._emit("ld", "sp,hl")
+                self._emit_entry_stack()
             else:
                 self._emit("ld", "sp,??STACK")
+                self._needs_stack = True
             for stmt in first_module_stmts:
                 self._gen_stmt(stmt)
             if self.mode in (Mode.CPM, Mode.MPM):
@@ -1842,12 +1901,12 @@ class CodeGenerator:
             self._emit()
             self._emit(comment="Entry point")
             if self.mode in (Mode.CPM, Mode.MPM):
-                self._emit("ld", f"hl,({self._pz(0x0006)})")
-                self._emit("ld", "sp,hl")
+                self._emit_entry_stack()
                 self._emit("call", entry_proc_name)
                 self._emit("jp", self._pz(0x0000))
             else:
                 self._emit("ld", "sp,??STACK")
+                self._needs_stack = True
                 self._emit("call", entry_proc_name)
 
         # Procedures hoisted out of DO blocks in the module body.
@@ -1910,18 +1969,16 @@ class CodeGenerator:
             self._emit_label("??AUTO")
             self._emit("ds", str(self.total_auto_storage))
 
-        # Emit stack storage for BARE mode
-        if self.mode == Mode.BARE:
-            self._emit()
-            self._emit(comment="Stack storage (64 bytes)")
-            self._emit("ds", "64")
-            self._emit_label("??STACK")
+        # Emit stack storage for the modes that carry their own
+        self._emit_stack_storage()
 
         # Define __END__ label if program uses .MEMORY built-in
         # __END__ marks the first free byte after all code/data
         if self.needs_end_symbol:
             self._emit()
             self._emit_label("__END__")
+            for alias in self._memory_aliases:
+                self._emit_label(alias)
 
         # Page-zero references have to be declared so the linker resolves them
         # and, for MP/M relocatable output, records them in the bitmap.
@@ -2211,7 +2268,13 @@ class CodeGenerator:
             )
         elif initial_values_nodes:
             self.data_segment.append(AsmLine(label=asm_name))
-            self._emit_initial_values(initial_values_nodes, data_type or DataType.BYTE)
+            self._emit_initial_values(
+                initial_values_nodes,
+                data_type or DataType.BYTE,
+                struct_members=struct_members,
+                dimension=dimension,
+                size=size,
+            )
         elif use_shared:
             # Using shared automatic storage - no individual allocation needed
             pass
@@ -2246,27 +2309,49 @@ class CodeGenerator:
             if isinstance(loc_operand, P.Identifier):
                 ref_name_text = ident_text(loc_operand.name)
                 if ref_name_text.upper() == "MEMORY":
+                    # AT(.MEMORY) is the first free byte after the program, so
+                    # the name has to carry the address of __END__ - which is
+                    # only known at the end of the file.  Emit it as a LABEL
+                    # beside __END__ rather than an EQU here: a forward label
+                    # reference resolves on the assembler's second pass, and a
+                    # forward EQU does not.  UTIL7/DSE.PLM declares its hash
+                    # table this way and indexes it from three places above the
+                    # declaration; as an EQU all three read zero, so SDIR
+                    # cleared 128 entries over page zero and took out the BDOS
+                    # entry with them.
                     self.needs_end_symbol = True
-                    # SET (not EQU) — forward reference to __END__ at file end.
-                    self.data_segment.append(
-                        AsmLine(label=asm_name, opcode="SET", operands="__END__")
-                    )
+                    if asm_name and asm_name not in self._memory_aliases:
+                        self._memory_aliases.append(asm_name)
                 else:
                     ref_sym = self.symbols.lookup(ref_name_text)
                     if ref_sym and ref_sym.is_external:
-                        # AT(.external) — alias the external's name; no directive.
-                        sym.asm_name = (
+                        # AT(.external) — alias the external's name, so later
+                        # references name the external directly.
+                        ref_asm = (
                             ref_sym.asm_name if ref_sym.asm_name
                             else self._mangle_name(ref_name_text)
                         )
+                        sym.asm_name = ref_asm
+                        # An EQU as well, because a reference can come BEFORE
+                        # the declaration: UTIL5/SUB.PLM initialises a
+                        # structure with `.a$buff' in the same DECLARE that
+                        # goes on to declare `a$buff ... AT(.tbuff)'.  Without
+                        # it that forward reference has no definition at all.
+                        if asm_name and asm_name != ref_asm:
+                            self.data_segment.append(
+                                AsmLine(label=asm_name, opcode="EQU",
+                                        operands=ref_asm)
+                            )
                     else:
                         ref_asm = (
                             ref_sym.asm_name if ref_sym and ref_sym.asm_name
                             else self._mangle_name(ref_name_text)
                         )
-                        # SET allows forward references.
+                        # EQU: one value everywhere, forward reference or
+                        # not.  A SET symbol would read as zero above its
+                        # definition.
                         self.data_segment.append(
-                            AsmLine(label=asm_name, opcode="SET", operands=ref_asm)
+                            AsmLine(label=asm_name, opcode="EQU", operands=ref_asm)
                         )
                 return
 
@@ -2300,12 +2385,12 @@ class CodeGenerator:
                             )
                         elif offset == 0:
                             self.data_segment.append(
-                                AsmLine(label=asm_name, opcode="SET", operands=base_asm)
+                                AsmLine(label=asm_name, opcode="EQU", operands=base_asm)
                             )
                         else:
                             self.data_segment.append(
                                 AsmLine(
-                                    label=asm_name, opcode="SET",
+                                    label=asm_name, opcode="EQU",
                                     operands=f"{base_asm}+{offset}",
                                 )
                             )
@@ -2372,25 +2457,9 @@ class CodeGenerator:
             elif isinstance(val, P.LocationOf):
                 # Address-of expression: .variable or .procedure
                 operand = val.operand
-                if isinstance(operand, P.Identifier):
-                    name = ident_text(operand.name)
-                    sym = None
-                    # Search in current scope hierarchy
-                    if self.current_proc:
-                        parts = self.current_proc.split('$')
-                        for i in range(len(parts), 0, -1):
-                            scoped_name = '$'.join(parts[:i]) + '$' + name
-                            sym = self.symbols.lookup(scoped_name)
-                            if sym:
-                                break
-                    if sym is None:
-                        sym = self.symbols.lookup(name)
-                    asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
-                    target.append(
-                        AsmLine(opcode="dw", operands=asm_name)
-                    )
-                else:
-                    raise CodeGenError(f"Unsupported operand in DATA location expression: {operand}")
+                target.append(
+                    AsmLine(opcode="dw", operands=self._location_operand(operand))
+                )
             elif isinstance(val, P.BinaryOp):
                 # Binary expression like .name-3 or name+offset
                 expr_str = self._data_expr_to_string(val)
@@ -2404,6 +2473,48 @@ class CodeGenerator:
             elif isinstance(val, P.ParenExpr):
                 # Parenthesised single value — unwrap and re-emit.
                 self._emit_data_values([val.inner], dtype, inline=inline)
+            else:
+                raise CodeGenError(
+                    f"Unsupported value in DATA/INITIAL: {type(val).__name__}")
+
+    def _location_operand(self, operand) -> str:
+        """Assembly operand for the target of a `.' address-of in DATA/INITIAL.
+
+        ``.name`` is the symbol; ``.name(n)`` is the n-th element of it, which
+        DRI's sources use to point into an array - MP/M II's UTIL7/DM.PLM
+        initialises a structure with ``.buff(0)`` and ``.fcb(0)``.  The offset
+        is in elements, so it is scaled by the element width.
+        """
+        if isinstance(operand, P.ParenExpr):
+            return self._location_operand(operand.inner)
+        if isinstance(operand, P.Identifier):
+            return self._data_expr_to_string(operand)
+        if isinstance(operand, P.Call):
+            base = self._data_expr_to_string(operand.callee)
+            args = list(operand.args or [])
+            if len(args) != 1 or not isinstance(args[0], P.NumberLiteral):
+                raise CodeGenError(
+                    f"Unsupported subscript in DATA location expression: {operand}")
+            index = number_value(args[0])
+            if index == 0:
+                return base
+            width = 1
+            if isinstance(operand.callee, P.Identifier):
+                sym = self._lookup_scoped(ident_text(operand.callee.name))
+                if sym is not None and sym.data_type != DataType.BYTE:
+                    width = 2
+            return f"{base}+{self._format_number(index * width)}"
+        raise CodeGenError(f"Unsupported operand in DATA location expression: {operand}")
+
+    def _lookup_scoped(self, name: str):
+        """Look a name up in the enclosing procedure scopes, then at module level."""
+        if self.current_proc:
+            parts = self.current_proc.split('$')
+            for i in range(len(parts), 0, -1):
+                sym = self.symbols.lookup('$'.join(parts[:i]) + '$' + name)
+                if sym:
+                    return sym
+        return self.symbols.lookup(name)
 
     def _data_expr_to_string(self, expr) -> str:
         """Convert a typed DATA expression to an assembly operand string."""
@@ -2425,7 +2536,9 @@ class CodeGenerator:
                 sym = self.symbols.lookup(name)
             return sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
         elif isinstance(expr, P.LocationOf):
-            return self._data_expr_to_string(expr.operand)
+            return self._location_operand(expr.operand)
+        elif isinstance(expr, P.Call):
+            return self._location_operand(expr)
         elif isinstance(expr, P.ParenExpr):
             return self._data_expr_to_string(expr.inner)
         elif isinstance(expr, P.BinaryOp):
@@ -2445,18 +2558,56 @@ class CodeGenerator:
         else:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
 
-    def _emit_initial_values(self, values, dtype: DataType) -> None:
-        """Emit typed INITIAL values to the data segment."""
-        for val in values:
-            if isinstance(val, P.NumberLiteral):
-                directive = "db" if dtype == DataType.BYTE else "dw"
-                self.data_segment.append(
-                    AsmLine(opcode=directive, operands=self._format_number(number_value(val)))
-                )
-            elif isinstance(val, P.StringLiteral):
-                self.data_segment.append(
-                    AsmLine(opcode="db", operands=self._escape_string(string_value(val)))
-                )
+    def _initial_member_widths(self, struct_members, dimension):
+        """Byte width of each slot a STRUCTURE initialiser fills, in order."""
+        if not struct_members:
+            return None
+        one = []
+        for m in struct_members:
+            width = 1 if m.data_type == DataType.BYTE else 2
+            one.extend([width] * (m.dimension or 1))
+        return one * (dimension or 1)
+
+    def _initial_value_width(self, val, dtype: DataType) -> int:
+        """Bytes a single INITIAL value occupies once emitted."""
+        if isinstance(val, P.StringLiteral):
+            return len(string_value(val))
+        if isinstance(val, P.ParenExpr):
+            return self._initial_value_width(val.inner, dtype)
+        if isinstance(val, P.LocationOfList):
+            return 2 * len(val.values or [])
+        return 1 if dtype == DataType.BYTE else 2
+
+    def _emit_initial_values(self, values, dtype: DataType,
+                             struct_members=None, dimension=None,
+                             size: int | None = None) -> None:
+        """Emit typed INITIAL values to the data segment.
+
+        A STRUCTURE initialiser supplies one value per member and the members
+        have their own widths, so the list cannot be emitted at a single width
+        the way an array's can.  Emitting every value as a byte both wrote the
+        wrong values and left the structure short, which moved everything
+        declared after it: MP/M II's UTIL7/DM.PLM declares a seven-member,
+        ten-byte parser control block and got five bytes of zero, so SDIR
+        scanned its command line through a null pointer and blanked the BDOS
+        entry in page zero.
+
+        Whatever the list does not fill is reserved, so the next declaration
+        still lands where it should.
+        """
+        widths = self._initial_member_widths(struct_members, dimension)
+        emitted = 0
+        for i, val in enumerate(values):
+            if widths is not None and i < len(widths):
+                slot = DataType.BYTE if widths[i] == 1 else DataType.ADDRESS
+            else:
+                slot = dtype
+            self._emit_data_values([val], slot)
+            emitted += self._initial_value_width(val, slot)
+        if size is not None and emitted < size:
+            self.data_segment.append(
+                AsmLine(opcode="ds", operands=str(size - emitted))
+            )
 
     def _gen_proc_decl(self, decl) -> None:
         """Generate code for a procedure declaration.
