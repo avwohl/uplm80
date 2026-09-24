@@ -7023,10 +7023,15 @@ class CodeGenerator:
             return DataType.BYTE
 
         if name == "LOW":
-            arg_type = self._gen_expr(args[0])
+            arg = unwrap_paren(args[0])
+            arg_type = self._gen_expr(arg)
             if arg_type == DataType.ADDRESS:
-                # Check if A already has L (from embedded assign to BYTE)
-                if self.a_has_l:
+                # A already holds L when the operand is itself an embedded
+                # assignment to a BYTE, which set the flag last. When the
+                # assignment is only part of it -- `LOW((b := w) + 5)' --
+                # the flag outlives code that never went through _gen_expr
+                # (`ld de,5 / add hl,de'), and A holds L of w, not the sum.
+                if self.a_has_l and isinstance(arg, P.EmbeddedAssign):
                     self.a_has_l = False  # Consume the flag
                 else:
                     self._emit("ld", "a,l")  # Get low byte into A

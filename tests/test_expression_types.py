@@ -613,6 +613,28 @@ call run;
 """, [0xFF, 0xFF, 0, 0x1234])
 
 
+def test_low_of_arithmetic_on_an_embedded_assignment():
+    """The embedded assignment to a BYTE sets a flag saying A holds L, for
+    LOW((b := w)); arithmetic on it that never goes back through _gen_expr
+    (`ld de,5 / add hl,de') left the flag set, and LOW took L of w."""
+    _check("""
+declare b byte, (w, v, r) address;
+run: procedure;
+  w = 1234h; v = 0101h;
+  r = low((b := w) + 5); call ph(r);
+  r = low((b := w) + v); call ph(r);
+  r = low((b := w) - 1); call ph(r);
+  r = low(shl((b := w), 1)); call ph(r);
+  r = low(not (b := w)); call ph(r);
+  r = low(-(b := w)); call ph(r);
+  r = low((b := w) * 2); call ph(r);
+  r = low((b := w) / 2); call ph(r);
+  r = low((b := w)); call ph(r); call ph(b);
+end run;
+call run;
+""", [0x39, 0x35, 0x33, 0x68, 0xCB, 0xCC, 0x68, 0x1A, 0x34, 0x34])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])
