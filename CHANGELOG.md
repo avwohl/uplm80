@@ -377,6 +377,12 @@ Each fix has a regression test that fails without it.
   it is read from the stack as it should be.
 - **A procedure named like a register,** `H: PROCEDURE`, is not renamed as a
   variable of that name is, and the assembler rejects `call H`.
+- **A counted loop trusts that a pointer made from `.x` reaches only `x`.**
+  A BYTE `DO i = 0 TO n` whose body does not name `i` counts its passes in
+  B, and is not used when anything can reach `i` another way: a procedure
+  that names it, `.i` anywhere, `i` AT or BASED. A pointer computed from the
+  address of the variable declared before `i` still can, and a store
+  through it does not end the loop. DRI's compiler never counts a loop.
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
 

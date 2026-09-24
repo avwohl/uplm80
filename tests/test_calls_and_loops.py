@@ -7,7 +7,9 @@ wraps (5.1.4). Each case here printed something else at some level before
 its fix.
 """
 
-from tests.test_expression_types import _check
+import re
+
+from tests.test_expression_types import _PRELUDE, _asm, _check
 
 
 def test_a_byte_argument_fills_an_address_parameter():
@@ -257,3 +259,58 @@ call p3(4, 6, g(1, 1)); call ph(r1); call ph(r2); call ph(r3);
 call p3(g(3, 4), 1, g(1, 1)); call ph(r1); call ph(r2); call ph(r3);
 r1 = f2(5, g(1, 2)); call ph(r1);
 """, [5, 3, 4, 6, 2, 7, 1, 2, 0x53])
+
+
+def test_every_pass_tests_the_carry_as_dri_does():
+    """DRI's code tests the step's carry on every pass, even where the limit
+    and the step cannot carry each other: UTIL3/LOAD.COM's `DO I = 0 TO 127'
+    ends `LXI H,I / INR M / JNZ 0629H', and UTIL6/ED.PRL steps an ADDRESS
+    index with `LXI D,1 / DAD D / SHLD I / JNC'. So a body that moves the
+    index past the limit ends the loop at the step that carries, however it
+    moved it -- here through a pointer to the variable declared next to it,
+    which no analysis of the body sees. uplm80 left the carry test out of
+    an ADDRESS loop whose constant limit and step fit, unless it saw the
+    body change the index: the first loop went round again from 0 and ran
+    107 times. (The BYTE loops read their index, or they would be counted
+    in B, which trusts that nothing but the loop moves the index.)"""
+    src = """
+declare (pad, w) address, (pb, b) byte, (n, p, q) address;
+declare wp based p address, bp based q byte;
+run: procedure;
+  p = .pad + 2; q = .pb + 1;
+  w = 1234h; if wp <> 1234h then call ph(0eeeeh);
+  b = 12h; if bp <> 12h then call ph(0eeeeh);
+  n = 0; do w = 0 to 100; n = n + 1; if n = 6 then wp = 0ffffh; end;
+  call ph(n); call ph(w);
+  n = 0; do w = 0 to 1000 by 16; n = n + 1; if n = 3 then wp = 0fff8h; end;
+  call ph(n); call ph(w);
+  n = 0; do b = 0 to 100; n = n + 1; if b = 5 then bp = 0ffh; end;
+  call ph(n); call ph(b);
+  n = 0; do b = 0 to 11 by 2; n = n + 1; if b = 4 then b = 254; end;
+  call ph(n); call ph(b);
+end run;
+call run;
+"""
+    _check(src, [6, 0, 3, 8, 6, 0, 3, 0])
+    # The back edge is conditional in every one of those loops: a jump on
+    # the carry (or the INC's zero) to the test at the top, never a plain one.
+    asm = _asm(_PRELUDE + src + "\nend t;\n", 2)
+    run = asm[asm.index("RUN:"):]
+    assert not re.search(r"\n\t(jp|jr)\s+\?\?TEST", run), run
+
+
+def test_a_loop_whose_index_is_moved_past_the_limit_stops_at_the_carry():
+    """The verification's f4_index_past_limit: a body that sets the index
+    past the limit, so that the step carries out, ends the loop there."""
+    _check("""
+declare (i, n) byte, w address;
+run: procedure;
+  n = 0; do i = 0 to 11 by 2; if i = 4 then i = 254; n = n + 1; end;
+  call ph(n); call ph(i);
+  n = 0; do i = 0 to 10; if i = 3 then i = 255; n = n + 1; end;
+  call ph(n); call ph(i);
+  n = 0; do w = 0 to 100; if w = 5 then w = 0ffffh; n = n + 1; end;
+  call ph(n); call ph(w);
+end run;
+call run;
+""", [3, 0, 4, 0, 6, 0])
