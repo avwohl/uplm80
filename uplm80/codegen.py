@@ -39,7 +39,6 @@ from .ast_view import (
     binop_kind,
     unop_kind,
     ident_text,
-    parse_plm_number,
     number_value,
     string_value,
     string_bytes,
@@ -2395,10 +2394,9 @@ class CodeGenerator:
             target_segment.append(AsmLine(label=asm_name))
             self._emit_value_list(
                 data_values_nodes or initial_values_nodes,
-                data_type or DataType.BYTE,
-                struct_members=struct_members,
-                dimension=(dimension or 1) * n_names if struct_members else dimension,
-                size=size * n_names,
+                self._scalar_widths(data_type or DataType.BYTE, struct_members,
+                                    dimension) * n_names,
+                spare=1 if (data_type or DataType.BYTE) == DataType.BYTE else 2,
                 inline=bool(data_values_nodes) and self.emit_data_inline,
             )
         elif use_shared:
@@ -2724,10 +2722,12 @@ class CodeGenerator:
                 count += 1
         return max(1, count)
 
-    def _initial_member_widths(self, struct_members, dimension):
-        """Byte width of each slot a STRUCTURE initialiser fills, in order."""
+    @staticmethod
+    def _scalar_widths(dtype: DataType, struct_members, dimension) -> list[int]:
+        """Byte width of each scalar a declaration holds, in order - the slots a
+        DATA or INITIAL list fills."""
         if not struct_members:
-            return None
+            return [1 if dtype == DataType.BYTE else 2] * (dimension or 1)
         one = []
         for m in struct_members:
             width = 1 if m.data_type == DataType.BYTE else 2
@@ -2745,10 +2745,13 @@ class CodeGenerator:
                 flat.append(val)
         return flat
 
-    def _emit_value_list(self, values, dtype: DataType,
-                         struct_members=None, dimension=None,
-                         size: int | None = None, inline: bool = False) -> None:
+    def _emit_value_list(self, values, widths: list[int], spare: int,
+                         inline: bool = False) -> None:
         """Emit a DATA or INITIAL value list, and reserve what it leaves unfilled.
+
+        ``widths`` is the byte width of each scalar the list fills
+        (:meth:`_scalar_widths`), ``spare`` the width a value past the last of
+        them takes.
 
         INITIAL goes to the data segment; DATA to the same place, or inline in
         the code when ``inline`` is set.  DATA is INITIAL stored with the code
@@ -2781,12 +2784,9 @@ class CodeGenerator:
         Whatever the list does not fill is reserved, so the next declaration
         still lands where it should.
         """
-        widths = self._initial_member_widths(struct_members, dimension)
-        if widths is None:
-            widths = []
-        # Past the declared scalars - a list longer than its declaration -
-        # the values keep the declaration's own width, as they always have.
-        spare = 1 if dtype == DataType.BYTE else 2
+        # Past the declared scalars - a list longer than its declaration - the
+        # values keep the declaration's own width (``spare``), as they always
+        # have: `DECLARE MSG BYTE DATA ('HELLO$')' is an idiom.
         target = self.code_data_segment if inline else self.data_segment
         slot = 0
         emitted = 0
@@ -2811,9 +2811,9 @@ class CodeGenerator:
                 [val], DataType.BYTE if width == 1 else DataType.ADDRESS,
                 inline=inline)
             emitted += width
-        if size is not None and emitted < size:
+        if emitted < sum(widths):
             target.append(
-                AsmLine(opcode="ds", operands=str(size - emitted))
+                AsmLine(opcode="ds", operands=str(sum(widths) - emitted))
             )
 
     def _gen_proc_decl(self, decl) -> None:
