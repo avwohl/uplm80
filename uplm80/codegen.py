@@ -38,6 +38,8 @@ from .ast_view import (
     binop_kind,
     unop_kind,
     ident_text,
+    make_binary,
+    make_unary,
     parse_plm_number,
     number_value,
     string_value,
@@ -50,7 +52,7 @@ from .ast_view import (
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
-from .runtime import get_runtime_library
+from .runtime import get_runtime_library, plm_div, plm_mod
 
 
 # Map ast_view's DataType (used by typed AST helpers) to the legacy
@@ -615,6 +617,13 @@ class CodeGenerator:
                     return left_val | right_val
                 elif op == BinaryOpKind.XOR:
                     return left_val ^ right_val
+                elif op == BinaryOpKind.MUL:
+                    return (left_val * right_val) & 0xFFFF
+                # PL/M-80's divide: x / 0 is 0FFFFH, x MOD 0 is x.
+                elif op == BinaryOpKind.DIV:
+                    return plm_div(left_val, right_val)
+                elif op == BinaryOpKind.MOD:
+                    return plm_mod(left_val, right_val)
         return None
 
     def _check_impossible_comparison(self, left, right, op) -> None:
@@ -2561,6 +2570,17 @@ class CodeGenerator:
                     AsmLine(opcode="dw", operands=self._location_operand(operand))
                 )
             elif isinstance(val, P.BinaryOp):
+                const_val = self._try_eval_const(val)
+                if const_val is not None:
+                    # A constant expression is evaluated here, the way PL/M-80
+                    # evaluates it (the assembler would reject `7/0', and
+                    # knows nothing of `7 MOD 0' = 7), and takes the width of
+                    # the slot like any other value.
+                    directive = "db" if dtype == DataType.BYTE else "dw"
+                    target.append(AsmLine(
+                        opcode=directive,
+                        operands=self._format_number(const_val & 0xFFFF)))
+                    continue
                 # Binary expression like .name-3 or name+offset
                 expr_str = self._data_expr_to_string(val)
                 target.append(
@@ -2649,11 +2669,15 @@ class CodeGenerator:
                 BinaryOpKind.SUB: '-',
                 BinaryOpKind.MUL: '*',
                 BinaryOpKind.DIV: '/',
+                BinaryOpKind.MOD: ' MOD ',
                 BinaryOpKind.AND: ' AND ',
                 BinaryOpKind.OR: ' OR ',
                 BinaryOpKind.XOR: ' XOR ',
             }
-            op = op_map.get(binop_kind(expr), '+')
+            op = op_map.get(binop_kind(expr))
+            if op is None:
+                raise CodeGenError(
+                    f"Unsupported operator in DATA expression: {binop_kind(expr).name}")
             return f"({left}{op}{right})"
         else:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
@@ -3115,7 +3139,10 @@ class CodeGenerator:
                 return
 
         # Evaluate the value expression (result in A for BYTE, HL for ADDRESS)
-        value_type = self._gen_expr(stmt.value)
+        value = stmt.value
+        if all(self._is_byte_target(t) for t in targets):
+            value = self._low_byte_form(value)
+        value_type = self._gen_expr(value)
 
         # Store to each target (multiple assignment support)
         for i, target in enumerate(targets):
@@ -3304,6 +3331,8 @@ class CodeGenerator:
                                 self._emit("ld", f"a,{self._format_number(const)}")
                                 continue
                         # Evaluate arg - result in A (BYTE) or HL (ADDRESS)
+                        if param_type == DataType.BYTE:
+                            arg = self._low_byte_form(arg)
                         arg_type = self._gen_expr(arg)
                         if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
                             self._emit("ld", "a,l")
@@ -3334,6 +3363,8 @@ class CodeGenerator:
                             self._emit("ld", f"({param_asm}),a")
                             continue
 
+                    if param_type == DataType.BYTE:
+                        arg = self._low_byte_form(arg)
                     arg_type = self._gen_expr(arg)
                     if param_type == DataType.BYTE or arg_type == DataType.BYTE:
                         # BYTE param - ensure value is in A, use LD (addr),A
@@ -3412,6 +3443,8 @@ class CodeGenerator:
                     f"a,{self._format_number(number_value(value))}",
                 )
             else:
+                if return_type == DataType.BYTE:
+                    value = self._low_byte_form(value)
                 result_type = self._gen_expr(value)
                 # Return value is in A (BYTE) or HL (ADDRESS)
                 # If procedure returns BYTE but we have ADDRESS, convert
@@ -3469,7 +3502,7 @@ class CodeGenerator:
             pass
         else:
             # Fallback: evaluate condition and test result
-            result_type = self._gen_expr(stmt.condition)
+            result_type = self._gen_expr(self._low_byte_form(stmt.condition))
             self._emit_truth_test(result_type, false_target, jump_when_true=False)
 
         self.current_if_stmt = old_if_stmt  # Restore before generating body
@@ -3532,6 +3565,10 @@ class CodeGenerator:
         optimised jump was generated (caller skips the fallback),
         False otherwise.
         """
+        # A condition is its bit 0, and a comparison of two bytes is a byte
+        # compare, however wide the optimizer left them.
+        condition = self._narrowed_comparison(self._low_byte_form(condition))
+
         # Handle constant conditions. Truth is bit 0, not non-zero (see
         # _emit_truth_test), so `DO WHILE 2` never runs and `IF NOT TRUE`
         # with `TRUE LITERALLY '1'` -- NOT 1 is 0FEH -- is false.
@@ -3712,6 +3749,8 @@ class CodeGenerator:
         jump was generated, False if the caller should fall back to
         the generic ``_gen_expr`` + test-flags sequence.
         """
+        condition = self._narrowed_comparison(self._low_byte_form(condition))
+
         # Handle constant conditions - truth is bit 0, not non-zero.
         if isinstance(condition, P.NumberLiteral):
             if number_value(condition) & 1:
@@ -4144,7 +4183,7 @@ class CodeGenerator:
 
             # Try optimized condition jump, fallback to generic
             if not self._gen_condition_jump_false(stmt.condition, end_label):
-                result_type = self._gen_expr(stmt.condition)
+                result_type = self._gen_expr(self._low_byte_form(stmt.condition))
                 self._emit_truth_test(result_type, end_label, jump_when_true=False)
 
             # Loop body
@@ -5545,6 +5584,7 @@ class CodeGenerator:
 
     def _gen_binary(self, expr) -> DataType:
         """Generate code for a typed binary expression."""
+        expr = self._narrowed_comparison(expr)
         op = binop_kind(expr)
         left = unwrap_paren(expr.left)
         right = unwrap_paren(expr.right)
@@ -6065,9 +6105,72 @@ class CodeGenerator:
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
 
+    def _unwidened(self, expr):
+        """``x`` when ``expr`` is ``DOUBLE(x)`` of a BYTE ``x``, else None.
+
+        The optimizer keeps a strength-reduced quotient or remainder ADDRESS
+        by wrapping it in DOUBLE (``x MOD 8`` is ``DOUBLE(x AND 7)``), since
+        in PL/M-80 one is an ADDRESS even of BYTE operands. That width only
+        shows where the value meets 16-bit arithmetic; a use that reads its
+        low byte, or compares it with another BYTE, gets the same answer
+        from ``x`` itself.
+        """
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Call) and len(expr.args) == 1:
+            callee = unwrap_paren(expr.callee)
+            if (isinstance(callee, P.Identifier)
+                    and ident_text(callee.name).upper() == 'DOUBLE'
+                    and self._get_expr_type(expr.args[0]) == DataType.BYTE):
+                return expr.args[0]
+        return None
+
+    def _low_byte_form(self, expr):
+        """``expr`` for a use that reads only its low byte (or bit 0).
+
+        The low byte of a sum, difference, bitwise result or complement
+        depends only on the low bytes of the operands, so a DOUBLE anywhere
+        in that tree can go.
+        """
+        inner = self._unwidened(expr)
+        if inner is not None:
+            return self._low_byte_form(inner)
+        e = unwrap_paren(expr)
+        if isinstance(e, P.BinaryOp) and binop_kind(e) in (
+                BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.AND,
+                BinaryOpKind.OR, BinaryOpKind.XOR):
+            left = self._low_byte_form(e.left)
+            right = self._low_byte_form(e.right)
+            if left is not e.left or right is not e.right:
+                return make_binary(binop_kind(e), left, right, pos=e.pos)
+        elif isinstance(e, P.UnaryOp):
+            operand = self._low_byte_form(e.operand)
+            if operand is not e.operand:
+                return make_unary(unop_kind(e), operand, pos=e.pos)
+        return expr
+
+    def _narrowed_comparison(self, expr):
+        """A comparison of ``DOUBLE(x)`` with a BYTE, as one of two BYTEs.
+
+        Both sides are then bytes zero-extended, which a byte compare orders
+        exactly as the 16-bit one does.
+        """
+        e = unwrap_paren(expr)
+        if not (isinstance(e, P.BinaryOp) and binop_kind(e) in self._COMPARISON_KINDS):
+            return expr
+        left = self._unwidened(e.left)
+        right = self._unwidened(e.right)
+        if left is None and right is None:
+            return expr
+        left = e.left if left is None else left
+        right = e.right if right is None else right
+        if (self._get_expr_type(left) != DataType.BYTE
+                or self._get_expr_type(right) != DataType.BYTE):
+            return expr
+        return make_binary(binop_kind(e), left, right, pos=e.pos)
+
     def _gen_expr_to_a(self, expr) -> None:
         """Generate code to load an expression into A (for byte operations)."""
-        expr = unwrap_paren(expr)
+        expr = unwrap_paren(self._low_byte_form(expr))
         const_val = self._get_const_byte_value(expr)
         if const_val is not None:
             self._emit("ld", f"a,{self._format_number(const_val)}")
@@ -6160,6 +6263,9 @@ class CodeGenerator:
         if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
             self._gen_call_expr(expr)
             return
+
+        # An index is zero-extended anyway.
+        index = unwrap_paren(self._unwidened(index) or index)
 
         elem_size = 1
         if isinstance(base, P.Identifier):
@@ -6460,6 +6566,8 @@ class CodeGenerator:
                             if const is not None:
                                 self._emit("ld", f"a,{self._format_number(const)}")
                                 continue
+                        if param_type == DataType.BYTE:
+                            arg = self._low_byte_form(arg)
                         arg_type = self._gen_expr(arg)
                         if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
                             self._emit("ld", "a,l")
@@ -6486,6 +6594,8 @@ class CodeGenerator:
                             self._emit("ld", f"({param_asm}),a")
                             continue
 
+                    if param_type == DataType.BYTE:
+                        arg = self._low_byte_form(arg)
                     arg_type = self._gen_expr(arg)
                     if param_type == DataType.BYTE or arg_type == DataType.BYTE:
                         if arg_type == DataType.ADDRESS:

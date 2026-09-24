@@ -5,6 +5,13 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 
 ## Unreleased
 
+Division and `MOD` now give what DRI's PL/M-80 gives for every operand pair,
+zero divisors included, on every path uplm80 computes them by: the runtime
+routines, constant folding, strength reduction and DATA/INITIAL values.
+`tests/test_divmod_dri.py` runs DRI's own divide routine on an 8080
+interpreter as the reference and compares a compiled table of divisions
+against it at `-O0` to `-O3`.
+
 ### Fixed
 
 - **`x MOD 0` was 0; PL/M-80 gives `x`.** DRI's PL/M-80 sends every `/` and
@@ -24,6 +31,25 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 - **`SHR(x, 7)` lost bit 15,** and with it `x / 128`, which strength reduction
   turns into that shift: 8000H / 128 came out 0 instead of 100H. The result of
   a shift right by 7 has nine bits.
+- **The compile-time forms of `/` and `MOD` disagreed with the runtime.**
+  * Constant folding left `c / 0` and `c MOD 0` to the runtime; they now fold
+    to 0FFFFH and `c`.
+  * `0 / x` was folded to 0, but `0 / 0` is 0FFFFH, so the rule is gone.
+    `x MOD 1` and `0 MOD x` (both 0) dropped a procedure call in the operand
+    they discard; they now keep it.
+  * A strength-reduced quotient or remainder of a BYTE became a BYTE:
+    `x MOD 8` turned into `x AND 7` and `x / 1` into `x`, so
+    `(x MOD 8) + 0FFH` wrapped at eight bits and `(x MOD 8) - 1` did not
+    borrow. They stay ADDRESS now (as `DOUBLE(x AND 7)`), and code generation
+    reads the byte itself wherever only the low byte is used or the value is
+    compared with a BYTE, so assignments, arguments, subscripts and
+    comparisons compile exactly as before.
+  * A constant expression in DATA or INITIAL that the optimizer had not
+    folded (any of them at `-O0`, and `c / 0` or `c MOD 0` at every level)
+    went to the assembler, which rejects `7/0`; `MOD` was written as `+`, and
+    in a BYTE list the value was a word. Such an expression is now evaluated
+    the way PL/M-80 evaluates it and takes the width of its slot. An operator
+    the assembler cannot evaluate is an error rather than a `+`.
 
 ## 0.3.6 — 2026-09-24
 

@@ -26,6 +26,8 @@ import tempfile
 
 import pytest
 
+from uplm80.ast_optimizer import ASTOptimizer
+from uplm80.ast_view import BinaryOpKind
 from uplm80.compiler import Compiler
 from uplm80.runtime import plm_div, plm_mod
 
@@ -164,6 +166,69 @@ def _asm(src: str, opt: int) -> str:
     return out
 
 
+# --- Compile time: the folder and the rewrites.
+
+def test_constant_folder_follows_the_oracle():
+    """`7 MOD 0' folds to 7 and `7 / 0' to 0FFFFH instead of being left alone."""
+    opt = ASTOptimizer(2)
+    for dividend in K_DIVIDENDS + A_VALS:
+        for divisor in K_DIVISORS + A_VALS:
+            q, r = dri_divide(dividend, divisor)
+            assert opt._eval_binary_const(BinaryOpKind.DIV, dividend, divisor) == q
+            assert opt._eval_binary_const(BinaryOpKind.MOD, dividend, divisor) == r
+
+
+def test_zero_over_a_variable_is_not_folded_to_zero():
+    """`0 / x' is 0FFFFH when x is 0, so it is not the constant 0."""
+    for opt in (1, 2, 3):
+        asm = _asm("""
+t: do;
+declare (x, r) address;
+r = 0 / x;
+end t;
+""", opt)
+        assert "??div16" in asm, opt
+
+
+def test_an_identity_does_not_drop_a_call():
+    """`f MOD 1', `0 MOD f' and `f / 1' still call f."""
+    for opt in (1, 2, 3):
+        for expr in ("f mod 1", "0 mod f", "f / 1"):
+            asm = _asm(f"""
+t: do;
+declare r address;
+f: procedure address external; end f;
+r = {expr};
+end t;
+""", opt)
+            assert "call\tF" in asm, (opt, expr)
+
+
+@pytest.mark.parametrize("use", [
+    "y = {e};",
+    "if ({e}) = 3 then call pb(1);",
+    "if ({e}) < y then call pb(1);",
+    "call pb({e});",
+    "buf({e}) = 0;",
+    "if {e} then call pb(1);",
+    "y = ({e}) + y;",
+])
+def test_a_byte_remainder_costs_nothing_where_its_width_does_not_show(use):
+    """`x MOD 8' is an ADDRESS, so it becomes DOUBLE(x AND 7); where only its
+    low byte is read, or it is compared with a BYTE, that must compile to
+    exactly what `x AND 7' does."""
+    def compile_with(expr):
+        asm = _asm(f"""
+t: do;
+declare (x, y) byte, buf(16) byte;
+pb: procedure (c) external; declare c byte; end pb;
+{use.format(e=expr)}
+end t;
+""", 2)
+        return [line for line in asm.splitlines() if not line.startswith(";")]
+    assert compile_with("x mod 8") == compile_with("x and 7")
+
+
 # --- End to end: compile a table of divisions, run it, compare with the oracle.
 
 def _cpmemu() -> str | None:
@@ -238,8 +303,13 @@ def _probe_stmts(expr: str) -> list[str]:
             f"call ph(({expr}) - 1);"]
 
 
-def _program() -> tuple[str, list[tuple[str, int]]]:
-    """PL/M source that prints every case, and the values it must print."""
+def _program(everything: bool) -> tuple[str, list[tuple[str, int]]]:
+    """PL/M source that prints every case, and the values it must print.
+
+    Without ``everything``, only the cases the runtime routines compute:
+    both operands variables, and constants that only -O3 propagates.
+    """
+    decls: list[str] = []
     body: list[str] = []
     expect: list[tuple[str, int]] = []
 
@@ -274,22 +344,84 @@ def _program() -> tuple[str, list[tuple[str, int]]]:
         body.extend(_probe_stmts(expr))
         check("propagated", expr, v)
 
+    if everything:
+        _compile_time_cases(tables, decls, body, check, expect)
+
     src = "\n".join([
         *_PRELUDE,
         "declare (a, b) address;",
         "declare (x, y, i, j) byte;",
         "declare av(*) address data (" + ", ".join(_hex(v) for v in A_VALS) + ");",
         "declare bv(*) byte data (" + ", ".join(_hex(v) for v in B_VALS) + ");",
+        *decls,
         *body,
         *_POSTLUDE,
     ])
     return src, expect
 
 
+def _compile_time_cases(tables, decls, body, check, expect) -> None:
+    """Cases with a constant operand: folding, strength reduction, DATA."""
+    # Constant divisor, variable dividend: strength reduction and folding.
+    for dname, dvals, dtab in tables:
+        dvar = "a" if dname == "A" else "x"
+        body.append(f"do i = 0 to {len(dvals) - 1};")
+        body.append(f"  {dvar} = {dtab}(i);")
+        for k in K_DIVISORS:
+            for expr in (f"{dvar} / {_hex(k)}", f"{dvar} mod {_hex(k)}"):
+                body.extend(_probe_stmts(expr))
+        body.append("end;")
+        for p in dvals:
+            for k in K_DIVISORS:
+                ops = (f"{dvar} / {_hex(k)}", f"{dvar} mod {_hex(k)}")
+                for expr, v in zip(ops, dri_divide(p, k)):
+                    check(f"{dname} {p:#x}", expr, v)
+
+    # Constant dividend, variable divisor.
+    for sname, svals, stab in tables:
+        svar = "b" if sname == "A" else "y"
+        body.append(f"do j = 0 to {len(svals) - 1};")
+        body.append(f"  {svar} = {stab}(j);")
+        for k in K_DIVIDENDS:
+            for expr in (f"{_hex(k)} / {svar}", f"{_hex(k)} mod {svar}"):
+                body.extend(_probe_stmts(expr))
+        body.append("end;")
+        for q in svals:
+            for k in K_DIVIDENDS:
+                ops = (f"{_hex(k)} / {svar}", f"{_hex(k)} mod {svar}")
+                for expr, v in zip(ops, dri_divide(k, q)):
+                    check(f"{sname} {q:#x}", expr, v)
+
+    # Both constant: folded at -O1 and above, the runtime at -O0.
+    for k in K_DIVIDENDS:
+        for m in K_DIVISORS:
+            ops = (f"{_hex(k)} / {_hex(m)}", f"{_hex(k)} mod {_hex(m)}")
+            for expr, v in zip(ops, dri_divide(k, m)):
+                body.extend(_probe_stmts(expr))
+                check("constants", expr, v)
+
+    # DATA and INITIAL values are constant expressions too.
+    dk = [(7, "mod", 3), (7, "/", 0), (7, "mod", 0), (0, "/", 0), (0, "mod", 0),
+          (0xFFFF, "mod", 0), (1000, "mod", 7), (1000, "/", 7), (256, "/", 256)]
+    bk = [(7, "mod", 3), (7, "mod", 0), (0, "mod", 0), (250, "/", 7),
+          (200, "mod", 0), (255, "mod", 16)]
+
+    def text(items):
+        return ", ".join(f"{_hex(p)} {op} {_hex(q)}" for p, op, q in items)
+
+    decls.append(f"declare dk(*) address data ({text(dk)});")
+    decls.append(f"declare bk(*) byte data ({text(bk)});")
+    decls.append(f"declare ik({len(dk)}) address initial ({text(dk)});")
+    for name, items in (("dk", dk), ("bk", bk), ("ik", dk)):
+        body.append(f"do i = 0 to last({name}); call ph({name}(i)); end;")
+        for p, op, q in items:
+            expect.append((f"{name}: {p} {op} {q}", dri_divide(p, q)[op != "/"]))
+
+
 @pytest.mark.parametrize("opt", [0, 1, 2, 3])
-def test_runtime_divisions_match_dri(opt):
+def test_compiled_divisions_match_dri(opt):
     """Every quotient and remainder the program prints is DRI's, at every -O."""
-    src, expect = _program()
+    src, expect = _program(everything=True)
     _compare(expect, _run(src, opt))
 
 

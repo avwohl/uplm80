@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import _plm_parser as P
+from .runtime import plm_div, plm_mod
 from .ast_view import (
     BinaryOpKind,
     UnaryOpKind,
@@ -1812,14 +1813,12 @@ class ASTOptimizer:
                 return (left - right) & mask
             elif kind == BinaryOpKind.MUL:
                 return (left * right) & mask
+            # PL/M-80's divide, zero divisor included: x / 0 is 0FFFFH and
+            # x MOD 0 is x, which is what ??div16 / ??mod16 give at run time.
             elif kind == BinaryOpKind.DIV:
-                if right == 0:
-                    return None
-                return (left // right) & mask
+                return plm_div(left, right)
             elif kind == BinaryOpKind.MOD:
-                if right == 0:
-                    return None
-                return (left % right) & mask
+                return plm_mod(left, right)
             elif kind == BinaryOpKind.AND:
                 return left & right
             elif kind == BinaryOpKind.OR:
@@ -1905,33 +1904,66 @@ class ASTOptimizer:
                     pos=pos,
                 )
 
-        # Divide by power of 2 -> shift right.
+        # Divide by power of 2 -> shift right. A quotient is an ADDRESS
+        # even of BYTE operands, and SHR's result is one.
         if kind == BinaryOpKind.DIV and _is_number(right):
             r_val = _num_value(right)
             shift = self._log2_if_power_of_2(r_val)
             if shift is not None:
                 if shift == 0:
-                    return left
+                    return self._as_address(left, pos)
                 return P.Call(
                     callee=make_identifier("SHR", pos=pos),
                     args=[left, make_number_literal(shift, pos=pos)],
                     pos=pos,
                 )
 
-        # Modulo by power of 2 -> AND with (2^n - 1).
+        # Modulo by power of 2 -> AND with (2^n - 1), kept ADDRESS: a BYTE
+        # `x AND 7' in place of `x MOD 8' would make `(x MOD 8) + 0FFH' wrap.
         if kind == BinaryOpKind.MOD and _is_number(right):
             r_val = _num_value(right)
             shift = self._log2_if_power_of_2(r_val)
             if shift is not None:
                 mask = r_val - 1
-                return make_binary(
+                return self._as_address(make_binary(
                     BinaryOpKind.AND,
                     left,
                     make_number_literal(mask, pos=pos),
                     pos=pos,
-                )
+                ), pos)
 
         return None
+
+    def _as_address(self, expr, pos):
+        """``expr`` widened, where it might not be, to the ADDRESS it replaces.
+
+        PL/M-80 has no BYTE divide: DRI's compiler zero-extends BYTE operands
+        and calls its one 16-bit routine, so a quotient or remainder is an
+        ADDRESS and the arithmetic around it is 16-bit. A rewrite of one must
+        not narrow it. DOUBLE of an ADDRESS generates no code.
+        """
+        if self._is_address_valued(expr):
+            return expr
+        return P.Call(callee=make_identifier("DOUBLE", pos=pos), args=[expr], pos=pos)
+
+    def _is_address_valued(self, expr) -> bool:
+        """Whether code generation certainly types ``expr`` ADDRESS."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.NumberLiteral):
+            return number_value(expr) > 0xFF
+        if isinstance(expr, P.Call):
+            callee = unwrap_paren(expr.callee)
+            return (isinstance(callee, P.Identifier)
+                    and ident_text(callee.name).upper() in ("DOUBLE", "SHL", "SHR"))
+        if isinstance(expr, P.BinaryOp):
+            kind = binop_kind(expr)
+            if kind in (BinaryOpKind.MUL, BinaryOpKind.DIV, BinaryOpKind.MOD):
+                return True
+            if kind in (BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.AND,
+                        BinaryOpKind.OR, BinaryOpKind.XOR):
+                return (self._is_address_valued(expr.left)
+                        or self._is_address_valued(expr.right))
+        return False
 
     def _algebraic_simplify(
         self, kind: BinaryOpKind, left, right, pos
@@ -1969,10 +2001,10 @@ class ASTOptimizer:
             if _is_number(left) and _num_value(left) == 0 and self._is_side_effect_free(right):
                 return make_number_literal(0, pos=pos)
 
-        # x / 1 = x
+        # x / 1 = x, as an ADDRESS
         if kind == BinaryOpKind.DIV:
             if _is_number(right) and _num_value(right) == 1:
-                return left
+                return self._as_address(left, pos)
 
         # x AND 0 = 0, x AND FFFF = x
         if kind == BinaryOpKind.AND:
@@ -2075,19 +2107,16 @@ class ASTOptimizer:
                             pos=pos,
                         )
 
-        # x MOD 1 = 0
+        # x MOD 1 = 0 and 0 MOD x = 0 (0 MOD 0 is 0 too: the remainder of a
+        # zero divisor is the dividend), only when the operand dropped does
+        # nothing. There is no `0 / x = 0': 0 / 0 is 0FFFFH.
         if kind == BinaryOpKind.MOD:
+            dropped = None
             if _is_number(right) and _num_value(right) == 1:
-                return make_number_literal(0, pos=pos)
-
-        # 0 / x = 0 (unless x = 0, but compile-time we can't check)
-        if kind == BinaryOpKind.DIV:
-            if _is_number(left) and _num_value(left) == 0:
-                return make_number_literal(0, pos=pos)
-
-        # 0 MOD x = 0
-        if kind == BinaryOpKind.MOD:
-            if _is_number(left) and _num_value(left) == 0:
+                dropped = left
+            elif _is_number(left) and _num_value(left) == 0:
+                dropped = right
+            if dropped is not None and self._is_side_effect_free(dropped):
                 return make_number_literal(0, pos=pos)
 
         return None
