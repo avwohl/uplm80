@@ -490,6 +490,10 @@ class CodeGenerator:
         self.current_proc_attrs = None  # type: ignore[var-annotated]
         self.current_proc_return_type: DataType | None = None
         self.loop_stack: list[tuple[str, str]] = []  # (continue_label, break_label)
+        # Words the loops around this point in the current procedure keep
+        # pushed while their bodies run.  A RETURN from inside one has to pop
+        # them first, or its RET takes a loop count for the return address.
+        self._loop_words = 0
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
@@ -2783,6 +2787,8 @@ class CodeGenerator:
         old_proc_decl = self.current_proc_decl
         old_proc_attrs = self.current_proc_attrs
         old_proc_return_type = self.current_proc_return_type
+        old_loop_words = self._loop_words
+        self._loop_words = 0
 
         attrs = proc_attrs(decl)
         name = proc_name(decl)
@@ -2837,6 +2843,7 @@ class CodeGenerator:
             self.current_proc_decl = old_proc_decl
             self.current_proc_attrs = old_proc_attrs
             self.current_proc_return_type = old_proc_return_type
+            self._loop_words = old_loop_words
             return
 
         self._emit()
@@ -3038,6 +3045,7 @@ class CodeGenerator:
         self.current_proc_decl = old_proc_decl
         self.current_proc_attrs = old_proc_attrs
         self.current_proc_return_type = old_proc_return_type
+        self._loop_words = old_loop_words
 
     def _gen_proc_epilogue(self, decl) -> None:
         """Generate procedure epilogue for a typed :class:`P.ProcDecl`."""
@@ -3479,6 +3487,11 @@ class CodeGenerator:
                 elif return_type == DataType.ADDRESS and result_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
+
+        # Leaving from inside a counted loop's body: its count is still on the
+        # stack.  POP BC leaves the result alone - it is in A or HL.
+        for _ in range(self._loop_words):
+            self._emit("pop", "bc")
 
         if proc_attrs_view is not None and proc_attrs_view.interrupt_num is not None:
             # Interrupt handler return
@@ -4314,20 +4327,7 @@ class CodeGenerator:
                 isinstance(stmt.bound, P.NumberLiteral)
                 and number_value(stmt.bound) + 1 <= 255
             ):
-                # Loop body - save B since body may clobber it
-                self._emit_label(loop_label)
-                self._emit("push", "bc")
-                for s in body_stmts:
-                    self._gen_stmt(s)
-                self._emit("pop", "bc")
-
-                # Decrement B and jump if not zero
-                # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
-                self._emit_label(incr_label)
-                self._emit("dec", "b")
-                self._emit("jp", f"nz,{loop_label}")
-
-                self._emit_label(end_label)
+                self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
                 self.loop_stack.pop()
                 return
             elif not isinstance(stmt.bound, P.NumberLiteral):
@@ -4338,20 +4338,7 @@ class CodeGenerator:
                 self._emit("or", "a")
                 self._emit("jp", f"z,{end_label}")  # Skip if iteration count is 0
 
-                # Loop body - save B since body may clobber it
-                self._emit_label(loop_label)
-                self._emit("push", "bc")
-                for s in body_stmts:
-                    self._gen_stmt(s)
-                self._emit("pop", "bc")
-
-                # Decrement B and jump if not zero
-                # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
-                self._emit_label(incr_label)
-                self._emit("dec", "b")
-                self._emit("jp", f"nz,{loop_label}")
-
-                self._emit_label(end_label)
+                self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
                 self.loop_stack.pop()
                 return
 
@@ -4567,6 +4554,32 @@ class CodeGenerator:
 
         self._emit_label(end_label)
         self.loop_stack.pop()
+
+    def _gen_counted_body(self, body_stmts, loop_label: str, incr_label: str,
+                          end_label: str) -> None:
+        """The body and back edge of a loop that counts down B.
+
+        B is pushed while the body runs, since the body is free to use it, so
+        for that long there is a word on the stack that is not the return
+        address: a RETURN in the body pops it (see :attr:`_loop_words`).  A
+        GOTO out of the body would strand it, and such a loop is not counted
+        in B at all.
+        """
+        self._emit_label(loop_label)
+        self._emit("push", "bc")
+        self._loop_words += 1
+        for s in body_stmts:
+            self._gen_stmt(s)
+        self._loop_words -= 1
+        self._emit("pop", "bc")
+
+        # Decrement B and jump if not zero
+        # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
+        self._emit_label(incr_label)
+        self._emit("dec", "b")
+        self._emit("jp", f"nz,{loop_label}")
+
+        self._emit_label(end_label)
 
     def _gen_do_case(self, stmt) -> None:
         """Generate code for a ``DO CASE selector ... END`` block.
