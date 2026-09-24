@@ -4938,6 +4938,15 @@ class CodeGenerator:
                 if sym:
                     if sym.kind == SymbolKind.PROCEDURE:
                         return sym.return_type or DataType.ADDRESS
+                    # A subscripted variable is an element, which
+                    # _gen_subscript loads as a BYTE unless the variable is
+                    # an ADDRESS -- an untyped `DECLARE hex DATA ('0123')'
+                    # too, which was typed ADDRESS here, so `hex(i) + 0FFH'
+                    # added the BYTE in A to whatever HL held.
+                    if (sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER)
+                            and isinstance(expr, P.Call) and len(expr.args) == 1):
+                        return (DataType.ADDRESS if sym.data_type == DataType.ADDRESS
+                                else DataType.BYTE)
                     if sym.dimension is not None:
                         return sym.data_type or DataType.BYTE
                     return sym.data_type or DataType.ADDRESS

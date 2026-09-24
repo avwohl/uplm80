@@ -561,6 +561,24 @@ call run;
 """, [7, 8, 0x77, 0, 5, 6])
 
 
+def test_an_element_of_untyped_data_is_a_byte():
+    """`DECLARE hex DATA ('0123')' (as 80un's bas.plm has it) has BYTE
+    elements, which _gen_subscript loads into A; typed ADDRESS, `hex(i) +
+    0FFH' added A to whatever HL held."""
+    _check("""
+declare i byte, r address;
+run: procedure;
+  declare hx data ('0123');
+  declare hy byte data ('0123');
+  i = 1;
+  r = hx(i) + 0ffh; call ph(r);
+  r = hy(i) + 0ffh; call ph(r);
+  r = hx(i) + 100h; call ph(r);
+end run;
+call run;
+""", [0x30, 0x30, 0x131])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])
