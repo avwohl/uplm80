@@ -5,13 +5,38 @@ Contains assembly code for runtime support routines that are too complex
 to generate inline (multiply, divide, etc.).
 """
 
-# 16-bit unsigned multiply: HL = HL * DE
-# Uses BC as temp
+
+def plm_div(dividend: int, divisor: int) -> int:
+    """PL/M-80's ``dividend / divisor`` on 16-bit unsigned operands.
+
+    Digital Research's PL/M-80 divides with PLM80.LIB's @P0029, sixteen
+    shift-and-subtract steps with no zero test: a zero divisor never makes a
+    trial subtraction fail, so every quotient bit is set. The compile-time
+    folder and ``??div16`` both have to give this.
+    """
+    dividend &= 0xFFFF
+    divisor &= 0xFFFF
+    return dividend // divisor if divisor else 0xFFFF
+
+
+def plm_mod(dividend: int, divisor: int) -> int:
+    """PL/M-80's ``dividend MOD divisor``: the dividend itself when divisor is 0."""
+    dividend &= 0xFFFF
+    divisor &= 0xFFFF
+    return dividend % divisor if divisor else dividend
+
+
+# 16-bit unsigned multiply: HL = HL * DE, the low sixteen bits of the product
+# (DRI's PLM80.LIB @P0034 computes the same, most significant bit first).
+# The shifts shift in zeros: the rotates through carry this used to do took in
+# the carry of the add before them, and of the multiplicand's top bit, so a
+# product that overflowed came out wrong -- 81H * 511 gave 817FH, not 017FH.
+# DE is 0 on return.
 RUNTIME_MUL16 = """\
 ??mul16:
 	; 16-bit multiply: HL = HL * DE
 	; Input: HL = multiplicand, DE = multiplier
-	; Output: HL = product (low 16 bits)
+	; Output: HL = product (low 16 bits), DE = 0
 	; Destroys: A, B, C, D, E
 	ld	b,h
 	ld	c,l		; BC = multiplicand
@@ -20,90 +45,65 @@ RUNTIME_MUL16 = """\
 	ld	a,e
 	or	d		; DE == 0?
 	ret	z		; Yes, done
-	ld	a,e
-	rra			; LSB of multiplier into carry
+	srl	d
+	rr	e		; multiplier >>= 1, its low bit into carry
 	jp	nc,??mul16s	; If bit 0 clear, skip add
 	add	hl,bc		; HL = HL + BC
 ??mul16s:
-	; Shift multiplicand left
-	ld	a,c
-	rla
-	ld	c,a
-	ld	a,b
-	rla
-	ld	b,a
-	; Shift multiplier right
-	ld	a,d
-	rra
-	ld	d,a
-	ld	a,e
-	rra
-	ld	e,a
+	sla	c
+	rl	b		; multiplicand <<= 1
 	jp	??mul16l
 """
 
-# 16-bit unsigned divide: HL = HL / DE, DE = HL % DE
+# 16-bit unsigned divide and remainder, as PL/M-80 defines them.
+#
+# DRI's PL/M-80 routes every `/' and `MOD', BYTE operands zero-extended, through
+# one routine, PLM80.LIB's @P0029: sixteen shift-and-subtract steps and no test
+# for a zero divisor. With a zero divisor every trial subtraction fits, so the
+# quotient comes out 0FFFFH and the remainder is the dividend; programs rely on
+# that (MP/M II's SDIR tests `cur$line mod page$len = 0' with page$len 0).
+# These routines do the same steps and so give the same results for every
+# operand pair. ??mod16 is the loop itself, which leaves the remainder in HL;
+# ??div16 moves the quotient into HL.
+RUNTIME_MOD16 = """\
+??mod16:
+	; 16-bit divide: HL = HL MOD DE, quotient in A (high) and C (low)
+	; Input: HL = dividend, DE = divisor
+	; Output: HL = remainder, AC = quotient, B = 0
+	; Preserves: DE
+	; A zero divisor gives quotient 0FFFFH, remainder = dividend (as PL/M-80)
+	ld	a,h
+	ld	c,l		; AC = dividend; the quotient shifts in behind it
+	ld	hl,0		; HL = partial remainder
+	ld	b,16
+??mod16l:
+	sla	c
+	rla			; next dividend bit into carry
+	adc	hl,hl		; remainder = 2*remainder + bit; cannot carry out
+	inc	c		; quotient bit = 1 (INC leaves carry clear)
+	sbc	hl,de		; does the divisor fit?
+	jr	nc,??mod16n	; yes: keep the difference and the bit
+	add	hl,de		; no: restore the remainder
+	dec	c		; and clear the bit
+??mod16n:
+	djnz	??mod16l
+	ret
+"""
+
+# 16-bit unsigned divide: HL = HL / DE, remainder in BC
 RUNTIME_DIV16 = """\
 ??div16:
 	; 16-bit divide: HL = HL / DE, remainder in BC
 	; Input: HL = dividend, DE = divisor
 	; Output: HL = quotient, BC = remainder
-	; Destroys: A
-	ld	a,d
-	or	e
-	jp	z,??div16z	; Divide by zero
-	push	de		; Save divisor
-	ld	bc,0		; BC = remainder = 0
-	ld	a,16		; 16 bits to process
-??div16l:
-	push	af		; Save counter
-	; Shift HL left, MSB into remainder
-	add	hl,hl		; HL = HL * 2, carry = old H bit 7
-	ld	a,c
-	rla
-	ld	c,a		; C = C<<1 + carry (from HL)
-	ld	a,b
-	rla
-	ld	b,a		; B = B<<1 + carry (from C), BC shifted left with HL carry in
-	; Shift carry into bit 0 of dividend (will be quotient)
-	; Actually we need to track if remainder >= divisor
-	; Compare BC with DE
-	ld	a,c
-	sub	e
-	ld	a,b
-	sbc	a,d
-	jp	c,??div16n	; BC < DE, don't subtract
-	; BC >= DE, subtract and set quotient bit
-	ld	a,c
-	sub	e
-	ld	c,a
-	ld	a,b
-	sbc	a,d
+	; Preserves: DE
+	; A zero divisor gives quotient 0FFFFH, remainder = dividend (as PL/M-80)
+	call	??mod16		; HL = remainder, AC = quotient
 	ld	b,a
-	inc	hl		; Set quotient bit
-??div16n:
-	pop	af		; Restore counter
-	dec	a
-	jp	nz,??div16l
-	pop	de		; Restore divisor (not needed, but balance stack)
-	ret
-??div16z:
-	; Divide by zero - return FFFF
-	ld	hl,0ffffh
-	ld	bc,0
-	ret
-"""
-
-# 16-bit modulo: HL = HL MOD DE
-RUNTIME_MOD16 = """\
-??mod16:
-	; 16-bit modulo: HL = HL MOD DE
-	; Input: HL = dividend, DE = divisor
-	; Output: HL = remainder
-	; Destroys: A, B, C
-	call	??div16
-	ld	h,b
-	ld	l,c		; Move remainder to HL
+	push	bc
+	ld	b,h
+	ld	c,l		; BC = remainder
+	pop	hl		; HL = quotient
 	ret
 """
 
@@ -216,7 +216,7 @@ def get_runtime_library(needed: set[str] | None = None) -> str:
 
     # Dependencies: some routines call others
     dependencies = {
-        "mod16": {"div16"},  # mod16 calls div16
+        "div16": {"mod16"},  # div16 calls mod16
     }
 
     parts = ["; PL/M-80 Runtime Library", ""]

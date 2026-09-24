@@ -5,16 +5,179 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 
 ## Unreleased
 
-Six defects found while rebuilding MP/M II's resident system processes from
-DRI's sources, each worked around in those sources until now, three more
-found in the same code on the way, and the rest found by an independent
-verification of those fixes. DRI's binaries settle what is right: the
+Two sets of fixes, each checked against what Digital Research's own PL/M-80
+does.
+
+The first began with six defects found while rebuilding MP/M II's resident
+system processes from DRI's sources, each worked around in those sources until
+now; three more turned up in the same code, and an independent verification of
+those fixes found the rest. DRI's binaries settle what is right: the
 `SPOOL.RSP`, `SCHED.RSP` and `MPMSTAT.RSP` built from source now match DRI's in
 layout and in every initialised byte, and each resident process's stack holds
-what DRI's `SCHED.BRS` holds. Each fix has a regression test that fails
-without it.
+what DRI's `SCHED.BRS` holds.
+
+The second makes division, `MOD` and every other expression give what DRI's
+PL/M-80 gives. Division and `MOD` agree with DRI's divide routine for every
+operand pair, zero divisors included, on every path uplm80 computes them by:
+the runtime routines, constant folding, strength reduction and DATA/INITIAL
+values. `tests/test_divmod_dri.py` runs DRI's own routine on an 8080
+interpreter as the reference and compares a compiled table of divisions
+against it at `-O0` to `-O3`. Every expression now has the value and the type
+Intel's PL/M-80 Programming Manual gives it, at every optimization level: a
+constant up to 255 is a BYTE; `+ - AND OR XOR` of two BYTEs and `-` or `NOT`
+of one wrap at eight bits; `* / MOD` are ADDRESS; a relation is the BYTE 0FFH
+or 0. The optimizer folded constants as untyped 16-bit numbers that code
+generation then typed by magnitude, so arithmetic next to a folded, propagated
+or rewritten operand could change width. `uplm80/plm_types.py` states the
+rules once, the optimizer and the code generator follow them, and
+`tests/plm_difftest.py` checks random programs against a Python model of them.
+DO loops now end the way DRI's end, when the increment carries out of the
+index.
+
+Each fix has a regression test that fails without it.
 
 ### Fixed
+
+#### Division and MOD
+
+- **`x MOD 0` was 0; PL/M-80 gives `x`.** DRI's PL/M-80 sends every `/` and
+  `MOD` through one routine, module @P0029 of its PLM80.LIB (the same 31 bytes
+  sit at 39B0H in MP/M II's SDIR.PRL, and in DIR, ED, STAT, SHOW, TOD, SCHED,
+  MPMSTAT, GENSYS, LINK and LIB). It has no zero test: sixteen
+  shift-and-subtract steps, in which a zero divisor always fits, so the
+  quotient comes out 0FFFFH and the remainder is the dividend. `??div16`
+  tested for zero and returned a remainder of 0. SDIR's `page$len` defaults to
+  0 and UTIL7/DSH.PLM asks `cur$line mod page$len = 0`, so every SDIR built
+  from source reprinted its heading before every line of output. `??div16` and
+  `??mod16` now run the same steps without the test, and are smaller: 31 bytes
+  for the pair (50 before), 22 for `??mod16` alone. There is no BYTE divide to
+  match: DRI zero-extends BYTE operands into the same routine (SDIR loads one
+  with `LHLD` / `MVI H,00H` before `CALL 39B0H`), so a quotient or remainder
+  of two BYTEs is an ADDRESS.
+- **`SHR(x, 7)` lost bit 15,** and with it `x / 128`, which strength reduction
+  turns into that shift: 8000H / 128 came out 0 instead of 100H. The result of
+  a shift right by 7 has nine bits.
+- **The compile-time forms of `/` and `MOD` disagreed with the runtime.**
+  * Constant folding left `c / 0` and `c MOD 0` to the runtime; they now fold
+    to 0FFFFH and `c`.
+  * `0 / x` was folded to 0, but `0 / 0` is 0FFFFH, so the rule is gone.
+    `x MOD 1` and `0 MOD x` (both 0) dropped a procedure call in the operand
+    they discard; they now keep it.
+  * A strength-reduced quotient or remainder of a BYTE became a BYTE:
+    `x MOD 8` turned into `x AND 7` and `x / 1` into `x`, so
+    `(x MOD 8) + 0FFH` wrapped at eight bits and `(x MOD 8) - 1` did not
+    borrow. They stay ADDRESS now (as `DOUBLE(x AND 7)`), and code generation
+    reads the byte itself wherever only the low byte is used or the value is
+    compared with a BYTE, so assignments, arguments, subscripts and
+    comparisons compile exactly as before.
+  * A constant expression in DATA or INITIAL that the optimizer had not
+    folded (any of them at `-O0`, and `c / 0` or `c MOD 0` at every level)
+    went to the assembler, which rejects `7/0`, and `MOD` was written as `+`.
+    Such an expression is now evaluated the way PL/M-80 evaluates it, and an
+    operator the assembler cannot evaluate is an error rather than a `+`.
+
+#### Expression types
+
+- **A folded constant was typed by its size, not by PL/M-80's rules.**
+  `(8 MOD 0FFH) + b` with `b = 0FFH` gave 7 at `-O1` and above: the remainder
+  is the ADDRESS 8, and adding 0FFH carries into the high byte (107H). The
+  same folded 7 made `(7 MOD 0) > 1000H` fail to compile as "comparison BYTE >
+  4096 is always false". Folding is typed now; an ADDRESS constant below 256
+  is carried as `DOUBLE(n)`, and a constant the optimizer derived is not held
+  against the program by the impossible-comparison check, nor is a relation
+  between two constants.
+- **`NOT` and unary `-` of a BYTE worked in sixteen bits,** even at `-O0`:
+  `(NOT 7) MOD w` divided 0FFF8H. `NOT 7` is the BYTE 0F8H, `3 - 5` the BYTE
+  0FEH and `-1` the BYTE 0FFH. The levels disagreed as well: `-O1` and up
+  folded `-1` to 0FFFFH, while at `-O0` it was negated in HL and the
+  BYTE-index path took A for the index, so `buf(-1)` was BUF-1 at one level
+  and BUF+255 at another. It is `buf(255)` at every level now (see Changed),
+  and the index path reads the register the index actually came out in.
+- **BYTE `x * 2` became the BYTE add `x + x`,** so 200 * 2 was 144 at `-O2`.
+  The product is an ADDRESS. Other rewrites kept the value but not the type
+  and are fixed the same way: `b AND 0FFFFH`, `b XOR 0FFFFH`, `b + DOUBLE(0)`
+  and `x * 1` are ADDRESS, `(b + 100) + 300` is not reassociated across the
+  change of width, and a copy `w = b` is not propagated.
+- **An element of a BYTE array member was typed ADDRESS.** Code for
+  `s.m(i)` compared and combined it in sixteen bits, and a test against 0
+  loaded the byte into A and then tested HL: SDIR (DSH.PLM:290, 294) printed
+  every file's update and create stamps whether it had them or not.
+- **`??mul16` took the carry of its own add into the product,** so any
+  product that overflowed sixteen bits was wrong: 81H * 511 gave 817FH.
+- **A nested subscript's release restored an outer claim's spill of DE,**
+  and `aw(aw(aw(i) AND 7) AND 7)` added a stale DE in place of the base.
+- **A BYTE value generated into A was read from HL** by a store through a
+  BASED ADDRESS, by `MEMORY(b)` as a value and as a target, and by `MOVE`
+  with a constant count and `TIME`; `OUTPUT(p) = b` replaced it with L.
+  BYTE `1 - x` was `x XOR 1`, right only for 0 and 1.
+- **`LOW` could take A for its operand after an unrelated embedded
+  assignment.** `(b := w) + LOW(LAST(a))` added the low byte of `w` for 7: the
+  flag that lets `LOW((b := w))` skip reloading A outlived the assignment.
+- **Shift and rotate counts of 129 or more shifted nothing:** the count loop
+  tested the sign. Counts are unsigned BYTEs now, and a constant rotate is
+  unrolled.
+
+#### DO loops
+
+- **A BYTE loop to 255 ran no times.** DRI's PL/M-80 tests the limit before
+  each pass and leaves the loop when the increment carries out of the index
+  (GENSYS.COM's code for `do j = common$base to 0ffh` ends `INR A / JNZ top`;
+  LOAD.COM's `BY 128` loop, `DAD D / JNC top`), so `DO j = 0 TO 255` runs 256
+  times and leaves the index 0 (manual, 5.1.4). uplm80 tested
+  `index < bound + 1`, and bound + 1 is 0, with a constant bound and with a
+  variable one that is 255 - and at -O3 constant propagation turns the
+  variable form into the constant one. BYTE and ADDRESS loops now end on the
+  carry, so `DO w = 0FFF0H TO 0FFFFH` stops too; a step that would wrap stops
+  the loop; and the limit, start and step are converted to the index's type
+  (`DO b = 0 TO 300` runs to 44, and `BY -1` is `BY 0FFH`: PL/M-80 has no
+  downward step). MPMLDR's `GENSYS.PLM` has two `TO 0FFH` loops that ran no
+  times from 0.
+- **A counted `DO` loop ignored its index being written or read in a
+  target.** A loop whose body does not use its index counts in B, and never
+  stores the index while it runs. `s(i).x = 0` and `i = n` in the body went
+  unseen, so the index was never stored or its assignment ignored:
+  `SCBRS.PLM` cleared one entry of its table four times, and `PIP.PLM` and
+  `ED.PLM` (FILLSOURCE) kept reading past end of file. A variable bound of
+  255 skipped the loop instead of running it 256 times: a count of 0 is 256
+  passes to DJNZ, and the loop tested for 0 first.
+- **A counted `DO` loop's index was stale to everything but its body.** An
+  inner `DO` over the same index left it where it was, so
+  `DO i = 0 TO 9; ...; DO i = 0 TO 9; END; END;` ran the outer body ten times
+  instead of once; the code after the loop, a procedure the body calls, and
+  the caller after a `RETURN` all read a stale index; and the bound was
+  evaluated once, where PL/M-80 evaluates it at every test. The index now gets
+  its final value before the loop starts, and a loop is counted only when
+  nothing else can see its index - no procedure the body calls names it, no
+  store reaches it through its address, no caller reads it after a `RETURN`
+  from the body - and nothing can change its bound.
+- **A `RETURN` inside a counted `DO` loop left the count on the stack.** The
+  count is pushed around the body, and the RET took it for its return
+  address. A `RETURN` now pops what the loops around it pushed. Live in
+  `SPBRS.PLM` (the spooler's stop request at the end of a line) and 80un's
+  `lzh.plm` (a failed write).
+
+#### -O3
+
+- **-O3 changed what programs do.** The inliner kept a `RETURN` that was not
+  the last statement, which then returned from the caller - `ED.PLM`'s
+  BACKSPACE, `PIP.PLM`'s and `SHOW.PLM`'s user checks and `TOD.PLM`'s
+  COMPUTE$MONTH among them - defined a label once per call site, captured the
+  caller's locals, and could inline another procedure of the same name. It now
+  inlines only a small parameterless untyped procedure with no `RETURN` but a
+  last one, no label, `GOTO` or declaration, whose names mean the same at the
+  call as where it is declared. Nothing learned before a call was forgotten
+  after it: `GENSYS.PLM` lost a whole `IF` after `get$response(.accept)`, and
+  `cnt = 0; rw = f; call ph(cnt)`, where `f` increments `cnt`, printed 0. A
+  call now ends everything the optimizer knows about variables, no fact is
+  used in an expression that makes one, and a store through a BASED variable,
+  a subscript or a member ends everything too, common subexpressions
+  included. `.x` was folded like a value, so `c = 1; CALL setv(.c)` passed
+  the address 1; a copy was propagated for a BASED variable, so 80un's
+  `read16` returned its high byte twice; what a loop body sets was taken to
+  be known after the loop; and an unrolled loop left its index at the last
+  value.
+
+#### DATA, INITIAL and AT
 
 - **`DATA` ignored member types and did not reserve the variable.** The 0.3.6
   fix that placed a STRUCTURE's `INITIAL` values member by member never
@@ -36,16 +199,23 @@ without it.
   words, and `SCBRS.PLM`, `MSBRS.PLM` and `SPBRS.PLM` build each process's
   stack as `initial (restarts,.entry)` with SP at `.stk+38`: the entry point
   landed in the second word and SP pointed at a zero.
-- **A `RETURN` inside a counted `DO` loop left the count on the stack.** A loop
-  whose body does not use its index counts in B and pushes B around the body,
-  and the RET took the count for its return address. A `RETURN` now pops what
-  the loops around it pushed. Live in `SPBRS.PLM` (the spooler's stop request
-  at the end of a line) and 80un's `lzh.plm` (a failed write).
-- **A counted `DO` loop ignored its index being written or read in a
-  target.** `s(i).x = 0` and `i = n` in the body went unseen, so the index was
-  never stored or its assignment ignored: `SCBRS.PLM` cleared one entry of its
-  table four times, and `PIP.PLM` and `ED.PLM` kept reading past end of file.
-  A variable bound of 255 skipped the loop instead of running it 256 times.
+- **An expression in `DATA` was always a word.** At -O0, where nothing folds it
+  first, `x (4) BYTE DATA (68H+80H, k+1, 6)` took six bytes and moved
+  everything after it, and a unary minus was not accepted: `SET.PLM` did not
+  compile at -O0. An expression now fills its scalar at the scalar's width,
+  evaluated as PL/M-80 evaluates a restricted expression: as plain 16-bit
+  numbers, `/` and `MOD` as DRI's divide gives them.
+- **`.(constant list)` in `DATA` or `INITIAL` was laid out in place.** It is the
+  location of the constants (manual, 4.1.3), as it is in an expression, so
+  `msgs (3) ADDRESS DATA (.('one$'), ...)` held characters, not pointers.
+  `.'text'` in a list was not accepted at all.
+- **Every name in a factored declaration got the first one's `AT` or values.**
+  `DECLARE (A, B, C) BYTE AT (.BUF)` put all three at BUF, and
+  `DECLARE (COUNTER, LIMIT, INCR) ADDRESS INITIAL (0, 1024, 2)` gave each name
+  the whole list. Neither MP/M II nor 80un writes either form, but Intel's
+  LINK does: `tests/link1a.plm`, from Mark Ogden's reconstruction, declares
+  `(s, e) ADDRESS AT(.inRecord$p)` to reach the record pointer and the one
+  after it, and `e = s + inRecord.len + 2` wrote over the record pointer.
 - **`AT (.external +/- constant)` compiled to `EQU $`.** The catch-all at the
   end of `_emit_at_decl` was still there. `MSPL.PLM`'s
   `spool$msg (1) byte at (.tbuff-1)` sat on the queue control block after it.
@@ -53,11 +223,13 @@ without it.
   location plus or minus constants - and anything else is an error. A location
   reference to a variable declared further down, which DRI's compiler
   accepted, is measured from that declaration instead of taken to be a byte.
-- **A negative constant offset was written as `+65535`.** `.tbuff(-1)` was
-  `TBUFF+65535`, whose relocation um80 0.3.48 drops, and a subscript of a
-  variable AT an external was `EXT+c1+c2`, which it assembles as `EXT+c2`.
-  Offsets from a symbol are written signed, and folded into one where the
-  symbol is external.
+- **A negative constant offset was written as `+65535`.** `.tbuff(-1)` in an
+  `AT` was `TBUFF+65535`, whose relocation um80 0.3.48 drops, and a subscript
+  of a variable AT an external was `EXT+c1+c2`, which it assembles as
+  `EXT+c2`. Offsets from a symbol are written signed, and folded into one
+  where the symbol is external. (An `AT`, `DATA` or `INITIAL` value is a
+  restricted expression, evaluated as plain 16-bit numbers, so there `-1` is
+  0FFFFH.)
 - **An `AT` naming something declared further down was placed at 0.** An EQU
   is evaluated where it stands, and um80 0.3.48 takes a symbol it has not
   reached as zero; AT variables were defined in the data segment ahead of
@@ -71,73 +243,69 @@ without it.
   0.3.48 assembles `@A+2` with `@A EQU E1+1` as `E1+2`. A later declaration's
   own `AT` is now resolved down to its root, and a later EXTERNAL is known to
   be one. A circle of ATs is an error.
-- **A counted `DO` loop's index was stale to everything but its body.** An
-  inner `DO` over the same index left it where it was, so
-  `DO i = 0 TO 9; ...; DO i = 0 TO 9; END; END;` ran the outer body ten times
-  instead of once; the code after the loop, a procedure the body calls, and
-  the caller after a `RETURN` all read a stale index; and the bound was
-  evaluated once, where PL/M-80 evaluates it at every test. The index now gets
-  its final value before the loop starts, and a loop is counted only when
-  nothing else can see its index or change its bound.
-- **A BYTE loop to 255 ran no times.** The test was `index < bound + 1`, and
-  bound + 1 is 0: `DO j = 0 TO 255` with a constant bound, or a variable one
-  that is 255 in a loop that reads its index, never ran - and at -O3 constant
-  propagation turns the variable form into the constant one. The loop now ends
-  when stepping the index carries out of the byte, as the manual says (5.1.4).
-  MPMLDR's `GENSYS.PLM` has two `TO 0FFH` loops that ran no times from 0.
-- **An expression in `DATA` was always a word.** At -O0, where nothing folds it
-  first, `x (4) BYTE DATA (68H+80H, k+1, 6)` took six bytes and moved
-  everything after it, and a unary minus was not accepted: `SET.PLM` did not
-  compile at -O0. An expression now fills its scalar at the scalar's width.
-- **`.(constant list)` in `DATA` or `INITIAL` was laid out in place.** It is the
-  location of the constants (manual, 4.1.3), as it is in an expression, so
-  `msgs (3) ADDRESS DATA (.('one$'), ...)` held characters, not pointers.
-  `.'text'` in a list was not accepted at all.
-- **A negative constant subscript on a BYTE array was +255 at -O0.**
-  `buf(-1)` read and wrote BUF+255: the index came out in HL and was taken
-  from A.
 - **`AT` with `INITIAL` or `DATA` dropped the values without a word.** It is
   now an error.
-- **-O3 changed what programs do.** The inliner kept a `RETURN` that was not
-  the last statement, which then returned from the caller - `ED.PLM`'s
-  BACKSPACE, `PIP.PLM`'s and `SHOW.PLM`'s user checks and `TOD.PLM`'s
-  COMPUTE$MONTH among them - defined a label once per call site, captured the
-  caller's locals, and could inline another procedure of the same name.
-  Nothing learned before a `CALL` was forgotten after it (`GENSYS.PLM` lost a
-  whole `IF` after `get$response(.accept)`); `.x` was folded like a value, so
-  `c = 1; CALL setv(.c)` passed the address 1; a copy was propagated for a
-  BASED variable, so 80un's `read16` returned its high byte twice; and an
-  unrolled loop left its index at the last value.
-- **Every name in a factored declaration got the first one's `AT` or values.**
-  `DECLARE (A, B, C) BYTE AT (.BUF)` put all three at BUF, and
-  `DECLARE (COUNTER, LIMIT, INCR) ADDRESS INITIAL (0, 1024, 2)` gave each name
-  the whole list. Neither MP/M II nor 80un writes either form, but Intel's
-  LINK does: `tests/link1a.plm`, from Mark Ogden's reconstruction, declares
-  `(s, e) ADDRESS AT(.inRecord$p)` to reach the record pointer and the one
-  after it, and `e = s + inRecord.len + 2` wrote over the record pointer.
+
+### Changed
+
+- **Constants in expressions are typed as PL/M-80 types them, so some
+  programs compute something else.** `w = -1` stores 00FFH, since the
+  manual makes `-1` the BYTE `0 - 1` (write 0FFFFH for all ones), and for the
+  same reason `buf(-1)` is `buf(255)`, not the element before `buf`
+  (`buf(0FFFFH)` is); `NOT 0` is 0FFH. Comparing a BYTE with a constant from
+  0FF00H up used to compare the low byte and is now the "always false/true"
+  error, since the BYTE is zero-extended. An embedded assignment has the type
+  of its right half (manual 4.6.3); BYTE `PLUS` and `MINUS` BYTE is a BYTE;
+  `LENGTH` and `LAST` are BYTE when they fit; `CARRY` is 0FFH when set, as
+  DRI's code has it; `SCL` and `SCR` have their pattern's type and rotate an
+  ADDRESS in 17 bits; a two-character string is an ADDRESS constant, first
+  character high.
+- **`SHL` and `SHR` stay ADDRESS** even of a BYTE pattern, where the manual
+  and DRI's compiler shift a BYTE in eight bits: programs written for uplm80
+  rely on it (80un builds words with `lo + SHL(b, 8)`).
+
+### Added
+
+- **`tests/plm_difftest.py`**, a differential test: random programs over
+  BYTE and ADDRESS variables, constants, every operator but `PLUS` and
+  `MINUS` (whose carry-in depends on the code before them), built-ins, calls
+  of procedures that change globals, BASED stores and DO loops, compiled at
+  `-O0` to `-O3`, run under cpmemu and compared with a Python model of the
+  manual's rules. The suite runs three programs; `scripts/difftest.py
+  --seeds N` runs more.
 
 ### Known issues
 
-- An ADDRESS loop to 0FFFFH does not end: `DO w = 0FFF0H TO 0FFFFH` goes on
-  past the wrap, where a BYTE loop to 255 now stops. `DO I = N TO 0 BY 255`
-  still counts down N+1 times, where PL/M-80 has no downward step. Neither
-  form occurs in MP/M II or 80un.
-- -O3 is still less trustworthy than -O2, which is what MP/M II and 80un are
-  built with: a constant known before a call in an expression is still used
-  for an operand evaluated after that call, and common subexpressions are not
-  forgotten when a pointer is written through.
+- **upeepz80 0.2.4 deletes two register loads that are still needed,** both
+  found by the differential test, both in 0.3.6's output as well; the fixes
+  belong in upeepz80.
+  * It rewrites `ld a,(x) / cpl / cpl / inc a / push af / ld (x),a / pop af`
+    into `ld hl,x / inc (hl)` although A is read next: `b, w = -(NOT b)` - a
+    BYTE and an ADDRESS assigned together - leaves `w` holding A's old value
+    at `-O1` and above (one of 700 random programs).
+  * Right after a load of A, it rewrites `ld hl,nn / ld a,l / ld l,a /
+    ld h,0` into `ld a,nn / ld h,0`, so L keeps whatever it held: after
+    `b = 0FEH`, `w = LOW(LAST(big))`, with `big` 300 bytes long, got the low
+    byte of the statement before instead of 2BH at `-O1` and above (seed 1063
+    of `scripts/difftest.py`).
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
 
 ### Verified
 
-- Every PL/M source in MP/M II (41, in the mode `tools/build.py` uses, and the
-  13 overrides) and in 80un (38) compiled with 0.3.6 and with this release at
-  -O0, -O2 and -O3: at -O2, 33 of the 79 non-override outputs change, and every
-  change is accounted for in the commit that makes it. The same 82 of 92
-  assemble with um80 0.3.48, and no EQU names a symbol defined after it.
-  `80unbas.com` does not change. `80un.com` does, in `lzh.plm`, and extracts
-  the same files, with the same console output, from all 17 sample archives.
+- Every PL/M source in MP/M II (the 41 in DRI's tree and the 14 overrides,
+  each in the mode `tools/build.py` uses) and in 80un (35 files one at a time,
+  and `80un.com` and `80unbas.com` as their Makefile compiles them) compiles
+  at -O0, -O2 and -O3. At -O2, 65 of the 92 outputs change from 0.3.6, and
+  each change is one of the fixes above. The same 82 of 92 assemble with
+  um80 0.3.48 as with 0.3.6 (the rest are single modules of multi-module
+  programs, and MSCMN.PLM, which is only ever included). `80un.com` and
+  `80unbas.com` change; `80un.com` extracts the same files, with the same
+  console output, from all 17 sample archives as 0.3.6's, and `80unbas.com`
+  detokenises `PALLOPS.BAS` the same.
+- `scripts/difftest.py --seeds 320 --first 1000`: 319 of the 320 random
+  programs print what the model says at `-O0` to `-O3`; seed 1063 differs at
+  `-O1` and above, by the second upeepz80 defect above.
 - The run tests compile with the checkout under test: they used to start the
   compiler with `python -P`, which found whatever uplm80 was installed.
 

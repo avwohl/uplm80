@@ -567,25 +567,34 @@ NEGATIVE_SUBSCRIPT_SRC = """
 t: do;
 mon1: procedure (f, a) external; declare f byte, a address; end mon1;
 declare pad (4) byte;
-declare buf (16) byte;
+declare buf (256) byte;
 putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
 chk: procedure (ok); declare ok byte;
     if ok then call putc('Y'); else call putc('N');
 end chk;
+/* an ADDRESS subscript of 0FFFFH is the byte before buf */
 pad(3) = 5;
-call chk(.buf(-1) = .pad + 3);
-call chk(buf(-1) = 5);
-buf(-1) = 9; call chk(pad(3) = 9);
+call chk(.buf(0ffffh) = .pad + 3);
+call chk(buf(0ffffh) = 5);
+buf(0ffffh) = 9; call chk(pad(3) = 9);
+/* -1 is the BYTE 0 - 1, 0FFH, so buf(-1) is buf(255) */
+call chk(.buf(-1) = .buf + 255);
+buf(255) = 7; call chk(buf(-1) = 7);
+buf(-1) = 8; call chk(buf(255) = 8);
 end t;
 """
 
 
 @pytest.mark.parametrize("opt", [0, 2])
 def test_a_negative_subscript_is_below_the_array_when_run(opt):
-    """`buf(-1)' is the byte before buf.  At -O0 the index `-1' is negated
-    in HL, and the BYTE-index path took A for the index instead, so it
-    addressed BUF+255; -O1 and up fold the constant and were right."""
-    assert run_plm(NEGATIVE_SUBSCRIPT_SRC, opt).strip() == "YYY", opt
+    """A subscript of 0FFFFH is the element before the array, and every level
+    agrees on it.  At -O0 the BYTE-index path took A for an index that had
+    come out in HL, so what `buf(-1)' addressed depended on the level.
+
+    `-1' itself is the BYTE 0 - 1 (PL/M-80 manual, 4.2.2), 0FFH, as
+    tests/test_expression_types.py has it for MEMORY(-1): `buf(-1)' is
+    buf(255), at every level."""
+    assert run_plm(NEGATIVE_SUBSCRIPT_SRC, opt).strip() == "YYYYYY", opt
 
 
 def test_at_a_variable_declared_further_down_is_defined_after_it():

@@ -39,6 +39,8 @@ from .ast_view import (
     binop_kind,
     unop_kind,
     ident_text,
+    make_binary,
+    make_unary,
     number_value,
     string_value,
     string_bytes,
@@ -50,7 +52,15 @@ from .ast_view import (
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
-from .runtime import get_runtime_library
+from .runtime import get_runtime_library, plm_div, plm_mod
+from .plm_types import (
+    BYTE_BUILTINS,
+    PATTERN_TYPED_BUILTINS,
+    eval_typed,
+    is_derived,
+    is_double_call,
+    typed_const,
+)
 
 
 # Map ast_view's DataType (used by typed AST helpers) to the legacy
@@ -62,12 +72,6 @@ _VIEW_DT_TO_LEGACY = {
     ViewDataType.LABEL: DataType.LABEL,
     ViewDataType.PROCEDURE: DataType.PROCEDURE,
 }
-
-# Equality-operator BinaryOpKinds — the comparison ops that allow
-# negative-byte truncation (`BYTE = -1`, `BYTE <> -1`) in the
-# BYTE-range diagnostic below.
-_BYTE_EQ_KINDS = frozenset({BinaryOpKind.EQ, BinaryOpKind.NE})
-
 
 def _legacy_dt(dt):
     """Convert an ast_view DataType (or None) to the legacy enum."""
@@ -212,6 +216,11 @@ class RegisterAllocator:
     # Stack tracking for spilled registers
     spill_stack: list[str] = field(default_factory=list)
 
+    # Per register, the claims not yet released and whether each spilled
+    # the one before it. Claims nest (a subscript inside a subscript), and
+    # a release restores only what its own claim spilled.
+    claims: dict[str, list[tuple[bool, str]]] = field(default_factory=dict)
+
     # Statistics for debugging/optimization
     stats: dict[str, int] = field(default_factory=dict)
 
@@ -249,7 +258,9 @@ class RegisterAllocator:
 
         desc = self.get_reg(reg)
 
-        if desc.state == RegState.BUSY:
+        spilled = desc.state == RegState.BUSY
+        self.claims.setdefault(reg, []).append((spilled, desc.owner))
+        if spilled:
             # Must spill - save current contents to stack
             self._spill_reg(reg, emit_fn)
 
@@ -280,14 +291,22 @@ class RegisterAllocator:
         """
         reg = reg.lower()
         desc = self.get_reg(reg)
+        claims = self.claims.get(reg)
+        spilled, outer_owner = claims.pop() if claims else (False, "")
 
-        # Check if we need to restore from spill
-        if self.spill_stack and self.spill_stack[-1] == reg:
-            # This register was spilled and is top of stack - restore it
+        # Restore what this claim spilled, and only that: an inner claim's
+        # release used to pop whatever an OUTER claim had spilled, from
+        # under the values pushed since -- `aw(aw(aw(i) AND 7) AND 7)'
+        # added a stale DE in place of the array's base.
+        if spilled and self.spill_stack and self.spill_stack[-1] == reg:
             pop_reg = 'af' if reg == 'a' else reg
             emit_fn("pop", pop_reg)
             self.spill_stack.pop()
             self.stats['restores'] = self.stats.get('restores', 0) + 1
+            desc.state = RegState.BUSY
+            desc.owner = outer_owner
+            desc.spill_depth = 0
+            return
 
         desc.state = RegState.FREE
         desc.owner = ""
@@ -339,6 +358,7 @@ class RegisterAllocator:
             desc.state = RegState.FREE
             desc.owner = ""
             desc.spill_depth = 0
+        self.claims.clear()
         self.spill_stack.clear()
 
     def get_status(self) -> str:
@@ -521,6 +541,9 @@ class CodeGenerator:
         self._module_decl_items: list = []
         # Names whose AT _declared_later is resolving, to stop a circle.
         self._resolving_at: set[str] = set()
+        # Names whose address is taken, or which are placed AT something
+        # (see _survey_aliases).
+        self._aliased: set[str] = set()
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
@@ -600,6 +623,17 @@ class CodeGenerator:
                         return val
                 except ValueError:
                     pass
+        elif isinstance(expr, P.Call) and len(expr.args) == 1:
+            # LENGTH / LAST of an array is a BYTE constant when it fits.
+            callee = unwrap_paren(expr.callee)
+            if isinstance(callee, P.Identifier):
+                name = ident_text(callee.name).upper()
+                if name in ('LENGTH', 'LAST'):
+                    extent = self._array_extent(expr.args[0])
+                    if extent is not None:
+                        val = extent if name == 'LENGTH' else extent - 1
+                        if val <= 255:
+                            return val
         return None
 
     def _try_eval_const(self, expr) -> int | None:
@@ -624,6 +658,10 @@ class CodeGenerator:
                     return self._parse_plm_number(self.literal_macros[name])
                 except ValueError:
                     pass
+        elif is_double_call(expr):
+            # DOUBLE(n) is how the optimizer writes an ADDRESS constant
+            # below 256; its value is n.
+            return self._try_eval_const(expr.args[0])
         elif isinstance(expr, P.UnaryOp):
             kind = unop_kind(expr)
             if kind == UnaryOpKind.NEG:
@@ -649,65 +687,70 @@ class CodeGenerator:
                     return left_val | right_val
                 elif op == BinaryOpKind.XOR:
                     return left_val ^ right_val
+                elif op == BinaryOpKind.MUL:
+                    return (left_val * right_val) & 0xFFFF
+                # PL/M-80's divide: x / 0 is 0FFFFH, x MOD 0 is x.
+                elif op == BinaryOpKind.DIV:
+                    return plm_div(left_val, right_val)
+                elif op == BinaryOpKind.MOD:
+                    return plm_mod(left_val, right_val)
         return None
 
+    def _literal_macro_value(self, name: str) -> int | None:
+        """The numeric value of a LITERALLY macro, or None."""
+        text = self.literal_macros.get(name)
+        if text is None:
+            return None
+        try:
+            return self._parse_plm_number(text)
+        except ValueError:
+            return None
+
     def _check_impossible_comparison(self, left, right, op) -> None:
-        """Check for comparisons that can never or always be true and raise an error.
+        """Reject a BYTE compared with a constant it can never equal.
 
         ``op`` is the typed-AST :class:`ast_view.BinaryOpKind` decoded
         by :func:`binop_kind` at every call site (``EQ``/``NE``/``LT``/
-        ``LE``/``GT``/``GE``). For BYTE compared to constant outside
-        0-255:
+        ``LE``/``GT``/``GE``). A BYTE is zero-extended into a comparison
+        with an ADDRESS, so against a constant above 255 ``=`` is always
+        false, ``<>`` and ``<`` always true, and so on -- almost certainly
+        not what was meant, so it is an error.
 
-        - For ``=`` and ``<>``, allow truncation only for "negative byte"
-          values (``0xFF00`` - ``0xFFFF``, i.e. -256 to -1).
-        - For ``<``, ``>``, ``<=``, ``>=``, the comparison is always
-          true / false so we error.
+        The constant is typed and evaluated the way the program would
+        compute it: ``-1`` and ``NOT 0`` are the BYTE 0FFH (4.2.2, 4.3), and
+        ``7 MOD 0`` an ADDRESS 7. A constant the optimizer derived -- from
+        a variable whose value it knew, or an operand it dropped -- is not
+        something the programmer wrote, and is not checked: the comparison
+        is compiled as it stands, as it is at -O 0.
         """
         left_type = self._get_expr_type(left)
-        right_val = self._try_eval_const(right)
-
-        if left_type == DataType.BYTE and right_val is not None:
-            # For BYTE comparisons, check if value is outside 0-255 range
-            if right_val < 0:
-                unsigned_val = right_val & 0xFFFF
-            else:
-                unsigned_val = right_val
-
-            if unsigned_val > 255:
-                from .errors import CodeGenError, SourceLocation
-                loc = None
-                if hasattr(right, 'span') and right.span:
-                    loc = SourceLocation(right.span.start_line, right.span.start_col)
-
-                op_kind = op
-
-                # For = and <>, allow truncation only for "negative byte" values (high byte is 0xFF)
-                # This handles BYTE <> -1 (0xFFFF -> 0xFF) but catches BYTE <> 0x123
-                if op_kind in _BYTE_EQ_KINDS:
-                    if (unsigned_val & 0xFF00) == 0xFF00:
-                        return  # Valid: -256 to -1 range, will truncate to byte
-                    # Otherwise, error - constant like 256 or 0x123 shouldn't be compared to BYTE
-                    byte_val = unsigned_val & 0xFF
-                    if op_kind is BinaryOpKind.EQ:
-                        msg = f"comparison BYTE = {unsigned_val} is always false (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
-                    else:
-                        msg = f"comparison BYTE <> {unsigned_val} is always true (BYTE can only hold 0-255; truncating to {byte_val} would change semantics)"
-                    raise CodeGenError(msg, loc)
-
-                # For ordering comparisons, values outside 0-255 give always true/false
-                if op_kind is BinaryOpKind.LT:
-                    msg = f"comparison BYTE < {right_val} is always true (BYTE can only hold 0-255)"
-                elif op_kind is BinaryOpKind.LE:
-                    msg = f"comparison BYTE <= {right_val} is always true (BYTE can only hold 0-255)"
-                elif op_kind is BinaryOpKind.GT:
-                    msg = f"comparison BYTE > {right_val} is always false (BYTE can only hold 0-255)"
-                elif op_kind is BinaryOpKind.GE:
-                    msg = f"comparison BYTE >= {right_val} is always false (BYTE can only hold 0-255)"
-                else:
-                    return  # Unknown comparison operator
-
-                raise CodeGenError(msg, loc)
+        if left_type != DataType.BYTE:
+            return
+        # Two constants make a constant, which the optimizer folds; the
+        # check is about a BYTE the program computes.
+        if eval_typed(left, self._literal_macro_value) is not None:
+            return
+        typed = eval_typed(right, self._literal_macro_value)
+        if typed is None:
+            return
+        value, _, derived = typed
+        if derived or value <= 255:
+            return
+        from .errors import CodeGenError, SourceLocation
+        loc = None
+        pos = getattr(right, 'pos', None)
+        if pos is not None and getattr(pos, 'start_line', 0):
+            loc = SourceLocation(pos.start_line, pos.start_column)
+        verdict = {
+            BinaryOpKind.EQ: ("=", "false"), BinaryOpKind.NE: ("<>", "true"),
+            BinaryOpKind.LT: ("<", "true"), BinaryOpKind.LE: ("<=", "true"),
+            BinaryOpKind.GT: (">", "false"), BinaryOpKind.GE: (">=", "false"),
+        }.get(op)
+        if verdict is None:
+            return
+        raise CodeGenError(
+            f"comparison BYTE {verdict[0]} {value} is always {verdict[1]} "
+            "(BYTE can only hold 0-255)", loc)
 
     def _check_trivial_condition(self, condition, context: str = "condition") -> None:
         """Check for trivial constant conditions and raise an error.
@@ -961,10 +1004,34 @@ class CodeGenerator:
             scope = self.proc_parent.get(scope)
         return owner is None
 
+    def _survey_aliases(self, modules) -> None:
+        """Record the names a store can reach without naming them: a name
+        whose address is taken anywhere (``.x``, ``.x(i)``, ``.x.m``), and one
+        placed AT something (see :meth:`_only_the_loop_sees`)."""
+        self._aliased = set()
+        stack: list = list(modules)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.LocationOf):
+                base = unwrap_paren(n.operand)
+                while isinstance(base, (P.Call, P.MemberAccess)):
+                    base = unwrap_paren(base.callee if isinstance(base, P.Call) else base.base)
+                if isinstance(base, P.Identifier):
+                    self._aliased.add(ident_text(base.name))
+            elif isinstance(n, P.DeclItem) and decl_attrs(n).at_location is not None:
+                self._aliased.update(decl_item_names(n))
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+
     def _only_the_loop_sees(self, name: str, body_stmts, after_return: bool) -> bool:
         """Whether nothing but the loop's own code can read or write `name'
-        while the loop runs - no procedure the body calls names it - and, if
-        `after_return', nothing can read it after a RETURN from the body.
+        while the loop runs - no procedure the body calls names it, and no
+        store reaches it through its address - and, if `after_return',
+        nothing can read it after a RETURN from the body.
 
         A counted loop keeps its count in B and gives the index its final
         value before it starts, and evaluates its bound once; both are only
@@ -973,6 +1040,8 @@ class CodeGenerator:
         sym = self._lookup_symbol(name)
         if sym is None or sym.kind != SymbolKind.VARIABLE or sym.based_on:
             return False
+        if name in self._aliased:
+            return False    # a store through its address does not name it
         owner = self._var_owner(sym, name)
         if owner == self._UNKNOWN_OWNER:
             return False
@@ -1017,7 +1086,7 @@ class CodeGenerator:
                 n = ident_text(e.callee.name).upper()
                 if n in ("LAST", "LENGTH", "SIZE"):
                     return True
-                if n in ("LOW", "HIGH", "DOUBLE"):
+                if n in ("LOW", "HIGH", "DOUBLE", "SHL", "SHR", "ROL", "ROR"):
                     return all(walk(a) for a in e.args or [])
                 return walk(e.callee) and all(walk(a) for a in e.args or [])
             return False
@@ -1824,6 +1893,7 @@ class CodeGenerator:
         self._page_zero_refs = set()
         self._needs_stack = False
         self.literal_macros = {}
+        self._survey_aliases([module])
 
         shape = module_shape(module)
         self._module_decl_items = [d for d in shape.decls if isinstance(d, P.DeclItem)]
@@ -2048,6 +2118,7 @@ class CodeGenerator:
         self._page_zero_refs = set()
         self._needs_stack = False
         self.literal_macros = {}
+        self._survey_aliases(modules)
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]
@@ -2909,11 +2980,15 @@ class CodeGenerator:
                 BinaryOpKind.SUB: '-',
                 BinaryOpKind.MUL: '*',
                 BinaryOpKind.DIV: '/',
+                BinaryOpKind.MOD: ' MOD ',
                 BinaryOpKind.AND: ' AND ',
                 BinaryOpKind.OR: ' OR ',
                 BinaryOpKind.XOR: ' XOR ',
             }
-            op = op_map.get(binop_kind(expr), '+')
+            op = op_map.get(binop_kind(expr))
+            if op is None:
+                raise CodeGenError(
+                    f"Unsupported operator in DATA expression: {binop_kind(expr).name}")
             return f"({left}{op}{right})"
         else:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
@@ -3449,7 +3524,10 @@ class CodeGenerator:
                 return
 
         # Evaluate the value expression (result in A for BYTE, HL for ADDRESS)
-        value_type = self._gen_expr(stmt.value)
+        value = stmt.value
+        if all(self._is_byte_target(t) for t in targets):
+            value = self._low_byte_form(value)
+        value_type = self._gen_expr(value)
 
         # Store to each target (multiple assignment support)
         for i, target in enumerate(targets):
@@ -3638,6 +3716,8 @@ class CodeGenerator:
                                 self._emit("ld", f"a,{self._format_number(const)}")
                                 continue
                         # Evaluate arg - result in A (BYTE) or HL (ADDRESS)
+                        if param_type == DataType.BYTE:
+                            arg = self._low_byte_form(arg)
                         arg_type = self._gen_expr(arg)
                         if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
                             self._emit("ld", "a,l")
@@ -3668,6 +3748,8 @@ class CodeGenerator:
                             self._emit("ld", f"({param_asm}),a")
                             continue
 
+                    if param_type == DataType.BYTE:
+                        arg = self._low_byte_form(arg)
                     arg_type = self._gen_expr(arg)
                     if param_type == DataType.BYTE or arg_type == DataType.BYTE:
                         # BYTE param - ensure value is in A, use LD (addr),A
@@ -3746,6 +3828,8 @@ class CodeGenerator:
                     f"a,{self._format_number(number_value(value))}",
                 )
             else:
+                if return_type == DataType.BYTE:
+                    value = self._low_byte_form(value)
                 result_type = self._gen_expr(value)
                 # Return value is in A (BYTE) or HL (ADDRESS)
                 # If procedure returns BYTE but we have ADDRESS, convert
@@ -3808,7 +3892,7 @@ class CodeGenerator:
             pass
         else:
             # Fallback: evaluate condition and test result
-            result_type = self._gen_expr(stmt.condition)
+            result_type = self._gen_expr(self._low_byte_form(stmt.condition))
             self._emit_truth_test(result_type, false_target, jump_when_true=False)
 
         self.current_if_stmt = old_if_stmt  # Restore before generating body
@@ -3871,6 +3955,11 @@ class CodeGenerator:
         optimised jump was generated (caller skips the fallback),
         False otherwise.
         """
+        # A condition is its bit 0, and a comparison of two bytes is a byte
+        # compare, however wide the optimizer left them.
+        condition = self._without_redundant_double(
+            self._narrowed_comparison(self._low_byte_form(condition)))
+
         # Handle constant conditions. Truth is bit 0, not non-zero (see
         # _emit_truth_test), so `DO WHILE 2` never runs and `IF NOT TRUE`
         # with `TRUE LITERALLY '1'` -- NOT 1 is 0FEH -- is false.
@@ -3921,14 +4010,14 @@ class CodeGenerator:
         both_bytes = (left_type == DataType.BYTE and right_type == DataType.BYTE)
 
         # Byte comparison with constant - use cp n
-        # Handle both regular bytes (0-255) and "negative bytes" (0xFF00-0xFFFF like -1)
+        # A constant above 255 is an ADDRESS, and the BYTE is zero-extended
+        # to meet it: that is a 16-bit comparison, below.
         if left_type == DataType.BYTE:
             const_val = None
             if isinstance(condition.right, P.NumberLiteral):
                 val = number_value(condition.right)
-                # Allow direct byte values (0-255) or negative byte values (0xFF00-0xFFFF)
-                if val <= 255 or (val & 0xFF00) == 0xFF00:
-                    const_val = val & 0xFF
+                if val <= 255:
+                    const_val = val
             elif isinstance(condition.right, P.StringLiteral):
                 s = string_value(condition.right)
                 if len(s) == 1:
@@ -4051,6 +4140,9 @@ class CodeGenerator:
         jump was generated, False if the caller should fall back to
         the generic ``_gen_expr`` + test-flags sequence.
         """
+        condition = self._without_redundant_double(
+            self._narrowed_comparison(self._low_byte_form(condition)))
+
         # Handle constant conditions - truth is bit 0, not non-zero.
         if isinstance(condition, P.NumberLiteral):
             if number_value(condition) & 1:
@@ -4099,14 +4191,14 @@ class CodeGenerator:
         both_bytes = (left_type == DataType.BYTE and right_type == DataType.BYTE)
 
         # Byte comparison with constant - use cp n
-        # Handle both regular bytes (0-255) and "negative bytes" (0xFF00-0xFFFF like -1)
+        # A constant above 255 is an ADDRESS, and the BYTE is zero-extended
+        # to meet it: that is a 16-bit comparison, below.
         if left_type == DataType.BYTE:
             const_val = None
             if isinstance(condition.right, P.NumberLiteral):
                 val = number_value(condition.right)
-                # Allow direct byte values (0-255) or negative byte values (0xFF00-0xFFFF)
-                if val <= 255 or (val & 0xFF00) == 0xFF00:
-                    const_val = val & 0xFF
+                if val <= 255:
+                    const_val = val
             elif isinstance(condition.right, P.StringLiteral):
                 s = string_value(condition.right)
                 if len(s) == 1:
@@ -4483,7 +4575,7 @@ class CodeGenerator:
 
             # Try optimized condition jump, fallback to generic
             if not self._gen_condition_jump_false(stmt.condition, end_label):
-                result_type = self._gen_expr(stmt.condition)
+                result_type = self._gen_expr(self._low_byte_form(stmt.condition))
                 self._emit_truth_test(result_type, end_label, jump_when_true=False)
 
             # Loop body
@@ -4532,9 +4624,10 @@ class CodeGenerator:
         if sym and sym.data_type == DataType.BYTE:
             index_type = DataType.BYTE
 
-        # Also check bound type
-        bound_type = self._get_expr_type(stmt.bound)
-        both_bytes = (index_type == DataType.BYTE and bound_type == DataType.BYTE)
+        # The limit (like the start and the step) is converted to the
+        # index's type (5.1.4), so a BYTE index makes a byte loop whatever
+        # the limit is: `DO b = 0 TO 300' runs to 44.
+        both_bytes = index_type == DataType.BYTE
 
         # Get step value (default +1 when no BY clause; only constant
         # NumberLiteral steps drive the byte-loop optimisations).
@@ -4568,9 +4661,10 @@ class CodeGenerator:
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
         # The count stands in for the index, so nothing else may look at the
-        # index while the loop runs: not a procedure the body calls, and not
-        # the caller after a RETURN from the body.  The bound is evaluated
-        # once, so nothing may change it either.
+        # index while the loop runs: not a procedure the body calls, not a
+        # store through its address, and not the caller after a RETURN from
+        # the body.  The bound is evaluated once, where PL/M-80 evaluates the
+        # limit on every pass, so nothing may change it either.
         if (
             both_bytes
             and step_is_const
@@ -4585,7 +4679,8 @@ class CodeGenerator:
             # A = the number of passes, bound + 1.  A bound of 255 is 256
             # passes, a count of 0 in B, which is where DJNZ counts 256 from
             # - a DO from 0 runs at least once whatever its bound (PL/M-80
-            # manual, 5.1.4).
+            # manual, 5.1.4).  The bound is converted to the BYTE index's
+            # type, so an ADDRESS bound counts by its low byte.
             if isinstance(stmt.bound, P.NumberLiteral):
                 self._emit("ld", f"a,{self._format_number((number_value(stmt.bound) + 1) & 0xFF)}")
             else:
@@ -4602,52 +4697,83 @@ class CodeGenerator:
             self.loop_stack.pop()
             return
 
-        # Check for optimized down-counting loop: DO I = N TO 0
-        # When start is variable, bound is 0, and step is -1 (or default counting down)
-        is_downcount_to_zero = (
-            both_bytes
-            and step_is_const
-            and isinstance(stmt.bound, P.NumberLiteral)
-            and number_value(stmt.bound) == 0
-            and (step_val == -1 or step_val == 0xFF)
-        )
+        # PL/M-80's iterative DO, as DRI's compiler codes it (UTIL4/ERAQ.PRL,
+        # UTIL3/LOAD.COM): the index is compared with the limit before each
+        # pass, and the loop ends when the increment carries out of the
+        # index's width -- `INR A / JNZ top' for a BYTE step of 1,
+        # `DAD D / JNC top' for a BY step. So `DO b = 0 TO 255' runs 256
+        # times and leaves b = 0, and a step that would wrap past the limit
+        # stops the loop instead. A step of 0FFH (or -1) is 255, not a
+        # count downwards (5.1.4).
+        if both_bytes:
+            bound_val = (number_value(stmt.bound) & 0xFF
+                         if isinstance(stmt.bound, P.NumberLiteral) else None)
+            step_byte = step_val & 0xFF if step_is_const else None
 
-        if is_downcount_to_zero:
-            # Optimized down-counting byte loop
-            # Initialize: load start into A, store to index
+            # Initialize index variable
             start_type = self._gen_expr(stmt.start)
             if start_type == DataType.ADDRESS:
                 self._emit("ld", "a,l")
             self._gen_store(index_var, DataType.BYTE)
 
-            # Jump to test
-            self._emit("jp", test_label)
+            # A limit of 255 passes every index, so there is nothing to test.
+            if bound_val != 0xFF:
+                self._emit("jp", test_label)
 
             # Loop body
             self._emit_label(loop_label)
             for s in body_stmts:
                 self._gen_stmt(s)
 
-            # Decrement
+            # Increment, and stop when it carries out.  INC sets Z when it
+            # wraps, ADD sets carry; storing a BYTE is all loads, so the flags
+            # survive the store.
             self._emit_label(incr_label)
             self._gen_load(index_var)  # A = index
-            self._emit("dec", "a")
+            if not step_is_const:
+                # The step is an expression: keep the index while it runs.
+                self._emit("push", "af")
+                if self._gen_expr(step_expr) == DataType.ADDRESS:
+                    self._emit("ld", "a,l")
+                self._emit("ld", "b,a")
+                self._emit("pop", "af")
+                self._emit("add", "a,b")
+                wrap = "c"
+            elif step_byte == 1:
+                self._emit("inc", "a")
+                wrap = "z"
+            else:
+                self._emit("add", f"a,{self._format_number(step_byte)}")
+                wrap = "c"
             self._gen_store(index_var, DataType.BYTE)
-
-            # Test: if A >= 0 (not wrapped), continue
-            # After DEC, if result is not negative (i.e., >= 0), continue
-            self._emit_label(test_label)
-            self._gen_load(index_var)  # A = index
-            self._emit("or", "a")  # Set flags
-            self._emit("jp", f"p,{loop_label}")  # Jump if positive (bit 7 clear)
+            # With a constant limit the index is at most the limit before
+            # the step, so if limit + step fits in a byte it cannot wrap.
+            can_wrap = (bound_val is None or not step_is_const
+                        or bound_val + step_byte > 0xFF)
+            if bound_val == 0xFF:
+                self._emit("jp", f"n{wrap},{loop_label}")
+                self._emit_label(test_label)
+            else:
+                if can_wrap:
+                    self._emit("jp", f"{wrap},{end_label}")
+                self._emit_label(test_label)
+                if bound_val is not None:
+                    self._gen_load(index_var)  # A = index
+                    self._emit("cp", self._format_number(bound_val + 1))
+                    self._emit("jp", f"C,{loop_label}")  # index <= limit
+                else:
+                    # The limit is evaluated on every pass, converted to a
+                    # BYTE. Continue while index <= limit.
+                    bound_result = self._gen_expr(stmt.bound)
+                    if bound_result == DataType.ADDRESS:
+                        self._emit("ld", "a,l")
+                    self._emit("ld", "b,a")  # B = limit
+                    self._gen_load(index_var)  # A = index
+                    self._emit("cp", "b")
+                    self._emit("jp", f"c,{loop_label}")
+                    self._emit("jp", f"z,{loop_label}")
 
             self._emit_label(end_label)
-            self.loop_stack.pop()
-            return
-
-        if both_bytes:
-            self._gen_byte_loop(stmt, index_var, body_stmts, (step_expr, step_is_const, step_val),
-                                (loop_label, test_label, incr_label, end_label))
             self.loop_stack.pop()
             return
 
@@ -4663,19 +4789,24 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
+        bound_val = (number_value(stmt.bound) & 0xFFFF
+                     if isinstance(stmt.bound, P.NumberLiteral) else None)
+        step_word = step_val & 0xFFFF if step_is_const else None
+
         # Initialize index variable
-        self._gen_expr(stmt.start)
+        self._gen_expr_to_hl(stmt.start)
         self._gen_store(index_var, DataType.ADDRESS)
 
-        # Jump to test
-        self._emit("jp", test_label)
+        # Jump to test (a limit of 0FFFFH passes every index)
+        if bound_val != 0xFFFF:
+            self._emit("jp", test_label)
 
         # Loop body
         self._emit_label(loop_label)
         for s in body_stmts:
             self._gen_stmt(s)
 
-        # Increment
+        # Increment, and stop when it carries out.
         self._emit_label(incr_label)
         _index_to_hl()
         if not step_is_const:
@@ -4684,14 +4815,33 @@ class CodeGenerator:
             self._emit("ex", "de,hl")
             self._emit("pop", "hl")
             self._emit("add", "hl,de")
-        elif step_val == 1:
+            wrap = "c"
+        elif step_word == 1:
             self._emit("inc", "hl")
-        elif step_val == -1 or step_val == 0xFFFF:
-            self._emit("dec", "hl")
+            wrap = "z"
         else:
-            self._emit("ld", f"de,{self._format_number(step_val)}")
-            self._emit("add", "hl,de")
+            # BC, not DE: the peephole turns `ld de,1..3 / add hl,de' into
+            # `inc hl', which sets no carry.
+            can_carry = bound_val is None or bound_val + step_word > 0xFFFF
+            pair = "bc" if can_carry else "de"
+            self._emit("ld", f"{pair},{self._format_number(step_word)}")
+            self._emit("add", f"hl,{pair}")
+            wrap = "c"
         self._gen_store(index_var, DataType.ADDRESS)
+        can_wrap = (bound_val is None or not step_is_const
+                    or bound_val + step_word > 0xFFFF)
+        if can_wrap:
+            if wrap == "z":
+                # `inc hl' sets no flags: the index wrapped if it is now 0.
+                self._emit("ld", "a,h")
+                self._emit("or", "l")
+            if bound_val == 0xFFFF:
+                self._emit("jp", f"n{wrap},{loop_label}")
+                self._emit_label(test_label)
+                self._emit_label(end_label)
+                self.loop_stack.pop()
+                return
+            self._emit("jp", f"{wrap},{end_label}")
 
         # Test condition
         self._emit_label(test_label)
@@ -4715,105 +4865,6 @@ class CodeGenerator:
 
         self._emit_label(end_label)
         self.loop_stack.pop()
-
-    def _gen_byte_loop(self, stmt, index_var, body_stmts, step: tuple,
-                       labels: tuple[str, str, str, str]) -> None:
-        """An iterative DO whose index and bound are both BYTEs.
-
-        The loop ends when the index passes the bound, or when stepping it
-        carries out of the byte, which passes any bound: `DO j = 0 TO 255'
-        runs 256 times and leaves j at 0 (PL/M-80 manual, 5.1.4).  The test
-        used to be `index < bound + 1', and bound + 1 is 0 when the bound is
-        255, so such a loop ran no times at all - with a constant bound as
-        well as a variable one.  With a constant 255 there is nothing to
-        compare: the first test always passes and only the carry ends it.
-
-        A step of -1 counts down, and is left as it was.  `step' is (the BY
-        expression or None, whether it is a constant, its value).
-        """
-        step_expr, step_is_const, step_val = step
-        loop_label, test_label, incr_label, end_label = labels
-        bound_val = (number_value(stmt.bound)
-                     if isinstance(stmt.bound, P.NumberLiteral) else None)
-        down = step_is_const and (step_val == -1 or step_val == 0xFF)
-        by_inc = step_is_const and step_val == 1
-        to_255 = bound_val == 255 and not down
-
-        # Initialize index variable
-        start_type = self._gen_expr(stmt.start)
-        if start_type == DataType.ADDRESS:
-            self._emit("ld", "a,l")
-        self._gen_store(index_var, DataType.BYTE)
-
-        if not to_255:
-            self._emit("jp", test_label)
-
-        # Loop body
-        self._emit_label(loop_label)
-        for s in body_stmts:
-            self._gen_stmt(s)
-
-        # Step.  INC sets Z when it wraps, ADD sets carry; storing a BYTE is
-        # all loads, so the flags survive the store.
-        self._emit_label(incr_label)
-        self._gen_load(index_var)  # A = index
-        if not step_is_const:
-            # The step is an expression: keep the index while it runs.
-            self._emit("push", "af")
-            if self._gen_expr(step_expr) == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._emit("ld", "b,a")
-            self._emit("pop", "af")
-            self._emit("add", "a,b")
-        elif by_inc:
-            self._emit("inc", "a")
-        elif down:
-            self._emit("dec", "a")
-        else:
-            self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-        self._gen_store(index_var, DataType.BYTE)
-
-        if to_255:
-            self._emit("jp", f"{'nz' if by_inc else 'nc'},{loop_label}")
-            self._emit_label(end_label)
-            return
-        if not down and not (by_inc and bound_val is not None):
-            # Wrapped: past any bound.  (By 1 up to a constant below 255 it
-            # cannot wrap.)
-            self._emit("jp", f"{'z' if by_inc else 'c'},{end_label}")
-
-        self._emit_label(test_label)
-        if bound_val == 255:
-            # Down to 255: as before, go on until the index is 0.
-            self._gen_load(index_var)
-            self._emit("or", "a")
-            self._emit("jp", f"nz,{loop_label}")
-        elif bound_val is not None:
-            self._gen_load(index_var)  # A = index
-            self._emit("cp", self._format_number(bound_val + 1))
-            self._emit("jp", f"C,{loop_label}")  # index < bound+1, i.e. index <= bound
-        elif down:
-            # As before: index < bound + 1.
-            if self._gen_expr(stmt.bound) == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._emit("inc", "a")
-            self._emit("ld", "b,a")
-            self._gen_load(index_var)
-            self._emit("cp", "B")
-            self._emit("jp", f"C,{loop_label}")
-        else:
-            # index <= bound, as bound - index with no borrow; bound + 1
-            # would be 0 for a bound of 255.
-            if self._gen_expr(stmt.bound) == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._emit("ld", "b,a")  # B = bound
-            self._gen_load(index_var)  # A = index
-            self._emit("ld", "c,a")
-            self._emit("ld", "a,b")
-            self._emit("cp", "c")
-            self._emit("jp", f"nc,{loop_label}")
-
-        self._emit_label(end_label)
 
     def _gen_counted_body(self, body_stmts, loop_label: str, incr_label: str,
                           end_label: str) -> None:
@@ -4946,13 +4997,22 @@ class CodeGenerator:
             # of A - UTIL4/STAT.PLM's getfile calls its own nested
             # `setfilestatus' that way.
             sym = self._lookup_symbol(name)
-            if sym:
+            if sym and sym.kind != SymbolKind.BUILTIN:
                 if sym.kind == SymbolKind.PROCEDURE:
                     return sym.return_type or DataType.ADDRESS
                 return sym.data_type or DataType.ADDRESS
+            # The condition flags, read without parentheses, are BYTE
+            # procedures (12.5) -- unless a variable of the name hides them.
+            if name.upper() in ('CARRY', 'ZERO', 'SIGN', 'PARITY'):
+                return DataType.BYTE
+            if sym:
+                return sym.data_type or DataType.ADDRESS
             return DataType.ADDRESS
         elif isinstance(expr, P.EmbeddedAssign):
-            return self._get_expr_type(expr.target)
+            # "The value of the embedded assignment is the same as that of
+            # its right half" (PL/M-80 manual 4.6.3): `(b := w)' is w, all
+            # sixteen bits of it, whatever b keeps.
+            return self._get_expr_type(expr.value)
         elif isinstance(expr, P.BinaryOp):
             op = binop_kind(expr)
             if op in (
@@ -4964,9 +5024,11 @@ class CodeGenerator:
             left_type = self._get_expr_type(expr.left)
             right_type = self._get_expr_type(expr.right)
             if left_type == DataType.BYTE and right_type == DataType.BYTE:
+                # PLUS and MINUS "perform similarly to + and -" (12.2).
                 if op in (
                     BinaryOpKind.ADD, BinaryOpKind.SUB,
                     BinaryOpKind.AND, BinaryOpKind.OR, BinaryOpKind.XOR,
+                    BinaryOpKind.PLUS, BinaryOpKind.MINUS,
                 ):
                     return DataType.BYTE
             return DataType.ADDRESS
@@ -4974,15 +5036,19 @@ class CodeGenerator:
             return DataType.ADDRESS
         elif isinstance(expr, (P.Call, P.CallNoArgs)):
             callee = unwrap_paren(expr.callee)
+            # An element of an array member, `s.m(i)': the member's type, as
+            # _gen_call_expr loads it. It was typed ADDRESS, so a BYTE
+            # element was compared and added in sixteen bits.
+            if (isinstance(callee, P.MemberAccess) and isinstance(expr, P.Call)
+                    and len(expr.args) == 1):
+                _, member_type = self._get_member_info(callee)
+                return member_type
             if isinstance(callee, P.Identifier):
                 name = ident_text(callee.name).upper()
-                if name in ('LOW', 'HIGH', 'INPUT', 'ROL', 'ROR'):
-                    return DataType.BYTE
-                if name == 'MEMORY':
-                    return DataType.BYTE
-                if name in ('SHL', 'SHR', 'DOUBLE', 'LENGTH', 'LAST', 'SIZE',
-                            'STACKPTR', 'TIME', 'CPUTIME'):
-                    return DataType.ADDRESS
+                # Built-ins first, as _gen_call_expr dispatches them.
+                builtin_type = self._builtin_type(name, expr)
+                if builtin_type is not None:
+                    return builtin_type
                 sym = self._lookup_symbol(ident_text(callee.name))
                 if sym:
                     if sym.kind == SymbolKind.PROCEDURE:
@@ -5003,6 +5069,40 @@ class CodeGenerator:
             _, member_type = self._get_member_info(expr)
             return member_type
         return DataType.ADDRESS
+
+    def _builtin_type(self, name: str, expr) -> DataType | None:
+        """The type of a call to built-in ``name`` (upper case), or None.
+
+        SCL and SCR have the type of their pattern (12.3), and LENGTH and
+        LAST are BYTE when the value fits in one (11.1.2). SHL and SHR are
+        always ADDRESS here: the manual gives them their pattern's type
+        (11.1.4), but uplm80 has always shifted a BYTE pattern as a
+        zero-extended ADDRESS, and programs written for it -- 80un's
+        `lo + shl(b, 8)' -- depend on that (see plm_types).
+        """
+        if name in BYTE_BUILTINS:
+            return DataType.BYTE
+        if name in ('DOUBLE', 'SIZE', 'STACKPTR', 'TIME', 'CPUTIME', 'SHL', 'SHR'):
+            return DataType.ADDRESS
+        args = expr.args if isinstance(expr, P.Call) else []
+        if name in PATTERN_TYPED_BUILTINS and args:
+            return self._get_expr_type(args[0])
+        if name in ('LENGTH', 'LAST'):
+            extent = self._array_extent(args[0]) if args else None
+            if extent is None:
+                return DataType.ADDRESS
+            value = extent if name == 'LENGTH' else extent - 1
+            return DataType.BYTE if value <= 0xFF else DataType.ADDRESS
+        return None
+
+    def _array_extent(self, arg) -> int | None:
+        """The declared extent of the array ``arg`` names, if known."""
+        arg = unwrap_paren(arg)
+        if isinstance(arg, P.Identifier):
+            sym = self._lookup_scoped(ident_text(arg.name))
+            if sym and sym.dimension:
+                return sym.dimension
+        return None
 
     def _is_simple_address_expr(self, expr) -> bool:
         """Check if expression is simple enough to load directly into DE."""
@@ -5274,9 +5374,12 @@ class CodeGenerator:
         Returns the type of the expression.
         """
         expr = unwrap_paren(expr)
-        # Clear a_has_l for most expression types (embedded assign sets it)
-        if not isinstance(expr, (P.EmbeddedAssign, P.Call, P.CallNoArgs)):
-            self.a_has_l = False
+        # a_has_l says that A holds L of the value generated last: an
+        # embedded assignment of an ADDRESS to a BYTE sets it when it
+        # returns, and LOW reads it straight after generating its operand.
+        # Anything generated since makes it stale -- `(b := w * 5) XOR
+        # LOW(LAST(a))' took A for LAST's L.
+        self.a_has_l = False
 
         if isinstance(expr, P.NumberLiteral):
             self._emit("ld", f"hl,{self._format_number(number_value(expr))}")
@@ -5287,6 +5390,13 @@ class CodeGenerator:
             if len(s) == 1:
                 self._emit("ld", f"a,{self._format_number(ord(s[0]))}")
                 return DataType.BYTE
+            if len(s) == 2:
+                # A two-character string is an ADDRESS constant, the first
+                # character in the high byte (4.1.1) -- not a pointer: that
+                # is `.('AB')'.
+                value = (ord(s[0]) << 8) | ord(s[1])
+                self._emit("ld", f"hl,{self._format_number(value)}")
+                return DataType.ADDRESS
             label = self._new_string_label()
             self.string_literals.append((label, s))
             self._emit("ld", f"hl,{label}")
@@ -5412,8 +5522,9 @@ class CodeGenerator:
                 # `ld a,0 / rla` cannot be used: the peephole rewrites
                 # `ld a,0` into the one-byte `xor a`, which CLEARS the
                 # very flag being read, and CARRY then always reads 0.
+                # CARRY is 0FFH when the flag is set (12.5), and `sbc a,a'
+                # leaves the flag as it found it for a later PLUS or CARRY.
                 self._emit("sbc", "a,a")
-                self._emit("and", "1")
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
                 return DataType.BYTE
@@ -5607,6 +5718,11 @@ class CodeGenerator:
                     self._emit("ld", "a,b")  # Restore value
                     self._emit("ld", "(hl),a")  # Store via HL
                 else:
+                    # A BYTE value is in A: widen it into HL, which the
+                    # store below takes the value from.
+                    if val_type == DataType.BYTE:
+                        self._emit("ld", "l,a")
+                        self._emit("ld", "h,0")
                     # Save value in HL
                     self._emit("push", "hl")
                     self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
@@ -5683,15 +5799,19 @@ class CodeGenerator:
             if isinstance(callee, P.Identifier) and ident_text(callee.name).upper() == "OUTPUT":
                 port_arg = expr.args[0]
                 port_num = self._try_eval_const(port_arg)
-                if port_num is not None and 0 <= port_num <= 255:
+                if port_num is not None:
+                    port_num &= 0xFF        # the port is a BYTE
+                # A BYTE value is in A already; `ld a,l' replaced it with
+                # whatever L held.
+                if val_type != DataType.BYTE:
                     self._emit("ld", "a,l")
+                if port_num is not None:
                     self._emit("out", f"({self._format_number(port_num)}),a")
                 else:
-                    self._emit("push", "hl")
-                    self._gen_expr(port_arg)
-                    self._emit("ld", "c,l")
-                    self._emit("pop", "hl")
-                    self._emit("ld", "a,l")
+                    self._emit("push", "af")
+                    self._gen_expr_to_a(port_arg)
+                    self._emit("ld", "c,a")
+                    self._emit("pop", "af")
                     self._emit("call", "??outp")
                     self.needs_runtime.add("outp")
                 return
@@ -5704,7 +5824,10 @@ class CodeGenerator:
             ):
                 self.needs_end_symbol = True
                 addr_arg = expr.args[0]
-                addr_val = self._try_eval_const(addr_arg)
+                # The subscript is an expression like any other: `MEMORY(-1)'
+                # is MEMORY(0FFH), -1 being a BYTE (4.2.2).
+                typed = eval_typed(addr_arg, self._literal_macro_value)
+                addr_val = None if typed is None else typed[0]
                 if addr_val is not None:
                     if val_type != DataType.BYTE:
                         self._emit("ld", "a,l")
@@ -5713,16 +5836,18 @@ class CodeGenerator:
                     else:
                         self._emit("ld", f"(__END__+{self._format_number(addr_val)}),a")
                 else:
+                    # A BYTE subscript is generated into A: widen it into
+                    # HL, where it is added to __END__.
                     if val_type == DataType.BYTE:
                         self._emit("push", "af")
-                        self._gen_expr(addr_arg)
+                        self._gen_expr_to_hl(addr_arg)
                         self._emit("ld", "de,__END__")
                         self._emit("add", "hl,de")
                         self._emit("pop", "af")
                         self._emit("ld", "(hl),a")
                     else:
                         self._emit("push", "hl")
-                        self._gen_expr(addr_arg)
+                        self._gen_expr_to_hl(addr_arg)
                         self._emit("ld", "de,__END__")
                         self._emit("add", "hl,de")
                         self._emit("ex", "de,hl")
@@ -5899,6 +6024,7 @@ class CodeGenerator:
 
     def _gen_binary(self, expr) -> DataType:
         """Generate code for a typed binary expression."""
+        expr = self._without_redundant_double(self._narrowed_comparison(expr))
         op = binop_kind(expr)
         left = unwrap_paren(expr.left)
         right = unwrap_paren(expr.right)
@@ -5947,8 +6073,8 @@ class CodeGenerator:
                 const_val = None
                 if isinstance(right, P.NumberLiteral):
                     val = number_value(right)
-                    if val <= 255 or (val & 0xFF00) == 0xFF00:
-                        const_val = val & 0xFF
+                    if val <= 255:
+                        const_val = val
                 elif isinstance(right, P.StringLiteral):
                     s = string_value(right)
                     if len(s) == 1:
@@ -5964,6 +6090,9 @@ class CodeGenerator:
             BinaryOpKind.AND, BinaryOpKind.OR, BinaryOpKind.XOR,
         ):
             return self._gen_byte_binary(left, right, op)
+
+        if both_bytes and op in (BinaryOpKind.PLUS, BinaryOpKind.MINUS):
+            return self._gen_byte_carry_op(left, right, op)
 
         if (
             op == BinaryOpKind.PLUS
@@ -6051,6 +6180,10 @@ class CodeGenerator:
         left_need = self._label_reg_need(left)
         right_need = self._label_reg_need(right)
 
+        # Paths 2 and 3 claim DE only where they keep a value in it; a
+        # release without its claim would restore someone else's spill.
+        claimed_de = False
+
         # Path 1: left is simple AND DE is free
         if self._expr_preserves_de(left) and self.regs.is_free('de'):
             right_result = self._gen_expr(right)
@@ -6065,7 +6198,6 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
             self.regs.mark_free('de')
-            used_general_path = False
 
         # Path 2: Sethi-Ullman - right needs more registers.
         elif right_need > left_need:
@@ -6083,12 +6215,12 @@ class CodeGenerator:
                 self._emit("pop", "de")
             else:
                 self.regs.need_reg('de', 'binary_right_sethi', self._emit)
+                claimed_de = True
                 self._emit("ex", "de,hl")
                 left_result = self._gen_expr(left)
                 if left_result == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
-            used_general_path = True
 
         else:
             # Path 3: General - left first.
@@ -6107,6 +6239,7 @@ class CodeGenerator:
                 self._emit("pop", "hl")
             else:
                 self.regs.need_reg('de', 'binary_left', self._emit)
+                claimed_de = True
                 self._emit("ex", "de,hl")
                 right_result = self._gen_expr(right)
                 if right_result == DataType.BYTE:
@@ -6114,7 +6247,6 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("ex", "de,hl")
 
-            used_general_path = True
 
         if op == BinaryOpKind.ADD:
             self._emit("add", "hl,de")
@@ -6162,7 +6294,7 @@ class CodeGenerator:
             BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
             BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
         ):
-            if used_general_path:
+            if claimed_de:
                 self.regs.release_reg('de', self._emit)
             return self._gen_comparison(op)
 
@@ -6182,7 +6314,7 @@ class CodeGenerator:
             self._emit("sbc", "a,d")
             self._emit("ld", "h,a")
 
-        if used_general_path:
+        if claimed_de:
             self.regs.release_reg('de', self._emit)
 
         return DataType.ADDRESS
@@ -6364,14 +6496,13 @@ class CodeGenerator:
 
         left_const = self._get_const_byte_value(left)
         if op == BinaryOpKind.SUB and left_const is not None:
-            if left_const == 1:
-                self._gen_expr_to_a(right)
-                self._emit("xor", "1")
-            else:
-                self._gen_expr_to_a(right)
-                self._emit("cpl")
-                self._emit("inc", "a")
-                self._emit("add", f"a,{self._format_number(left_const)}")
+            # c - x, with the borrow a subtraction leaves. (`1 - x' was
+            # `x XOR 1', which is 1 - x only for x = 0 or 1: 1 - 0FFH is 2,
+            # not 0FEH; and `-x + c' left the carry inverted.)
+            self._gen_expr_to_a(right)
+            self._emit("ld", "b,a")
+            self._emit("ld", f"a,{self._format_number(left_const)}")
+            self._emit("sub", "b")
             return DataType.BYTE
 
         if op == BinaryOpKind.SUB:
@@ -6407,6 +6538,26 @@ class CodeGenerator:
 
         return DataType.BYTE
 
+    def _gen_byte_carry_op(self, left, right, op: BinaryOpKind) -> DataType:
+        """BYTE PLUS / MINUS BYTE: an 8-bit `adc' / `sbc' with a BYTE result.
+
+        PLUS and MINUS "perform similarly to + and -" (12.2), so two BYTEs
+        give a BYTE, taking in whatever carry the left operand's evaluation
+        left; `push af' / `pop af' carry the flags across the right one.
+        """
+        mnemonic = "adc" if op == BinaryOpKind.PLUS else "sbc"
+        right_const = self._get_const_byte_value(right)
+        self._gen_expr_to_a(left)
+        if right_const is not None:
+            self._emit(mnemonic, f"a,{self._format_number(right_const)}")
+            return DataType.BYTE
+        self._emit("push", "af")
+        self._gen_expr_to_a(right)
+        self._emit("ld", "b,a")
+        self._emit("pop", "af")
+        self._emit(mnemonic, "a,b")
+        return DataType.BYTE
+
     def _gen_expr_to_hl(self, expr) -> None:
         """Generate an expression into ``HL``, widening a byte result.
 
@@ -6419,9 +6570,100 @@ class CodeGenerator:
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
 
+    def _unwidened(self, expr):
+        """``x`` when ``expr`` is ``DOUBLE(x)`` of a BYTE ``x``, else None.
+
+        The optimizer keeps a strength-reduced quotient or remainder ADDRESS
+        by wrapping it in DOUBLE (``x MOD 8`` is ``DOUBLE(x AND 7)``), since
+        in PL/M-80 one is an ADDRESS even of BYTE operands. That width only
+        shows where the value meets 16-bit arithmetic; a use that reads its
+        low byte, or compares it with another BYTE, gets the same answer
+        from ``x`` itself.
+        """
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.Call) and len(expr.args) == 1:
+            callee = unwrap_paren(expr.callee)
+            if (isinstance(callee, P.Identifier)
+                    and ident_text(callee.name).upper() == 'DOUBLE'
+                    and self._get_expr_type(expr.args[0]) == DataType.BYTE):
+                return expr.args[0]
+        return None
+
+    def _low_byte_form(self, expr):
+        """``expr`` for a use that reads only its low byte (or bit 0).
+
+        The low byte of a sum, difference, bitwise result or complement
+        depends only on the low bytes of the operands, so a DOUBLE anywhere
+        in that tree can go.
+        """
+        inner = self._unwidened(expr)
+        if inner is not None:
+            return self._low_byte_form(inner)
+        e = unwrap_paren(expr)
+        if isinstance(e, P.BinaryOp) and binop_kind(e) in (
+                BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.AND,
+                BinaryOpKind.OR, BinaryOpKind.XOR):
+            left = self._low_byte_form(e.left)
+            right = self._low_byte_form(e.right)
+            if left is not e.left or right is not e.right:
+                return make_binary(binop_kind(e), left, right, pos=e.pos)
+        elif isinstance(e, P.UnaryOp):
+            operand = self._low_byte_form(e.operand)
+            if operand is not e.operand:
+                return make_unary(unop_kind(e), operand, pos=e.pos)
+        return expr
+
+    def _narrowed_comparison(self, expr):
+        """A comparison of ``DOUBLE(x)`` with a BYTE, as one of two BYTEs.
+
+        Both sides are then bytes zero-extended, which a byte compare orders
+        exactly as the 16-bit one does.
+        """
+        e = unwrap_paren(expr)
+        if not (isinstance(e, P.BinaryOp) and binop_kind(e) in self._COMPARISON_KINDS):
+            return expr
+        left = self._unwidened(e.left)
+        right = self._unwidened(e.right)
+        if left is None and right is None:
+            return expr
+        left = e.left if left is None else left
+        right = e.right if right is None else right
+        if (self._get_expr_type(left) != DataType.BYTE
+                or self._get_expr_type(right) != DataType.BYTE):
+            return expr
+        return make_binary(binop_kind(e), left, right, pos=e.pos)
+
+    def _without_redundant_double(self, expr):
+        """``expr`` with a constant operand ``DOUBLE(n)`` written ``n`` where
+        the operation is 16-bit anyway.
+
+        The optimizer writes an ADDRESS constant below 256 as ``DOUBLE(n)``
+        so that it widens what it meets. Against an ADDRESS, or in a
+        product, quotient or remainder, the operation is 16-bit either way,
+        and the plain literal is what the short forms (`inc hl', `ld de,n')
+        look for.
+        """
+        e = unwrap_paren(expr)
+        if not isinstance(e, P.BinaryOp):
+            return expr
+        op = binop_kind(e)
+        always_wide = op in (BinaryOpKind.MUL, BinaryOpKind.DIV, BinaryOpKind.MOD)
+
+        def strip(x, other):
+            if (is_double_call(x) and typed_const(x) is not None
+                    and (always_wide or self._get_expr_type(other) == DataType.ADDRESS)):
+                return unwrap_paren(unwrap_paren(x).args[0])
+            return x
+
+        left = strip(e.left, e.right)
+        right = strip(e.right, left)
+        if left is e.left and right is e.right:
+            return expr
+        return make_binary(op, left, right, pos=e.pos)
+
     def _gen_expr_to_a(self, expr) -> None:
         """Generate code to load an expression into A (for byte operations)."""
-        expr = unwrap_paren(expr)
+        expr = unwrap_paren(self._low_byte_form(expr))
         const_val = self._get_const_byte_value(expr)
         if const_val is not None:
             self._emit("ld", f"a,{self._format_number(const_val)}")
@@ -6433,9 +6675,21 @@ class CodeGenerator:
                 self._emit("ld", "a,l")
 
     def _gen_unary(self, expr) -> DataType:
-        """Generate code for a typed unary expression."""
+        """Generate code for a typed unary expression.
+
+        `-x' and `NOT x' have x's type (4.2.2, 4.3): NOT 7 is the BYTE
+        0F8H and -1 the BYTE 0FFH. The width is the operand's static type,
+        not the register it happens to be generated into -- a literal
+        loads into HL, and complementing all of HL made `(NOT 7) MOD w'
+        divide 0FFF8H.
+        """
         kind = unop_kind(expr)
-        operand_type = self._gen_expr(expr.operand)
+        if self._get_expr_type(expr.operand) == DataType.BYTE:
+            self._gen_expr_to_a(expr.operand)
+            operand_type = DataType.BYTE
+        else:
+            self._gen_expr_to_hl(expr.operand)
+            operand_type = DataType.ADDRESS
 
         if kind == UnaryOpKind.NEG:
             if operand_type == DataType.BYTE:
@@ -6515,6 +6769,9 @@ class CodeGenerator:
             self._gen_call_expr(expr)
             return
 
+        # An index is zero-extended anyway.
+        index = unwrap_paren(self._unwidened(index) or index)
+
         elem_size = 1
         if isinstance(base, P.Identifier):
             sym = self.symbols.lookup(ident_text(base.name))
@@ -6543,8 +6800,8 @@ class CodeGenerator:
             idx_type = self._get_expr_type(index)
             if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
                 # What the index comes out as, not what it was expected to:
-                # `-1' is negated in HL, and taking A as the index put
-                # `buf(-1)' at BUF+255 at -O0.
+                # taking A for an index generated into HL put the element
+                # somewhere that depended on the optimization level.
                 if self._gen_expr(index) == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
@@ -6814,6 +7071,8 @@ class CodeGenerator:
                             if const is not None:
                                 self._emit("ld", f"a,{self._format_number(const)}")
                                 continue
+                        if param_type == DataType.BYTE:
+                            arg = self._low_byte_form(arg)
                         arg_type = self._gen_expr(arg)
                         if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
                             self._emit("ld", "a,l")
@@ -6840,6 +7099,8 @@ class CodeGenerator:
                             self._emit("ld", f"({param_asm}),a")
                             continue
 
+                    if param_type == DataType.BYTE:
+                        arg = self._low_byte_form(arg)
                     arg_type = self._gen_expr(arg)
                     if param_type == DataType.BYTE or arg_type == DataType.BYTE:
                         if arg_type == DataType.ADDRESS:
@@ -6874,7 +7135,8 @@ class CodeGenerator:
                 arg = args[0]
                 port_num = self._try_eval_const(arg)
                 if port_num is not None:
-                    self._emit("in", f"a,({self._format_number(port_num)})")
+                    # The port is a BYTE: `INPUT(-1)' reads port 0FFH.
+                    self._emit("in", f"a,({self._format_number(port_num & 0xFF)})")
                 else:
                     self._gen_expr(arg)
                     self._emit("call", "??inp")
@@ -6944,26 +7206,11 @@ class CodeGenerator:
                 return DataType.ADDRESS
 
             # Variable shift - use loop
-            arg_type = self._gen_expr(args[0])
-            if arg_type == DataType.BYTE:
-                # BYTE value is in A, move to HL
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
+            self._gen_expr_to_hl(args[0])
             self._emit("push", "hl")
-            count_type = self._gen_expr(args[1])
-            if count_type == DataType.BYTE:
-                self._emit("ld", "c,a")  # Count in C (from A for byte)
-            else:
-                self._emit("ld", "c,l")  # Count in C (from L for address)
+            self._gen_count_to_b(args[1])
             self._emit("pop", "hl")   # Value in HL
-            shift_loop = self._new_label("SHL")
-            end_label = self._new_label("SHLE")
-            self._emit_label(shift_loop)
-            self._emit("dec", "c")
-            self._emit("jp", f"m,{end_label}")
-            self._emit("add", "hl,hl")  # HL = HL * 2
-            self._emit("jp", shift_loop)
-            self._emit_label(end_label)
+            self._emit_counted_loop("SHL", [("add", "hl,hl")])
             return DataType.ADDRESS
 
         if name == "SHR":
@@ -7001,15 +7248,14 @@ class CodeGenerator:
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
                 elif shift_count == 7:
-                    # Special case for shift by 7: result = (H << 1) | (L >> 7)
-                    # This is faster than 7 iterations
-                    # RLC sets carry from bit 7, so no need to clear carry first
-                    self._emit("ld", "a,l")
-                    self._emit("rlca")        # Carry = bit 7 of L (A also rotated but we discard it)
-                    self._emit("ld", "a,h")
-                    self._emit("rla")        # A = (H << 1) | carry
-                    self._emit("ld", "l,a")
+                    # Shift by 7 is a shift left by 1 and a byte move. The
+                    # result has nine bits: bit 15 comes down to bit 8, which
+                    # `(H << 1) | (L >> 7)' alone dropped, so 8000H / 128
+                    # (strength-reduced to this) came out 0 instead of 100H.
+                    self._emit("add", "hl,hl")  # carry = bit 15
+                    self._emit("ld", "l,h")     # L = bits 14..7
                     self._emit("ld", "h,0")
+                    self._emit("rl", "h")       # H = bit 15
                 elif shift_count <= 3:
                     # Small shifts: inline the loop (SRL/RR — 2 insns per shift).
                     for _ in range(shift_count):
@@ -7051,57 +7297,8 @@ class CodeGenerator:
             self._emit_label(end_label)
             return DataType.ADDRESS
 
-        if name == "ROL":
-            arg_type = self._gen_expr(args[0])
-            if arg_type == DataType.BYTE:
-                # BYTE value is in A, move to HL
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
-            self._emit("push", "hl")
-            count_type = self._gen_expr(args[1])
-            if count_type == DataType.BYTE:
-                self._emit("ld", "c,a")  # Count in C (from A for byte)
-            else:
-                self._emit("ld", "c,l")  # Count in C (from L for address)
-            self._emit("pop", "hl")
-            self._emit("ld", "a,l")
-            shift_loop = self._new_label("ROL")
-            end_label = self._new_label("ROLE")
-            self._emit_label(shift_loop)
-            self._emit("dec", "c")
-            self._emit("jp", f"m,{end_label}")
-            self._emit("rlca")
-            self._emit("jp", shift_loop)
-            self._emit_label(end_label)
-            self._emit("ld", "l,a")
-            self._emit("ld", "h,0")
-            return DataType.BYTE
-
-        if name == "ROR":
-            arg_type = self._gen_expr(args[0])
-            if arg_type == DataType.BYTE:
-                # BYTE value is in A, move to HL
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
-            self._emit("push", "hl")
-            count_type = self._gen_expr(args[1])
-            if count_type == DataType.BYTE:
-                self._emit("ld", "c,a")  # Count in C (from A for byte)
-            else:
-                self._emit("ld", "c,l")  # Count in C (from L for address)
-            self._emit("pop", "hl")
-            self._emit("ld", "a,l")
-            shift_loop = self._new_label("ROR")
-            end_label = self._new_label("RORE")
-            self._emit_label(shift_loop)
-            self._emit("dec", "c")
-            self._emit("jp", f"m,{end_label}")
-            self._emit("rrca")
-            self._emit("jp", shift_loop)
-            self._emit_label(end_label)
-            self._emit("ld", "l,a")
-            self._emit("ld", "h,0")
-            return DataType.BYTE
+        if name in ("ROL", "ROR", "SCL", "SCR"):
+            return self._gen_rotate(name, args)
 
         if name == "LENGTH":
             if args:
@@ -7142,7 +7339,9 @@ class CodeGenerator:
             if isinstance(arg0, P.NumberLiteral) and number_value(arg0) == 0:
                 self._emit("ld", "hl,__END__")
             else:
-                self._gen_expr(args[0])
+                # A BYTE subscript is generated into A; `add hl,de' took
+                # whatever HL held instead.
+                self._gen_expr_to_hl(args[0])
                 self._emit("ld", "de,__END__")
                 self._emit("add", "hl,de")
             self._emit("ld", "a,(hl)")
@@ -7160,16 +7359,18 @@ class CodeGenerator:
                 # Generate: dest -> DE, source -> HL, bc=count, ldir
                 # Must check if source expression clobbers DE
                 source_preserves_de = self._expr_preserves_de(args[1])
+                # Each address is converted to an ADDRESS: a BYTE one is
+                # generated into A, and has to be widened into HL.
                 if source_preserves_de:
                     # Source is simple - can load dest to DE first
-                    self._gen_expr(args[2])  # dest -> HL
+                    self._gen_expr_to_hl(args[2])  # dest -> HL
                     self._emit("ex", "de,hl")  # dest -> DE
-                    self._gen_expr(args[1])  # source -> HL (preserves DE)
+                    self._gen_expr_to_hl(args[1])  # source -> HL (preserves DE)
                 else:
                     # Source is complex and may clobber DE - must save dest
-                    self._gen_expr(args[2])  # dest -> HL
+                    self._gen_expr_to_hl(args[2])  # dest -> HL
                     self._emit("push", "hl")  # save dest
-                    self._gen_expr(args[1])  # source -> HL (may clobber DE)
+                    self._gen_expr_to_hl(args[1])  # source -> HL (may clobber DE)
                     self._emit("pop", "de")  # dest -> DE
                 self._emit("ld", f"bc,{self._format_number(count_const)}")
                 self._emit("ldir")
@@ -7199,8 +7400,8 @@ class CodeGenerator:
             return None
 
         if name == "TIME":
-            # Delay loop
-            self._gen_expr(args[0])
+            # Delay loop; a BYTE count is generated into A.
+            self._gen_expr_to_hl(args[0])
             loop_label = self._new_label("TIME")
             self._emit_label(loop_label)
             self._emit("dec", "hl")
@@ -7213,7 +7414,6 @@ class CodeGenerator:
             # Return carry flag value; see the other CARRY site for why
             # `ld a,0 / rla` cannot be used.
             self._emit("sbc", "a,a")
-            self._emit("and", "1")
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
             return DataType.BYTE
@@ -7299,62 +7499,79 @@ class CodeGenerator:
             self._emit("daa")
             return DataType.BYTE
 
-        if name == "SCL":
-            # Shift through carry left
-            arg_type = self._gen_expr(args[0])
-            if arg_type == DataType.BYTE:
-                # BYTE value is in A, move to HL
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
-            self._emit("push", "hl")
-            count_type = self._gen_expr(args[1])
-            if count_type == DataType.BYTE:
-                self._emit("ld", "c,a")  # Count in C (from A for byte)
-            else:
-                self._emit("ld", "c,l")  # Count in C (from L for address)
-            self._emit("pop", "hl")
-            self._emit("ld", "a,l")
-            shift_loop = self._new_label("SCL")
-            end_label = self._new_label("SCLE")
-            self._emit_label(shift_loop)
-            self._emit("dec", "c")
-            self._emit("jp", f"m,{end_label}")
-            self._emit("rla")  # Rotate through carry
-            self._emit("jp", shift_loop)
-            self._emit_label(end_label)
-            self._emit("ld", "l,a")
-            self._emit("ld", "h,0")
-            return DataType.BYTE
-
-        if name == "SCR":
-            # Shift through carry right
-            arg_type = self._gen_expr(args[0])
-            if arg_type == DataType.BYTE:
-                # BYTE value is in A, move to HL
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
-            self._emit("push", "hl")
-            count_type = self._gen_expr(args[1])
-            if count_type == DataType.BYTE:
-                self._emit("ld", "c,a")  # Count in C (from A for byte)
-            else:
-                self._emit("ld", "c,l")  # Count in C (from L for address)
-            self._emit("pop", "hl")
-            self._emit("ld", "a,l")
-            shift_loop = self._new_label("SCR")
-            end_label = self._new_label("SCRE")
-            self._emit_label(shift_loop)
-            self._emit("dec", "c")
-            self._emit("jp", f"m,{end_label}")
-            self._emit("rra")  # Rotate through carry
-            self._emit("jp", shift_loop)
-            self._emit_label(end_label)
-            self._emit("ld", "l,a")
-            self._emit("ld", "h,0")
-            return DataType.BYTE
-
         # Not a built-in we handle inline
         return None
+
+    def _gen_rotate(self, name: str, args) -> DataType:
+        """ROL / ROR, and SCL / SCR through the carry.
+
+        ROL and ROR rotate their pattern converted to a BYTE (11.1.4); SCL
+        and SCR rotate a BYTE pattern nine bits round the carry and an
+        ADDRESS one seventeen, and return the pattern's type (12.3). The
+        count is converted to a BYTE; a constant one is unrolled. INC, DEC
+        and DJNZ leave the carry alone.
+        """
+        wide = (name in ("SCL", "SCR")
+                and self._get_expr_type(args[0]) == DataType.ADDRESS)
+        ops = {
+            "ROL": [("rlca", "")], "ROR": [("rrca", "")],
+            "SCL": [("rl", "l"), ("rl", "h")] if wide else [("rla", "")],
+            "SCR": [("rr", "h"), ("rr", "l")] if wide else [("rra", "")],
+        }[name]
+        count = self._try_eval_const(args[1])
+        if wide:
+            self._gen_expr_to_hl(args[0])
+        else:
+            self._gen_expr_to_a(args[0])
+        if count is not None:
+            count &= 0xFF
+            if name in ("ROL", "ROR"):
+                count &= 7          # eight rotations give the byte back
+            if count <= 8:
+                for _ in range(count):
+                    for opcode, operands in ops:
+                        if operands:
+                            self._emit(opcode, operands)
+                        else:
+                            self._emit(opcode)
+            else:
+                self._emit("ld", f"b,{self._format_number(count)}")
+                self._emit_counted_loop(name, ops)
+        else:
+            self._emit("push", "hl" if wide else "af")
+            self._gen_count_to_b(args[1])
+            self._emit("pop", "hl" if wide else "af")
+            self._emit_counted_loop(name, ops)
+        if wide:
+            return DataType.ADDRESS
+        self._emit("ld", "l,a")
+        self._emit("ld", "h,0")
+        return DataType.BYTE
+
+    def _gen_count_to_b(self, count) -> None:
+        """Load a shift or rotate count, converted to a BYTE, into B."""
+        self._gen_expr_to_a(count)
+        self._emit("ld", "b,a")
+
+    def _emit_counted_loop(self, prefix: str, ops) -> None:
+        """Repeat ``ops`` B times, not at all when B is 0.
+
+        The count is unsigned: the `dec c / jp m' loops this replaces
+        stopped at once for a count of 129 or more.
+        """
+        loop_label = self._new_label(prefix)
+        end_label = self._new_label(prefix + "E")
+        self._emit("inc", "b")
+        self._emit("dec", "b")
+        self._emit("jp", f"z,{end_label}")
+        self._emit_label(loop_label)
+        for opcode, operands in ops:
+            if operands:
+                self._emit(opcode, operands)
+            else:
+                self._emit(opcode)
+        self._emit("djnz", loop_label)
+        self._emit_label(end_label)
 
     def _gen_location(self, expr) -> DataType:
         """Generate code to load address of a typed location expression.

@@ -577,11 +577,11 @@ class TestSideEffectingOperandIsNotDropped:
 class TestFoldedRelationalMatchesTheRuntimeValue:
     """
     A folded relational has to agree with the one the generator computes at
-    runtime, under every operator that consumes it. The folder is untyped
-    and masks to 16 bits, so the folded value must be a fixed point of
-    NOT / unary minus / +1 the way the runtime's 0FFH is: an attempt to
-    narrow it to 0FFH made `NOT (1 = 1)` fold to 0FF00H, where -O 0 and
-    PL/M-80 both give 0.
+    runtime, under every operator that consumes it. A relation is the BYTE
+    0FFH (PL/M-80 manual 4.4), and NOT of a BYTE is a BYTE, so `NOT (1 = 1)`
+    is 0. When the folder was untyped and masked to 16 bits, NOT 0FFH folded
+    to 0FF00H, and it had to be kept from folding relations in a value; it
+    now folds them with their type.
     """
 
     # `w = NOT (1 = 1)` is zero: NOT of true is false. -O 0 computes it and
@@ -597,27 +597,17 @@ class TestFoldedRelationalMatchesTheRuntimeValue:
     """
 
     def test_every_level_computes_it_the_same_way(self) -> None:
-        # Folding a relational is only safe where just bit 0 is observable,
-        # so as a value it is left to the generator at every level. All four
-        # then emit the same opcode sequence, which is what guarantees they
-        # agree on the value.
-        shapes = {}
         for level in (0, 1, 2, 3):
             asm = Compiler(opt_level=level).compile(self.SRC, "<test>")
             assert asm is not None
             instrs = _instructions(asm)
             body = instrs[instrs.index("P:"):]
             body = body[:body.index("ret") + 1]
-            # Opcodes only: label names and jp/jr selection are not the point.
-            ops = [i.split()[0].replace("jr", "jp") for i in body
-                   if not i.endswith(":")]
-            shapes[level] = ops
-        assert len(set(map(tuple, shapes.values()))) == 1, (
-            f"the levels disagree on how NOT (1 = 1) is evaluated: {shapes}"
-        )
-        assert "cpl" in shapes[2], (
-            f"-O 2 did not compute the NOT at all: {shapes[2]}"
-        )
+            if level == 0:
+                # The relation in A, complemented as a BYTE and widened.
+                assert body[-5:] == ["cpl", "ld\tl,a", "ld\th,0", "ld\t(W),hl", "ret"], body
+            else:
+                assert body[1:] == ["ld\thl,0", "ld\t(W),hl", "ret"], (level, body)
 
 
 class TestBdosFunctionNumberSurvivesTheArgument:

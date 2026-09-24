@@ -427,3 +427,29 @@ call g;
 end t;
 """, 2)
     assert _counted(asm), asm
+
+
+ALIASED_SRC = """
+0100H:
+t: do;
+declare (i, n, c) byte, (p, q) address;
+declare bi based p byte, bn based q byte;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+/* reads the index, and changes the bound, through pointers to them */
+look: procedure; c = c + bi; if c > 5 then bn = 2; end look;
+p = .i; q = .n;
+c = 0; do i = 0 to 3; call look; end; call putc('0' + c);
+n = 9; c = 0; do i = 0 to n; call look; end; call putc('0' + c); call putc('0' + i);
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2, 3])
+def test_an_index_or_bound_reached_through_its_address_is_not_counted(opt):
+    """A procedure the body calls can read the index, or change the bound,
+    without naming either: through a pointer to it.  Counted, the index is
+    only stored once and the bound read once, so `look' saw 4 every time round
+    the first loop and the second ran ten times."""
+    assert not _counted(_asm(ALIASED_SRC, 2))
+    assert run_plm(ALIASED_SRC, opt).strip() == "664", opt
