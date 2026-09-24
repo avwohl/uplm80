@@ -677,6 +677,20 @@ call run;
 """, [0x1235, 0x34, 0x34, 1, 0x1269])
 
 
+def test_size_of_a_variable_whose_value_is_known():
+    """SIZE's operand names a variable; -O3 propagated `b0 = 5' into it,
+    and SIZE(5) does not compile."""
+    _check("""
+declare (b0, r) byte, (w0) address, arr(10) address;
+run: procedure;
+  b0 = 5; w0 = 300;
+  r = size(b0) + size(w0); call ph(r);
+  r = size(arr) + length(arr) + last(arr); call ph(r);
+end run;
+call run;
+""", [3, 39])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])

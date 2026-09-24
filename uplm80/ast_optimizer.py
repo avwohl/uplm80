@@ -2079,6 +2079,13 @@ class ASTOptimizer:
 
         if isinstance(expr, P.Call):
             opt_callee = self._optimize_expr(expr.callee)
+            callee = unwrap_paren(opt_callee)
+            if (isinstance(callee, P.Identifier)
+                    and ident_text(callee.name).upper() in ("SIZE", "LENGTH", "LAST")
+                    and self._is_builtin(ident_text(callee.name))):
+                # The operand names a variable; it is not a value. After
+                # `b0 = 5', SIZE(b0) became SIZE(5), which does not compile.
+                return P.Call(callee=opt_callee, args=list(expr.args), pos=expr.pos)
             opt_args = [self._optimize_expr(a) for a in expr.args]
             # A subscript, an argument, or a built-in's operand is converted
             # to the type it is used as -- except the pattern of SCL and SCR,
