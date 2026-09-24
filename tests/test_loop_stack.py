@@ -221,3 +221,62 @@ def test_a_return_from_inside_a_counted_loop_runs(opt):
     # g2 runs twice: w reaches 7 on the first call, and on the second it
     # goes past 7 and the loop runs out, returning 0.
     assert run_plm(RUN_SRC, opt).strip() == "AB0."
+
+
+def _counted(asm: str) -> bool:
+    """Whether the loop kept its count in B - pushed around the body."""
+    return "push\tbc" in [l.strip() for l in asm.splitlines()]
+
+
+@pytest.mark.parametrize("body", [
+    # read in the subscript of a member - UTIL2/SCBRS.PLM clears its table so
+    "s(i).x = 0;",
+    # written, to end the loop early - UTIL6/PIP.PLM and ED.PLM stop reading
+    # a file that way at end of file
+    "if c = 3 then i = 9;",
+    # the index of an inner loop
+    "do i = 0 to 1; end;",
+])
+def test_a_body_that_uses_its_index_is_not_a_counted_loop(body):
+    """The count in B stands in for the index, which is never stored, so it
+    is only right when the body neither reads nor writes the index."""
+    asm = _asm(f"""
+t: do;
+declare (i, c) byte, s (10) structure (x byte, y byte);
+do i = 0 to 9; c = c + 1; {body} end;
+end t;
+""", 2)
+    assert not _counted(asm), asm
+
+
+LOOP_RUN_SRC = """
+0100H:
+t: do;
+declare (i, j, n, c) byte, w address;
+declare s (4) structure (x byte, y byte);
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+
+do i = 0 to 3; s(i).x = 'K'; end;
+do i = 0 to 3; call putc(s(i).x); end;
+
+c = 0;
+do i = 0 to 9; c = c + 1; if c = 3 then i = 9; end;
+call putc('0' + c);
+
+n = 255; w = 0;
+do j = 0 to n; w = w + 1; end;
+call putc('0' + high(w));
+call putc('0' + low(w));
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_counted_loops_run_the_right_number_of_times(opt):
+    """`DO j = 0 TO n' runs n+1 times, 256 when n is 255 (PL/M-80 manual,
+    5.1.4: the loop ends when the index wraps).  The counted form skipped the
+    loop entirely for n = 255, because a count of 256 is 0 in B - which is
+    exactly what DJNZ counts down from.  It also cleared only s(0) and ran
+    the early-exit loop all ten times."""
+    assert run_plm(LOOP_RUN_SRC, opt).strip() == "KKKK310"

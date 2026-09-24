@@ -800,18 +800,13 @@ class CodeGenerator:
         return False
 
     def _var_used_in_stmt(self, var_name: str, stmt) -> bool:
-        """Check if variable is referenced in a typed statement node."""
+        """Check if variable is referenced - read or written - in a typed statement node."""
         if isinstance(stmt, P.AssignStmt):
             if self._var_used_in_expr(var_name, stmt.value):
                 return True
-            for target in stmt.targets:
-                t = unwrap_paren(target)
-                # Subscript-as-Call: var in index counts as use.
-                if isinstance(t, P.Call):
-                    for arg in t.args:
-                        if self._var_used_in_expr(var_name, arg):
-                            return True
-            return False
+            # Anywhere in a target: assigned itself, or in a subscript, which
+            # can sit under a member - `s(i).x = 0'.
+            return any(self._var_used_in_expr(var_name, t) for t in stmt.targets)
         elif isinstance(stmt, P.CallStmt):
             inner = stmt.callee
             if isinstance(inner, P.Call):
@@ -853,7 +848,8 @@ class CodeGenerator:
                     return True
             return False
         elif isinstance(stmt, (P.DoIterBlock, P.DoIterByBlock)):
-            # Don't recurse into nested DO-ITER as inner loop var shadows outer
+            if ident_text(stmt.index) == var_name:
+                return True
             if self._var_used_in_expr(var_name, stmt.start):
                 return True
             if self._var_used_in_expr(var_name, stmt.bound):
@@ -4329,10 +4325,11 @@ class CodeGenerator:
                 step_is_const = False
 
         # Check if loop index is used in body - if not, we can use DJNZ on Z80.
-        # _index_used_in_body / _stmts_contain_goto still walk the
-        # legacy AST shape; they recurse via isinstance and return
-        # False for unrecognised typed nodes, which is conservative
-        # (forces the safe fallback path).
+        # The count in B stands in for the index, which is then never stored,
+        # so a body that reads OR writes it cannot be counted: UTIL2/SCBRS.PLM
+        # clears its table with `sched$table(tindx).date = 0', which cleared
+        # one entry four times, and UTIL6/PIP.PLM and ED.PLM end their
+        # read loops at end of file with `I = N', which the count ignored.
         index_used = self._index_used_in_body(index_var, body_stmts)
 
         # Skip DJNZ optimization when the body has a GOTO — the pattern
@@ -4379,13 +4376,11 @@ class CodeGenerator:
                 self.loop_stack.pop()
                 return
             elif not isinstance(stmt.bound, P.NumberLiteral):
-                # Variable bound case - we set up B above
-                # But need to handle the case where bound might be 255 (iter count = 256 = 0 in byte)
-                # Skip loop if B is 0 (this handles bound = 255 case)
-                self._emit("ld", "a,b")
-                self._emit("or", "a")
-                self._emit("jp", f"z,{end_label}")  # Skip if iteration count is 0
-
+                # Variable bound case - we set up B above.  A bound of 255 is
+                # 256 iterations, a count of 0 in B, which is where DJNZ
+                # counts 256 from.  The loop used to be skipped then: a DO
+                # from 0 runs at least once whatever the bound (PL/M-80
+                # manual, 5.1.4).
                 self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
                 self.loop_stack.pop()
                 return
