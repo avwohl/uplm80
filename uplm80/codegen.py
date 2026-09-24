@@ -1057,12 +1057,14 @@ class CodeGenerator:
                 return False    # another module's procedure, which may name it
         return True
 
-    def _bound_is_fixed(self, bound, body_stmts) -> bool:
+    def _bound_is_fixed(self, bound, body_stmts, index_name: str) -> bool:
         """Whether a loop's bound is the same every time round.
 
         PL/M-80 evaluates the bound at every test; a counted loop evaluates
-        it once.  That is the same only if the bound calls nothing and none
-        of its variables is named in the body or by what the body calls.
+        it once.  That is the same only if the bound calls nothing, does not
+        read the index - which the loop itself steps, so `DO k = 0 TO k + 5'
+        runs until k + 5 wraps - and none of its variables is named in the
+        body or by what the body calls.
         """
         names: set[str] = set()
 
@@ -1092,7 +1094,7 @@ class CodeGenerator:
                 return walk(e.callee) and all(walk(a) for a in e.args or [])
             return False
 
-        if not walk(bound):
+        if not walk(bound) or index_name in names:
             return False
         return all(not any(self._var_used_in_stmt(n, s) for s in body_stmts)
                    and self._only_the_loop_sees(n, body_stmts, after_return=False)
@@ -4667,7 +4669,8 @@ class CodeGenerator:
         # loop runs: not a procedure the body calls, not a store through its
         # address, and not the caller after a RETURN from the body.  The
         # count is taken once, where PL/M-80 evaluates the limit on every
-        # pass, so nothing may change the bound either.  B is on the stack while
+        # pass, so nothing may change the bound - nor may the bound read the
+        # index, which the loop itself changes.  B is on the stack while
         # the body runs: a RETURN pops it (_gen_counted_body), a GOTO would
         # strand it, so a body with a GOTO is not counted.
         if (
@@ -4677,7 +4680,8 @@ class CodeGenerator:
             and not self._index_used_in_body(index_var, body_stmts)
             and not self._stmts_contain_goto(body_stmts)
             and self._only_the_loop_sees(index_name, body_stmts, after_return=True)
-            and (bound_val is not None or self._bound_is_fixed(stmt.bound, body_stmts))
+            and (bound_val is not None
+                 or self._bound_is_fixed(stmt.bound, body_stmts, index_name))
         ):
             # The count is bound + 1.  A bound of 255 is 256 passes, a count
             # of 0 in B, which is where DJNZ counts 256 from - a DO from 0

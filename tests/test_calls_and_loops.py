@@ -217,3 +217,23 @@ run: procedure;
 end run;
 call run;
 """, [1, 5])
+
+
+def test_a_loop_whose_bound_reads_its_index_is_not_counted():
+    """PL/M-80 evaluates the limit before every pass, after the index has
+    been set and stepped, so `DO k = 0 TO k + 5' runs until k + 5 wraps: 251
+    passes, leaving k at 251. The counted form took its count once, from k
+    as it was before the loop: 106 passes, and k = 106. (Found by the
+    verification's random programs, seeds 50092, 50114 and 50242.)"""
+    _check("""
+declare k byte, n address;
+run: procedure;
+  n = 0; k = 100;
+  do k = 0 to k + 5; n = n + 1; end;
+  call ph(n); call ph(k);
+  n = 0; k = 100;
+  do k = 0 to shr(k, 1) + 3; n = n + 1; end;
+  call ph(n); call ph(k);
+end run;
+call run;
+""", [251, 251, 7, 7])

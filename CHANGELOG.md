@@ -185,7 +185,9 @@ Each fix has a regression test that fails without it.
   store reaches it through its address, no caller reads it after a `RETURN`
   from the body - and nothing can change its bound, by name or through a
   pointer (a bound BASED on `buf(3)` that the body sets through `buf(3)` was
-  counted from its first value). The final value is left out only where
+  counted from its first value), and the bound does not read the index:
+  `DO k = 0 TO k + 5` runs until `k + 5` wraps, 251 times, and was counted
+  from `k`'s value before the loop. The final value is left out only where
   nothing can read the index afterwards.
 - **A `RETURN` inside a counted `DO` loop left the count on the stack.** The
   count is pushed around the body, and the RET took it for its return
