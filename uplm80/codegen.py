@@ -2765,9 +2765,12 @@ class CodeGenerator:
         target = self.code_data_segment if inline else self.data_segment
         for val in values:
             if isinstance(val, P.NumberLiteral):
+                # A BYTE holds the low byte: -1 folds to 0FFFFH, which is
+                # 0FFH here, not `db 0FFFFH'.
                 directive = "db" if dtype == DataType.BYTE else "dw"
+                mask = 0xFF if directive == "db" else 0xFFFF
                 target.append(
-                    AsmLine(opcode=directive, operands=self._format_number(number_value(val)))
+                    AsmLine(opcode=directive, operands=self._format_number(number_value(val) & mask))
                 )
             elif isinstance(val, P.StringLiteral):
                 target.append(
@@ -2799,12 +2802,19 @@ class CodeGenerator:
                 target.append(
                     AsmLine(opcode="dw", operands=self._location_operand(operand))
                 )
-            elif isinstance(val, P.BinaryOp):
-                # Binary expression like .name-3 or name+offset
-                expr_str = self._data_expr_to_string(val)
-                target.append(
-                    AsmLine(opcode="dw", operands=expr_str)
-                )
+            elif isinstance(val, (P.BinaryOp, P.UnaryOp)):
+                # An expression - `68H+80H', `-1', `.name-3' - at the width
+                # of the scalar it fills.  It was always a word, so at -O0,
+                # where nothing folds it first, `x (4) BYTE DATA (68H+80H,
+                # 6)' took six bytes and moved everything after it, and a
+                # unary minus was not accepted at all (UTIL4/SET.PLM).
+                directive = "db" if dtype == DataType.BYTE else "dw"
+                value = self._try_eval_const(val)
+                if value is not None:
+                    operand = self._format_number(value & (0xFF if directive == "db" else 0xFFFF))
+                else:
+                    operand = self._data_expr_to_string(val)
+                target.append(AsmLine(opcode=directive, operands=operand))
             elif isinstance(val, P.LocationOfList):
                 # Nested address-of list: .(a, b, c)
                 for v in val.values or []:

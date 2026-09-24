@@ -792,3 +792,33 @@ def test_intel_link_reaches_the_pointer_after_inrecord_p():
     assert asm is not None
     d = _defs(asm)
     assert "@GETRECORD$S: EQU INRECORDP" in d and "@GETRECORD$@E: EQU INRECORDP+2" in d, d
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_an_expression_in_data_fills_one_scalar_at_its_width(opt):
+    """A value that is an expression was always emitted as a word.  At -O0,
+    where nothing folds it first, `x (4) BYTE DATA (68H+80H, k+1, 6)' came
+    out `dw / dw / db / ds 1', six bytes, and moved everything declared
+    after it; a unary minus was not accepted at all, and UTIL4/SET.PLM did
+    not compile at -O0.  A folded -1 in a BYTE is 0FFH, not `db 0FFFFH'."""
+    asm = _asm("""
+t: do;
+declare k literally '5';
+declare x (4) byte data (68h+80h, k+1, 6);
+declare n (2) byte data (-1, not 0);
+declare s structure (a byte, b address, c byte) initial (2+3, k-1, 0ffh and 7);
+declare z byte data (.x-1);
+declare after byte data (0eeh);
+declare q address; q = .after;
+end t;
+""", opt=opt)
+    lines = [" ".join(l.split()) for l in asm.splitlines() if l.strip() and not l.strip().startswith(";")]
+
+    def body(label, n):
+        i = lines.index(label + ":")
+        return lines[i + 1:i + 1 + n]
+
+    assert body("X", 4) == ["db 0E8H", "db 6", "db 6", "ds 1"], lines
+    assert body("N", 2) == ["db 0FFH", "db 0FFH"], lines
+    assert body("S", 3) == ["db 5", "dw 4", "db 7"], lines
+    assert body("Z", 1) == ["db (X-1)"], lines
