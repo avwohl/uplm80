@@ -41,8 +41,12 @@ def cpmemu() -> str | None:
     return None
 
 
-def run_plm(src: str, opt: int = 2) -> str:
-    """What the program prints, carriage returns removed."""
+def run_plm(src: str, opt: int = 2, extra_asm: str | None = None) -> str:
+    """What the program prints, carriage returns removed.
+
+    `extra_asm' is a second module, in assembly, linked after the program:
+    somewhere to define what the program declares EXTERNAL.
+    """
     emu = cpmemu()
     for tool in ("um80", "ul80"):
         if shutil.which(tool) is None:
@@ -61,7 +65,15 @@ def run_plm(src: str, opt: int = 2) -> str:
         assert r.returncode == 0, r.stderr
         r = run("um80", "-o", rel, mac)
         assert r.returncode == 0, r.stderr
-        r = run("ul80", "-o", com, rel)
+        rels = [rel]
+        if extra_asm is not None:
+            xmac, xrel = os.path.join(d, "X.MAC"), os.path.join(d, "X.REL")
+            with open(xmac, "w") as fh:
+                fh.write(extra_asm)
+            r = run("um80", "-o", xrel, xmac)
+            assert r.returncode == 0, r.stderr
+            rels.append(xrel)
+        r = run("ul80", "-o", com, *rels)
         assert r.returncode == 0, r.stderr
         r = run(emu, com)
         return r.stdout.replace("\r", "")

@@ -517,6 +517,8 @@ class CodeGenerator:
         # Every module-level DeclItem, for an AT that names a variable declared
         # further down (see _declared_later).
         self._module_decl_items: list = []
+        # Names whose AT _declared_later is resolving, to stop a circle.
+        self._resolving_at: set[str] = set()
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
@@ -2411,7 +2413,7 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
-    def _declared_later(self, name: str) -> Symbol | None:
+    def _declared_later(self, name: str) -> tuple[Symbol, tuple[str | None, int] | None] | None:
         """A module-level variable an AT names before the DECLARE that makes it.
 
         PL/M-80 asks for the variable to be declared first, and DRI's compiler
@@ -2420,9 +2422,17 @@ class CodeGenerator:
         UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.  A subscript or a
         member needs the variable's shape, so it is read from the declaration
         itself rather than guessed.
+
+        Returns the symbol, and where it is if it is itself AT: the (root,
+        offset) of :meth:`_at_address`.  An AT is defined by an EQU, and the
+        EQUs go out in declaration order, so naming the later variable would
+        name a symbol um80 has not reached yet and reads as zero.  An
+        EXTERNAL further down is entered in `_extern_names' now, so a
+        variable AT it is aliased to it (see :meth:`_emit_at_decl`).
         """
         for item in self._module_decl_items:
-            if name not in decl_item_names(item):
+            names = decl_item_names(item)
+            if name not in names:
                 continue
             attrs = decl_attrs(item)
             data_type, dimension = _decl_item_type(item)
@@ -2435,10 +2445,24 @@ class CodeGenerator:
                     for m in members for sn in struct_member_names(m)
                 ]
             based_on, _ = decl_item_based(item)
-            return Symbol(name=name, kind=SymbolKind.VARIABLE, data_type=data_type,
-                          dimension=dimension, struct_members=struct_members,
-                          based_on=based_on, is_external=attrs.is_external,
-                          asm_name=self._mangle_name(name))
+            sym = Symbol(name=name, kind=SymbolKind.VARIABLE, data_type=data_type,
+                         dimension=dimension, struct_members=struct_members,
+                         based_on=based_on, is_external=attrs.is_external,
+                         asm_name=self._mangle_name(name))
+            if attrs.is_external:
+                self._extern_names.add(sym.asm_name)
+            if attrs.at_location is None or based_on:
+                return sym, None
+            if name in self._resolving_at:
+                raise CodeGenError(f"AT(.{name}): the AT addresses name each other in a circle")
+            self._resolving_at.add(name)
+            try:
+                root, offset = self._at_address(attrs.at_location)
+            finally:
+                self._resolving_at.discard(name)
+            # A factored AT places each name after the last (6.2.8).
+            size = self._element_width(sym) * max(dimension or 1, 1)
+            return sym, (root, offset + names.index(name) * size)
         return None
 
     @staticmethod
@@ -2468,9 +2492,14 @@ class CodeGenerator:
                 return None, "__END__", 0, 1
             base_sym = self._lookup_scoped(name)
             if base_sym is None:
-                base_sym = self._declared_later(name)
-            if base_sym is None:
-                raise CodeGenError(f"AT(.{name}): {name} is not declared")
+                later = self._declared_later(name)
+                if later is None:
+                    raise CodeGenError(f"AT(.{name}): {name} is not declared")
+                base_sym, at = later
+                if at is not None:
+                    # Itself AT, further down: where it is, not its name.
+                    root, offset = at
+                    return base_sym, root or "", offset, self._element_width(base_sym)
             if base_sym.based_on or base_sym.stack_offset is not None:
                 raise CodeGenError(
                     f"AT(.{name}): {name} has no fixed address "
@@ -2512,6 +2541,8 @@ class CodeGenerator:
             return None, value
         if isinstance(expr, P.LocationOf):
             _, asm, offset, _ = self._at_designator(expr.operand)
+            if not asm:
+                return None, offset     # AT a later variable AT a number
             root, base_offset = self._split_offset(asm)
             return root, base_offset + offset
         if isinstance(expr, P.BinaryOp) and binop_kind(expr) in (BinaryOpKind.ADD,
@@ -2560,6 +2591,8 @@ class CodeGenerator:
         if root is None:
             operand = self._format_number(offset & 0xFFFF)
         else:
+            if root == asm_name:
+                raise CodeGenError(f"AT(...): {sym.name} is declared at its own address")
             operand = self._sym_offset(root, offset)
             if root in self._extern_names:
                 sym.asm_name = operand

@@ -615,6 +615,114 @@ end t;
     assert out.strip() == "BD", out
 
 
+def _equ_forward_refs(asm: str) -> list[str]:
+    """EQUs whose operand names a label defined further down the file.
+
+    um80 0.3.48 evaluates an EQU where it stands and takes a symbol it has not
+    reached yet as zero, so each of these is a wrong address that links."""
+    lines = [l.split(";")[0] for l in asm.splitlines()]
+    labels = {}
+    for i, l in enumerate(lines):
+        m = re.match(r"([A-Za-z@?$_][\w@?$]*):", l)
+        if m:
+            labels.setdefault(m.group(1).upper(), i)
+    bad = []
+    for i, l in enumerate(lines):
+        m = re.match(r"([A-Za-z@?$_][\w@?$]*):?\s+EQU\s+(.*)", l)
+        if m:
+            for tok in re.findall(r"[A-Za-z@?$_][\w@?$]*", m.group(2)):
+                if labels.get(tok.upper(), -1) > i:
+                    bad.append(" ".join(l.split()))
+    return bad
+
+
+FORWARD_AT_SRC = """
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare a1 byte at (.b1 + 1);
+declare a2 byte at (.m1(3));
+declare (a3, a4) byte at (.b2(1));
+declare b1 (4) byte at (.buf(2));
+declare m1 (8) byte at (.memory);
+declare (b0, b2) (2) address at (.buf(1));
+declare buf (16) byte;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+chk: procedure (ok); declare ok byte;
+    if ok then call putc('Y'); else call putc('N');
+end chk;
+call chk(.a1 = .buf + 3);
+call chk(.a2 = .memory + 3);
+call chk(.a3 = .buf + 7);
+call chk(.a4 = .buf + 8);
+a1 = 5; call chk(buf(3) = 5);
+a4 = 6; call chk(buf(8) = 6);
+end t;
+"""
+
+
+def test_an_at_naming_a_later_at_variable_resolves_to_where_that_one_is():
+    """`a1 AT (.b1 + 1)' with `b1 AT (.buf(2))' declared further down.  The
+    EQU for a1 named b1, and stood above b1's own EQU, so um80 read b1 as 0
+    and a1 was at 0001H.  a1 is now defined by what b1 itself stands for:
+    buf, with the offsets added up.  The same for a variable further down at
+    .MEMORY, and a factored one."""
+    asm = _asm(FORWARD_AT_SRC)
+    d = _defs(asm)
+    assert "A1: EQU BUF+3" in d, d
+    assert "A2: EQU __END__+3" in d, d
+    assert "A3: EQU BUF+7" in d and "A4: EQU BUF+8" in d, d
+    assert not _equ_forward_refs(asm), _equ_forward_refs(asm)
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_an_at_naming_a_later_at_variable_runs(opt):
+    assert run_plm(FORWARD_AT_SRC, opt=opt).strip() == "YYYYYY"
+
+
+FORWARD_EXT_SRC = """
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare a (4) byte at (.e1(1));
+declare b byte at (.a(2));
+declare e1 (8) byte external;
+declare i byte;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+chk: procedure (ok); declare ok byte;
+    if ok then call putc('Y'); else call putc('N');
+end chk;
+call chk(.a = .e1 + 1);
+call chk(.b = .e1 + 3);
+call chk(.a(2) = .e1 + 3);
+a(2) = 5; call chk(e1(3) = 5);
+e1(4) = 6; call chk(a(3) = 6);
+i = 1; a(i) = 7; call chk(e1(2) = 7);
+end t;
+"""
+
+E1_ASM = "\t.z80\n\tpublic E1\n\tds 20h\nE1:\tds 8\n\tend\n"
+
+
+def test_an_at_naming_a_later_external_names_the_external():
+    """`a AT (.e1(1))' with `e1 EXTERNAL' declared further down.  A variable
+    at an external is aliased to the external and one offset, because um80
+    0.3.48 assembles `@A+2', with `@A EQU E1+1', as E1+2.  That was done only
+    for an external already declared; now it is done for one further down."""
+    asm = _asm(FORWARD_EXT_SRC)
+    lines = [" ".join(l.split()) for l in asm.splitlines()]
+    assert not any(re.search(r"@A[+-]", l) for l in lines if "EQU" not in l), asm
+    assert "ld (E1+3),a" in lines or "ld hl,E1+3" in lines, asm
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_an_at_naming_a_later_external_runs(opt):
+    assert run_plm(FORWARD_EXT_SRC, opt=opt, extra_asm=E1_ASM).strip() == "YYYYYY"
+
+
+def test_ats_that_name_each_other_are_an_error():
+    src = "t: do; declare a byte at (.b); declare b byte at (.c); declare c byte at (.b); end t;"
+    assert Compiler().compile(src, "<test>") is None
+
+
 def test_a_factored_at_places_each_name_after_the_last():
     """PL/M-80 manual, 6.2.8: `DECLARE (CHAR$A, CHAR$B, CHAR$C) BYTE AT
     (.BUFFER)' puts CHAR$B and CHAR$C in the next two bytes.  Every name was
