@@ -6503,9 +6503,12 @@ class CodeGenerator:
         if not isinstance(index, P.NumberLiteral):
             idx_type = self._get_expr_type(index)
             if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
-                self._gen_expr(index)
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
+                # What the index comes out as, not what it was expected to:
+                # `-1' is negated in HL, and taking A as the index put
+                # `buf(-1)' at BUF+255 at -O0.
+                if self._gen_expr(index) == DataType.BYTE:
+                    self._emit("ld", "l,a")
+                    self._emit("ld", "h,0")
                 sym = self.symbols.lookup(ident_text(base.name))
                 if sym and sym.based_on:
                     base_sym = self.symbols.lookup(sym.based_on)

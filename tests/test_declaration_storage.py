@@ -562,6 +562,32 @@ end t;
     assert "ld\thl,(W-4)" in lines, asm
 
 
+NEGATIVE_SUBSCRIPT_SRC = """
+0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare pad (4) byte;
+declare buf (16) byte;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+chk: procedure (ok); declare ok byte;
+    if ok then call putc('Y'); else call putc('N');
+end chk;
+pad(3) = 5;
+call chk(.buf(-1) = .pad + 3);
+call chk(buf(-1) = 5);
+buf(-1) = 9; call chk(pad(3) = 9);
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_a_negative_subscript_is_below_the_array_when_run(opt):
+    """`buf(-1)' is the byte before buf.  At -O0 the index `-1' is negated
+    in HL, and the BYTE-index path took A for the index instead, so it
+    addressed BUF+255; -O1 and up fold the constant and were right."""
+    assert run_plm(NEGATIVE_SUBSCRIPT_SRC, opt).strip() == "YYY", opt
+
+
 def test_at_a_variable_declared_further_down_is_defined_after_it():
     """An EQU is evaluated where it stands, and um80 0.3.48 takes a symbol it
     has not reached yet as zero.  UTIL5/SUB.PLM declares
