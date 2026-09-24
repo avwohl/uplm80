@@ -496,7 +496,10 @@ class CodeGenerator:
         # them first, or its RET takes a loop count for the return address.
         self._loop_words = 0
         # Assembly names declared EXTRN, which _sym_offset folds offsets onto.
-        self._extern_names: set[str] = set()
+        self._extern_names: set[str] = {"__END__"}
+        # Every module-level DeclItem, for an AT that names a variable declared
+        # further down (see _declared_later).
+        self._module_decl_items: list = []
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
@@ -1650,6 +1653,7 @@ class CodeGenerator:
         self.literal_macros = {}
 
         shape = module_shape(module)
+        self._module_decl_items = [d for d in shape.decls if isinstance(d, P.DeclItem)]
 
         # Header
         self._emit(comment=f"PL/M-80 Compiler Output - {shape.name}")
@@ -1871,6 +1875,8 @@ class CodeGenerator:
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]
+        self._module_decl_items = [d for sh in shapes for d in sh.decls
+                                   if isinstance(d, P.DeclItem)]
 
         # Header
         module_names = ', '.join(s.name for s in shapes)
@@ -2372,7 +2378,45 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
-    def _at_designator(self, expr):
+    def _declared_later(self, name: str) -> Symbol | None:
+        """A module-level variable an AT names before the DECLARE that makes it.
+
+        PL/M-80 asks for the variable to be declared first, and DRI's compiler
+        did not insist: UTIL5/SUB.PLM declares `rbuff(1) byte at
+        (.minimum$buffer)' two hundred lines above minimum$buffer, and
+        UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.  A subscript or a
+        member needs the variable's shape, so it is read from the declaration
+        itself rather than guessed.
+        """
+        for item in self._module_decl_items:
+            if name not in decl_item_names(item):
+                continue
+            attrs = decl_attrs(item)
+            data_type, dimension = _decl_item_type(item)
+            members = decl_item_struct_members(item)
+            struct_members = None
+            if members is not None:
+                struct_members = [
+                    _ast_nodes.StructMember(name=sn, data_type=_legacy_dt(struct_member_type(m)),
+                                            dimension=struct_member_dim(m))
+                    for m in members for sn in struct_member_names(m)
+                ]
+            based_on, _ = decl_item_based(item)
+            return Symbol(name=name, kind=SymbolKind.VARIABLE, data_type=data_type,
+                          dimension=dimension, struct_members=struct_members,
+                          based_on=based_on, is_external=attrs.is_external,
+                          asm_name=self._mangle_name(name))
+        return None
+
+    @staticmethod
+    def _element_width(sym: Symbol) -> int:
+        """Bytes in one element of `sym' - what a subscript steps by."""
+        if sym.struct_members:
+            return sum((m.dimension or 1) * (1 if m.data_type == DataType.BYTE else 2)
+                       for m in sym.struct_members)
+        return 1 if sym.data_type == DataType.BYTE else 2
+
+    def _at_designator(self, expr) -> tuple[Symbol | None, str, int, int]:
         """Resolve a constant `.designator' to (base symbol, name, offset, elem).
 
         Handles NAME, NAME(const), STRUCT.MEMBER and any chain of those, which
@@ -2381,153 +2425,111 @@ class CodeGenerator:
         ``code$size ADDRESS AT (.buffer(0).sector(1))``.  ``elem`` is the width
         of one element of whatever a further subscript would index.
 
-        Returns None when any part is not a compile-time constant.
+        Raises CodeGenError for anything that is not a constant address.
         """
         expr = unwrap_paren(expr)
         if isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
+            if name.upper() == "MEMORY":
+                self._use_end_symbol()
+                return None, "__END__", 0, 1
             base_sym = self._lookup_scoped(name)
-            asm = (base_sym.asm_name if base_sym and base_sym.asm_name
-                   else self._mangle_name(name))
-            if base_sym is not None and base_sym.struct_members:
-                elem = sum((m.dimension or 1)
-                           * (1 if m.data_type == DataType.BYTE else 2)
-                           for m in base_sym.struct_members)
-            elif base_sym is not None and base_sym.data_type != DataType.BYTE:
-                elem = 2
-            else:
-                elem = 1
-            return base_sym, asm, 0, elem
+            if base_sym is None:
+                base_sym = self._declared_later(name)
+            if base_sym is None:
+                raise CodeGenError(f"AT(.{name}): {name} is not declared")
+            if base_sym.based_on or base_sym.stack_offset is not None:
+                raise CodeGenError(
+                    f"AT(.{name}): {name} has no fixed address "
+                    f"({'BASED' if base_sym.based_on else 'a REENTRANT local'})")
+            asm = base_sym.asm_name or self._mangle_name(name)
+            return base_sym, asm, 0, self._element_width(base_sym)
         if isinstance(expr, P.MemberAccess):
-            base = self._at_designator(expr.base)
-            if base is None:
-                return None
-            base_sym, asm, off, _ = base
-            m_off, m_type = self._get_member_info(expr)
-            return base_sym, asm, off + m_off, (1 if m_type == DataType.BYTE else 2)
+            base_sym, asm, off, _ = self._at_designator(expr.base)
+            member = ident_text(expr.member)
+            m_off = 0
+            for m in (base_sym.struct_members if base_sym else None) or []:
+                width = 1 if m.data_type == DataType.BYTE else 2
+                if m.name == member:
+                    return base_sym, asm, off + m_off, width
+                m_off += width * (m.dimension or 1)
+            raise CodeGenError(f"AT(...): no member {member} in the structure")
         if isinstance(expr, P.Call):
             args = list(expr.args or [])
-            if len(args) != 1:
-                return None
-            index = self._try_eval_const(args[0])
+            index = self._try_eval_const(args[0]) if len(args) == 1 else None
             if index is None:
-                return None
-            base = self._at_designator(expr.callee)
-            if base is None:
-                return None
-            base_sym, asm, off, elem = base
+                raise CodeGenError("AT(...): a subscript in an AT address must be a constant")
+            base_sym, asm, off, elem = self._at_designator(expr.callee)
             return base_sym, asm, off + index * elem, elem
-        return None
+        raise CodeGenError(
+            f"AT(...): cannot take the location of a {type(expr).__name__}")
+
+    def _at_address(self, expr) -> tuple[str | None, int]:
+        """An AT address as (symbol, offset), or (None, address) for a number.
+
+        The PL/M-80 manual (6.2.8) allows a constant, or a location reference
+        followed by constants added or subtracted.  Anything else is an error:
+        it used to fall through to `EQU $', the location counter, and
+        UTIL5/MSPL.PLM's `spool$msg (1) byte at (.tbuff-1)' landed on the
+        queue control block after it.
+        """
+        expr = unwrap_paren(expr)
+        value = self._try_eval_const(expr)
+        if value is not None:
+            return None, value
+        if isinstance(expr, P.LocationOf):
+            _, asm, offset, _ = self._at_designator(expr.operand)
+            root, base_offset = self._split_offset(asm)
+            return root, base_offset + offset
+        if isinstance(expr, P.BinaryOp) and binop_kind(expr) in (BinaryOpKind.ADD,
+                                                                  BinaryOpKind.SUB):
+            left, left_off = self._at_address(expr.left)
+            right, right_off = self._at_address(expr.right)
+            if binop_kind(expr) == BinaryOpKind.ADD and not (left and right):
+                return left or right, left_off + right_off
+            if binop_kind(expr) == BinaryOpKind.SUB and right is None:
+                return left, left_off - right_off
+        raise CodeGenError(
+            "AT(...) needs a constant, or a location plus or minus constants")
+
+    def _use_end_symbol(self) -> None:
+        """Declare __END__, the linker's end of the whole program, as EXTRN.
+
+        .MEMORY is the first free byte after the whole PROGRAM, and only the
+        linker knows where that is.  A label at the end of this module marks
+        the end of the MODULE, which in a program linked from several of them
+        is somewhere in the middle: SDIR is eight modules, and its 128-entry
+        hash table, declared AT (.MEMORY) in UTIL7/DSE.PLM, landed on top of
+        another module's strings and cleared them.  The EXTRN has to come
+        before the EQU that names it: an EQU is evaluated where it stands, and
+        if __END__ is not known to be external by then it silently takes the
+        value zero.
+        """
+        if not self.needs_end_symbol:
+            self.data_segment.append(AsmLine(opcode="extrn", operands="__END__"))
+        self.needs_end_symbol = True
 
     def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol) -> None:
-        """Emit the EQU/SET line(s) for a ``DECLARE ... AT(addr)`` clause.
+        """Define the name of a ``DECLARE ... AT(addr)`` variable.
 
-        ``at_expr`` is a typed expression node. A bare ``NUMBER`` is
-        emitted as a direct EQU; a ``.NAME`` (LocationOf) becomes a SET
-        to the referenced symbol; ``.ARR(i)`` resolves to a SET with the
-        appropriate element offset when the index is a constant.
+        The address is a number, or a symbol and a single signed offset
+        (:meth:`_at_address`), and the name is an EQU for it.  A variable at an
+        external's address is also aliased to that address, so references
+        name the external with one offset (:meth:`_sym_offset`); the EQU is
+        still needed for a reference that comes before the declaration -
+        UTIL5/SUB.PLM initialises a structure with `.a$buff' in the same
+        DECLARE that goes on to declare `a$buff ... AT(.tbuff)'.
         """
-        # AT(<number>): direct address EQU.
-        if isinstance(at_expr, P.NumberLiteral):
-            addr = parse_plm_number(at_expr.value.text)
-            self.data_segment.append(
-                AsmLine(label=asm_name, opcode="EQU", operands=self._format_number(addr))
-            )
-            return
-
-        if isinstance(at_expr, P.LocationOf):
-            loc_operand = at_expr.operand
-            # AT(.NAME)
-            if isinstance(loc_operand, P.Identifier):
-                ref_name_text = ident_text(loc_operand.name)
-                if ref_name_text.upper() == "MEMORY":
-                    # .MEMORY is the first free byte after the whole PROGRAM,
-                    # and only the linker knows where that is.  A label at the
-                    # end of this module marks the end of the MODULE, which in
-                    # a program linked from several of them is somewhere in the
-                    # middle: SDIR is eight modules, and its 128-entry hash
-                    # table, declared AT (.MEMORY) in UTIL7/DSE.PLM, landed on
-                    # top of another module's strings and cleared them.
-                    # __END__ is the linker's own symbol, so name it as one.
-                    # The EXTRN has to come first: an EQU is evaluated where
-                    # it stands, and if __END__ is not known to be external by
-                    # then the symbol silently takes the value zero.
-                    if not self.needs_end_symbol:
-                        self.data_segment.append(
-                            AsmLine(opcode="extrn", operands="__END__")
-                        )
-                    self.needs_end_symbol = True
-                    self.data_segment.append(
-                        AsmLine(label=asm_name, opcode="EQU", operands="__END__")
-                    )
-                else:
-                    ref_sym = self.symbols.lookup(ref_name_text)
-                    if ref_sym and ref_sym.is_external:
-                        # AT(.external) — alias the external's name, so later
-                        # references name the external directly.
-                        ref_asm = (
-                            ref_sym.asm_name if ref_sym.asm_name
-                            else self._mangle_name(ref_name_text)
-                        )
-                        sym.asm_name = ref_asm
-                        # An EQU as well, because a reference can come BEFORE
-                        # the declaration: UTIL5/SUB.PLM initialises a
-                        # structure with `.a$buff' in the same DECLARE that
-                        # goes on to declare `a$buff ... AT(.tbuff)'.  Without
-                        # it that forward reference has no definition at all.
-                        if asm_name and asm_name != ref_asm:
-                            self.data_segment.append(
-                                AsmLine(label=asm_name, opcode="EQU",
-                                        operands=ref_asm)
-                            )
-                    else:
-                        ref_asm = (
-                            ref_sym.asm_name if ref_sym and ref_sym.asm_name
-                            else self._mangle_name(ref_name_text)
-                        )
-                        # EQU: one value everywhere, forward reference or
-                        # not.  A SET symbol would read as zero above its
-                        # definition.
-                        self.data_segment.append(
-                            AsmLine(label=asm_name, opcode="EQU", operands=ref_asm)
-                        )
-                return
-
-            # Anything else: a constant designator - NAME(i), STRUCT.MEMBER,
-            # or a chain of them.  Previously only a bare NAME(<literal>) was
-            # understood and everything else silently became `EQU $', the
-            # assembler's location counter, which pointed the variable at a
-            # arbitrary spot: UTIL4/STAT.PLM's
-            #     dolla literally '.fcb(6dh-5ch)',  doll byte at (dolla),
-            # read a stray byte as its `$' parameter, so `stat <file>' was
-            # taken for a request to change the file's attributes.
-            resolved = self._at_designator(loc_operand)
-            if resolved is None:
-                raise CodeGenError(
-                    f"AT(...) needs a constant address expression; got "
-                    f"{type(loc_operand).__name__}")
-            base_sym, base_asm, offset, _ = resolved
-            operand = self._sym_offset(base_asm, offset)
-            # An external base is aliased rather than defined, so that
-            # references name the external and the linker resolves them.
-            is_base_external = bool(base_sym and base_sym.is_external)
-            if not is_base_external and base_sym and base_sym.asm_name:
-                root = base_sym.asm_name.split('+')[0].strip()
-                root_sym = self.symbols.lookup(root)
-                if root_sym and root_sym.is_external:
-                    is_base_external = True
-            if is_base_external:
+        root, offset = self._at_address(at_expr)
+        if root is None:
+            operand = self._format_number(offset & 0xFFFF)
+        else:
+            operand = self._sym_offset(root, offset)
+            if root in self._extern_names:
                 sym.asm_name = operand
-            else:
-                self.data_segment.append(
-                    AsmLine(label=asm_name, opcode="EQU", operands=operand)
-                )
-            return
-
-        # Catch-all: evaluate at assembly time.
-        self.data_segment.append(
-            AsmLine(label=asm_name, opcode="EQU", operands="$")
-        )
+        if asm_name and asm_name != operand:
+            self.data_segment.append(
+                AsmLine(label=asm_name, opcode="EQU", operands=operand))
 
     def _emit_data_values(self, values, dtype: DataType, inline: bool = False) -> None:
         """Emit typed DATA values to the data segment or inline code segment.

@@ -470,6 +470,72 @@ end sched;
     assert lines[i + 1:i + 21] == ["dw\t0C7C7H"] * 19 + ["dw\tSCHED"], lines[i + 1:i + 21]
 
 
+def _defs(asm: str) -> list[str]:
+    return [" ".join(l.split()) for l in asm.splitlines() if "EQU" in l]
+
+
+def test_at_an_external_minus_a_constant_is_that_address():
+    """`AT (.ext - 1)' - a location reference and a constant, the restricted
+    expression the PL/M-80 manual (6.2.8) allows.  It fell past every case
+    `_emit_at_decl' knew into a catch-all `EQU $', the location counter.
+
+    UTIL5/MSPL.PLM builds the spooler's message one byte below the command
+    tail, `spool$msg (1) byte at (.tbuff-1)', and SPOOL.PRL wrote it over the
+    queue control block declared after it.
+    """
+    asm = _asm("""
+t: do;
+declare ext (4) byte external;
+declare m (1) byte at (.ext-1);
+declare y byte;
+y = m(0);
+y = m(3);
+end t;
+""", opt=0)
+    assert "@M: EQU EXT-1" in _defs(asm), _defs(asm)
+    assert not any("$" in d.split()[-1] for d in _defs(asm)), _defs(asm)
+    lines = [l.strip() for l in asm.splitlines()]
+    # The references name the external with one offset, not `EXT-1+3'.
+    assert "ld\thl,EXT-1" in lines and "ld\thl,EXT+2" in lines, asm
+
+
+@pytest.mark.parametrize("expr,want", [
+    (".buf+128", "X: EQU BUF+128"),
+    (".buf(2)+3-1", "X: EQU BUF+4"),
+    ("3+.buf(1)", "X: EQU BUF+4"),
+    ("5CH+1", "X: EQU 5DH"),
+    (".w(1)", "X: EQU W+2"),
+])
+def test_at_accepts_every_restricted_expression(expr, want):
+    asm = _asm(f"t: do; declare buf (200) byte, w (4) address; declare x byte at ({expr}); "
+               "declare y byte; y = x; end t;")
+    assert want in _defs(asm), _defs(asm)
+
+
+@pytest.mark.parametrize("expr", [".buf+y", ".buf*2", "y", ".buf-.w"])
+def test_an_at_that_is_not_a_constant_address_is_an_error(expr):
+    """Never `EQU $'."""
+    out = Compiler().compile(
+        f"t: do; declare buf (4) byte, w (4) byte, y byte; declare x byte at ({expr}); "
+        "y = x; end t;", "<test>")
+    assert out is None, out
+
+
+def test_at_a_variable_declared_further_down_uses_that_declaration():
+    """PL/M-80 wants an AT's variable declared first; DRI's compiler did not
+    insist (UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb).  A subscript
+    or member of such a variable is measured from its own declaration, not
+    taken to be a byte."""
+    asm = _asm("""
+t: do;
+declare x address at (.later(2)), y byte at (.rec.b);
+declare later (4) address, rec structure (a address, b byte);
+declare z address; z = x + y;
+end t;
+""")
+    assert "X: EQU LATER+4" in _defs(asm) and "Y: EQU REC+2" in _defs(asm), _defs(asm)
+
+
 def test_at_a_negative_subscript_is_a_negative_offset():
     """`AT (.tbuff(-1))' is TBUFF-1.  The index was taken modulo 65536 and
     written `TBUFF+65535', which um80 0.3.48 assembles without the external's
