@@ -69,3 +69,19 @@ def test_multiply_keeps_only_the_low_sixteen_bits():
     body += "  do i = 0 to last(av); do j = 0 to last(av);\n"
     body += "    a = av(i); b = av(j); call ph(a * b);\n  end; end;\nend run;\ncall run;\n"
     _check(body, [(a * b) & 0xFFFF for a in values for b in values])
+
+
+def test_nested_subscripts():
+    """A subscript's release popped the spill of an enclosing subscript's
+    claim on DE, so `aw(aw(aw(i) AND 7) AND 7)' added a stale DE in place of
+    the array's base."""
+    _check("""
+declare (b3) byte, (w4) address;
+run: procedure;
+  declare aw(*) address data (076h, 081h, 03h, 0eah, 0ff00h, 0d24ah, 07h, 02h);
+  b3 = 0; w4 = 1182h;
+  call ph(aw(aw(aw(b3 and 7) and 7) and 7));
+  call ph(aw(aw(aw(b3) and 7) and 7) + w4);
+end run;
+call run;
+""", [2, 0x1184])

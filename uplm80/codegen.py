@@ -214,6 +214,11 @@ class RegisterAllocator:
     # Stack tracking for spilled registers
     spill_stack: list[str] = field(default_factory=list)
 
+    # Per register, the claims not yet released and whether each spilled
+    # the one before it. Claims nest (a subscript inside a subscript), and
+    # a release restores only what its own claim spilled.
+    claims: dict[str, list[tuple[bool, str]]] = field(default_factory=dict)
+
     # Statistics for debugging/optimization
     stats: dict[str, int] = field(default_factory=dict)
 
@@ -251,7 +256,9 @@ class RegisterAllocator:
 
         desc = self.get_reg(reg)
 
-        if desc.state == RegState.BUSY:
+        spilled = desc.state == RegState.BUSY
+        self.claims.setdefault(reg, []).append((spilled, desc.owner))
+        if spilled:
             # Must spill - save current contents to stack
             self._spill_reg(reg, emit_fn)
 
@@ -282,14 +289,22 @@ class RegisterAllocator:
         """
         reg = reg.lower()
         desc = self.get_reg(reg)
+        claims = self.claims.get(reg)
+        spilled, outer_owner = claims.pop() if claims else (False, "")
 
-        # Check if we need to restore from spill
-        if self.spill_stack and self.spill_stack[-1] == reg:
-            # This register was spilled and is top of stack - restore it
+        # Restore what this claim spilled, and only that: an inner claim's
+        # release used to pop whatever an OUTER claim had spilled, from
+        # under the values pushed since -- `aw(aw(aw(i) AND 7) AND 7)'
+        # added a stale DE in place of the array's base.
+        if spilled and self.spill_stack and self.spill_stack[-1] == reg:
             pop_reg = 'af' if reg == 'a' else reg
             emit_fn("pop", pop_reg)
             self.spill_stack.pop()
             self.stats['restores'] = self.stats.get('restores', 0) + 1
+            desc.state = RegState.BUSY
+            desc.owner = outer_owner
+            desc.spill_depth = 0
+            return
 
         desc.state = RegState.FREE
         desc.owner = ""
@@ -341,6 +356,7 @@ class RegisterAllocator:
             desc.state = RegState.FREE
             desc.owner = ""
             desc.spill_depth = 0
+        self.claims.clear()
         self.spill_stack.clear()
 
     def get_status(self) -> str:
@@ -5737,6 +5753,10 @@ class CodeGenerator:
         left_need = self._label_reg_need(left)
         right_need = self._label_reg_need(right)
 
+        # Paths 2 and 3 claim DE only where they keep a value in it; a
+        # release without its claim would restore someone else's spill.
+        claimed_de = False
+
         # Path 1: left is simple AND DE is free
         if self._expr_preserves_de(left) and self.regs.is_free('de'):
             right_result = self._gen_expr(right)
@@ -5751,7 +5771,6 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
             self.regs.mark_free('de')
-            used_general_path = False
 
         # Path 2: Sethi-Ullman - right needs more registers.
         elif right_need > left_need:
@@ -5769,12 +5788,12 @@ class CodeGenerator:
                 self._emit("pop", "de")
             else:
                 self.regs.need_reg('de', 'binary_right_sethi', self._emit)
+                claimed_de = True
                 self._emit("ex", "de,hl")
                 left_result = self._gen_expr(left)
                 if left_result == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
-            used_general_path = True
 
         else:
             # Path 3: General - left first.
@@ -5793,6 +5812,7 @@ class CodeGenerator:
                 self._emit("pop", "hl")
             else:
                 self.regs.need_reg('de', 'binary_left', self._emit)
+                claimed_de = True
                 self._emit("ex", "de,hl")
                 right_result = self._gen_expr(right)
                 if right_result == DataType.BYTE:
@@ -5800,7 +5820,6 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("ex", "de,hl")
 
-            used_general_path = True
 
         if op == BinaryOpKind.ADD:
             self._emit("add", "hl,de")
@@ -5848,7 +5867,7 @@ class CodeGenerator:
             BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
             BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
         ):
-            if used_general_path:
+            if claimed_de:
                 self.regs.release_reg('de', self._emit)
             return self._gen_comparison(op)
 
@@ -5868,7 +5887,7 @@ class CodeGenerator:
             self._emit("sbc", "a,d")
             self._emit("ld", "h,a")
 
-        if used_general_path:
+        if claimed_de:
             self.regs.release_reg('de', self._emit)
 
         return DataType.ADDRESS
