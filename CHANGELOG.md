@@ -110,12 +110,41 @@ Each fix has a regression test that fails without it.
   BASED ADDRESS, by `MEMORY(b)` as a value and as a target, and by `MOVE`
   with a constant count and `TIME`; `OUTPUT(p) = b` replaced it with L.
   BYTE `1 - x` was `x XOR 1`, right only for 0 and 1.
-- **`LOW` could take A for its operand after an unrelated embedded
-  assignment.** `(b := w) + LOW(LAST(a))` added the low byte of `w` for 7: the
-  flag that lets `LOW((b := w))` skip reloading A outlived the assignment.
+- **`LOW` could take A for its operand after an embedded assignment.**
+  `(b := w) + LOW(LAST(a))` added the low byte of `w` for 7, and
+  `LOW((b := w) + 5)` - or `- 1`, `* 2`, `SHL`, `NOT` or unary minus in
+  place of `+ 5` - took L of `w`: the flag that lets `LOW((b := w))` skip
+  reloading A outlived the assignment. It is now used only when LOW's
+  operand is the embedded assignment itself, as in ED's
+  `LOW((N := SHR(NDEST,SECTSHF) - 1))`.
 - **Shift and rotate counts of 129 or more shifted nothing:** the count loop
   tested the sign. Counts are unsigned BYTEs now, and a constant rotate is
   unrolled.
+- **`LENGTH` and `LAST` were typed BYTE but generated into HL,** and an
+  element of an untyped DATA array, `DECLARE hex DATA ('0123')`, was typed
+  ADDRESS while being loaded as a BYTE. Code that goes by the type found
+  nothing where it looked: `ab(LAST(sa))` read `ab(0FFH)`, and
+  `hex(i) + 0FFH` added whatever HL held. A constant BYTE is now loaded
+  straight into the register it is wanted in.
+- **A 16-bit relation in an ADDRESS array's subscript** compared with a DE
+  it had already restored for the subscript: `aw(w = 5)` read `aw(0)`.
+- **An embedded assignment to a BASED BYTE** lost its value to the pointer
+  the store loads into HL: `(x := w) + 1` added 1 to the pointer.
+- **BYTE `0 PLUS x` and `0 MINUS x` cleared the carry they read:** `ld a,0`
+  is `xor a` after the peephole. A constant left operand is now added to the
+  other, by loads that leave the flags alone.
+
+#### Calls
+
+- **A BYTE argument to an ADDRESS parameter was stored as one byte,** unless
+  it was the last argument, leaving the parameter's high byte from the call
+  before. SHOW's and STAT's `pdecimal(getuser, 100, true)` printed the user
+  number with the high byte of the previous number printed.
+- **An argument that calls the procedure again,** `f(1, f(2, 3))`, stored over
+  the arguments before it, which go into the procedure's own storage before
+  the call. They now wait on the stack until it has run.
+- **A `CALL` with five or more stacked arguments** (a REENTRANT, PUBLIC or
+  EXTERNAL procedure) set SP to SP + HL instead of SP + 2n.
 
 #### DO loops
 
@@ -131,7 +160,12 @@ Each fix has a regression test that fails without it.
   the loop; and the limit, start and step are converted to the index's type
   (`DO b = 0 TO 300` runs to 44, and `BY -1` is `BY 0FFH`: PL/M-80 has no
   downward step). MPMLDR's `GENSYS.PLM` has two `TO 0FFH` loops that ran no
-  times from 0.
+  times from 0. The wrap ends the loop even when the body put the index
+  there: `DO i = 0 TO 0FEH` whose body adds 3 to `i` never stopped, since a
+  constant limit and step that fit the index were taken to mean it could
+  not wrap. The carry is now tested on every pass, as DRI's code tests it
+  whatever the limit (LOAD.COM's `DO I = 0 TO 127` ends `INR M / JNZ`), so
+  however the index got past the limit, the step that carries ends the loop.
 - **A counted `DO` loop ignored its index being written or read in a
   target.** A loop whose body does not use its index counts in B, and never
   stores the index while it runs. `s(i).x = 0` and `i = n` in the body went
@@ -149,12 +183,21 @@ Each fix has a regression test that fails without it.
   its final value before the loop starts, and a loop is counted only when
   nothing else can see its index - no procedure the body calls names it, no
   store reaches it through its address, no caller reads it after a `RETURN`
-  from the body - and nothing can change its bound.
+  from the body - and nothing can change its bound, by name or through a
+  pointer (a bound BASED on `buf(3)` that the body sets through `buf(3)` was
+  counted from its first value). The final value is left out only where
+  nothing can read the index afterwards.
 - **A `RETURN` inside a counted `DO` loop left the count on the stack.** The
   count is pushed around the body, and the RET took it for its return
   address. A `RETURN` now pops what the loops around it pushed. Live in
   `SPBRS.PLM` (the spooler's stop request at the end of a line) and 80un's
   `lzh.plm` (a failed write).
+- **A REENTRANT procedure's BYTE `DO` loop did not assemble** at `-O1` and
+  above: upeepz80 turned the increment of `(ix+n)` into `ld hl,ix+n`. The
+  index is now incremented in place, `inc (ix+n)`.
+- **A BASED ADDRESS loop index stepped by 1 never wrapped:** the `inc hl`
+  sets no flags, and the zero test that stands for it came after the store,
+  which leaves the pointer in HL.
 
 #### -O3
 
@@ -176,6 +219,16 @@ Each fix has a regression test that fails without it.
   `read16` returned its high byte twice; what a loop body sets was taken to
   be known after the loop; and an unrolled loop left its index at the last
   value.
+- **-O3 unrolled a loop whose body could change its index,** through a call
+  or a store through a pointer: `DO i = 0 TO 1; CALL bump; ...` with `bump`
+  setting `i` ran twice. A loop is unrolled now only if its body calls
+  nothing, and stores through no pointer when a pointer may reach the index.
+- **`-O3` turned `SIZE(b)` into `SIZE(5)`** after `b = 5`, which does not
+  compile; SIZE, LENGTH and LAST name a variable, not its value.
+- **`-O3` rejected a constant it had moved right of a relation:**
+  `w = 'AB' <> b` was "comparison BYTE <> 16706 is always true" at `-O3`
+  only. A constant the optimizer moves is marked as derived, like one it
+  folds.
 
 #### DATA, INITIAL and AT
 
@@ -262,7 +315,17 @@ Each fix has a regression test that fails without it.
   character high.
 - **`SHL` and `SHR` stay ADDRESS** even of a BYTE pattern, where the manual
   and DRI's compiler shift a BYTE in eight bits: programs written for uplm80
-  rely on it (80un builds words with `lo + SHL(b, 8)`).
+  rely on it (80un builds words with `lo + SHL(b, 8)`). A count of 0 leaves
+  the pattern as it is; the manual leaves that undefined, and DRI's shift
+  and rotate routines (SHOW.PRL's at 182BH to 1843H) have no zero test, so
+  there a count of 0 shifts 256 times.
+- **`DO` loops are laid out as DRI's are:** the limit is tested at the top,
+  and the step jumps back only if it did not carry out, `jr nz` after an
+  `INC`, `jr nc` after an `ADD`, so there is no jump to a test at the bottom
+  and no separate wrap exit. A variable BYTE limit is compared in place,
+  `ld hl,i / cp (hl)`. A limit, start or step that is a constant but not a
+  literal (`LAST(x)`, `SIZE(x)`, `-1`) is used as one. MP/M II and 80un are
+  about 670 bytes smaller at `-O2`.
 
 ### Added
 
@@ -276,8 +339,8 @@ Each fix has a regression test that fails without it.
 
 ### Known issues
 
-- **upeepz80 0.2.4 deletes two register loads that are still needed,** both
-  found by the differential test, both in 0.3.6's output as well; the fixes
+- **upeepz80 0.2.4 deletes register loads that are still needed,** all found
+  by the differential test and all in 0.3.6's output as well; the fixes
   belong in upeepz80.
   * It rewrites `ld a,(x) / cpl / cpl / inc a / push af / ld (x),a / pop af`
     into `ld hl,x / inc (hl)` although A is read next: `b, w = -(NOT b)` - a
@@ -288,6 +351,25 @@ Each fix has a regression test that fails without it.
     `b = 0FEH`, `w = LOW(LAST(big))`, with `big` 300 bytes long, got the low
     byte of the statement before instead of 2BH at `-O1` and above (seed 1063
     of `scripts/difftest.py`).
+  * It drops an `ld hl,n` that a store of HL still reads: `ld hl,0 / ld a,l /
+    ld (sb),a / push hl / ld (w1),hl / pop hl / ld (w0),hl` becomes `xor a /
+    ld (sb),a / ld (w1),hl / ld (w0),hl`. Its check that HL is dead, before
+    `ld hl,n / ld a,l` becomes `ld a,n`, does not count `ld (nn),hl` as a
+    read. LOW and HIGH of a constant no longer generate either shape, but
+    other code can.
+  * Its `ld a,(x) / inc a / ld (x),a` to `ld hl,x / inc (hl)` takes `(ix+n)`
+    for an address (`ld hl,ix+n`); DO loops no longer generate that.
+- **PLUS, MINUS, SCL and SCR after `+ 1` to `+ 4` or `- 1` to `- 4` of an
+  ADDRESS** take a stale carry: those are `inc hl` and `dec hl`, which set
+  none, so `(w - 1) MINUS z` with w = z = 0 gives 0FFFFH, not 0FFFEH. DRI's
+  PL/M-80 increments with INX and INR too (PIP.PLM declares a variable
+  `ONE = 1` so that `DEC(C1 + ONE)` gets an ADD and its carry), and the
+  manual (12.1) warns that the flags cannot be relied on.
+- **A REENTRANT procedure's parameter in a factored declaration with its
+  locals,** `DECLARE (top, c) BYTE`, is taken for a local; declared on its own
+  it is read from the stack as it should be.
+- **A procedure named like a register,** `H: PROCEDURE`, is not renamed as a
+  variable of that name is, and the assembler rejects `call H`.
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
 

@@ -541,6 +541,176 @@ end run;
 call run;
 """, [0x123B, 0x34, 0x35])
 
+# ---- what review of the typing found ----------------------------------------
+
+def test_length_and_last_as_a_byte_subscript():
+    """LENGTH and LAST of an array of up to 255 elements are BYTEs, and a
+    BYTE subscript is taken from A -- where `ld hl,7' had left nothing: with
+    ab(k) = k, `ab(LAST(sa))' read ab(0FFH), the store went elsewhere, and
+    `.ab(LENGTH(sa))' was off by 18H."""
+    _check("""
+declare ab(256) byte, sa(8) byte, (k, p, q) address;
+run: procedure;
+  do k = 0 to 255; ab(k) = k; end;
+  call ph(ab(last(sa))); call ph(ab(length(sa)));
+  ab(last(sa)) = 77h; call ph(ab(7));
+  p = .ab(length(sa)); q = .ab(8); call ph(p - q);
+  sa(last(sa)) = 5; call ph(sa(7));
+  k = 1; call ph(ab(last(sa) - k));
+end run;
+call run;
+""", [7, 8, 0x77, 0, 5, 6])
+
+
+def test_an_element_of_untyped_data_is_a_byte():
+    """`DECLARE hex DATA ('0123')' (as 80un's bas.plm has it) has BYTE
+    elements, which _gen_subscript loads into A; typed ADDRESS, `hex(i) +
+    0FFH' added A to whatever HL held."""
+    _check("""
+declare i byte, r address;
+run: procedure;
+  declare hx data ('0123');
+  declare hy byte data ('0123');
+  i = 1;
+  r = hx(i) + 0ffh; call ph(r);
+  r = hy(i) + 0ffh; call ph(r);
+  r = hx(i) + 100h; call ph(r);
+end run;
+call run;
+""", [0x30, 0x30, 0x131])
+
+
+def test_a_constant_moved_right_of_a_relation_is_not_checked():
+    """-O3 puts a relation's constant on the right. Marked as derived when it
+    was a plain number, but not when it was `'AB'' or a sum left unfolded
+    because the procedure uses PLUS; the impossible-comparison check then
+    rejected, at -O3 alone, what compiles at every other level."""
+    _check("""
+declare b byte, w address;
+run: procedure;
+  b = 5;
+  w = 'AB' <> b; call ph(w);
+  w = 0ff01h + 170 <> b; call ph(w);
+  w = 'AB' = b; call ph(w);
+  b = b minus 1;
+end run;
+call run;
+""", [0xFF, 0xFF, 0])
+
+
+def test_a_relation_of_addresses_as_a_subscript():
+    """A 16-bit relation in an ADDRESS array's subscript let go of DE --
+    popping the subscript's spill back into it -- before comparing with
+    it, so `aw(w = 5)' compared w with a stale DE and read aw(0)."""
+    _check("""
+declare aw(256) address, (w, k) address;
+run: procedure;
+  do k = 0 to 255; aw(k) = k; end;
+  w = 5;
+  call ph(aw(w = 5)); call ph(aw(w > 4)); call ph(aw(w < 4));
+  aw(w = 5) = 1234h; call ph(aw(255));
+end run;
+call run;
+""", [0xFF, 0xFF, 0, 0x1234])
+
+
+def test_low_of_arithmetic_on_an_embedded_assignment():
+    """The embedded assignment to a BYTE sets a flag saying A holds L, for
+    LOW((b := w)); arithmetic on it that never goes back through _gen_expr
+    (`ld de,5 / add hl,de') left the flag set, and LOW took L of w."""
+    _check("""
+declare b byte, (w, v, r) address;
+run: procedure;
+  w = 1234h; v = 0101h;
+  r = low((b := w) + 5); call ph(r);
+  r = low((b := w) + v); call ph(r);
+  r = low((b := w) - 1); call ph(r);
+  r = low(shl((b := w), 1)); call ph(r);
+  r = low(not (b := w)); call ph(r);
+  r = low(-(b := w)); call ph(r);
+  r = low((b := w) * 2); call ph(r);
+  r = low((b := w) / 2); call ph(r);
+  r = low((b := w)); call ph(r); call ph(b);
+end run;
+call run;
+""", [0x39, 0x35, 0x33, 0x68, 0xCB, 0xCC, 0x68, 0x1A, 0x34, 0x34])
+
+
+def test_plus_and_minus_of_a_constant_keep_the_carry():
+    """BYTE `c PLUS x' loaded c into A first; `ld a,0' is `xor a' after
+    the peephole, which clears the carry PLUS and MINUS read."""
+    _check("""
+declare (b1, b2, b3, z, one) byte, ab(4) byte;
+run: procedure;
+  b1 = 0ffh; z = 0; one = 1; ab(1) = 7;
+  b2 = b1 + 1; b3 = 0 plus z; call ph(b3);
+  b2 = z - 1; b3 = 0 minus z; call ph(b3);
+  b2 = b1 + 1; b3 = 5 plus z; call ph(b3);
+  b2 = z - 1; b3 = 5 minus one; call ph(b3);
+  b2 = b1 + 1; b3 = 0 plus 0; call ph(b3);
+  b2 = z - 1; b3 = 0 minus 0; call ph(b3);
+  b2 = b1 + 1; b3 = 0 plus ab(one); call ph(b3);
+  b2 = z - 1; b3 = 0 minus ab(one); call ph(b3);
+  b2 = z + 1; b3 = 0 minus one; call ph(b3);
+  b2 = b1 + 1; b3 = (0 minus z) minus z; call ph(b3);
+end run;
+call run;
+""", [1, 0xFF, 6, 3, 1, 0xFF, 8, 0xF8, 0xFF, 0xFE])
+
+
+def test_an_embedded_assignment_through_a_pointer_keeps_its_value():
+    """`(x := w)' with x a BASED BYTE is w, all of it; the store loads the
+    pointer into HL, where the value was, and nothing kept it."""
+    _check("""
+declare (w, r, p) address, x based p byte, buf(4) byte;
+rf: procedure (v) address reentrant;
+  declare v address, y byte;
+  return (y := v) + 1 + y;
+end rf;
+run: procedure;
+  p = .buf; w = 1234h;
+  r = (x := w) + 1; call ph(r); call ph(buf(0));
+  r = low((x := w)); call ph(r);
+  if (x := w) = 1234h then call ph(1); else call ph(2);
+  call ph(rf(1234h));
+end run;
+call run;
+""", [0x1235, 0x34, 0x34, 1, 0x1269])
+
+
+def test_size_of_a_variable_whose_value_is_known():
+    """SIZE's operand names a variable; -O3 propagated `b0 = 5' into it,
+    and SIZE(5) does not compile."""
+    _check("""
+declare (b0, r) byte, (w0) address, arr(10) address;
+run: procedure;
+  b0 = 5; w0 = 300;
+  r = size(b0) + size(w0); call ph(r);
+  r = size(arr) + length(arr) + last(arr); call ph(r);
+end run;
+call run;
+""", [3, 39])
+
+
+def test_low_and_high_of_size():
+    """LOW(SIZE(aw)) was `ld hl,16 / ld a,l'; stored to an ADDRESS that is
+    `... / ld h,0 / ld (w4),hl', and upeepz80 0.2.4, taking HL for dead
+    since the store is not among the reads it knows, made it `ld a,16' --
+    w4 got whatever L held (seed 80071 of the differential test)."""
+    _check("""
+declare (w4) address, b4 byte;
+run: procedure;
+  declare aw(*) address data (0ch, 07h, 025h, 0100h, 056h, 08001h, 08h, 044ddh);
+  declare big(300) byte;
+  w4 = low(size(aw));
+  call ph(b4); call ph(w4);
+  w4 = high(size(big)); call ph(w4);
+  w4 = low(length(big)) + high(last(big)); call ph(w4);
+end run;
+call run;
+""", [0, 0x10, 1, 0x2D])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])

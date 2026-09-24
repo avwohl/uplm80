@@ -40,6 +40,7 @@ from .ast_view import (
     unop_kind,
     ident_text,
     make_binary,
+    make_number_literal,
     make_unary,
     number_value,
     string_value,
@@ -1098,36 +1099,13 @@ class CodeGenerator:
                    for n in names)
 
     def _stmts_contain_goto(self, stmts) -> bool:
-        """Recursively check whether any statement in the tree is a GotoStmt.
+        """Whether any statement in the tree is a GOTO.
 
-        Used to disable loop optimizations (DJNZ) that push state onto the
-        stack across iterations. A GOTO escaping such a loop body would
-        leave that pushed state stranded — see test_goto_loops.
+        A counted loop keeps its count pushed while the body runs, and a
+        GOTO escaping the body would strand it (see test_goto_loops), so
+        such a loop is not counted.
         """
-        for stmt in stmts:
-            if self._stmt_contains_goto(stmt):
-                return True
-        return False
-
-    def _stmt_contains_goto(self, stmt) -> bool:
-        if isinstance(stmt, P.GotoStmt):
-            return True
-        if isinstance(stmt, P.LabeledStmt):
-            return self._stmt_contains_goto(stmt.stmt)
-        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
-            if self._stmt_contains_goto(stmt.then_stmt):
-                return True
-            if isinstance(stmt, P.IfStmtElse) and self._stmt_contains_goto(
-                stmt.else_stmt
-            ):
-                return True
-            return False
-        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
-            _, body_stmts = block_items_split(stmt.items)
-            return self._stmts_contain_goto(body_stmts)
-        if isinstance(stmt, P.DoCaseBlock):
-            return self._stmts_contain_goto(stmt.items or [])
-        return False
+        return any(self._stmt_contains(s, P.GotoStmt) for s in stmts)
 
     # ========================================================================
     # Register Liveness Analysis
@@ -3678,13 +3656,8 @@ class CodeGenerator:
 
         # For non-reentrant LOCAL procedures, store args directly to parameter memory
         # For reentrant procedures, external procedures, or indirect calls, use stack
-        use_stack = True
-        full_callee_name = None
-        if (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
-                and not sym.is_external and not sym.is_public):
-            use_stack = False
-            # Get the full procedure name (needed for storage_labels lookup)
-            full_callee_name = sym.name
+        use_stack = not (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
+                         and not sym.is_external and not sym.is_public)
 
         if use_stack:
             # Stack-based parameter passing (reentrant or indirect calls)
@@ -3695,70 +3668,7 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("push", "hl")
         else:
-            # Direct memory parameter passing (non-reentrant)
-            # Last param is passed in register (A for BYTE, HL for ADDRESS)
-            # Other params are stored to memory
-            last_param_idx = len(args) - 1
-            uses_reg = sym.uses_reg_param and len(args) > 0
-
-            for i, arg in enumerate(args):
-                if i < len(sym.params):
-                    param_name = sym.params[i]
-                    param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
-                    is_last = (i == last_param_idx)
-
-                    # Last param passed in register - just evaluate it
-                    if is_last and uses_reg:
-                        # Optimize constants for BYTE
-                        if param_type == DataType.BYTE:
-                            const = self._get_const_byte_value(arg)
-                            if const is not None:
-                                self._emit("ld", f"a,{self._format_number(const)}")
-                                continue
-                        # Evaluate arg - result in A (BYTE) or HL (ADDRESS)
-                        if param_type == DataType.BYTE:
-                            arg = self._low_byte_form(arg)
-                        arg_type = self._gen_expr(arg)
-                        if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        elif param_type == DataType.ADDRESS and arg_type == DataType.BYTE:
-                            self._emit("ld", "l,a")
-                            self._emit("ld", "h,0")
-                        continue
-
-                    # Non-last params: store to memory
-                    # Try to get param asm name from shared storage
-                    param_asm = None
-                    if (hasattr(self, 'storage_labels')
-                        and full_callee_name in self.storage_labels
-                        and param_name in self.storage_labels[full_callee_name]):
-                        param_asm = self.storage_labels[full_callee_name][param_name]
-                    else:
-                        # Fallback: build param asm name: @procname$param
-                        proc_base = sym.asm_name if sym.asm_name else callee_name_str or ""
-                        if proc_base.startswith('@'):
-                            proc_base = proc_base[1:]
-                        param_asm = f"@{proc_base}${self._mangle_name(param_name)}"
-
-                    # Optimize: for BYTE parameter with constant, use ld a,n directly
-                    if param_type == DataType.BYTE:
-                        const = self._get_const_byte_value(arg)
-                        if const is not None:
-                            self._emit("ld", f"a,{self._format_number(const)}")
-                            self._emit("ld", f"({param_asm}),a")
-                            continue
-
-                    if param_type == DataType.BYTE:
-                        arg = self._low_byte_form(arg)
-                    arg_type = self._gen_expr(arg)
-                    if param_type == DataType.BYTE or arg_type == DataType.BYTE:
-                        # BYTE param - ensure value is in A, use LD (addr),A
-                        if arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        self._emit("ld", f"({param_asm}),a")
-                    else:
-                        # ADDRESS param - use LD (addr),HL
-                        self._emit("ld", f"({param_asm}),hl")
+            self._gen_slot_args(sym, args, callee_name_str)
 
         # Call the procedure
         if callee_name_str is not None:
@@ -3780,10 +3690,113 @@ class CodeGenerator:
                 for _ in range(len(args)):
                     self._emit("pop", "de")
             else:
-                # Adjust stack pointer directly
-                self._emit("ld", f"de,{stack_bytes}")
+                # Adjust the stack pointer directly. (This loaded DE and
+                # added SP to whatever the procedure left in HL.)
+                self._emit("ld", f"hl,{stack_bytes}")
                 self._emit("add", "hl,sp")
                 self._emit("ld", "sp,hl")
+
+    def _param_slot(self, sym, param_name: str, callee_name: str | None) -> str:
+        """The label of parameter ``param_name`` of procedure ``sym``."""
+        labels = getattr(self, 'storage_labels', {}).get(sym.name, {})
+        if param_name in labels:
+            return labels[param_name]
+        # Fallback: @procname$param
+        proc_base = sym.asm_name if sym.asm_name else callee_name or ""
+        if proc_base.startswith('@'):
+            proc_base = proc_base[1:]
+        return f"@{proc_base}${self._mangle_name(param_name)}"
+
+    def _may_reenter(self, expr, callee: str) -> bool:
+        """Whether evaluating ``expr`` may call procedure ``callee`` (its full
+        name): a call of it, of a procedure that reaches it, or through an
+        address."""
+        stack = [expr]
+        while stack:
+            e = unwrap_paren(stack.pop())
+            target = None
+            if isinstance(e, (P.Call, P.CallNoArgs)):
+                c = unwrap_paren(e.callee)
+                if isinstance(c, P.Identifier):
+                    target = ident_text(c.name)
+                elif not isinstance(c, P.MemberAccess):   # `s.m(i)' is an element
+                    return True             # an indirect call
+            elif isinstance(e, P.Identifier):
+                target = ident_text(e.name)
+            elif isinstance(e, P.LocationOf) and isinstance(unwrap_paren(e.operand), P.Identifier):
+                continue                    # `.f' names f, it does not call it
+            if target is not None:
+                g = self._resolve_proc_name(target, self.current_proc or "")
+                if g is not None and (g == callee or callee in self._get_reachable(g, set())):
+                    return True
+            if isinstance(e, (list, tuple)):
+                stack.extend(e)
+                continue
+            fields = getattr(e, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(e, f, None) for f in fields if f != "pos")
+        return False
+
+    def _gen_slot_args(self, sym, args, callee_name: str | None) -> None:
+        """Pass ``args`` to a non-reentrant local procedure ``sym``: each is
+        stored in the procedure's own slot for its parameter, converted to
+        the parameter's type (8.2), except a last one passed in A or HL.
+
+        An argument whose evaluation calls the procedure again -- ``f(1,
+        f(2, 3))'' -- would store over the slots the arguments before it
+        already filled, so those are kept on the stack until it has run.
+        DRI's PL/M-80 passes them on the stack and lets the callee store
+        them, which comes to the same thing.
+        """
+        last_param_idx = len(args) - 1
+        uses_reg = sym.uses_reg_param and len(args) > 0
+        reenter = max((j for j in range(1, len(args))
+                       if self._may_reenter(args[j], sym.name)), default=0)
+        stashed: list[tuple[str, DataType]] = []
+
+        for i, arg in enumerate(args):
+            if i >= len(sym.params):
+                continue
+            param_name = sym.params[i]
+            param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
+
+            # Evaluate into A for a BYTE parameter, HL for an ADDRESS one.
+            if param_type == DataType.BYTE:
+                self._gen_expr_to_a(arg)
+            else:
+                self._gen_expr_to_hl(arg)
+
+            if i == last_param_idx and uses_reg:
+                continue                    # passed in the register
+            slot = self._param_slot(sym, param_name, callee_name)
+            if i < reenter:
+                self._emit("push", "af" if param_type == DataType.BYTE else "hl")
+                stashed.append((slot, param_type))
+            elif param_type == DataType.BYTE:
+                self._emit("ld", f"({slot}),a")
+            else:
+                # A BYTE argument is widened: storing A alone left the high
+                # byte of an ADDRESS parameter as the last call had left it.
+                self._emit("ld", f"({slot}),hl")
+
+        if stashed:
+            reg_type = sym.param_types[last_param_idx] if (
+                uses_reg and last_param_idx < len(sym.param_types)) else None
+            if reg_type == DataType.BYTE:
+                self._emit("ld", "e,a")
+            elif reg_type is not None:
+                self._emit("ex", "de,hl")
+            for slot, t in reversed(stashed):
+                if t == DataType.BYTE:
+                    self._emit("pop", "af")
+                    self._emit("ld", f"({slot}),a")
+                else:
+                    self._emit("pop", "hl")
+                    self._emit("ld", f"({slot}),hl")
+            if reg_type == DataType.BYTE:
+                self._emit("ld", "a,e")
+            elif reg_type is not None:
+                self._emit("ex", "de,hl")
 
     def _gen_return(self, stmt) -> None:
         """Generate code for a RETURN statement.
@@ -4624,154 +4637,141 @@ class CodeGenerator:
         if sym and sym.data_type == DataType.BYTE:
             index_type = DataType.BYTE
 
-        # The limit (like the start and the step) is converted to the
-        # index's type (5.1.4), so a BYTE index makes a byte loop whatever
-        # the limit is: `DO b = 0 TO 300' runs to 44.
+        # The start, the limit and the step are converted to the index's
+        # type (5.1.4), so a BYTE index makes a byte loop whatever the limit
+        # is: `DO b = 0 TO 300' runs to 44, and BY -1 is BY 0FFH.
         both_bytes = index_type == DataType.BYTE
+        width = 0xFF if both_bytes else 0xFFFF
 
-        # Get step value (default +1 when no BY clause; only constant
-        # NumberLiteral steps drive the byte-loop optimisations).
+        def const(expr) -> int | None:
+            value = self._const_value(expr)
+            return None if value is None else value & width
+
+        start_val = const(stmt.start)
+        bound_val = const(stmt.bound)
         # A BY clause whose step is not a constant has to be evaluated each
-        # time round.  Defaulting step_val to 1 for it silently turned
-        # `DO J = A TO B BY I' into `BY 1': MP/M II's UTIL7/DSE.PLM walks an
-        # FCB disk map `BY i', where i is 1 or 2 according to whether the disk
-        # uses byte or word block numbers, and counted every allocated block
-        # twice on a disk with word numbers.
-        step_val = 1
-        step_is_const = True
-        if step_expr is not None:
-            if isinstance(step_expr, P.NumberLiteral):
-                step_val = number_value(step_expr)
-            else:
-                step_is_const = False
-
-        # Check if loop index is used in body - if not, we can use DJNZ on Z80.
-        # The count in B stands in for the index, which is then never stored,
-        # so a body that reads OR writes it cannot be counted: UTIL2/SCBRS.PLM
-        # clears its table with `sched$table(tindx).date = 0', which cleared
-        # one entry four times, and UTIL6/PIP.PLM and ED.PLM end their
-        # read loops at end of file with `I = N', which the count ignored.
-        index_used = self._index_used_in_body(index_var, body_stmts)
-
-        # Skip DJNZ optimization when the body has a GOTO — the pattern
-        # pushes BC at the top of each iteration and pops at the bottom,
-        # so a GOTO escaping the body strands the pushed BC on the stack.
-        body_has_goto = self._stmts_contain_goto(body_stmts)
+        # time round.  Defaulting it to 1 silently turned `DO J = A TO B BY I'
+        # into `BY 1': MP/M II's UTIL7/DSE.PLM walks an FCB disk map `BY i',
+        # where i is 1 or 2 according to whether the disk uses byte or word
+        # block numbers, and counted every allocated block twice on a disk
+        # with word numbers.
+        step_val = 1 if step_expr is None else const(step_expr)
+        step_is_const = step_val is not None
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
-        # The count stands in for the index, so nothing else may look at the
-        # index while the loop runs: not a procedure the body calls, not a
-        # store through its address, and not the caller after a RETURN from
-        # the body.  The bound is evaluated once, where PL/M-80 evaluates the
-        # limit on every pass, so nothing may change it either.
+        # The count in B stands in for the index, so the body may neither
+        # read nor write it by name (UTIL2/SCBRS.PLM clears its table with
+        # `sched$table(tindx).date = 0'; UTIL6/PIP.PLM and ED.PLM end their
+        # read loops with `I = N'), and nothing else may look at it while the
+        # loop runs: not a procedure the body calls, not a store through its
+        # address, and not the caller after a RETURN from the body.  The
+        # count is taken once, where PL/M-80 evaluates the limit on every
+        # pass, so nothing may change the bound either.  B is on the stack while
+        # the body runs: a RETURN pops it (_gen_counted_body), a GOTO would
+        # strand it, so a body with a GOTO is not counted.
         if (
             both_bytes
-            and step_is_const
             and step_val == 1
-            and not index_used
-            and not body_has_goto
-            and isinstance(stmt.start, P.NumberLiteral)
-            and number_value(stmt.start) == 0
+            and start_val == 0
+            and not self._index_used_in_body(index_var, body_stmts)
+            and not self._stmts_contain_goto(body_stmts)
             and self._only_the_loop_sees(index_name, body_stmts, after_return=True)
-            and self._bound_is_fixed(stmt.bound, body_stmts)
+            and (bound_val is not None or self._bound_is_fixed(stmt.bound, body_stmts))
         ):
-            # A = the number of passes, bound + 1.  A bound of 255 is 256
-            # passes, a count of 0 in B, which is where DJNZ counts 256 from
-            # - a DO from 0 runs at least once whatever its bound (PL/M-80
-            # manual, 5.1.4).  The bound is converted to the BYTE index's
-            # type, so an ADDRESS bound counts by its low byte.
-            if isinstance(stmt.bound, P.NumberLiteral):
-                self._emit("ld", f"a,{self._format_number((number_value(stmt.bound) + 1) & 0xFF)}")
-            else:
-                if self._gen_expr(stmt.bound) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("inc", "a")
+            # The count is bound + 1.  A bound of 255 is 256 passes, a count
+            # of 0 in B, which is where DJNZ counts 256 from - a DO from 0
+            # runs at least once whatever its bound (PL/M-80 manual, 5.1.4).
             # That is also where the index ends up, one past the bound, and
-            # nothing reads it until the loop is over, so it is stored now.
-            # It was never stored at all: an inner DO over the same index
-            # left the outer loop to go round again from a stale value.
-            self._gen_store(index_var, DataType.BYTE)
-            self._emit("ld", "b,a")
+            # nothing reads it until the loop is over, so it is stored now:
+            # an inner DO over the same index, the code after the loop and a
+            # caller after a RETURN all read it.  Unless nothing can.
+            index_live = self._read_outside(index_name, stmt)
+            if bound_val is not None and not index_live:
+                self._emit("ld", f"b,{self._format_number((bound_val + 1) & 0xFF)}")
+            else:
+                if bound_val is not None:
+                    self._emit("ld", f"a,{self._format_number((bound_val + 1) & 0xFF)}")
+                else:
+                    self._gen_expr_to_a(stmt.bound)
+                    self._emit("inc", "a")
+                if index_live:
+                    self._gen_store(index_var, DataType.BYTE)
+                self._emit("ld", "b,a")
             self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
             self.loop_stack.pop()
             return
 
-        # PL/M-80's iterative DO, as DRI's compiler codes it (UTIL4/ERAQ.PRL,
-        # UTIL3/LOAD.COM): the index is compared with the limit before each
-        # pass, and the loop ends when the increment carries out of the
-        # index's width -- `INR A / JNZ top' for a BYTE step of 1,
-        # `DAD D / JNC top' for a BY step. So `DO b = 0 TO 255' runs 256
-        # times and leaves b = 0, and a step that would wrap past the limit
-        # stops the loop instead. A step of 0FFH (or -1) is 255, not a
-        # count downwards (5.1.4).
+        # PL/M-80's iterative DO, laid out the way DRI's compiler lays it out
+        # (MPMLDR/GENSYS.COM 106BH, UTIL4/STAT.PRL 133AH, UTIL3/LOAD.COM
+        # 0487H, UTIL6/ED.PRL 0AF1H): the index is compared with the limit
+        # at the top, before every pass, and the step jumps back to that
+        # test only if it did not carry out of the index's width -- `INR A /
+        # JNZ top' for a BYTE step of 1, `DAD D / JNC top' for a BY step and
+        # an ADDRESS one. So `DO b = 0 TO 255' runs 256 times and leaves
+        # b = 0, and a step that carries out stops the loop wherever the
+        # index was (5.1.4, step 4). DRI tests the carry on every pass, even
+        # where the limit and the step cannot carry each other - LOAD.COM's
+        # `DO I = 0 TO 127' ends `INR M / JNZ' (0654H) - so a body that moves
+        # the index past the limit ends the loop there, however it moved it.
+        # A limit of 0FFH (0FFFFH) passes every index, so it needs no test
+        # at the top.
         if both_bytes:
-            bound_val = (number_value(stmt.bound) & 0xFF
-                         if isinstance(stmt.bound, P.NumberLiteral) else None)
-            step_byte = step_val & 0xFF if step_is_const else None
-
-            # Initialize index variable
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
+            self._gen_expr_to_a(stmt.start)
             self._gen_store(index_var, DataType.BYTE)
 
-            # A limit of 255 passes every index, so there is nothing to test.
-            if bound_val != 0xFF:
-                self._emit("jp", test_label)
+            self._emit_label(test_label)
+            if bound_val is not None and bound_val != 0xFF:
+                self._gen_load(index_var)  # A = index
+                self._emit("cp", self._format_number(bound_val + 1))
+                self._emit("jp", f"nc,{end_label}")    # index > limit
+            elif bound_val is None:
+                # The limit is evaluated on every pass, converted to a BYTE:
+                # leave if limit - index borrows.
+                self._gen_expr_to_a(stmt.bound)
+                operand = self._byte_var_operand(index_var)
+                if operand is None:
+                    self._emit("ld", "b,a")
+                    self._gen_load(index_var)
+                    self._emit("ld", "c,a")
+                    self._emit("ld", "a,b")
+                    operand = "c"
+                self._emit("cp", operand)
+                self._emit("jp", f"c,{end_label}")
 
-            # Loop body
             self._emit_label(loop_label)
             for s in body_stmts:
                 self._gen_stmt(s)
 
-            # Increment, and stop when it carries out.  INC sets Z when it
-            # wraps, ADD sets carry; storing a BYTE is all loads, so the flags
-            # survive the store.
+            # Step, and go round again unless it carried out. INC sets Z
+            # when it wraps, ADD sets carry; storing a BYTE is all loads, so
+            # the flags survive the store.
             self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-                wrap = "c"
-            elif step_byte == 1:
-                self._emit("inc", "a")
-                wrap = "z"
+            operand = self._byte_var_operand(index_var) if step_val == 1 else None
+            if operand is not None:
+                # `inc (hl)' or `inc (ix+n)': in place. (The peephole makes
+                # `ld a,(x) / inc a / ld (x),a' into `ld hl,x / inc (hl)',
+                # and did so to `(ix+n)' as well: `ld hl,ix+-1', which does
+                # not assemble -- a REENTRANT procedure's BYTE loop.)
+                self._emit("inc", operand)
+                again = "nz"
             else:
-                self._emit("add", f"a,{self._format_number(step_byte)}")
-                wrap = "c"
-            self._gen_store(index_var, DataType.BYTE)
-            # With a constant limit the index is at most the limit before
-            # the step, so if limit + step fits in a byte it cannot wrap.
-            can_wrap = (bound_val is None or not step_is_const
-                        or bound_val + step_byte > 0xFF)
-            if bound_val == 0xFF:
-                self._emit("jp", f"n{wrap},{loop_label}")
-                self._emit_label(test_label)
-            else:
-                if can_wrap:
-                    self._emit("jp", f"{wrap},{end_label}")
-                self._emit_label(test_label)
-                if bound_val is not None:
+                if step_is_const:
                     self._gen_load(index_var)  # A = index
-                    self._emit("cp", self._format_number(bound_val + 1))
-                    self._emit("jp", f"C,{loop_label}")  # index <= limit
+                    if step_val == 1:
+                        self._emit("inc", "a")
+                        again = "nz"
+                    else:
+                        self._emit("add", f"a,{self._format_number(step_val)}")
+                        again = "nc"
                 else:
-                    # The limit is evaluated on every pass, converted to a
-                    # BYTE. Continue while index <= limit.
-                    bound_result = self._gen_expr(stmt.bound)
-                    if bound_result == DataType.ADDRESS:
-                        self._emit("ld", "a,l")
-                    self._emit("ld", "b,a")  # B = limit
-                    self._gen_load(index_var)  # A = index
-                    self._emit("cp", "b")
-                    self._emit("jp", f"c,{loop_label}")
-                    self._emit("jp", f"z,{loop_label}")
+                    self._gen_expr_to_a(step_expr)
+                    self._emit("ld", "b,a")
+                    self._gen_load(index_var)
+                    self._emit("add", "a,b")
+                    again = "nc"
+                self._gen_store(index_var, DataType.BYTE)
+            self._emit("jp", f"{again},{test_label}")
 
             self._emit_label(end_label)
             self.loop_stack.pop()
@@ -4789,24 +4789,35 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
-        bound_val = (number_value(stmt.bound) & 0xFFFF
-                     if isinstance(stmt.bound, P.NumberLiteral) else None)
-        step_word = step_val & 0xFFFF if step_is_const else None
-
-        # Initialize index variable
         self._gen_expr_to_hl(stmt.start)
         self._gen_store(index_var, DataType.ADDRESS)
 
-        # Jump to test (a limit of 0FFFFH passes every index)
-        if bound_val != 0xFFFF:
-            self._emit("jp", test_label)
+        self._emit_label(test_label)
+        if bound_val is not None and bound_val != 0xFFFF:
+            _index_to_hl()
+            # index - (limit + 1) does not borrow: index > limit.
+            self._emit("ld", f"de,{self._format_number(bound_val + 1)}")
+            self._emit_sub16()
+            self._emit("jp", f"nc,{end_label}")
+        elif bound_val is None:
+            _index_to_hl()
+            if self._expr_preserves_de(stmt.bound):
+                self._emit("ex", "de,hl")        # DE = index
+                self._gen_expr_to_hl(stmt.bound)  # HL = bound, DE untouched
+            else:
+                # The bound is free to use DE (a call, a 16-bit subexpression,
+                # `ld de,nn`), so the index has to survive on the stack.
+                self._emit("push", "hl")
+                self._gen_expr_to_hl(stmt.bound)  # HL = bound
+                self._emit("pop", "de")           # DE = index
+            self._emit_sub16()                    # limit - index borrows: done
+            self._emit("jp", f"c,{end_label}")
 
-        # Loop body
         self._emit_label(loop_label)
         for s in body_stmts:
             self._gen_stmt(s)
 
-        # Increment, and stop when it carries out.
+        # Step, and go round again unless it carried out.
         self._emit_label(incr_label)
         _index_to_hl()
         if not step_is_const:
@@ -4815,53 +4826,23 @@ class CodeGenerator:
             self._emit("ex", "de,hl")
             self._emit("pop", "hl")
             self._emit("add", "hl,de")
-            wrap = "c"
-        elif step_word == 1:
+            again = "nc"
+        elif step_val == 1:
+            # `inc hl' sets no flags: the index wrapped if it is now 0.
+            # Tested before the store, which for a BASED index leaves the
+            # pointer in HL; a store sets no flags.
             self._emit("inc", "hl")
-            wrap = "z"
+            self._emit("ld", "a,h")
+            self._emit("or", "l")
+            again = "nz"
         else:
             # BC, not DE: the peephole turns `ld de,1..3 / add hl,de' into
             # `inc hl', which sets no carry.
-            can_carry = bound_val is None or bound_val + step_word > 0xFFFF
-            pair = "bc" if can_carry else "de"
-            self._emit("ld", f"{pair},{self._format_number(step_word)}")
-            self._emit("add", f"hl,{pair}")
-            wrap = "c"
+            self._emit("ld", f"bc,{self._format_number(step_val)}")
+            self._emit("add", "hl,bc")
+            again = "nc"
         self._gen_store(index_var, DataType.ADDRESS)
-        can_wrap = (bound_val is None or not step_is_const
-                    or bound_val + step_word > 0xFFFF)
-        if can_wrap:
-            if wrap == "z":
-                # `inc hl' sets no flags: the index wrapped if it is now 0.
-                self._emit("ld", "a,h")
-                self._emit("or", "l")
-            if bound_val == 0xFFFF:
-                self._emit("jp", f"n{wrap},{loop_label}")
-                self._emit_label(test_label)
-                self._emit_label(end_label)
-                self.loop_stack.pop()
-                return
-            self._emit("jp", f"{wrap},{end_label}")
-
-        # Test condition
-        self._emit_label(test_label)
-        _index_to_hl()
-        if self._expr_preserves_de(stmt.bound):
-            self._emit("ex", "de,hl")        # DE = index
-            self._gen_expr_to_hl(stmt.bound)  # HL = bound, DE untouched
-        else:
-            # The bound is free to use DE (a call, a 16-bit subexpression,
-            # `ld de,nn`), so the index has to survive on the stack.
-            self._emit("push", "hl")
-            self._gen_expr_to_hl(stmt.bound)  # HL = bound
-            self._emit("pop", "de")           # DE = index
-
-        # Compare: if index > bound, exit (for positive step)
-        # HL - DE: if negative (carry), index > bound
-        self._emit_sub16()
-
-        # If no borrow (NC), bound >= index, continue
-        self._emit("jp", f"nc,{loop_label}")
+        self._emit("jp", f"{again},{test_label}")
 
         self._emit_label(end_label)
         self.loop_stack.pop()
@@ -4891,6 +4872,99 @@ class CodeGenerator:
         self._emit("jp", f"nz,{loop_label}")
 
         self._emit_label(end_label)
+
+    def _read_outside(self, name: str, loop) -> bool:
+        """Whether the index ``name`` of the counted ``loop`` may be read
+        anywhere but inside it.  Only a variable of the procedure being
+        compiled that nothing reaches through its address can be ruled out,
+        and then only if the procedure (nested procedures included) names it
+        nowhere else.  Another DO over the same index assigns it before
+        anything in it reads it, so it does not count - unless that DO
+        encloses this one, whose value its step then reads."""
+        sym = self._lookup_symbol(name)
+        if (self.current_proc_decl is None or sym is None
+                or sym.kind != SymbolKind.VARIABLE or sym.based_on
+                or sym.is_public or sym.is_external or name in self._aliased
+                or self._var_owner(sym, name) != self.current_proc):
+            return True
+        stack = [self.current_proc_decl.body]
+        while stack:
+            n = stack.pop()
+            if n is loop:
+                continue
+            if isinstance(n, P.Identifier) and ident_text(n.name) == name:
+                return True
+            if (isinstance(n, (P.DoIterBlock, P.DoIterByBlock))
+                    and ident_text(n.index) == name and self._encloses(n.items, loop)):
+                return True
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+        return False
+
+    @staticmethod
+    def _encloses(tree, node) -> bool:
+        """Whether ``node`` is ``tree`` or anywhere inside it."""
+        stack = [tree]
+        while stack:
+            n = stack.pop()
+            if n is node:
+                return True
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+        return False
+
+    def _const_value(self, expr) -> int | None:
+        """``expr`` as a constant, typed the way PL/M-80 types it (so `-1'
+        is 0FFH), or None. LENGTH, LAST and SIZE of a declared variable are
+        constants too: `DO i = 0 TO LAST(a)' has a limit known here."""
+        typed = eval_typed(expr, self._literal_macro_value)
+        if typed is not None:
+            return typed[0]
+        e = unwrap_paren(expr)
+        if isinstance(e, P.Call) and len(e.args) == 1:
+            callee = unwrap_paren(e.callee)
+            if isinstance(callee, P.Identifier):
+                name = ident_text(callee.name).upper()
+                sym = self._lookup_symbol(ident_text(callee.name))
+                if sym is not None and sym.kind != SymbolKind.BUILTIN:
+                    return None
+                if name in ("LENGTH", "LAST"):
+                    extent = self._array_extent(e.args[0])
+                    if extent:
+                        return extent if name == "LENGTH" else extent - 1
+                elif name == "SIZE":
+                    arg = unwrap_paren(e.args[0])
+                    if isinstance(arg, P.Identifier):
+                        var = self._lookup_scoped(ident_text(arg.name))
+                        if var is not None:
+                            return var.size
+        return None
+
+    def _byte_var_operand(self, var) -> str | None:
+        """An operand `cp' can compare A with, for the BYTE scalar ``var``:
+        `(hl)' once HL is loaded with its address, or `(ix+n)'. None when
+        it is none of those."""
+        sym = self._lookup_symbol(ident_text(var.name)) if isinstance(var, P.Identifier) else None
+        if sym is None or sym.kind not in (SymbolKind.VARIABLE, SymbolKind.PARAMETER):
+            return None
+        if sym.stack_offset is not None:
+            return f"(ix+{sym.stack_offset})"
+        if sym.based_on:
+            self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+            return "(hl)"
+        name = ident_text(var.name)
+        if name in self.literal_macros or name.upper() == "STACKPTR":
+            return None
+        self._emit("ld", f"hl,{sym.asm_name if sym.asm_name else self._mangle_name(name)}")
+        return "(hl)"
 
     def _gen_do_case(self, stmt) -> None:
         """Generate code for a ``DO CASE selector ... END`` block.
@@ -5053,6 +5127,15 @@ class CodeGenerator:
                 if sym:
                     if sym.kind == SymbolKind.PROCEDURE:
                         return sym.return_type or DataType.ADDRESS
+                    # A subscripted variable is an element, which
+                    # _gen_subscript loads as a BYTE unless the variable is
+                    # an ADDRESS -- an untyped `DECLARE hex DATA ('0123')'
+                    # too, which was typed ADDRESS here, so `hex(i) + 0FFH'
+                    # added the BYTE in A to whatever HL held.
+                    if (sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER)
+                            and isinstance(expr, P.Call) and len(expr.args) == 1):
+                        return (DataType.ADDRESS if sym.data_type == DataType.ADDRESS
+                                else DataType.BYTE)
                     if sym.dimension is not None:
                         return sym.data_type or DataType.BYTE
                     return sym.data_type or DataType.ADDRESS
@@ -5421,7 +5504,14 @@ class CodeGenerator:
             return self._gen_location(expr)
 
         elif isinstance(expr, P.EmbeddedAssign):
-            val_type = self._gen_expr(expr.value)
+            if self._get_const_byte_value(expr.value) is not None:
+                # A BYTE constant is a BYTE here too, in A: generated as a
+                # literal it came back in HL, and code that goes by the
+                # static type -- a BYTE subscript -- looked for it in A.
+                self._gen_expr_to_a(expr.value)
+                val_type = DataType.BYTE
+            else:
+                val_type = self._gen_expr(expr.value)
 
             target = unwrap_paren(expr.target)
             target_name = ident_text(target.name) if isinstance(target, P.Identifier) else None
@@ -5472,9 +5562,15 @@ class CodeGenerator:
             else:
                 target_sym = None
                 if isinstance(target, P.Identifier):
-                    target_sym = self.symbols.lookup(target_name)
+                    target_sym = self._lookup_symbol(target_name)
 
-                if target_sym and target_sym.data_type == DataType.BYTE:
+                # A plain BYTE variable is stored `ld a,l / ld (x),a', which
+                # keeps HL and leaves L in A. Through a BASED pointer or a
+                # stack frame the store needs HL for the address, so the
+                # value -- the embedded assignment's own, all sixteen bits
+                # of it -- has to survive on the stack like any other.
+                if (target_sym and target_sym.data_type == DataType.BYTE
+                        and not target_sym.based_on and target_sym.stack_offset is None):
                     self._gen_store(target, val_type)
                     self.a_has_l = True
                 else:
@@ -6186,8 +6282,11 @@ class CodeGenerator:
 
         # Path 1: left is simple AND DE is free
         if self._expr_preserves_de(left) and self.regs.is_free('de'):
-            right_result = self._gen_expr(right)
-            if right_result == DataType.BYTE:
+            right_const = self._get_const_byte_value(right)
+            if right_const is not None:
+                # LENGTH or LAST, say, which is generated into A.
+                self._emit("ld", f"de,{self._format_number(right_const)}")
+            elif self._gen_expr(right) == DataType.BYTE:
                 self._emit("ld", "e,a")
                 self._emit("ld", "d,0")
             else:
@@ -6294,9 +6393,13 @@ class CodeGenerator:
             BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
             BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
         ):
+            result = self._gen_comparison(op)
+            # Only now: releasing a claim that spilled pops the outer DE
+            # back, and the comparison compared against that -- `aw(w = 5)'
+            # tested w against the subscript's array base.
             if claimed_de:
                 self.regs.release_reg('de', self._emit)
-            return self._gen_comparison(op)
+            return result
 
         elif op == BinaryOpKind.PLUS:
             self._emit("ld", "a,l")
@@ -6547,6 +6650,10 @@ class CodeGenerator:
         """
         mnemonic = "adc" if op == BinaryOpKind.PLUS else "sbc"
         right_const = self._get_const_byte_value(right)
+        left_const = self._get_const_byte_value(left)
+        if left_const is not None:
+            self._gen_carry_op_const_left(left_const, right, right_const, op)
+            return DataType.BYTE
         self._gen_expr_to_a(left)
         if right_const is not None:
             self._emit(mnemonic, f"a,{self._format_number(right_const)}")
@@ -6558,6 +6665,51 @@ class CodeGenerator:
         self._emit(mnemonic, "a,b")
         return DataType.BYTE
 
+    def _gen_carry_op_const_left(self, c: int, right, right_const: int | None,
+                                 op: BinaryOpKind) -> None:
+        """``c PLUS right`` or ``c MINUS right`` of BYTEs, c a constant.
+
+        Loading c into A first, as the general form does, is `ld a,0' for
+        0, which the peephole makes the one-byte `xor a' -- clearing the
+        very carry PLUS and MINUS read: `0 PLUS z' after an add that
+        carried gave 0. So the other operand goes into A, by loads that
+        leave the flags alone, and c is added to it: c + x + carry for
+        PLUS; for MINUS, c - x - borrow is `sbc' from c when c can be
+        loaded, and c + NOT x + (1 - borrow) -- `cpl / ccf / adc a,c /
+        ccf', which also leaves the borrow -- when it is 0.
+        """
+        if right_const is not None and right_const == 0:
+            # c PLUS 0 or c MINUS 0: the carry alone.
+            if c != 0:
+                self._emit("ld", f"a,{self._format_number(c)}")
+                self._emit("adc" if op == BinaryOpKind.PLUS else "sbc", "a,0")
+            else:
+                self._emit("sbc", "a,a")          # A = -carry, carry kept
+                if op == BinaryOpKind.PLUS:
+                    self._emit("and", "1")        # 0 + 0 + carry, no carry out
+            return
+        if right_const is not None:
+            self._emit("ld", f"a,{self._format_number(right_const)}")
+        elif self._expr_preserves_hl(right):
+            self._gen_expr_to_a(right)            # a load: no flags touched
+        else:
+            self._emit("push", "af")
+            self._gen_expr_to_a(right)
+            self._emit("ld", "b,a")
+            self._emit("pop", "af")
+            self._emit("ld", "a,b")
+        if op == BinaryOpKind.PLUS:
+            self._emit("adc", f"a,{self._format_number(c)}")
+        elif c != 0:
+            self._emit("ld", "b,a")
+            self._emit("ld", f"a,{self._format_number(c)}")
+            self._emit("sbc", "a,b")
+        else:
+            self._emit("cpl")
+            self._emit("ccf")
+            self._emit("adc", "a,0")
+            self._emit("ccf")
+
     def _gen_expr_to_hl(self, expr) -> None:
         """Generate an expression into ``HL``, widening a byte result.
 
@@ -6566,6 +6718,10 @@ class CodeGenerator:
         calls BYTE still loads as ``ld hl,n``, and widening that with
         ``ld l,a`` would splice in an undefined ``A``.
         """
+        const_val = self._get_const_byte_value(expr)
+        if const_val is not None:
+            self._emit("ld", f"hl,{self._format_number(const_val)}")
+            return
         if self._gen_expr(expr) == DataType.BYTE:
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
@@ -6771,6 +6927,13 @@ class CodeGenerator:
 
         # An index is zero-extended anyway.
         index = unwrap_paren(self._unwidened(index) or index)
+        # LENGTH and LAST are constants like any other (a one-character
+        # string too): `ab(LAST(sa))' is `ab(7)', an address the assembler
+        # works out.
+        if not isinstance(index, P.NumberLiteral):
+            const_index = self._get_const_byte_value(index)
+            if const_index is not None:
+                index = make_number_literal(const_index, pos=getattr(index, "pos", None))
 
         elem_size = 1
         if isinstance(base, P.Identifier):
@@ -6799,12 +6962,14 @@ class CodeGenerator:
         if not isinstance(index, P.NumberLiteral):
             idx_type = self._get_expr_type(index)
             if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
-                # What the index comes out as, not what it was expected to:
-                # taking A for an index generated into HL put the element
-                # somewhere that depended on the optimization level.
+                # By what _gen_expr returns, not by idx_type: an index can
+                # come back in HL (an embedded assignment of a constant), and
+                # taking A for it put the element somewhere that depended on
+                # the optimization level.  Either way it is a BYTE (-1 is
+                # 0FFH, manual 4.2.2), so H is cleared.
                 if self._gen_expr(index) == DataType.BYTE:
                     self._emit("ld", "l,a")
-                    self._emit("ld", "h,0")
+                self._emit("ld", "h,0")
                 sym = self.symbols.lookup(ident_text(base.name))
                 if sym and sym.based_on:
                     base_sym = self.symbols.lookup(sym.based_on)
@@ -7018,14 +7183,11 @@ class CodeGenerator:
         # Regular function call
         sym = None
         call_name = None
-        full_callee_name = None
         name = None
         if isinstance(callee, P.Identifier):
             name = ident_text(callee.name)
             sym = self._lookup_symbol(name)
             call_name = sym.asm_name if sym and sym.asm_name else name
-            if sym:
-                full_callee_name = sym.name
 
             # CP/M BDOS optimisation: MON1/MON2(func, arg).
             if name.upper() in ('MON1', 'MON2') and len(args) == 2:
@@ -7056,58 +7218,7 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("push", "hl")
         else:
-            last_param_idx = len(args) - 1
-            uses_reg = sym.uses_reg_param and len(args) > 0
-
-            for i, arg in enumerate(args):
-                if sym and i < len(sym.params):
-                    param_name = sym.params[i]
-                    param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
-                    is_last = (i == last_param_idx)
-
-                    if is_last and uses_reg:
-                        if param_type == DataType.BYTE:
-                            const = self._get_const_byte_value(arg)
-                            if const is not None:
-                                self._emit("ld", f"a,{self._format_number(const)}")
-                                continue
-                        if param_type == DataType.BYTE:
-                            arg = self._low_byte_form(arg)
-                        arg_type = self._gen_expr(arg)
-                        if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        elif param_type == DataType.ADDRESS and arg_type == DataType.BYTE:
-                            self._emit("ld", "l,a")
-                            self._emit("ld", "h,0")
-                        continue
-
-                    param_asm = None
-                    if (hasattr(self, 'storage_labels')
-                        and full_callee_name in self.storage_labels
-                        and param_name in self.storage_labels[full_callee_name]):
-                        param_asm = self.storage_labels[full_callee_name][param_name]
-                    else:
-                        proc_base = sym.asm_name if sym.asm_name else name or ""
-                        if proc_base.startswith('@'):
-                            proc_base = proc_base[1:]
-                        param_asm = f"@{proc_base}${self._mangle_name(param_name)}"
-
-                    if param_type == DataType.BYTE:
-                        const = self._get_const_byte_value(arg)
-                        if const is not None:
-                            self._emit("ld", f"a,{self._format_number(const)}")
-                            self._emit("ld", f"({param_asm}),a")
-                            continue
-
-                    if param_type == DataType.BYTE:
-                        arg = self._low_byte_form(arg)
-                    arg_type = self._gen_expr(arg)
-                    if param_type == DataType.BYTE or arg_type == DataType.BYTE:
-                        if arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        self._emit("ld", f"({param_asm}),a")
-                    else:
-                        self._emit("ld", f"({param_asm}),hl")
+            self._gen_slot_args(sym, args, name)
 
         if isinstance(callee, P.Identifier):
             self._emit("call", call_name)
@@ -7147,11 +7258,28 @@ class CodeGenerator:
             self._emit("ld", "h,0")
             return DataType.BYTE
 
+        if name in ("LOW", "HIGH"):
+            # Of a constant the optimizer did not fold -- SIZE, say -- the
+            # byte itself. (`ld hl,16 / ld a,l' is also what upeepz80 0.2.4
+            # rewrites to `ld a,16' when HL is stored next, dropping the
+            # load the store reads.)
+            value = self._const_value(args[0])
+            if value is not None:
+                value &= 0xFFFF
+                byte = value & 0xFF if name == "LOW" else value >> 8
+                self._emit("ld", f"a,{self._format_number(byte)}")
+                return DataType.BYTE
+
         if name == "LOW":
-            arg_type = self._gen_expr(args[0])
+            arg = unwrap_paren(args[0])
+            arg_type = self._gen_expr(arg)
             if arg_type == DataType.ADDRESS:
-                # Check if A already has L (from embedded assign to BYTE)
-                if self.a_has_l:
+                # A already holds L when the operand is itself an embedded
+                # assignment to a BYTE, which set the flag last. When the
+                # assignment is only part of it -- `LOW((b := w) + 5)' --
+                # the flag outlives code that never went through _gen_expr
+                # (`ld de,5 / add hl,de'), and A holds L of w, not the sum.
+                if self.a_has_l and isinstance(arg, P.EmbeddedAssign):
                     self.a_has_l = False  # Consume the flag
                 else:
                     self._emit("ld", "a,l")  # Get low byte into A
@@ -7300,27 +7428,21 @@ class CodeGenerator:
         if name in ("ROL", "ROR", "SCL", "SCR"):
             return self._gen_rotate(name, args)
 
-        if name == "LENGTH":
-            if args:
-                arg0 = unwrap_paren(args[0])
-                if isinstance(arg0, P.Identifier):
-                    sym = self._lookup_scoped(ident_text(arg0.name))
-                    if sym and sym.dimension:
-                        self._emit("ld", f"hl,{sym.dimension}")
-                        return DataType.ADDRESS
-            raise CodeGenError(
-                "LENGTH() needs an array whose extent is known")
-
-        if name == "LAST":
-            if args:
-                arg0 = unwrap_paren(args[0])
-                if isinstance(arg0, P.Identifier):
-                    sym = self._lookup_scoped(ident_text(arg0.name))
-                    if sym and sym.dimension:
-                        self._emit("ld", f"hl,{sym.dimension - 1}")
-                        return DataType.ADDRESS
-            raise CodeGenError(
-                "LAST() needs an array whose extent is known")
+        if name in ("LENGTH", "LAST"):
+            extent = self._array_extent(args[0]) if args else None
+            if not extent:
+                raise CodeGenError(
+                    f"{name}() needs an array whose extent is known")
+            value = extent if name == "LENGTH" else extent - 1
+            # A BYTE when it fits (11.1.2), and generated as one: code that
+            # goes by the static type -- a BYTE subscript, above all -- takes
+            # the value from A, and `ld hl,7' left A as it was, so
+            # `ab(LAST(sa))' read whatever element A happened to name.
+            if value <= 0xFF:
+                self._emit("ld", f"a,{self._format_number(value)}")
+                return DataType.BYTE
+            self._emit("ld", f"hl,{self._format_number(value)}")
+            return DataType.ADDRESS
 
         if name == "SIZE":
             if args:
