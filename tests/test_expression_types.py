@@ -691,6 +691,25 @@ call run;
 """, [3, 39])
 
 
+def test_low_and_high_of_size():
+    """LOW(SIZE(aw)) was `ld hl,16 / ld a,l'; stored to an ADDRESS that is
+    `... / ld h,0 / ld (w4),hl', and upeepz80 0.2.4, taking HL for dead
+    since the store is not among the reads it knows, made it `ld a,16' --
+    w4 got whatever L held (seed 80071 of the differential test)."""
+    _check("""
+declare (w4) address, b4 byte;
+run: procedure;
+  declare aw(*) address data (0ch, 07h, 025h, 0100h, 056h, 08001h, 08h, 044ddh);
+  declare big(300) byte;
+  w4 = low(size(aw));
+  call ph(b4); call ph(w4);
+  w4 = high(size(big)); call ph(w4);
+  w4 = low(length(big)) + high(last(big)); call ph(w4);
+end run;
+call run;
+""", [0, 0x10, 1, 0x2D])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])

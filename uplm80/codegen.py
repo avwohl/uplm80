@@ -7079,6 +7079,18 @@ class CodeGenerator:
             self._emit("ld", "h,0")
             return DataType.BYTE
 
+        if name in ("LOW", "HIGH"):
+            # Of a constant the optimizer did not fold -- SIZE, say -- the
+            # byte itself. (`ld hl,16 / ld a,l' is also what upeepz80 0.2.4
+            # rewrites to `ld a,16' when HL is stored next, dropping the
+            # load the store reads.)
+            value = self._const_value(args[0])
+            if value is not None:
+                value &= 0xFFFF
+                byte = value & 0xFF if name == "LOW" else value >> 8
+                self._emit("ld", f"a,{self._format_number(byte)}")
+                return DataType.BYTE
+
         if name == "LOW":
             arg = unwrap_paren(args[0])
             arg_type = self._gen_expr(arg)
