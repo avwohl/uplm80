@@ -4606,108 +4606,9 @@ class CodeGenerator:
             self.loop_stack.pop()
             return
 
-        # Check for optimized byte loop with constant bound
-        if both_bytes and isinstance(stmt.bound, P.NumberLiteral):
-            bound_val = number_value(stmt.bound)
-
-            # Initialize index variable
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Jump to test
-            self._emit("jp", test_label)
-
-            # Loop body
-            self._emit_label(loop_label)
-            for s in body_stmts:
-                self._gen_stmt(s)
-
-            # Increment/Decrement
-            self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-            elif step_val == 1:
-                self._emit("inc", "a")
-            elif step_val == -1 or step_val == 0xFF:
-                self._emit("dec", "a")
-            else:
-                self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Test condition: compare index with bound
-            self._emit_label(test_label)
-            self._gen_load(index_var)  # A = index
-            if bound_val == 255:
-                # Special case: loop to 0xFF can't use cp 0x100 (truncates to 0)
-                # Instead, check if index wrapped to 0 (meaning we exceeded 0xFF)
-                self._emit("or", "a")  # Sets Z flag if A == 0
-                self._emit("jp", f"nz,{loop_label}")  # Continue if index != 0 (not wrapped)
-            else:
-                self._emit("cp", self._format_number(bound_val + 1))  # Compare with bound+1
-                self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
-
-            self._emit_label(end_label)
-            self.loop_stack.pop()
-            return
-
-        # Check for byte loop with variable bound
         if both_bytes:
-            # Initialize index variable as BYTE
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Jump to test
-            self._emit("jp", test_label)
-
-            # Loop body
-            self._emit_label(loop_label)
-            for s in body_stmts:
-                self._gen_stmt(s)
-
-            # Increment/Decrement
-            self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-            elif step_val == 1:
-                self._emit("inc", "a")
-            elif step_val == -1 or step_val == 0xFF:
-                self._emit("dec", "a")
-            else:
-                self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Test condition: compare index with bound variable
-            # Evaluate bound first, then compare with index
-            self._emit_label(test_label)
-            bound_result = self._gen_expr(stmt.bound)  # A = bound (or HL if ADDRESS)
-            if bound_result == DataType.ADDRESS:
-                self._emit("ld", "a,l")  # Get low byte if ADDRESS
-            self._emit("inc", "a")  # A = bound + 1
-            self._emit("ld", "b,a")  # B = bound + 1
-            self._gen_load(index_var)  # A = index
-            # cp b computes a - b (index - (bound+1)), sets C if index < bound+1
-            self._emit("cp", "B")  # Compare index with bound+1
-            self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
-
-            self._emit_label(end_label)
+            self._gen_byte_loop(stmt, index_var, body_stmts, (step_expr, step_is_const, step_val),
+                                (loop_label, test_label, incr_label, end_label))
             self.loop_stack.pop()
             return
 
@@ -4775,6 +4676,105 @@ class CodeGenerator:
 
         self._emit_label(end_label)
         self.loop_stack.pop()
+
+    def _gen_byte_loop(self, stmt, index_var, body_stmts, step: tuple,
+                       labels: tuple[str, str, str, str]) -> None:
+        """An iterative DO whose index and bound are both BYTEs.
+
+        The loop ends when the index passes the bound, or when stepping it
+        carries out of the byte, which passes any bound: `DO j = 0 TO 255'
+        runs 256 times and leaves j at 0 (PL/M-80 manual, 5.1.4).  The test
+        used to be `index < bound + 1', and bound + 1 is 0 when the bound is
+        255, so such a loop ran no times at all - with a constant bound as
+        well as a variable one.  With a constant 255 there is nothing to
+        compare: the first test always passes and only the carry ends it.
+
+        A step of -1 counts down, and is left as it was.  `step' is (the BY
+        expression or None, whether it is a constant, its value).
+        """
+        step_expr, step_is_const, step_val = step
+        loop_label, test_label, incr_label, end_label = labels
+        bound_val = (number_value(stmt.bound)
+                     if isinstance(stmt.bound, P.NumberLiteral) else None)
+        down = step_is_const and (step_val == -1 or step_val == 0xFF)
+        by_inc = step_is_const and step_val == 1
+        to_255 = bound_val == 255 and not down
+
+        # Initialize index variable
+        start_type = self._gen_expr(stmt.start)
+        if start_type == DataType.ADDRESS:
+            self._emit("ld", "a,l")
+        self._gen_store(index_var, DataType.BYTE)
+
+        if not to_255:
+            self._emit("jp", test_label)
+
+        # Loop body
+        self._emit_label(loop_label)
+        for s in body_stmts:
+            self._gen_stmt(s)
+
+        # Step.  INC sets Z when it wraps, ADD sets carry; storing a BYTE is
+        # all loads, so the flags survive the store.
+        self._emit_label(incr_label)
+        self._gen_load(index_var)  # A = index
+        if not step_is_const:
+            # The step is an expression: keep the index while it runs.
+            self._emit("push", "af")
+            if self._gen_expr(step_expr) == DataType.ADDRESS:
+                self._emit("ld", "a,l")
+            self._emit("ld", "b,a")
+            self._emit("pop", "af")
+            self._emit("add", "a,b")
+        elif by_inc:
+            self._emit("inc", "a")
+        elif down:
+            self._emit("dec", "a")
+        else:
+            self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
+        self._gen_store(index_var, DataType.BYTE)
+
+        if to_255:
+            self._emit("jp", f"{'nz' if by_inc else 'nc'},{loop_label}")
+            self._emit_label(end_label)
+            return
+        if not down and not (by_inc and bound_val is not None):
+            # Wrapped: past any bound.  (By 1 up to a constant below 255 it
+            # cannot wrap.)
+            self._emit("jp", f"{'z' if by_inc else 'c'},{end_label}")
+
+        self._emit_label(test_label)
+        if bound_val == 255:
+            # Down to 255: as before, go on until the index is 0.
+            self._gen_load(index_var)
+            self._emit("or", "a")
+            self._emit("jp", f"nz,{loop_label}")
+        elif bound_val is not None:
+            self._gen_load(index_var)  # A = index
+            self._emit("cp", self._format_number(bound_val + 1))
+            self._emit("jp", f"C,{loop_label}")  # index < bound+1, i.e. index <= bound
+        elif down:
+            # As before: index < bound + 1.
+            if self._gen_expr(stmt.bound) == DataType.ADDRESS:
+                self._emit("ld", "a,l")
+            self._emit("inc", "a")
+            self._emit("ld", "b,a")
+            self._gen_load(index_var)
+            self._emit("cp", "B")
+            self._emit("jp", f"C,{loop_label}")
+        else:
+            # index <= bound, as bound - index with no borrow; bound + 1
+            # would be 0 for a bound of 255.
+            if self._gen_expr(stmt.bound) == DataType.ADDRESS:
+                self._emit("ld", "a,l")
+            self._emit("ld", "b,a")  # B = bound
+            self._gen_load(index_var)  # A = index
+            self._emit("ld", "c,a")
+            self._emit("ld", "a,b")
+            self._emit("cp", "c")
+            self._emit("jp", f"nc,{loop_label}")
+
+        self._emit_label(end_label)
 
     def _gen_counted_body(self, body_stmts, loop_label: str, incr_label: str,
                           end_label: str) -> None:

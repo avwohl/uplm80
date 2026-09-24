@@ -356,6 +356,44 @@ def test_a_loop_index_is_where_pl_m_puts_it(opt):
     assert run_plm(LOOP_INDEX_SRC, opt).strip() == "1;.01230123.46.1.2.", opt
 
 
+LOOP_255_SRC = """
+0100H:
+t: do;
+declare (j, n) byte, w address;
+declare arr (256) byte;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+
+/* to 255 is 256 times, and the index wraps to 0 */
+w = 0; do j = 0 to 255; w = w + 1; end;
+call putc('0' + high(w)); call putc('0' + low(w)); call putc('0' + j);
+w = 0; do j = 0 to 255; arr(j) = 1; w = w + 1; end;
+call putc('0' + high(w)); call putc('0' + low(w)); call putc('0' + j);
+n = 255; w = 0; do j = 0 to n; arr(j) = 1; w = w + 1; end;
+call putc('0' + high(w)); call putc('0' + low(w)); call putc('0' + j);
+n = 255; w = 0; do j = 0 to n; w = w + 1; end;
+call putc('0' + high(w)); call putc('0' + low(w)); call putc('0' + j);
+w = 0; do j = 250 to 255; w = w + j; end;
+call putc('0' + high(w)); call putc('0' + j);
+w = 0; do j = 1 to 255 by 2; w = w + 1; end;
+call putc('0' + w - 120); call putc('0' + j);
+call putc('.');
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2, 3])
+def test_a_byte_loop_to_255_runs_256_times(opt):
+    """PL/M-80 manual, 5.1.4: the loop ends when stepping the index carries
+    out of the byte, which passes any bound, so `DO j = 0 TO 255' runs 256
+    times and leaves j at 0.  The test was `j < bound + 1', and bound + 1 is
+    0: a constant bound of 255, and a variable one that is 255 in a loop
+    that reads its index, ran the loop no times at all.  At -O3 constant
+    propagation turns `n = 255; DO j = 0 TO n' into the constant form.
+    Stepping BY 2 from 255 carries too."""
+    assert run_plm(LOOP_255_SRC, opt).strip() == "1001001001005081.", opt
+
+
 def test_an_index_a_called_procedure_reads_is_not_counted():
     asm = _asm("""
 t: do;
