@@ -597,6 +597,22 @@ call run;
 """, [0xFF, 0xFF, 0])
 
 
+def test_a_relation_of_addresses_as_a_subscript():
+    """A 16-bit relation in an ADDRESS array's subscript let go of DE --
+    popping the subscript's spill back into it -- before comparing with
+    it, so `aw(w = 5)' compared w with a stale DE and read aw(0)."""
+    _check("""
+declare aw(256) address, (w, k) address;
+run: procedure;
+  do k = 0 to 255; aw(k) = k; end;
+  w = 5;
+  call ph(aw(w = 5)); call ph(aw(w > 4)); call ph(aw(w < 4));
+  aw(w = 5) = 1234h; call ph(aw(255));
+end run;
+call run;
+""", [0xFF, 0xFF, 0, 0x1234])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])

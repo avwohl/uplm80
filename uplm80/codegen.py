@@ -6206,9 +6206,13 @@ class CodeGenerator:
             BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
             BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
         ):
+            result = self._gen_comparison(op)
+            # Only now: releasing a claim that spilled pops the outer DE
+            # back, and the comparison compared against that -- `aw(w = 5)'
+            # tested w against the subscript's array base.
             if claimed_de:
                 self.regs.release_reg('de', self._emit)
-            return self._gen_comparison(op)
+            return result
 
         elif op == BinaryOpKind.PLUS:
             self._emit("ld", "a,l")
