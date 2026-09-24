@@ -79,7 +79,10 @@ way DRI's end, when the increment carries out of the index.
   runs 256 times and leaves the index 0. BYTE and ADDRESS loops now do the
   same, a step that would wrap stops the loop, and the limit, start and step
   are converted to the index's type (`BY -1` is `BY 0FFH`). GENSYS's two
-  loops to 0FFH ran no times when they started at 0.
+  loops to 0FFH ran no times when they started at 0. The wrap ends the loop
+  even when the body put the index there: `DO i = 0 TO 0FEH` whose body adds
+  3 to `i` never stopped, since a constant limit and step that fit the index
+  were taken to mean it could not wrap.
 - **`-O3` lost a procedure's side effect.** `cnt = 0; rw = f; call ph(cnt)`,
   where `f` increments `cnt`, printed 0. A call now ends everything the
   optimizer knows about variables, and so does a store through a BASED
@@ -113,7 +116,32 @@ way DRI's end, when the increment carries out of the index.
 - **The DJNZ form of `DO i = 0 TO n`** skipped the loop for a limit of 255,
   took a variable limit once where PL/M-80 evaluates it every pass, ignored
   an assignment to the index in the body (ED's and PIP's FILLSOURCE end
-  with `I = N`) and left the index unset after the loop.
+  with `I = N`) and left the index unset after the loop. Nor did it see a
+  store through a pointer that changes the index or the limit, or a read of
+  the index through one, and a `RETURN` from its body returned through the
+  count it keeps on the stack. `-O3` unrolled a short loop whose body calls
+  a procedure that changes the index.
+- **A REENTRANT procedure's BYTE `DO` loop did not assemble** at `-O1` and
+  above: upeepz80 turned the increment of `(ix+n)` into `ld hl,ix+n`. The
+  index is now incremented in place, `inc (ix+n)`.
+- **A BYTE argument to an ADDRESS parameter was stored as one byte,** unless
+  it was the last argument, leaving the parameter's high byte from the call
+  before. SHOW's and STAT's `pdecimal(getuser, 100, true)` printed the user
+  number with the high byte of the previous number printed.
+- **An argument that calls the procedure again,** `f(1, f(2, 3))`, stored over
+  the arguments before it, which go into the procedure's own storage before
+  the call. They now wait on the stack until it has run.
+- **A `CALL` with five or more stacked arguments** (a REENTRANT, PUBLIC or
+  EXTERNAL procedure) set SP to SP + HL instead of SP + 2n.
+- **A 16-bit relation in an ADDRESS array's subscript** compared with a DE
+  it had already restored for the subscript: `aw(w = 5)` read `aw(0)`.
+- **An embedded assignment to a BASED BYTE** lost its value to the pointer
+  the store loads into HL: `(x := w) + 1` added 1 to the pointer.
+- **An element of an untyped DATA array,** `DECLARE hex DATA ('0123')`, was
+  typed ADDRESS while being loaded as a BYTE, so `hex(i) + 0FFH` added it to
+  whatever HL held.
+- **`-O3` turned `SIZE(b)` into `SIZE(5)`** after `b = 5`, which does not
+  compile; SIZE, LENGTH and LAST name a variable, not its value.
 
 ### Changed
 
@@ -130,7 +158,17 @@ way DRI's end, when the increment carries out of the index.
   an ADDRESS constant, first character high.
 - **`SHL` and `SHR` stay ADDRESS** even of a BYTE pattern, where the manual
   and DRI's compiler shift a BYTE in eight bits: programs written for uplm80
-  rely on it (80un builds words with `lo + SHL(b, 8)`).
+  rely on it (80un builds words with `lo + SHL(b, 8)`). A count of 0 leaves
+  the pattern as it is; the manual leaves that undefined, and DRI's shift
+  and rotate routines (SHOW.PRL's at 182BH to 1843H) have no zero test, so
+  there a count of 0 shifts 256 times.
+- **`DO` loops are laid out as DRI's are:** the limit is tested at the top,
+  and the step jumps back only if it did not carry out, `jr nz` after an
+  `INC`, `jr nc` after an `ADD`, so there is no jump to a test at the bottom
+  and no separate wrap exit. A variable BYTE limit is compared in place,
+  `ld hl,i / cp (hl)`. A limit, start or step that is a constant but not a
+  literal (`LAST(x)`, `SIZE(x)`, `-1`) is used as one. MP/M II and 80un are
+  about 670 bytes smaller at `-O2`.
 
 ### Added
 
@@ -148,6 +186,28 @@ way DRI's end, when the increment carries out of the index.
   `b, w = -(NOT b)` - a BYTE and an ADDRESS assigned together - leaves `w`
   holding A's old value at `-O1` and above. The differential test found it in
   one of 700 random programs; main has it too. The fix belongs in upeepz80.
+- **upeepz80 0.2.4 drops an `ld hl,n` that a store of HL still reads.**
+  `ld hl,0 / ld a,l / ld (sb),a / push hl / ld (w1),hl / pop hl / ld (w0),hl`
+  becomes `xor a / ld (sb),a / ld (w1),hl / ld (w0),hl`; that was the code for
+  `w1, w0 = (sb := HIGH(LOW(100Q)))`, which now loads its constant into A and
+  no longer meets it. The check that HL is dead, before `ld hl,n / ld a,l`
+  becomes `ld a,n`, does not count `ld (nn),hl` as a read either: `ld hl,16 /
+  ld a,l / ld l,a / ld h,0 / ld (w4),hl` stores whatever L held. LOW and HIGH
+  of a constant no longer generate that, but other code can. And upeepz80's
+  `ld a,(x) / inc a / ld (x),a` to `ld hl,x / inc (hl)` takes `(ix+n)` for an
+  address (`ld hl,ix+n`); DO loops no longer generate that. These belong in
+  upeepz80.
+- **PLUS, MINUS, SCL and SCR after `+ 1` to `+ 4` or `- 1` to `- 4` of an
+  ADDRESS** take a stale carry: those are `inc hl` and `dec hl`, which set
+  none, so `(w - 1) MINUS z` with w = z = 0 gives 0FFFFH, not 0FFFEH. DRI's
+  PL/M-80 increments with INX and INR too (PIP.PLM declares a variable
+  `ONE = 1` so that `DEC(C1 + ONE)` gets an ADD and its carry), and the
+  manual (12.1) warns that the flags cannot be relied on.
+- **A REENTRANT procedure's parameter in a factored declaration with its
+  locals,** `DECLARE (top, c) BYTE`, is taken for a local; declared on its own
+  it is read from the stack as it should be.
+- **A procedure named like a register,** `H: PROCEDURE`, is not renamed as a
+  variable of that name is, and the assembler rejects `call H`.
 
 ## 0.3.6 — 2026-09-24
 
