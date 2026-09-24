@@ -5308,6 +5308,11 @@ class CodeGenerator:
                     self._emit("ld", "a,b")  # Restore value
                     self._emit("ld", "(hl),a")  # Store via HL
                 else:
+                    # A BYTE value is in A: widen it into HL, which the
+                    # store below takes the value from.
+                    if val_type == DataType.BYTE:
+                        self._emit("ld", "l,a")
+                        self._emit("ld", "h,0")
                     # Save value in HL
                     self._emit("push", "hl")
                     self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
@@ -5384,15 +5389,19 @@ class CodeGenerator:
             if isinstance(callee, P.Identifier) and ident_text(callee.name).upper() == "OUTPUT":
                 port_arg = expr.args[0]
                 port_num = self._try_eval_const(port_arg)
-                if port_num is not None and 0 <= port_num <= 255:
+                if port_num is not None:
+                    port_num &= 0xFF        # the port is a BYTE
+                # A BYTE value is in A already; `ld a,l' replaced it with
+                # whatever L held.
+                if val_type != DataType.BYTE:
                     self._emit("ld", "a,l")
+                if port_num is not None:
                     self._emit("out", f"({self._format_number(port_num)}),a")
                 else:
-                    self._emit("push", "hl")
-                    self._gen_expr(port_arg)
-                    self._emit("ld", "c,l")
-                    self._emit("pop", "hl")
-                    self._emit("ld", "a,l")
+                    self._emit("push", "af")
+                    self._gen_expr_to_a(port_arg)
+                    self._emit("ld", "c,a")
+                    self._emit("pop", "af")
                     self._emit("call", "??outp")
                     self.needs_runtime.add("outp")
                 return
@@ -5414,16 +5423,18 @@ class CodeGenerator:
                     else:
                         self._emit("ld", f"(__END__+{self._format_number(addr_val)}),a")
                 else:
+                    # A BYTE subscript is generated into A: widen it into
+                    # HL, where it is added to __END__.
                     if val_type == DataType.BYTE:
                         self._emit("push", "af")
-                        self._gen_expr(addr_arg)
+                        self._gen_expr_to_hl(addr_arg)
                         self._emit("ld", "de,__END__")
                         self._emit("add", "hl,de")
                         self._emit("pop", "af")
                         self._emit("ld", "(hl),a")
                     else:
                         self._emit("push", "hl")
-                        self._gen_expr(addr_arg)
+                        self._gen_expr_to_hl(addr_arg)
                         self._emit("ld", "de,__END__")
                         self._emit("add", "hl,de")
                         self._emit("ex", "de,hl")
@@ -6069,14 +6080,13 @@ class CodeGenerator:
 
         left_const = self._get_const_byte_value(left)
         if op == BinaryOpKind.SUB and left_const is not None:
-            if left_const == 1:
-                self._gen_expr_to_a(right)
-                self._emit("xor", "1")
-            else:
-                self._gen_expr_to_a(right)
-                self._emit("cpl")
-                self._emit("inc", "a")
-                self._emit("add", f"a,{self._format_number(left_const)}")
+            # c - x, with the borrow a subtraction leaves. (`1 - x' was
+            # `x XOR 1', which is 1 - x only for x = 0 or 1: 1 - 0FFH is 2,
+            # not 0FEH; and `-x + c' left the carry inverted.)
+            self._gen_expr_to_a(right)
+            self._emit("ld", "b,a")
+            self._emit("ld", f"a,{self._format_number(left_const)}")
+            self._emit("sub", "b")
             return DataType.BYTE
 
         if op == BinaryOpKind.SUB:
@@ -6649,7 +6659,8 @@ class CodeGenerator:
                 arg = args[0]
                 port_num = self._try_eval_const(arg)
                 if port_num is not None:
-                    self._emit("in", f"a,({self._format_number(port_num)})")
+                    # The port is a BYTE: `INPUT(-1)' reads port 0FFH.
+                    self._emit("in", f"a,({self._format_number(port_num & 0xFF)})")
                 else:
                     self._gen_expr(arg)
                     self._emit("call", "??inp")
@@ -6916,7 +6927,9 @@ class CodeGenerator:
             if isinstance(arg0, P.NumberLiteral) and number_value(arg0) == 0:
                 self._emit("ld", "hl,__END__")
             else:
-                self._gen_expr(args[0])
+                # A BYTE subscript is generated into A; `add hl,de' took
+                # whatever HL held instead.
+                self._gen_expr_to_hl(args[0])
                 self._emit("ld", "de,__END__")
                 self._emit("add", "hl,de")
             self._emit("ld", "a,(hl)")
@@ -6934,16 +6947,18 @@ class CodeGenerator:
                 # Generate: dest -> DE, source -> HL, bc=count, ldir
                 # Must check if source expression clobbers DE
                 source_preserves_de = self._expr_preserves_de(args[1])
+                # Each address is converted to an ADDRESS: a BYTE one is
+                # generated into A, and has to be widened into HL.
                 if source_preserves_de:
                     # Source is simple - can load dest to DE first
-                    self._gen_expr(args[2])  # dest -> HL
+                    self._gen_expr_to_hl(args[2])  # dest -> HL
                     self._emit("ex", "de,hl")  # dest -> DE
-                    self._gen_expr(args[1])  # source -> HL (preserves DE)
+                    self._gen_expr_to_hl(args[1])  # source -> HL (preserves DE)
                 else:
                     # Source is complex and may clobber DE - must save dest
-                    self._gen_expr(args[2])  # dest -> HL
+                    self._gen_expr_to_hl(args[2])  # dest -> HL
                     self._emit("push", "hl")  # save dest
-                    self._gen_expr(args[1])  # source -> HL (may clobber DE)
+                    self._gen_expr_to_hl(args[1])  # source -> HL (may clobber DE)
                     self._emit("pop", "de")  # dest -> DE
                 self._emit("ld", f"bc,{self._format_number(count_const)}")
                 self._emit("ldir")
@@ -6973,8 +6988,8 @@ class CodeGenerator:
             return None
 
         if name == "TIME":
-            # Delay loop
-            self._gen_expr(args[0])
+            # Delay loop; a BYTE count is generated into A.
+            self._gen_expr_to_hl(args[0])
             loop_label = self._new_label("TIME")
             self._emit_label(loop_label)
             self._emit("dec", "hl")

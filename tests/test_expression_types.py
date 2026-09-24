@@ -85,3 +85,48 @@ run: procedure;
 end run;
 call run;
 """, [2, 0x1184])
+
+
+def test_one_minus_a_byte():
+    """`1 - x' was compiled `x XOR 1', right only for 0 and 1."""
+    _check("""
+declare b byte, r address;
+run: procedure;
+  declare bd(*) byte data (0ffh);
+  b = bd(0);
+  r = 1 - b; call ph(r);
+  r = 5 - b; call ph(r);
+end run;
+call run;
+""", [2, 6])
+
+
+def test_a_byte_stored_through_a_based_address():
+    """A BYTE stored through a BASED ADDRESS was taken from HL, not A."""
+    _check("""
+declare b byte, (w, p) address;
+declare bw based p address;
+declare wd(*) address data (1234h, 5678h);
+run: procedure;
+  w = wd(0); b = 5;
+  p = .w; bw = (b = 5); call ph(w);
+  w = wd(1);
+  p = .w; bw = b; call ph(w);
+end run;
+call run;
+""", [0xFF, 5])
+
+
+def test_a_byte_subscript_of_memory_is_widened():
+    """MEMORY(b) added __END__ to whatever HL held: a BYTE subscript is
+    generated into A."""
+    _check("""
+declare (b, x) byte;
+run: procedure;
+  b = 3;
+  memory(3) = 77h;
+  x = memory(b); call ph(x);
+  memory(b) = 66h; call ph(memory(3));
+end run;
+call run;
+""", [0x77, 0x66])
