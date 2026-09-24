@@ -5,6 +5,8 @@ program that assembled and linked cleanly and then wrote through a null or
 short pointer at run time.
 """
 
+import re
+
 import pytest
 
 from uplm80.codegen import Mode
@@ -318,3 +320,110 @@ end t;
     i = lines.index("Q:")
     # A,B -> n; C,D -> w; E -> x (and a zero byte); 7 -> y.
     assert lines[i + 1:i + 4] == ["db\t'ABCDE'", "db\t0", "db\t7"], lines[i + 1:i + 4]
+
+
+def _layout(asm: str) -> dict[str, int]:
+    """Offset of every label in the module's leading DATA, from its first byte.
+
+    Counts what each db/dw/ds line puts in the image, up to the first line
+    that is neither a label nor one of those.
+    """
+    offsets: dict[str, int] = {}
+    at = 0
+    for raw in asm.splitlines():
+        line = raw.split(";")[0].strip()
+        if not line or line == ".z80" or line.startswith(("public", "extrn")):
+            continue
+        if line.endswith(":"):
+            offsets[line[:-1]] = at
+            continue
+        op, _, arg = line.partition("\t")
+        if op == "ds":
+            at += int(arg)
+        elif op == "dw":
+            at += 2 * len(arg.split(","))
+        elif op == "db":
+            for piece in re.findall(r"'(?:[^']|'')*'|[^,]+", arg):
+                at += len(piece[1:-1].replace("''", "'")) if piece.startswith("'") else 1
+        else:
+            break
+    offsets["$"] = at
+    return offsets
+
+
+def test_structure_data_uses_each_member_width_and_reserves_the_whole_structure():
+    """DATA is INITIAL stored with the code (PL/M-80 Programming Manual,
+    6.2.9), so a STRUCTURE's DATA list is placed member by member and the rest
+    of the structure is reserved.  The 0.3.6 fix covered INITIAL only: DATA
+    still came out one byte per value and stopped at the last one."""
+    asm = _asm("""
+t: do;
+declare s structure (a address, b byte, c address) data (1, 2, 3);
+declare z structure (a address, b (6) byte) data (5);
+declare last byte data (0);
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    i = lines.index("S:")
+    assert lines[i + 1:i + 9] == ["dw\t1", "db\t2", "dw\t3",
+                                  "Z:", "dw\t5", "ds\t6",
+                                  "LAST:", "db\t0"], lines[i + 1:i + 9]
+    where = _layout(asm)
+    assert where["Z"] - where["S"] == 5 and where["LAST"] - where["Z"] == 8, where
+
+
+def test_a_short_data_array_still_has_its_declared_dimension():
+    """PL/M-80 Programming Manual, 6.2.9: a list may have fewer values than
+    the declaration has scalars, and the rest are left uninitialised - they are
+    still part of the variable.  DATA is the same as INITIAL but for where it is
+    stored, and INITIAL already reserved them."""
+    asm = _asm("""
+t: do;
+declare x address;
+declare tbl (4) address data (.x, 1234H);
+declare after byte data (7);
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    i = lines.index("TBL:")
+    assert lines[i + 1:i + 5] == ["dw\tX", "dw\t1234H", "ds\t4", "AFTER:"], lines[i + 1:i + 5]
+
+
+# UTIL2/SPRSP.PLM, with the queue and process literals it includes.
+SPRSP_SRC = """
+spool: do;
+declare queueheader literally 'ql address, name(8) byte, msglen address,
+    nmbmsgs address, dqph address, nqph address';
+declare cqueue literally 'queueheader, msgin address, msgout address, msgcnt address';
+declare circularqueue literally 'structure (cqueue, buf (1) byte)';
+declare lqueue literally 'queueheader, mh address, mt address, bh address';
+declare process$header literally 'structure (pl address, status byte,
+    priority byte, stkptr address';
+declare bdos$save literally 'disk$set$dma address, disk$slct byte, dcnt address,
+    searchl byte, searcha address, drvact address, registers (20) byte,
+    scratch (2) byte)';
+declare process$descriptor literally 'process$header, name (8) byte,
+    console byte, memseg byte, b address, thread address, bdos$save';
+declare os address public data (0);
+declare spool$pd process$descriptor public
+    data (0,0,20,0, 'Sp',0efh,'ol  ', 0a0h,0,0,0);
+declare spool$lqcb structure (lqueue, buf (128) byte)
+    data (0,'SPOOLQ  ',62,2);
+declare stpspl$cqcb circularqueue data (0,'STOPSPLR',0,1);
+declare last byte data (0);
+end spool;
+"""
+
+
+def test_spool_rsp_lays_out_its_queues_where_dris_binary_has_them():
+    """The resident half of MP/M II's spooler is nothing but DATA.
+
+    GENSYS and the XDOS find the process descriptor and the queues by their
+    offsets, and DRI's SPOOL.RSP has the spooler's queue at 36H, the stop
+    queue at 0CEH and `last' at 0E7H - an image 0E8H bytes long.  Emitting
+    every value as a byte and stopping at the last one put them at 11H, 1CH
+    and 27H.
+    """
+    where = _layout(_asm(SPRSP_SRC))
+    assert (where["SPOOLPD"], where["SPOOLLQCB"], where["STPSPLCQCB"], where["LAST"], where["$"]) \
+        == (0x02, 0x36, 0xCE, 0xE7, 0xE8), where

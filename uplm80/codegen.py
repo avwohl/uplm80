@@ -2334,14 +2334,17 @@ class CodeGenerator:
 
         if data_values_nodes:
             target_segment.append(AsmLine(label=asm_name))
-            self._emit_data_values(
+            self._emit_value_list(
                 data_values_nodes,
                 data_type or DataType.BYTE,
+                struct_members=struct_members,
+                dimension=dimension,
+                size=size,
                 inline=self.emit_data_inline,
             )
         elif initial_values_nodes:
             self.data_segment.append(AsmLine(label=asm_name))
-            self._emit_initial_values(
+            self._emit_value_list(
                 initial_values_nodes,
                 data_type or DataType.BYTE,
                 struct_members=struct_members,
@@ -2659,10 +2662,20 @@ class CodeGenerator:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
 
     def _data_element_count(self, values, dtype: DataType) -> int:
-        """How many elements a DATA/INITIAL list supplies."""
-        total = sum(self._initial_value_width(v, dtype) for v in values)
+        """How many elements a DATA/INITIAL list supplies.
+
+        A string supplies one BYTE element per character and one ADDRESS
+        element per two, the way :meth:`_emit_value_list` places it.
+        """
         width = 1 if dtype == DataType.BYTE else 2
-        return max(1, total // width)
+        count = 0
+        for val in self._flatten_values(values):
+            inner = unwrap_paren(val)
+            if isinstance(inner, P.StringLiteral):
+                count += -(-len(string_value(inner)) // width)
+            else:
+                count += 1
+        return max(1, count)
 
     def _initial_member_widths(self, struct_members, dimension):
         """Byte width of each slot a STRUCTURE initialiser fills, in order."""
@@ -2673,16 +2686,6 @@ class CodeGenerator:
             width = 1 if m.data_type == DataType.BYTE else 2
             one.extend([width] * (m.dimension or 1))
         return one * (dimension or 1)
-
-    def _initial_value_width(self, val, dtype: DataType) -> int:
-        """Bytes a single INITIAL value occupies once emitted."""
-        if isinstance(val, P.StringLiteral):
-            return len(string_value(val))
-        if isinstance(val, P.ParenExpr):
-            return self._initial_value_width(val.inner, dtype)
-        if isinstance(val, P.LocationOfList):
-            return 2 * len(val.values or [])
-        return 1 if dtype == DataType.BYTE else 2
 
     @staticmethod
     def _flatten_values(values) -> list:
@@ -2695,10 +2698,21 @@ class CodeGenerator:
                 flat.append(val)
         return flat
 
-    def _emit_initial_values(self, values, dtype: DataType,
-                             struct_members=None, dimension=None,
-                             size: int | None = None) -> None:
-        """Emit typed INITIAL values to the data segment.
+    def _emit_value_list(self, values, dtype: DataType,
+                         struct_members=None, dimension=None,
+                         size: int | None = None, inline: bool = False) -> None:
+        """Emit a DATA or INITIAL value list, and reserve what it leaves unfilled.
+
+        INITIAL goes to the data segment; DATA to the same place, or inline in
+        the code when ``inline`` is set.  DATA is INITIAL stored with the code
+        and nothing else (PL/M-80 Programming Manual, 6.2.9), so the two are
+        laid out alike.  DATA used to be emitted one value at a time at the
+        declaration's width and stopped at the last value: a STRUCTURE came
+        out one byte per value and short, and an array shorter than its
+        dimension lost the rest.  MP/M II's UTIL2/SPRSP.PLM is nothing but
+        DATA - the spooler's process descriptor and two queues, which GENSYS
+        and the XDOS find by offset - and the stop queue landed at 1CH where
+        DRI's SPOOL.RSP has it at 0CEH.
 
         A STRUCTURE initialiser supplies one value per member and the members
         have their own widths, so the list cannot be emitted at a single width
@@ -2726,7 +2740,7 @@ class CodeGenerator:
         # Past the declared scalars - a list longer than its declaration -
         # the values keep the declaration's own width, as they always have.
         spare = 1 if dtype == DataType.BYTE else 2
-        target = self.data_segment
+        target = self.code_data_segment if inline else self.data_segment
         slot = 0
         emitted = 0
         for val in self._flatten_values(values):
@@ -2747,7 +2761,8 @@ class CodeGenerator:
             width = widths[slot] if slot < len(widths) else spare
             slot += 1
             self._emit_data_values(
-                [val], DataType.BYTE if width == 1 else DataType.ADDRESS)
+                [val], DataType.BYTE if width == 1 else DataType.ADDRESS,
+                inline=inline)
             emitted += width
         if size is not None and emitted < size:
             target.append(
