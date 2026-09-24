@@ -40,6 +40,7 @@ from .ast_view import (
     unop_kind,
     ident_text,
     make_binary,
+    make_number_literal,
     make_unary,
     parse_plm_number,
     number_value,
@@ -5278,7 +5279,14 @@ class CodeGenerator:
             return self._gen_location(expr)
 
         elif isinstance(expr, P.EmbeddedAssign):
-            val_type = self._gen_expr(expr.value)
+            if self._get_const_byte_value(expr.value) is not None:
+                # A BYTE constant is a BYTE here too, in A: generated as a
+                # literal it came back in HL, and code that goes by the
+                # static type -- a BYTE subscript -- looked for it in A.
+                self._gen_expr_to_a(expr.value)
+                val_type = DataType.BYTE
+            else:
+                val_type = self._gen_expr(expr.value)
 
             target = unwrap_paren(expr.target)
             target_name = ident_text(target.name) if isinstance(target, P.Identifier) else None
@@ -6043,8 +6051,11 @@ class CodeGenerator:
 
         # Path 1: left is simple AND DE is free
         if self._expr_preserves_de(left) and self.regs.is_free('de'):
-            right_result = self._gen_expr(right)
-            if right_result == DataType.BYTE:
+            right_const = self._get_const_byte_value(right)
+            if right_const is not None:
+                # LENGTH or LAST, say, which is generated into A.
+                self._emit("ld", f"de,{self._format_number(right_const)}")
+            elif self._gen_expr(right) == DataType.BYTE:
                 self._emit("ld", "e,a")
                 self._emit("ld", "d,0")
             else:
@@ -6423,6 +6434,10 @@ class CodeGenerator:
         calls BYTE still loads as ``ld hl,n``, and widening that with
         ``ld l,a`` would splice in an undefined ``A``.
         """
+        const_val = self._get_const_byte_value(expr)
+        if const_val is not None:
+            self._emit("ld", f"hl,{self._format_number(const_val)}")
+            return
         if self._gen_expr(expr) == DataType.BYTE:
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
@@ -6628,6 +6643,13 @@ class CodeGenerator:
 
         # An index is zero-extended anyway.
         index = unwrap_paren(self._unwidened(index) or index)
+        # LENGTH and LAST are constants like any other (a one-character
+        # string too): `ab(LAST(sa))' is `ab(7)', an address the assembler
+        # works out.
+        if not isinstance(index, P.NumberLiteral):
+            const_index = self._get_const_byte_value(index)
+            if const_index is not None:
+                index = make_number_literal(const_index, pos=getattr(index, "pos", None))
 
         elem_size = 1
         if isinstance(base, P.Identifier):
@@ -6659,8 +6681,10 @@ class CodeGenerator:
         if not isinstance(index, P.NumberLiteral):
             idx_type = self._get_expr_type(index)
             if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
-                self._gen_expr(index)
-                self._emit("ld", "l,a")
+                # By what _gen_expr returns, not by idx_type: an embedded
+                # assignment of a constant comes back in HL.
+                if self._gen_expr(index) == DataType.BYTE:
+                    self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
                 sym = self.symbols.lookup(ident_text(base.name))
                 if sym and sym.based_on:
@@ -7157,27 +7181,21 @@ class CodeGenerator:
         if name in ("ROL", "ROR", "SCL", "SCR"):
             return self._gen_rotate(name, args)
 
-        if name == "LENGTH":
-            if args:
-                arg0 = unwrap_paren(args[0])
-                if isinstance(arg0, P.Identifier):
-                    sym = self._lookup_scoped(ident_text(arg0.name))
-                    if sym and sym.dimension:
-                        self._emit("ld", f"hl,{sym.dimension}")
-                        return DataType.ADDRESS
-            raise CodeGenError(
-                "LENGTH() needs an array whose extent is known")
-
-        if name == "LAST":
-            if args:
-                arg0 = unwrap_paren(args[0])
-                if isinstance(arg0, P.Identifier):
-                    sym = self._lookup_scoped(ident_text(arg0.name))
-                    if sym and sym.dimension:
-                        self._emit("ld", f"hl,{sym.dimension - 1}")
-                        return DataType.ADDRESS
-            raise CodeGenError(
-                "LAST() needs an array whose extent is known")
+        if name in ("LENGTH", "LAST"):
+            extent = self._array_extent(args[0]) if args else None
+            if not extent:
+                raise CodeGenError(
+                    f"{name}() needs an array whose extent is known")
+            value = extent if name == "LENGTH" else extent - 1
+            # A BYTE when it fits (11.1.2), and generated as one: code that
+            # goes by the static type -- a BYTE subscript, above all -- takes
+            # the value from A, and `ld hl,7' left A as it was, so
+            # `ab(LAST(sa))' read whatever element A happened to name.
+            if value <= 0xFF:
+                self._emit("ld", f"a,{self._format_number(value)}")
+                return DataType.BYTE
+            self._emit("ld", f"hl,{self._format_number(value)}")
+            return DataType.ADDRESS
 
         if name == "SIZE":
             if args:

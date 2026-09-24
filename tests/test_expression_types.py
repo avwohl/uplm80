@@ -540,6 +540,27 @@ end run;
 call run;
 """, [0x123B, 0x34, 0x35])
 
+# ---- what review of the typing found ----------------------------------------
+
+def test_length_and_last_as_a_byte_subscript():
+    """LENGTH and LAST of an array of up to 255 elements are BYTEs, and a
+    BYTE subscript is taken from A -- where `ld hl,7' had left nothing: with
+    ab(k) = k, `ab(LAST(sa))' read ab(0FFH), the store went elsewhere, and
+    `.ab(LENGTH(sa))' was off by 18H."""
+    _check("""
+declare ab(256) byte, sa(8) byte, (k, p, q) address;
+run: procedure;
+  do k = 0 to 255; ab(k) = k; end;
+  call ph(ab(last(sa))); call ph(ab(length(sa)));
+  ab(last(sa)) = 77h; call ph(ab(7));
+  p = .ab(length(sa)); q = .ab(8); call ph(p - q);
+  sa(last(sa)) = 5; call ph(sa(7));
+  k = 1; call ph(ab(last(sa) - k));
+end run;
+call run;
+""", [7, 8, 0x77, 0, 5, 6])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])
