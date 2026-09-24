@@ -5381,9 +5381,15 @@ class CodeGenerator:
             else:
                 target_sym = None
                 if isinstance(target, P.Identifier):
-                    target_sym = self.symbols.lookup(target_name)
+                    target_sym = self._lookup_symbol(target_name)
 
-                if target_sym and target_sym.data_type == DataType.BYTE:
+                # A plain BYTE variable is stored `ld a,l / ld (x),a', which
+                # keeps HL and leaves L in A. Through a BASED pointer or a
+                # stack frame the store needs HL for the address, so the
+                # value -- the embedded assignment's own, all sixteen bits
+                # of it -- has to survive on the stack like any other.
+                if (target_sym and target_sym.data_type == DataType.BYTE
+                        and not target_sym.based_on and target_sym.stack_offset is None):
                     self._gen_store(target, val_type)
                     self.a_has_l = True
                 else:

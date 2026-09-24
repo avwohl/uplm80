@@ -657,6 +657,26 @@ call run;
 """, [1, 0xFF, 6, 3, 1, 0xFF, 8, 0xF8, 0xFF, 0xFE])
 
 
+def test_an_embedded_assignment_through_a_pointer_keeps_its_value():
+    """`(x := w)' with x a BASED BYTE is w, all of it; the store loads the
+    pointer into HL, where the value was, and nothing kept it."""
+    _check("""
+declare (w, r, p) address, x based p byte, buf(4) byte;
+rf: procedure (v) address reentrant;
+  declare v address, y byte;
+  return (y := v) + 1 + y;
+end rf;
+run: procedure;
+  p = .buf; w = 1234h;
+  r = (x := w) + 1; call ph(r); call ph(buf(0));
+  r = low((x := w)); call ph(r);
+  if (x := w) = 1234h then call ph(1); else call ph(2);
+  call ph(rf(1234h));
+end run;
+call run;
+""", [0x1235, 0x34, 0x34, 1, 0x1269])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])
