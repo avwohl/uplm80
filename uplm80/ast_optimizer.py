@@ -16,6 +16,14 @@ expression / statement nodes are constructed via the
 :func:`ast_view.make_*` synthetic-token builders so codegen (which only
 reads ``.text`` off operator / literal tokens) keeps round-tripping
 through the folded result.
+
+Every rewrite has to leave an expression with the value AND the type the
+unoptimized program gives it, by the rules in :mod:`plm_types`: a BYTE
+``x + 0FFH`` wraps where an ADDRESS one carries, so replacing an ADDRESS
+subexpression with a BYTE one of the same value changes the program. The
+optimizer therefore types what it rewrites (:meth:`ASTOptimizer._type_of`,
+from the declarations in scope), folds constants with their types, and writes
+an ADDRESS constant below 256 as ``DOUBLE(n)``.
 """
 
 from copy import deepcopy
@@ -30,9 +38,12 @@ from .ast_view import (
     binop_kind,
     block_items_split,
     DataType,
+    decl_attrs,
     decl_item_names,
+    decl_item_struct_members,
     decl_item_type,
     ident_text,
+    iter_block_proc_decls,
     make_binary,
     make_identifier,
     make_number_literal,
@@ -43,8 +54,27 @@ from .ast_view import (
     proc_local_decls_stmts,
     proc_name,
     proc_param_names,
+    proc_return_type,
     unop_kind,
     unwrap_paren,
+)
+from .plm_types import (
+    ADDRESS,
+    BYTE,
+    BYTE_BUILTINS,
+    DERIVED,
+    PATTERN_TYPED_BUILTINS,
+    RELATIONS,
+    binary_type,
+    convert,
+    fold_binary,
+    fold_builtin,
+    fold_unary,
+    is_derived,
+    literal_type,
+    make_typed_const,
+    typed_const,
+    untyped_root,
 )
 
 
@@ -66,6 +96,57 @@ _IMPURE_BUILTINS = {
     # SCL/SCR rotate through carry, so they depend on and set it.
     "SCL", "SCR",
 }
+
+
+@dataclass(eq=False)
+class _Decl:
+    """What a name denotes in one scope.
+
+    ``plain`` is an ordinary scalar variable: not BASED, not AT, not an
+    array or structure. Only a plain variable's value is tracked, because a
+    store through anything else may land on it.
+    """
+
+    kind: str                          # "var", "proc" or "other"
+    dtype: "DataType | None" = None    # scalar / element / return type
+    plain: bool = False
+    array: bool = False
+
+
+def _scope_of(items) -> dict:
+    """The names a block's (or procedure body's) declarations introduce."""
+    scope: dict[str, _Decl] = {}
+
+    def declare(it) -> None:
+        if isinstance(it, P.ProcDecl):
+            scope[proc_name(it)] = _Decl("proc", proc_return_type(it))
+        elif isinstance(it, P.DeclareStmt):
+            for d in it.declarations:
+                declare(d)
+        elif isinstance(it, P.DeclItem):
+            dt, dim = decl_item_type(it)
+            if dt not in (DataType.BYTE, DataType.ADDRESS) or decl_item_struct_members(it):
+                dt = None
+            plain = (dt is not None and dim is None and it.based is None
+                     and decl_attrs(it).at_location is None)
+            for name in decl_item_names(it):
+                scope[name] = _Decl("var", dt, plain, dim is not None)
+        elif isinstance(it, P.DeclItemBasedGroup):
+            dt, dim = decl_item_type(it)
+            if dt not in (DataType.BYTE, DataType.ADDRESS):
+                dt = None
+            for bd in it.based_decls:
+                scope[ident_text(bd.name)] = _Decl("var", dt, False, dim is not None)
+        elif isinstance(it, P.LiterallyDecl):
+            scope[ident_text(it.name)] = _Decl("other")
+
+    for it in items:
+        declare(it)
+    # A procedure declared in a nested DO block belongs to the enclosing
+    # procedure's scope (see iter_block_proc_decls).
+    for proc in iter_block_proc_decls(items):
+        scope.setdefault(proc_name(proc), _Decl("proc", proc_return_type(proc)))
+    return scope
 
 
 def _is_number(expr) -> bool:
@@ -115,6 +196,30 @@ def _get_expr_vars(expr) -> set[str]:
         result.update(_get_expr_vars(e.target))
         result.update(_get_expr_vars(e.value))
     return result
+
+
+def _all_names(node) -> set[str]:
+    """Every identifier (and DO index) named anywhere in ``node``."""
+    names: set[str] = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, P.Identifier):
+            names.add(ident_text(n.name))
+            continue
+        if isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
+            names.add(ident_text(n.index))
+        if isinstance(n, (list, tuple)):
+            stack.extend(n)
+            continue
+        fields = getattr(n, "__dataclass_fields__", None)
+        if not fields:
+            continue
+        for f in fields:
+            if f == "pos":
+                continue
+            stack.append(getattr(n, f, None))
+    return names
 
 
 def _expr_key(expr) -> str | None:
@@ -221,8 +326,14 @@ class ASTOptimizer:
         self.opt_level = opt_level
         self.optimize_for = optimize_for
         self.stats = OptimizationStats()
-        # Known constant values for propagation
-        self.constants: dict[str, int] = {}
+        # Known constant values for propagation: name -> (value, type,
+        # derived). The value is already converted to the variable's type.
+        self.constants: dict[str, tuple[int, DataType, bool]] = {}
+        # The declarations in scope, innermost last.
+        self.scopes: list[dict[str, _Decl]] = []
+        # For each inlinable procedure, the scopes its body's names resolve
+        # in; a call site may inline it only where they resolve the same.
+        self.inline_scopes: dict[str, list[dict[str, _Decl]]] = {}
         # Track which variables are modified in current scope
         self.modified_vars: set[str] = set()
         # CSE: map from expression key to (temp_var_name, expr) for level 3
@@ -238,17 +349,13 @@ class ASTOptimizer:
         # names one is a PL/M parameterless call, not a variable read.
         self.proc_names: set[str] = set()
         # True while optimizing a region that reads CARRY / ZERO /
-        # SIGN / PARITY, where an arithmetic operation's flag side
-        # effect is observable and must not be folded away.
+        # SIGN / PARITY, or uses PLUS / MINUS, where an arithmetic
+        # operation's flag side effect is observable and must not be
+        # folded away.
         self.flag_sensitive: bool = False
-        # Names declared BYTE, and names declared as anything else. A
-        # constant cached for a BYTE variable has to be narrowed: the
-        # store truncates, so `b = 300` leaves 44 behind, not 300.
-        # True while optimizing an IF / DO WHILE condition, where only
-        # bit 0 of the value is observable.
-        self.in_condition: bool = False
-        self.byte_vars: set[str] = set()
-        self.nonbyte_vars: set[str] = set()
+        # True while optimizing a DATA / INITIAL / AT value: a restricted
+        # expression, folded as plain 16-bit numbers.
+        self.restricted: bool = False
 
     def _parse_plm_number(self, s: str) -> int | None:
         """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
@@ -292,12 +399,13 @@ class ASTOptimizer:
     _FLAG_BUILTINS = frozenset({"CARRY", "ZERO", "SIGN", "PARITY"})
 
     def _reads_a_flag(self, node) -> bool:
-        """Whether anything in ``node`` reads a condition-flag built-in.
+        """Whether anything in ``node`` reads a condition flag.
 
         PL/M-80's CARRY / ZERO / SIGN / PARITY read the flags left by the
-        preceding operation, so in a region that uses them an arithmetic
-        expression is not a pure value: folding `A + B` to a constant
-        removes the `add` whose carry the next statement reads.
+        preceding operation, and PLUS / MINUS add in its carry, so in a
+        region that uses them an arithmetic expression is not a pure value:
+        folding `A + B` to a constant removes the `add` whose carry the next
+        operation reads.
         """
         stack = [node]
         while stack:
@@ -305,6 +413,13 @@ class ASTOptimizer:
             if isinstance(n, P.Identifier):
                 if ident_text(n.name).upper() in self._FLAG_BUILTINS:
                     return True
+                continue
+            # PLUS and MINUS add in the carry the operation before them left.
+            if isinstance(n, P.BinaryOp) and binop_kind(n) in (
+                    BinaryOpKind.PLUS, BinaryOpKind.MINUS):
+                return True
+            # A nested procedure is a region of its own (_optimize_proc_decl).
+            if isinstance(n, P.ProcDecl):
                 continue
             if isinstance(n, (list, tuple)):
                 stack.extend(n)
@@ -343,17 +458,117 @@ class ASTOptimizer:
                 stack.append(getattr(n, f, None))
         return False
 
-    def _collect_declared_widths(self, node) -> None:
-        """Record which names are declared BYTE and which are not."""
+    # ---- scopes and types -------------------------------------------------
+
+    def _push_scope(self, items) -> None:
+        """Enter a block declaring ``items``.
+
+        What was known about an outer variable a declaration here hides says
+        nothing about the new one.
+        """
+        scope = _scope_of(items)
+        self.scopes.append(scope)
+        self._forget(scope)
+
+    def _pop_scope(self) -> None:
+        """Leave a block: what was learned about its own names goes with it."""
+        self._forget(self.scopes.pop())
+
+    def _forget(self, names) -> None:
+        for name in names:
+            self.constants.pop(name, None)
+            self._invalidate_cse_for_var(name)
+            self._invalidate_copies_for_var(name)
+
+    def _lookup(self, name: str) -> "_Decl | None":
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def _is_builtin(self, name: str) -> bool:
+        """``name`` (as written) is the built-in procedure, not something the
+        program declared under the same name."""
+        return self._lookup(name) is None
+
+    def _plain_var_type(self, name: str) -> "DataType | None":
+        """The type of ``name`` when it is a plain scalar variable, else None."""
+        d = self._lookup(name)
+        if d is not None and d.kind == "var" and d.plain:
+            return d.dtype
+        return None
+
+    def _type_of(self, expr) -> "DataType | None":
+        """The type code generation gives ``expr``; None when not known.
+
+        Mirrors CodeGenerator._get_expr_type, from the declarations in scope.
+        """
+        e = unwrap_paren(expr)
+        tc = typed_const(e)
+        if tc is not None:
+            return tc[1]
+        if isinstance(e, P.StringLiteral):
+            return ADDRESS
+        if isinstance(e, P.Identifier):
+            name = ident_text(e.name)
+            d = self._lookup(name)
+            if d is None:
+                return ADDRESS if name.upper() == "STACKPTR" else None
+            if d.kind == "proc":
+                return d.dtype
+            if d.kind == "var" and not d.array:
+                return d.dtype
+            return None
+        if isinstance(e, P.BinaryOp):
+            kind = binop_kind(e)
+            return binary_type(kind, self._type_of(e.left), self._type_of(e.right))
+        if isinstance(e, P.UnaryOp):
+            return self._type_of(e.operand)
+        if isinstance(e, (P.LocationOf, P.LocationOfList, P.LocationOfString)):
+            return ADDRESS
+        if isinstance(e, P.EmbeddedAssign):
+            # "The value of the embedded assignment is the same as that of
+            # its right half" (4.6.3).
+            return self._type_of(e.value)
+        if isinstance(e, (P.Call, P.CallNoArgs)):
+            callee = unwrap_paren(e.callee)
+            if not isinstance(callee, P.Identifier):
+                return None
+            raw = ident_text(callee.name)
+            d = self._lookup(raw)
+            if d is not None:
+                return d.dtype if d.kind in ("proc", "var") else None
+            name = raw.upper()
+            if name in BYTE_BUILTINS:
+                return BYTE
+            if name in ("DOUBLE", "SIZE", "STACKPTR", "TIME", "SHL", "SHR"):
+                return ADDRESS
+            if name in PATTERN_TYPED_BUILTINS and isinstance(e, P.Call) and e.args:
+                return self._type_of(e.args[0])
+            return None
+        return None
+
+    def _is_plain_store(self, target) -> bool:
+        """A store to ``target`` changes one plain variable and nothing else."""
+        t = unwrap_paren(target)
+        return isinstance(t, P.Identifier) and self._plain_var_type(ident_text(t.name)) is not None
+
+    def _stores_indirectly(self, node) -> bool:
+        """Whether ``node`` stores anywhere but into plain variables.
+
+        A store through a BASED variable, an array element, a structure
+        member or an AT-located variable may land on any variable, so no
+        fact about any of them survives it.
+        """
         stack = [node]
         while stack:
             n = stack.pop()
-            if isinstance(n, P.DeclItem):
-                dt, dim = decl_item_type(n)
-                target = self.byte_vars if (dt == DataType.BYTE and not dim) else self.nonbyte_vars
-                for name in decl_item_names(n):
-                    target.add(name)
-                continue
+            if isinstance(n, P.AssignStmt):
+                if not all(self._is_plain_store(t) for t in n.targets):
+                    return True
+            elif isinstance(n, P.EmbeddedAssign):
+                if not self._is_plain_store(n.target):
+                    return True
             if isinstance(n, (list, tuple)):
                 stack.extend(n)
                 continue
@@ -364,28 +579,65 @@ class ASTOptimizer:
                 if f == "pos":
                     continue
                 stack.append(getattr(n, f, None))
+        return False
 
-    def _optimize_condition(self, expr):
-        """Optimize an expression that is only ever tested for truth.
+    def _as_address(self, expr, pos):
+        """``expr`` widened, where it might not be, to the ADDRESS it replaces.
 
-        Folding a relational is safe here because only bit 0 of the result
-        is observable. As a VALUE it is not: a PL/M-80 relational yields a
-        BYTE 0FFH, and this folder masks to 16 bits, so a folded `x = (1 = 1)`
-        would store 0FFFFH where the generator stores 00FFH. Outside a
-        condition the comparison is left for the generator to emit.
+        PL/M-80 has no BYTE divide: DRI's compiler zero-extends BYTE operands
+        and calls its one 16-bit routine, so a quotient or remainder is an
+        ADDRESS and the arithmetic around it is 16-bit. A rewrite of one must
+        not narrow it. DOUBLE of an ADDRESS generates no code.
         """
-        outer = self.in_condition
-        self.in_condition = True
-        try:
-            return self._optimize_expr(expr)
-        finally:
-            self.in_condition = outer
+        if self._type_of(expr) is ADDRESS:
+            return expr
+        tc = typed_const(expr)
+        if tc is not None:
+            return make_typed_const(tc[0], ADDRESS, pos, derived=is_derived(expr))
+        return P.Call(callee=make_identifier("DOUBLE", pos=pos), args=[expr], pos=pos)
 
-    def _narrow_to_declared_width(self, name: str, value: int) -> int:
-        """Truncate a cached constant to the width its variable is declared."""
-        if name in self.byte_vars and name not in self.nonbyte_vars:
-            return value & 0xFF
-        return value
+    def _optimize_value(self, expr, keep_type: bool = False):
+        """Optimize an expression a statement evaluates for its value.
+
+        A call can change any variable, and PL/M-80 leaves the order in
+        which an expression's operands are evaluated to the compiler, so no
+        fact about a variable is used in an expression that makes a call,
+        and none survives it. An embedded assignment's target is forgotten
+        for the same reason.
+
+        Unless ``keep_type``, the result is converted by whatever uses it
+        (stored, passed, tested...), so a constant's own type does not
+        matter and the plain literal is returned.
+        """
+        if expr is None:
+            return None
+        effectful = self._contains_call(expr)
+        self._forget_embedded_targets(expr)
+        if effectful:
+            self._reset_flow_state()
+        out = self._optimize_expr(expr)
+        if effectful or self._stores_indirectly(expr):
+            self._reset_flow_state()
+        return out if keep_type else untyped_root(out)
+
+    def _forget_embedded_targets(self, node) -> None:
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.EmbeddedAssign):
+                t = unwrap_paren(n.target)
+                if isinstance(t, P.Identifier):
+                    self._forget([ident_text(t.name)])
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
 
     def _contains_call(self, node) -> bool:
         """Whether anything in ``node`` can call out.
@@ -459,10 +711,12 @@ class ASTOptimizer:
         folded the condition to always-true and pinned ``n`` at 0 through
         the whole body, so the loop printed `0` forever.
 
-        A call can assign any global, so a body containing one clears
-        everything; otherwise only what the body assigns is dropped.
+        A call can assign any global, and a store through a BASED variable,
+        a subscript or a member can land on any variable, so a body with
+        either clears everything; otherwise only what the body assigns is
+        dropped.
         """
-        if self._contains_call(items):
+        if self._contains_call(items) or self._stores_indirectly(items):
             self._reset_flow_state()
             return
         _, stmts = block_items_split(items)
@@ -527,9 +781,6 @@ class ASTOptimizer:
 
         self.proc_names.clear()
         self._collect_proc_names(module.items)
-        self.byte_vars.clear()
-        self.nonbyte_vars.clear()
-        self._collect_declared_widths(module.items)
 
         # Multiple passes for iterative improvement
         changed = True
@@ -541,6 +792,9 @@ class ASTOptimizer:
             passes += 1
             self._reset_flow_state()
             self.flag_sensitive = any(self._reads_a_flag(x) for x in module.items)
+            self.scopes = [_scope_of(module.items)]
+            self.inlinable_procs.clear()
+            self.inline_scopes.clear()
 
             new_items: list = []
             for item in module.items:
@@ -551,6 +805,7 @@ class ASTOptimizer:
                         changed = True
 
             module = P.Module(items=new_items, pos=module.pos)
+            self.scopes = []
 
         return module
 
@@ -587,10 +842,12 @@ class ASTOptimizer:
         attrs = proc_attrs(decl)
         local_decls, body_stmts = proc_local_decls_stmts(decl)
 
-        # A procedure body is its own flow region.
+        # A procedure body is its own flow region, and its own scope.
         self._reset_flow_state()
         outer_flag_sensitive = self.flag_sensitive
         self.flag_sensitive = any(self._reads_a_flag(x) for x in body_stmts)
+        enclosing_scopes = list(self.scopes)
+        self._push_scope(decl.body.items)
 
         new_decls: list = []
         for d in local_decls:
@@ -610,6 +867,7 @@ class ASTOptimizer:
         new_stmts = self._eliminate_dead_stores(new_stmts)
 
         # Nothing learned inside this body is valid outside it.
+        self._pop_scope()
         self._reset_flow_state()
         self.flag_sensitive = outer_flag_sensitive
 
@@ -646,9 +904,13 @@ class ASTOptimizer:
             body=new_body,
             pos=decl.pos,
         )
-        # Level 3: Track inlinable procedures
+        # Level 3: Track inlinable procedures, and the scopes their bodies'
+        # names are resolved in.
+        name = proc_name(optimized_proc)
+        self.inlinable_procs.pop(name, None)
         if self.opt_level >= 3 and self._is_inlinable(optimized_proc, attrs, local_decls):
-            self.inlinable_procs[proc_name(optimized_proc)] = optimized_proc
+            self.inlinable_procs[name] = optimized_proc
+            self.inline_scopes[name] = enclosing_scopes
         return optimized_proc
 
     def _optimize_decl_in_body(self, decl):
@@ -671,8 +933,9 @@ class ASTOptimizer:
         if raw.startswith("'") and raw.endswith("'"):
             raw = raw[1:-1]
         val = self._parse_plm_number(raw)
-        if val is not None:
-            self.constants[name] = val
+        if val is not None and val <= 0xFFFF:
+            # The name stands for the literal, typed as a literal is.
+            self.constants[name] = (val, literal_type(val), False)
         return decl
 
     def _optimize_declare_stmt(self, stmt: P.DeclareStmt) -> P.DeclareStmt | None:
@@ -700,20 +963,30 @@ class ASTOptimizer:
         if tail is None:
             return item
 
-        # Optimize AttrInitial / AttrAt expressions in the attribute lists.
-        for attr_list_name in ("attrs", "leading_attrs", "trailing_attrs"):
-            attrs = getattr(tail, attr_list_name, None)
-            if not attrs:
-                continue
-            for attr in attrs:
-                if isinstance(attr, P.AttrInitial):
-                    attr.values = [self._optimize_expr(v) for v in (attr.values or [])]
-                elif isinstance(attr, P.AttrAt):
-                    attr.address = self._optimize_expr(attr.address)
+        # These are restricted expressions (6.2.8): address arithmetic on
+        # constants, evaluated as plain numbers -- "when a restricted
+        # expression is used to initialize a BYTE scalar, its value must not
+        # be greater than 255" -- not by the BYTE/ADDRESS rules of an
+        # executable expression. Code generation evaluates what is left the
+        # same way.
+        outer, self.restricted = self.restricted, True
+        try:
+            # Optimize AttrInitial / AttrAt expressions in the attribute lists.
+            for attr_list_name in ("attrs", "leading_attrs", "trailing_attrs"):
+                attrs = getattr(tail, attr_list_name, None)
+                if not attrs:
+                    continue
+                for attr in attrs:
+                    if isinstance(attr, P.AttrInitial):
+                        attr.values = [self._optimize_expr(v) for v in (attr.values or [])]
+                    elif isinstance(attr, P.AttrAt):
+                        attr.address = self._optimize_expr(attr.address)
 
-        # Optimize DATA values list (lives directly on the tail variant).
-        if hasattr(tail, "data_values") and tail.data_values:
-            tail.data_values = [self._optimize_expr(v) for v in tail.data_values]
+            # Optimize DATA values list (lives directly on the tail variant).
+            if hasattr(tail, "data_values") and tail.data_values:
+                tail.data_values = [self._optimize_expr(v) for v in tail.data_values]
+        finally:
+            self.restricted = outer
 
         return item
 
@@ -744,7 +1017,10 @@ class ASTOptimizer:
         in_unreachable = False
         for stmt in stmts:
             if in_unreachable:
-                if isinstance(stmt, P.LabeledStmt):
+                # A label anywhere inside the statement (in a nested DO, an
+                # IF arm) can be jumped to, and a GOTO elsewhere still names
+                # it.
+                if self._contains_label(stmt):
                     in_unreachable = False
                     result.append(stmt)
                 else:
@@ -759,7 +1035,14 @@ class ASTOptimizer:
         """Remove assignments that are immediately overwritten without being read.
 
         A variable assigned and then reassigned in consecutive statements
-        without being read between is a dead store.
+        without being read between is a dead store -- when dropping the
+        first assignment drops nothing else. Its value must do nothing
+        (no call, no embedded assignment), the variable must be a plain
+        one (a store to a BASED or AT variable is a store to memory
+        something else may read), and the second value must not be able to
+        read it: no call (the procedure may read the variable), and nothing
+        that reads memory by address (an element, a member, a BASED
+        variable), which may alias it.
         """
         if self.opt_level < 3:
             return stmts
@@ -769,107 +1052,97 @@ class ASTOptimizer:
         while i < len(stmts):
             stmt = stmts[i]
 
-            if isinstance(stmt, P.AssignStmt) and len(stmt.targets) == 1:
-                target = unwrap_paren(stmt.targets[0])
-                if isinstance(target, P.Identifier):
-                    name = ident_text(target.name)
-                    if i + 1 < len(stmts):
-                        next_stmt = stmts[i + 1]
-                        if (
-                            isinstance(next_stmt, P.AssignStmt)
-                            and len(next_stmt.targets) == 1
-                        ):
-                            next_t = unwrap_paren(next_stmt.targets[0])
-                            if (
-                                isinstance(next_t, P.Identifier)
-                                and ident_text(next_t.name) == name
-                                and name not in _get_expr_vars(next_stmt.value)
-                            ):
-                                self.stats.dead_stores_eliminated += 1
-                                i += 1
-                                continue
+            if (i + 1 < len(stmts)
+                    and self._single_plain_target(stmt) is not None
+                    and self._single_plain_target(stmt) == self._single_plain_target(stmts[i + 1])
+                    and self._is_side_effect_free(stmt.value)
+                    and self._reads_only_plain_scalars(stmts[i + 1].value)
+                    and self._single_plain_target(stmt) not in _get_expr_vars(stmts[i + 1].value)):
+                self.stats.dead_stores_eliminated += 1
+                i += 1
+                continue
 
             result.append(stmt)
             i += 1
 
         return result
 
+    def _single_plain_target(self, stmt) -> str | None:
+        """The one plain variable ``stmt`` assigns, if that is all it is."""
+        if not (isinstance(stmt, P.AssignStmt) and len(stmt.targets) == 1):
+            return None
+        t = unwrap_paren(stmt.targets[0])
+        if isinstance(t, P.Identifier) and self._plain_var_type(ident_text(t.name)):
+            return ident_text(t.name)
+        return None
+
+    def _reads_only_plain_scalars(self, expr) -> bool:
+        """``expr`` reads nothing but constants and plain variables."""
+        e = unwrap_paren(expr)
+        if isinstance(e, (P.NumberLiteral, P.StringLiteral)):
+            return True
+        if isinstance(e, P.Identifier):
+            return self._plain_var_type(ident_text(e.name)) is not None
+        if isinstance(e, P.BinaryOp):
+            return (self._reads_only_plain_scalars(e.left)
+                    and self._reads_only_plain_scalars(e.right))
+        if isinstance(e, P.UnaryOp):
+            return self._reads_only_plain_scalars(e.operand)
+        if isinstance(e, P.Call):
+            callee = unwrap_paren(e.callee)
+            return (isinstance(callee, P.Identifier)
+                    and ident_text(callee.name).upper() in _PURE_BUILTINS
+                    and self._is_builtin(ident_text(callee.name))
+                    and all(self._reads_only_plain_scalars(a) for a in e.args))
+        if isinstance(e, P.LocationOf):
+            return isinstance(unwrap_paren(e.operand), P.Identifier)
+        return isinstance(e, P.LocationOfString)
+
     def _get_modified_vars_in_stmts(self, stmts: list) -> set[str]:
-        """Get all variables modified within a list of statements."""
+        """Every variable the statements assign, anywhere inside them.
+
+        Statement targets (and the array of a subscripted one), embedded
+        assignments -- in a condition, a subscript or an argument as much
+        as in a value: `arr(i := i + 1) = x' modifies i as well as arr, and
+        missing that left a loop whose only induction step is in a
+        subscript looking invariant -- and iterative DO indices.
+        """
         modified: set[str] = set()
 
-        def visit_stmt(s) -> None:
-            if s is None:
-                return
-            if isinstance(s, P.AssignStmt):
-                for target in s.targets:
-                    t = unwrap_paren(target)
-                    if isinstance(t, P.Identifier):
-                        modified.add(ident_text(t.name))
-                    elif isinstance(t, P.Call):
-                        # PL/M subscript form: ARR(idx) = ...
-                        c = unwrap_paren(t.callee)
-                        if isinstance(c, P.Identifier):
-                            modified.add(ident_text(c.name))
-                        # The subscript is an expression and may assign to
-                        # something: `arr(i := i + 1) = x' modifies i as well
-                        # as arr.  Missing that left a loop whose only
-                        # induction step is in a subscript looking invariant,
-                        # and its exit test was folded away.
-                        for a in t.args or []:
-                            visit_expr(a)
-                visit_expr(s.value)
-            elif isinstance(s, P.DoBlock):
-                _, body = block_items_split(s.items)
-                for sub in body:
-                    visit_stmt(sub)
-            elif isinstance(s, P.DoWhileBlock):
-                _, body = block_items_split(s.items)
-                for sub in body:
-                    visit_stmt(sub)
-            elif isinstance(s, (P.DoIterBlock, P.DoIterByBlock)):
-                modified.add(ident_text(s.index))
-                _, body = block_items_split(s.items)
-                for sub in body:
-                    visit_stmt(sub)
-            elif isinstance(s, P.DoCaseBlock):
-                for case in s.items:
-                    visit_stmt(case)
-            elif isinstance(s, P.IfStmt):
-                visit_stmt(s.then_stmt)
-            elif isinstance(s, P.IfStmtElse):
-                visit_stmt(s.then_stmt)
-                visit_stmt(s.else_stmt)
-            elif isinstance(s, P.LabeledStmt):
-                visit_stmt(s.stmt)
-            elif isinstance(s, P.CallStmt):
-                # Calls may modify globals - be conservative; just walk args.
-                inner = s.callee
-                if isinstance(inner, P.Call):
-                    for arg in inner.args:
-                        visit_expr(arg)
+        def target_name(t) -> str | None:
+            t = unwrap_paren(t)
+            if isinstance(t, P.Identifier):
+                return ident_text(t.name)
+            if isinstance(t, P.Call):
+                c = unwrap_paren(t.callee)
+                if isinstance(c, P.Identifier):
+                    return ident_text(c.name)
+            return None
 
-        def visit_expr(e) -> None:
-            if e is None:
-                return
-            e = unwrap_paren(e)
-            if isinstance(e, P.EmbeddedAssign):
-                t = unwrap_paren(e.target)
-                if isinstance(t, P.Identifier):
-                    modified.add(ident_text(t.name))
-                visit_expr(e.value)
-            elif isinstance(e, P.BinaryOp):
-                visit_expr(e.left)
-                visit_expr(e.right)
-            elif isinstance(e, P.UnaryOp):
-                visit_expr(e.operand)
-            elif isinstance(e, P.Call):
-                for arg in e.args:
-                    visit_expr(arg)
-
-        for s in stmts:
-            visit_stmt(s)
-
+        stack: list = list(stmts)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.AssignStmt):
+                for t in n.targets:
+                    name = target_name(t)
+                    if name is not None:
+                        modified.add(name)
+            elif isinstance(n, P.EmbeddedAssign):
+                name = target_name(n.target)
+                if name is not None:
+                    modified.add(name)
+            elif isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
+                modified.add(ident_text(n.index))
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
         return modified
 
     def _cache_invariant_exprs(self, expr, modified_vars: set[str]) -> None:
@@ -978,21 +1251,60 @@ class ASTOptimizer:
         return count
 
     def _is_inlinable(self, proc: P.ProcDecl, attrs, local_decls) -> bool:
-        """Check if a procedure is suitable for inlining."""
+        """Check if a procedure is suitable for inlining.
+
+        Only a small untyped procedure with no parameters and nothing
+        declared in it: its body then means the same wherever it is copied,
+        provided the names it uses resolve to the same declarations there
+        (checked at the call, see _names_resolve_alike). It must not RETURN
+        other than by falling off its end -- a RETURN copied into the caller
+        returns from the caller -- nor hold a label, which the copy would
+        define twice, nor a GOTO, nor read a flag.
+        """
         if attrs.is_external or attrs.is_reentrant or attrs.interrupt_num is not None:
             return False
-        # Don't inline procedures that contain nested procedures
-        for d in local_decls:
-            if isinstance(d, P.ProcDecl):
-                return False
-        # Don't inline procedures with local declarations (complex scoping)
-        if local_decls:
+        if local_decls or proc_param_names(proc) or proc_return_type(proc) is not None:
             return False
         _, body_stmts = proc_local_decls_stmts(proc)
         if self._count_stmts(body_stmts) > 5:
             return False
-        if len(proc_param_names(proc)) > 3:
+        body = list(body_stmts)
+        if body and isinstance(body[-1], P.ReturnStmt):
+            body = body[:-1]
+        stack: list = list(body)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (P.ReturnStmt, P.ReturnStmtValue, P.LabeledStmt,
+                              P.GotoStmt, P.DeclareStmt, P.ProcDecl, P.DeclItem)):
+                return False
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+        return not self._reads_a_flag(body_stmts)
+
+    def _names_resolve_alike(self, proc_name_: str) -> bool:
+        """Every name in the procedure's body means here what it means there."""
+        home = self.inline_scopes.get(proc_name_)
+        if home is None:
             return False
+        proc = self.inlinable_procs[proc_name_]
+
+        def resolve(scopes, name):
+            for scope in reversed(scopes):
+                if name in scope:
+                    return scope[name]
+            return None
+
+        for name in _all_names(proc.body):
+            if resolve(home, name) is not self._lookup(name):
+                return False
         return True
 
     def _inline_procedure(self, proc: P.ProcDecl, args: list, pos):
@@ -1138,8 +1450,17 @@ class ASTOptimizer:
     }
 
     def _normalize_commutative(self, kind: BinaryOpKind, left, right):
-        """Normalize operand order for commutative operations to improve CSE."""
+        """Normalize operand order for commutative operations to improve CSE.
+
+        Only when neither operand does anything: PL/M-80 leaves the order
+        of evaluation open, and a swap changes the order code generation
+        picks. A literal moved to the right of a relation is marked derived,
+        since it is not where the programmer wrote it (see
+        CodeGenerator._check_impossible_comparison).
+        """
         if kind not in self._COMMUTATIVE:
+            return left, right
+        if not (self._is_side_effect_free(left) and self._is_side_effect_free(right)):
             return left, right
 
         def sort_key(e) -> tuple[int, str]:
@@ -1155,6 +1476,9 @@ class ASTOptimizer:
         right_key = sort_key(right)
 
         if right_key < left_key:
+            if kind in RELATIONS and isinstance(unwrap_paren(left), P.NumberLiteral):
+                left = make_number_literal(number_value(unwrap_paren(left)), pos=left.pos)
+                left.value.name = DERIVED
             return right, left
         return left, right
 
@@ -1171,10 +1495,15 @@ class ASTOptimizer:
         only that is optimized here.
         """
         inner = unwrap_paren(target)
-        if isinstance(inner, P.Call) and inner.args:
-            opt_args = [self._optimize_expr(a) for a in inner.args]
-            if any(a is not b for a, b in zip(opt_args, inner.args)):
-                return P.Call(callee=inner.callee, args=opt_args, pos=inner.pos)
+        if isinstance(inner, P.Call):
+            callee = self._optimize_target(inner.callee)
+            opt_args = [untyped_root(self._optimize_expr(a)) for a in inner.args]
+            if callee is not inner.callee or any(a is not b for a, b in zip(opt_args, inner.args)):
+                return P.Call(callee=callee, args=opt_args, pos=inner.pos)
+        elif isinstance(inner, P.MemberAccess):
+            base = self._optimize_target(inner.base)
+            if base is not inner.base:
+                return P.MemberAccess(base=base, member=inner.member, pos=inner.pos)
         return target
 
     def _optimize_stmt(self, stmt):
@@ -1183,87 +1512,16 @@ class ASTOptimizer:
             return None
 
         if isinstance(stmt, P.AssignStmt):
-            opt_value = self._optimize_expr(stmt.value)
-            opt_targets = [self._optimize_target(t) for t in stmt.targets]
-
-            # Track modified variables and invalidate caches
-            for target in opt_targets:
-                t = unwrap_paren(target)
-                if isinstance(t, P.Identifier):
-                    name = ident_text(t.name)
-                    self.modified_vars.add(name)
-                    self.constants.pop(name, None)
-                    self._invalidate_cse_for_var(name)
-                    self._invalidate_copies_for_var(name)
-
-            # Level 3: Track copies and constants
-            if self.opt_level >= 3 and len(opt_targets) == 1:
-                t = unwrap_paren(opt_targets[0])
-                v = unwrap_paren(opt_value)
-                if isinstance(t, P.Identifier):
-                    tname = ident_text(t.name)
-                    if isinstance(v, P.NumberLiteral):
-                        self.constants[tname] = self._narrow_to_declared_width(
-                            tname, number_value(v))
-                    elif isinstance(v, P.Identifier) and self._is_side_effect_free(v):
-                        # Not when the source names a procedure: `k = rd`
-                        # is a call, and propagating `k` into a later use
-                        # would call RD a second time.
-                        self.copies[tname] = ident_text(v.name)
-
-            return P.AssignStmt(targets=opt_targets, value=opt_value, pos=stmt.pos)
+            return self._optimize_assign(stmt)
 
         if isinstance(stmt, P.CallStmt):
-            # Unpack the call-form payload into (callee_expr, args) so
-            # we can fold builtin arguments and check for inlining.
-            inner = stmt.callee
-            if isinstance(inner, P.Call):
-                callee_expr = inner.callee
-                args = list(inner.args)
-                inner_pos = inner.pos
-            elif isinstance(inner, P.CallNoArgs):
-                callee_expr = inner.callee
-                args = []
-                inner_pos = inner.pos
-            else:
-                callee_expr = inner
-                args = []
-                inner_pos = getattr(inner, "pos", stmt.pos)
-
-            opt_callee = self._optimize_expr(callee_expr)
-            opt_args = [self._optimize_expr(a) for a in args]
-
-            # Level 3: Inline small procedures
-            if (
-                self.opt_level >= 3
-                and self.optimize_for != OptimizeFor.SIZE
-                and isinstance(unwrap_paren(opt_callee), P.Identifier)
-            ):
-                name = ident_text(unwrap_paren(opt_callee).name)
-                if name in self.inlinable_procs:
-                    proc = self.inlinable_procs[name]
-                    if len(opt_args) == len(proc_param_names(proc)):
-                        inlined = self._inline_procedure(proc, opt_args, stmt.pos)
-                        if inlined is not None:
-                            self.stats.procedures_inlined += 1
-                            return inlined
-
-            # Repack into the original call shape.
-            if opt_args:
-                new_inner = P.Call(callee=opt_callee, args=opt_args, pos=inner_pos)
-            elif isinstance(inner, P.Call):
-                new_inner = P.Call(callee=opt_callee, args=[], pos=inner_pos)
-            elif isinstance(inner, P.CallNoArgs):
-                new_inner = P.CallNoArgs(callee=opt_callee, pos=inner_pos)
-            else:
-                new_inner = opt_callee
-            return P.CallStmt(callee=new_inner, pos=stmt.pos)
+            return self._optimize_call_stmt(stmt)
 
         if isinstance(stmt, P.ReturnStmt):
             return stmt
 
         if isinstance(stmt, P.ReturnStmtValue):
-            opt_value = self._optimize_expr(stmt.value)
+            opt_value = self._optimize_value(stmt.value)
             return P.ReturnStmtValue(value=opt_value, pos=stmt.pos)
 
         if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
@@ -1304,6 +1562,109 @@ class ASTOptimizer:
         # P.GotoStmt, P.HaltStmt, P.EnableStmt, P.DisableStmt, P.NullStmt — pass through.
         return stmt
 
+    def _optimize_assign(self, stmt: P.AssignStmt):
+        """Optimize an assignment, and record what it makes known."""
+        # The value is computed first, then each target's subscript; a call
+        # anywhere in either can change any variable (see _optimize_value).
+        effectful = self._contains_call(stmt.value) or self._contains_call(stmt.targets)
+        self._forget_embedded_targets([stmt.value, stmt.targets])
+        if effectful:
+            self._reset_flow_state()
+        # Stored, the value takes the target's type, so its own type does
+        # not matter when it is a constant.
+        opt_value = untyped_root(self._optimize_expr(stmt.value))
+        if effectful:
+            self._reset_flow_state()
+        opt_targets = [self._optimize_target(t) for t in stmt.targets]
+
+        for target in opt_targets:
+            t = unwrap_paren(target)
+            if isinstance(t, P.Identifier):
+                name = ident_text(t.name)
+                self.modified_vars.add(name)
+                self._forget([name])
+
+        if effectful or self._stores_indirectly(stmt):
+            self._reset_flow_state()
+        elif self.opt_level >= 3 and len(opt_targets) == 1:
+            # Level 3: track constants and copies of plain variables, with
+            # the value converted to the variable's type.
+            t = unwrap_paren(opt_targets[0])
+            ttype = (self._plain_var_type(ident_text(t.name))
+                     if isinstance(t, P.Identifier) else None)
+            if ttype is not None:
+                tname = ident_text(t.name)
+                tc = typed_const(opt_value)
+                v = unwrap_paren(opt_value)
+                if tc is not None:
+                    self.constants[tname] = (convert(tc[0], ttype), ttype, True)
+                elif (isinstance(v, P.Identifier) and ident_text(v.name) != tname
+                      and self._plain_var_type(ident_text(v.name)) is ttype):
+                    # Only a plain variable of the same type: `w = b' makes
+                    # w the zero-extended b, and `w + 0FFH' is not `b +
+                    # 0FFH'. A name that is a procedure is a call, and is
+                    # not plain.
+                    self.copies[tname] = ident_text(v.name)
+
+        return P.AssignStmt(targets=opt_targets, value=opt_value, pos=stmt.pos)
+
+    def _optimize_call_stmt(self, stmt: P.CallStmt):
+        """Optimize a CALL statement; inline it at -O3 where that is sound."""
+        # Unpack the call-form payload into (callee_expr, args) so
+        # we can fold builtin arguments and check for inlining.
+        inner = stmt.callee
+        if isinstance(inner, P.Call):
+            callee_expr = inner.callee
+            args = list(inner.args)
+            inner_pos = inner.pos
+        elif isinstance(inner, P.CallNoArgs):
+            callee_expr = inner.callee
+            args = []
+            inner_pos = inner.pos
+        else:
+            callee_expr = inner
+            args = []
+            inner_pos = getattr(inner, "pos", stmt.pos)
+
+        # The arguments are evaluated before the call, so what is known
+        # holds in them -- unless one of them makes a call itself.
+        self._forget_embedded_targets(args)
+        if self._contains_call(args):
+            self._reset_flow_state()
+        opt_callee = self._optimize_expr(callee_expr)
+        # Each argument is converted to its parameter's type.
+        opt_args = [untyped_root(self._optimize_expr(a)) for a in args]
+
+        # Level 3: Inline small procedures
+        if (
+            self.opt_level >= 3
+            and self.optimize_for != OptimizeFor.SIZE
+            and isinstance(unwrap_paren(opt_callee), P.Identifier)
+            and not opt_args
+        ):
+            name = ident_text(unwrap_paren(opt_callee).name)
+            if name in self.inlinable_procs and self._names_resolve_alike(name):
+                inlined = self._inline_procedure(self.inlinable_procs[name], [], stmt.pos)
+                if inlined is not None:
+                    self.stats.procedures_inlined += 1
+                    # What the body changes is no longer known.
+                    self._invalidate_modified([inlined])
+                    return inlined
+
+        # The procedure may change any variable.
+        self._reset_flow_state()
+
+        # Repack into the original call shape.
+        if opt_args:
+            new_inner = P.Call(callee=opt_callee, args=opt_args, pos=inner_pos)
+        elif isinstance(inner, P.Call):
+            new_inner = P.Call(callee=opt_callee, args=[], pos=inner_pos)
+        elif isinstance(inner, P.CallNoArgs):
+            new_inner = P.CallNoArgs(callee=opt_callee, pos=inner_pos)
+        else:
+            new_inner = opt_callee
+        return P.CallStmt(callee=new_inner, pos=stmt.pos)
+
     def _optimize_if(self, stmt):
         """Optimize an IF / IF-ELSE statement.
 
@@ -1312,7 +1673,7 @@ class ASTOptimizer:
         (or a :class:`P.NullStmt`). Also collapses :class:`P.IfStmtElse`
         whose else-branch optimizes away into :class:`P.IfStmt`.
         """
-        opt_cond = self._optimize_condition(stmt.condition)
+        opt_cond = self._optimize_value(stmt.condition)
 
         # Constant condition elimination (level 2+). Not when either arm
         # declares a label: a GOTO elsewhere in the procedure still names it.
@@ -1376,6 +1737,7 @@ class ASTOptimizer:
                 )
                 decl_buf.clear()
 
+        self._push_scope(items)
         for it in items:
             if isinstance(it, P.ProcDecl):
                 flush()
@@ -1399,6 +1761,7 @@ class ASTOptimizer:
                 if opt is not None:
                     new_items.append(opt)
         flush()
+        self._pop_scope()
         return new_items
 
     def _optimize_do_block(self, stmt: P.DoBlock) -> P.DoBlock:
@@ -1453,7 +1816,7 @@ class ASTOptimizer:
         # Before anything is folded: the condition is re-evaluated on every
         # back edge, so it cannot use a fact the body invalidates.
         self._invalidate_modified(stmt.items)
-        opt_cond = self._optimize_condition(stmt.condition)
+        opt_cond = self._optimize_value(stmt.condition)
 
         # A DO WHILE whose condition has bit 0 clear never executes -- but
         # only drop the loop when its body declares no label.
@@ -1474,12 +1837,35 @@ class ASTOptimizer:
 
         new_items = self._optimize_block_items(stmt.items)
         new_items = self._eliminate_unreachable_in_items(new_items)
+        # The body may have run any number of times, including none, so
+        # what it established does not hold after the loop.
+        self._invalidate_modified(stmt.items)
         return P.DoWhileBlock(
             condition=opt_cond,
             items=new_items,
             end_label=stmt.end_label,
             pos=stmt.pos,
         )
+
+    @staticmethod
+    def _loop_values(start: int, bound: int, step: int, t: DataType,
+                     limit: int) -> "tuple[list[int], int] | None":
+        """The index values of ``DO i = start TO bound BY step`` and the
+        index's value after it, for an index of type ``t``, as DRI's PL/M-80
+        runs it: the index is compared with the limit before each pass and
+        the loop ends when the increment carries out of the index's width
+        (5.1.4). None when it runs more than ``limit`` times."""
+        i, bound, step = convert(start, t), convert(bound, t), convert(step, t)
+        values: list[int] = []
+        while i <= bound:
+            if len(values) >= limit or step == 0:
+                return None
+            values.append(i)
+            i += step
+            if i > convert(0xFFFF, t):
+                i = convert(i, t)
+                break
+        return values, i
 
     def _optimize_do_iter(self, stmt):
         """Optimize a ``DO I = start TO bound [BY step] ... END`` block.
@@ -1490,73 +1876,81 @@ class ASTOptimizer:
         of ``stmt.step``.
         """
         is_by = isinstance(stmt, P.DoIterByBlock)
+        index_name = ident_text(stmt.index)
         # The bound is re-tested on every iteration; the index and whatever
         # the body assigns are not constants inside it.
         self._invalidate_modified(stmt.items)
-        self.constants.pop(ident_text(stmt.index), None)
-        self.copies.pop(ident_text(stmt.index), None)
-        opt_start = self._optimize_expr(stmt.start)
-        opt_bound = self._optimize_expr(stmt.bound)
-        opt_step = self._optimize_expr(stmt.step) if is_by else None
+        self._forget([index_name])
+        # Start, limit and step are all converted to the index's type.
+        opt_start = self._optimize_value(stmt.start)
+        opt_bound = self._optimize_value(stmt.bound)
+        opt_step = self._optimize_value(stmt.step) if is_by else None
 
-        # Check for empty loop (start > bound with positive step).
+        index_decl = self._lookup(index_name)
+        index_type = (index_decl.dtype if index_decl is not None and index_decl.kind == "var"
+                      and not index_decl.array else None)
+        start_c, bound_c = typed_const(opt_start), typed_const(opt_bound)
+        step_c = typed_const(opt_step) if is_by else (1, BYTE)
+        bounds_known = index_type is not None and start_c is not None and bound_c is not None
+        constant = bounds_known and step_c is not None
+        _, body_stmts = block_items_split(stmt.items)
+
+        def assign_index(value: int):
+            return P.AssignStmt(targets=[make_identifier(index_name, pos=stmt.pos)],
+                                value=make_number_literal(value, pos=stmt.pos),
+                                pos=stmt.pos)
+
+        # A loop that never runs still assigns its index the start value.
         if (
             self.opt_level >= 2
-            and _is_number(opt_start)
-            and _is_number(opt_bound)
+            and bounds_known
+            and convert(start_c[0], index_type) > convert(bound_c[0], index_type)
+            and not any(self._contains_label(i) for i in stmt.items)
         ):
-            step_val = 1
-            if opt_step is not None and _is_number(opt_step):
-                step_val = _num_value(opt_step)
-            if step_val > 0 and _num_value(opt_start) > _num_value(opt_bound):
-                self.stats.dead_code_eliminated += 1
-                return P.NullStmt(pos=stmt.pos)
+            self.stats.dead_code_eliminated += 1
+            return self._optimize_stmt(assign_index(convert(start_c[0], index_type)))
 
-        # Level 3: Loop unrolling for small constant-bound loops.
+        # Level 3: Loop unrolling for small constant-bound loops: each pass
+        # assigns the index its value, and the index is left with the value
+        # the loop leaves in it. Not when the body changes the index, or
+        # holds a label or a declaration the copies would repeat.
+        max_iter = 4 if self.optimize_for == OptimizeFor.SPEED else 2
+        run = (self._loop_values(start_c[0], bound_c[0], step_c[0], index_type, max_iter)
+               if constant and self.opt_level >= 3
+               and self.optimize_for != OptimizeFor.SIZE else None)
         if (
-            self.opt_level >= 3
-            and self.optimize_for != OptimizeFor.SIZE
-            and _is_number(opt_start)
-            and _is_number(opt_bound)
+            run is not None
+            and run[0]
+            and len(body_stmts) <= 3
+            and index_name not in self._get_modified_vars_in_stmts(body_stmts)
+            and not any(self._contains_label(i) for i in stmt.items)
+            and not any(isinstance(n, (P.DeclareStmt, P.ProcDecl, P.DeclItem))
+                        for n in self._walk(stmt.items))
         ):
-            step_val = 1
-            if opt_step is not None and _is_number(opt_step):
-                step_val = _num_value(opt_step)
-            if step_val > 0:
-                start_v = _num_value(opt_start)
-                bound_v = _num_value(opt_bound)
-                iterations = (bound_v - start_v) // step_val + 1
-                max_iter = 4 if self.optimize_for == OptimizeFor.SPEED else 2
-                _, body_stmts = block_items_split(stmt.items)
-                if 1 <= iterations <= max_iter and len(body_stmts) <= 3:
-                    index_name = ident_text(stmt.index)
-                    unrolled: list = []
-                    for i in range(iterations):
-                        val = start_v + i * step_val
-                        unrolled.append(P.AssignStmt(
-                            targets=[make_identifier(index_name, pos=stmt.pos)],
-                            value=make_number_literal(val, pos=stmt.pos),
-                            pos=stmt.pos,
-                        ))
-                        for s in body_stmts:
-                            unrolled.append(deepcopy(s))
-                    self.stats.loops_unrolled += 1
-                    block = P.DoBlock(
-                        items=unrolled, end_label=stmt.end_label, pos=stmt.pos
-                    )
-                    return self._optimize_stmt(block)
+            values, final = run
+            unrolled: list = []
+            for val in values:
+                unrolled.append(assign_index(val))
+                for s in body_stmts:
+                    unrolled.append(deepcopy(s))
+            unrolled.append(assign_index(final))
+            self.stats.loops_unrolled += 1
+            block = P.DoBlock(items=unrolled, end_label=stmt.end_label, pos=stmt.pos)
+            return self._optimize_stmt(block)
 
         # Level 3: Cache loop-invariant bound expressions.
         if self.opt_level >= 3:
-            _, body_stmts = block_items_split(stmt.items)
             modified_vars = self._get_modified_vars_in_stmts(body_stmts)
-            modified_vars.add(ident_text(stmt.index))
+            modified_vars.add(index_name)
             self._cache_invariant_exprs(opt_bound, modified_vars)
             if opt_step is not None:
                 self._cache_invariant_exprs(opt_step, modified_vars)
 
         new_items = self._optimize_block_items(stmt.items)
         new_items = self._eliminate_unreachable_in_items(new_items)
+        # Nothing the body established survives: it may not have run.
+        self._invalidate_modified(stmt.items)
+        self._forget([index_name])
 
         if is_by:
             return P.DoIterByBlock(
@@ -1577,9 +1971,27 @@ class ASTOptimizer:
             pos=stmt.pos,
         )
 
+    @staticmethod
+    def _walk(node):
+        """Every node inside ``node``."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            yield n
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+
     def _optimize_do_case(self, stmt: P.DoCaseBlock):
         """Optimize a ``DO CASE selector ... END`` block."""
-        opt_selector = self._optimize_expr(stmt.selector)
+        opt_selector = self._optimize_value(stmt.selector)
 
         # If selector is constant, keep only that case (level 2+) -- unless
         # a discarded case declares a label a GOTO still names.
@@ -1640,7 +2052,8 @@ class ASTOptimizer:
             # Constant propagation (level 1+).
             if self.opt_level >= 1 and name in self.constants:
                 self.stats.constants_folded += 1
-                return make_number_literal(self.constants[name], pos=expr.pos)
+                value, vtype, derived = self.constants[name]
+                return make_typed_const(value, vtype, expr.pos, derived=derived)
             # Copy propagation (level 3).
             if self.opt_level >= 3 and name in self.copies:
                 self.stats.copies_propagated += 1
@@ -1660,6 +2073,15 @@ class ASTOptimizer:
         if isinstance(expr, P.Call):
             opt_callee = self._optimize_expr(expr.callee)
             opt_args = [self._optimize_expr(a) for a in expr.args]
+            # A subscript, an argument, or a built-in's operand is converted
+            # to the type it is used as -- except the pattern of SCL and SCR,
+            # whose type is the result's.
+            callee = unwrap_paren(opt_callee)
+            keep_first = (isinstance(callee, P.Identifier)
+                          and ident_text(callee.name).upper() in PATTERN_TYPED_BUILTINS
+                          and self._is_builtin(ident_text(callee.name)))
+            opt_args = [a if (keep_first and i == 0) else untyped_root(a)
+                        for i, a in enumerate(opt_args)]
 
             # Optimize built-in calls with constant args.
             if self.opt_level >= 1 and isinstance(unwrap_paren(opt_callee), P.Identifier):
@@ -1675,7 +2097,9 @@ class ASTOptimizer:
             return P.CallNoArgs(callee=opt_callee, pos=expr.pos)
 
         if isinstance(expr, P.LocationOf):
-            opt_operand = self._optimize_expr(expr.operand)
+            # `.x' names a place, as an assignment target does: propagating
+            # x's value into it turned `p = .x' after `x = 5' into `p = 5'.
+            opt_operand = self._optimize_target(expr.operand)
             return P.LocationOf(operand=opt_operand, pos=expr.pos)
 
         if isinstance(expr, P.LocationOfString):
@@ -1696,20 +2120,24 @@ class ASTOptimizer:
             # assignment does, so the facts recorded about it stop being true
             # here.  Without this, `q = (k := 7)' left the table still saying
             # k is 5, and a later `pc(k)' was handed the stale 5.
+            # Nothing new is recorded: the rest of the expression may be
+            # evaluated before or after the store, in whatever order code
+            # generation picks.
             t = unwrap_paren(opt_target)
             if isinstance(t, P.Identifier):
                 name = ident_text(t.name)
                 self.modified_vars.add(name)
-                self.constants.pop(name, None)
-                self._invalidate_cse_for_var(name)
-                self._invalidate_copies_for_var(name)
-                v = unwrap_paren(opt_value)
-                if self.opt_level >= 3 and isinstance(v, P.NumberLiteral):
-                    self.constants[name] = self._narrow_to_declared_width(
-                        name, number_value(v))
+                self._forget([name])
+            if not self._is_plain_store(opt_target):
+                self._reset_flow_state()
             return P.EmbeddedAssign(target=opt_target, value=opt_value, pos=expr.pos)
 
         return expr
+
+    # Operations whose carry a flag-reading region can observe.
+    _ARITH = frozenset({BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.MUL,
+                        BinaryOpKind.DIV, BinaryOpKind.MOD,
+                        BinaryOpKind.PLUS, BinaryOpKind.MINUS})
 
     def _optimize_binary(self, expr: P.BinaryOp):
         """Optimize a binary expression."""
@@ -1717,39 +2145,37 @@ class ASTOptimizer:
         left = self._optimize_expr(expr.left)
         right = self._optimize_expr(expr.right)
 
-        # Constant folding (level 1+). Arithmetic is skipped in a region
-        # that reads a flag built-in: the operation's carry is observable
-        # there, so the `add` has to survive.
-        _ARITH = (BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.MUL,
-                  BinaryOpKind.DIV, BinaryOpKind.MOD,
-                  BinaryOpKind.PLUS, BinaryOpKind.MINUS)
-        if (
-            self.opt_level >= 1
-            and _is_number(left)
-            and _is_number(right)
-            and not (self.flag_sensitive and kind in _ARITH)
-        ):
-            result = self._eval_binary_const(kind, _num_value(left), _num_value(right))
-            if result is not None:
+        # In a region that reads a flag (CARRY, PLUS...), an arithmetic
+        # operation's carry is observable, so the operation has to survive
+        # as written: no folding, no rewriting.
+        frozen = self.flag_sensitive and kind in self._ARITH
+
+        # Constant folding (level 1+), by PL/M-80's typing rules.
+        if self.opt_level >= 1 and not frozen:
+            folded = self._fold_binary(kind, left, right, expr.pos)
+            if folded is not None:
                 self.stats.constants_folded += 1
-                return make_number_literal(result, pos=expr.pos)
+                return folded
+
+        if self.restricted:
+            return make_binary(kind, left, right, pos=expr.pos)
 
         # Strength reduction (level 2+).
-        if self.opt_level >= 2:
+        if self.opt_level >= 2 and not frozen:
             reduced = self._strength_reduce(kind, left, right, expr.pos)
             if reduced is not None:
                 self.stats.strength_reductions += 1
                 return reduced
 
         # Algebraic simplifications (level 1+).
-        if self.opt_level >= 1:
+        if self.opt_level >= 1 and not frozen:
             simplified = self._algebraic_simplify(kind, left, right, expr.pos)
             if simplified is not None:
                 self.stats.algebraic_simplifications += 1
                 return simplified
 
         # Boolean/comparison simplifications (level 2+).
-        if self.opt_level >= 2:
+        if self.opt_level >= 2 and not self.flag_sensitive:
             bool_simp = self._boolean_simplify(kind, left, right, expr.pos)
             if bool_simp is not None:
                 self.stats.boolean_simplifications += 1
@@ -1776,19 +2202,50 @@ class ASTOptimizer:
 
         return result_expr
 
+    def _fold_binary(self, kind: BinaryOpKind, left, right, pos):
+        """``left kind right`` as a constant, if both operands are.
+
+        Typed, so `200 + 100' is the BYTE 44 and `7 MOD 0' the ADDRESS 7;
+        but a DATA / INITIAL / AT value is a restricted expression, folded
+        as a plain 16-bit number (see _optimize_decl_item).
+        """
+        if self.restricted:
+            if not (_is_number(left) and _is_number(right)):
+                return None
+            value = self._eval_binary_const(kind, _num_value(left), _num_value(right))
+            return None if value is None else make_number_literal(value, pos=pos)
+        lc, rc = typed_const(left), typed_const(right)
+        if lc is None or rc is None:
+            return None
+        folded = fold_binary(kind, lc[0], lc[1], rc[0], rc[1])
+        if folded is None:
+            return None
+        return make_typed_const(folded[0], folded[1], pos,
+                                derived=is_derived(left) or is_derived(right))
+
     def _optimize_unary(self, expr: P.UnaryOp):
         """Optimize a unary expression."""
         kind = unop_kind(expr)
         operand = self._optimize_expr(expr.operand)
 
-        # Constant folding.
-        if self.opt_level >= 1 and _is_number(operand):
-            result = self._eval_unary_const(kind, _num_value(operand))
-            if result is not None:
-                self.stats.constants_folded += 1
-                return make_number_literal(result, pos=expr.pos)
+        # Constant folding: `-x' and `NOT x' keep x's type, so NOT 7 is the
+        # BYTE 0F8H and -1 the BYTE 0FFH (4.2.2).
+        if self.opt_level >= 1:
+            if self.restricted:
+                if _is_number(operand):
+                    self.stats.constants_folded += 1
+                    return make_number_literal(
+                        self._eval_unary_const(kind, _num_value(operand)), pos=expr.pos)
+            else:
+                c = typed_const(operand)
+                if c is not None:
+                    self.stats.constants_folded += 1
+                    value, vtype = fold_unary(kind, c[0], c[1])
+                    return make_typed_const(value, vtype, expr.pos,
+                                            derived=is_derived(operand))
 
-        # Double negation elimination.
+        # Double negation elimination: -(-x) and NOT NOT x are x, in x's
+        # own width.
         inner = unwrap_paren(operand)
         if kind == UnaryOpKind.NEG and isinstance(inner, P.UnaryOp):
             if unop_kind(inner) == UnaryOpKind.NEG:
@@ -1804,77 +2261,38 @@ class ASTOptimizer:
         return make_unary(kind, operand, pos=expr.pos)
 
     def _eval_binary_const(self, kind: BinaryOpKind, left: int, right: int) -> int | None:
-        """Evaluate a binary operation on constants (16-bit unsigned PL/M semantics)."""
-        mask = 0xFFFF
-        try:
-            if kind == BinaryOpKind.ADD:
-                return (left + right) & mask
-            elif kind == BinaryOpKind.SUB:
-                return (left - right) & mask
-            elif kind == BinaryOpKind.MUL:
-                return (left * right) & mask
-            # PL/M-80's divide, zero divisor included: x / 0 is 0FFFFH and
-            # x MOD 0 is x, which is what ??div16 / ??mod16 give at run time.
-            elif kind == BinaryOpKind.DIV:
-                return plm_div(left, right)
-            elif kind == BinaryOpKind.MOD:
-                return plm_mod(left, right)
-            elif kind == BinaryOpKind.AND:
-                return left & right
-            elif kind == BinaryOpKind.OR:
-                return left | right
-            elif kind == BinaryOpKind.XOR:
-                return left ^ right
-            # Only reached in a condition (see _optimize_condition): as a
-            # value a relational is a BYTE 0FFH and this folder is untyped.
-            # 0FFFFH is used rather than 0FFH because
-            # _eval_unary_const and the arithmetic arms above all mask to
-            # 16 bits, and 0FFFFH is a fixed point for exactly the operators
-            # that consume a boolean -- NOT 0FFFFH = 0, -(0FFFFH) = 1,
-            # 0FFFFH + 1 = 0 -- where 0FFH is not: NOT 0FFH would fold to
-            # 0FF00H. Folding to 0FFFFH keeps NOT / NEG / + right; the cost
-            # is that a folded relational stored into an ADDRESS reads
-            # 0FFFFH where the runtime gives 00FFH. Narrowing this properly
-            # needs a width-aware folder; see todo.txt.
-            elif kind == BinaryOpKind.EQ:
-                if not self.in_condition:
-                    return None
-                return 0xFFFF if left == right else 0
-            elif kind == BinaryOpKind.NE:
-                if not self.in_condition:
-                    return None
-                return 0xFFFF if left != right else 0
-            elif kind == BinaryOpKind.LT:
-                if not self.in_condition:
-                    return None
-                return 0xFFFF if left < right else 0
-            elif kind == BinaryOpKind.GT:
-                if not self.in_condition:
-                    return None
-                return 0xFFFF if left > right else 0
-            elif kind == BinaryOpKind.LE:
-                if not self.in_condition:
-                    return None
-                return 0xFFFF if left <= right else 0
-            elif kind == BinaryOpKind.GE:
-                if not self.in_condition:
-                    return None
-                return 0xFFFF if left >= right else 0
-            # PLUS / MINUS (carry-aware) — don't fold at AST level; the
-            # codegen lowering depends on the runtime carry chain.
-        except (ZeroDivisionError, OverflowError):
-            return None
+        """A binary operation on constants as plain 16-bit numbers.
 
+        How a restricted expression (a DATA, INITIAL or AT value) is
+        folded. An executable expression is folded by type: see
+        plm_types.fold_binary.
+        """
+        mask = 0xFFFF
+        if kind == BinaryOpKind.ADD:
+            return (left + right) & mask
+        if kind == BinaryOpKind.SUB:
+            return (left - right) & mask
+        if kind == BinaryOpKind.MUL:
+            return (left * right) & mask
+        # PL/M-80's divide, zero divisor included: x / 0 is 0FFFFH and
+        # x MOD 0 is x, which is what ??div16 / ??mod16 give at run time.
+        if kind == BinaryOpKind.DIV:
+            return plm_div(left, right)
+        if kind == BinaryOpKind.MOD:
+            return plm_mod(left, right)
+        if kind == BinaryOpKind.AND:
+            return left & right
+        if kind == BinaryOpKind.OR:
+            return left | right
+        if kind == BinaryOpKind.XOR:
+            return left ^ right
         return None
 
-    def _eval_unary_const(self, kind: UnaryOpKind, value: int) -> int | None:
-        """Evaluate a unary operation on a constant."""
-        mask = 0xFFFF
+    def _eval_unary_const(self, kind: UnaryOpKind, value: int) -> int:
+        """A unary operation on a constant as a plain 16-bit number."""
         if kind == UnaryOpKind.NEG:
-            return (-value) & mask
-        elif kind == UnaryOpKind.NOT:
-            return (~value) & mask
-        return None
+            return (-value) & 0xFFFF
+        return (~value) & 0xFFFF
 
     def _strength_reduce(
         self, kind: BinaryOpKind, left, right, pos
@@ -1883,87 +2301,63 @@ class ASTOptimizer:
 
         Power-of-2 multiply / divide / modulo collapse into shift /
         mask forms expressed as builtin calls (``SHL`` / ``SHR``) or
-        a bitwise AND.
+        a bitwise AND. Each is an ADDRESS, as the product, quotient or
+        remainder it replaces is even of BYTE operands.
         """
-        # Multiply by power of 2 -> shift left.
-        if kind == BinaryOpKind.MUL and _is_number(right):
-            r_val = _num_value(right)
-            shift = self._log2_if_power_of_2(r_val)
-            if shift is not None:
-                if shift == 0:
-                    if _is_number(left) and _num_value(left) == 0:
-                        return make_number_literal(0, pos=pos)
-                    return left
-                if shift == 1:
-                    # x * 2 -> x + x
-                    return make_binary(BinaryOpKind.ADD, left, deepcopy(left), pos=pos)
-                # x * 2^n -> SHL(x, n)
-                return P.Call(
-                    callee=make_identifier("SHL", pos=pos),
-                    args=[left, make_number_literal(shift, pos=pos)],
-                    pos=pos,
-                )
+        rc = typed_const(right)
+        if rc is None:
+            return None
+        shift = self._log2_if_power_of_2(rc[0])
+        if shift is None:
+            return None
 
-        # Divide by power of 2 -> shift right. A quotient is an ADDRESS
-        # even of BYTE operands, and SHR's result is one.
-        if kind == BinaryOpKind.DIV and _is_number(right):
-            r_val = _num_value(right)
-            shift = self._log2_if_power_of_2(r_val)
-            if shift is not None:
-                if shift == 0:
-                    return self._as_address(left, pos)
-                return P.Call(
-                    callee=make_identifier("SHR", pos=pos),
-                    args=[left, make_number_literal(shift, pos=pos)],
-                    pos=pos,
-                )
+        # Multiply by power of 2 -> shift left.
+        if kind == BinaryOpKind.MUL:
+            if shift == 0:
+                return self._as_address(left, pos)
+            if shift == 1:
+                # x * 2 -> x + x, for an ADDRESS x that can be evaluated
+                # twice. A BYTE `x + x' would wrap; code generation doubles
+                # a zero-extended BYTE for `x * 2' anyway.
+                if self._type_of(left) is ADDRESS and self._is_side_effect_free(left):
+                    return make_binary(BinaryOpKind.ADD, left, deepcopy(left), pos=pos)
+                return None
+            # x * 2^n -> SHL(x, n), which is an ADDRESS (see plm_types).
+            return P.Call(
+                callee=make_identifier("SHL", pos=pos),
+                args=[left, make_number_literal(shift, pos=pos)],
+                pos=pos,
+            )
+
+        # Divide by power of 2 -> shift right; SHR is an ADDRESS, as the
+        # quotient is.
+        if kind == BinaryOpKind.DIV:
+            if shift == 0:
+                return self._as_address(left, pos)
+            return self._as_address(P.Call(
+                callee=make_identifier("SHR", pos=pos),
+                args=[left, make_number_literal(shift, pos=pos)],
+                pos=pos,
+            ), pos)
 
         # Modulo by power of 2 -> AND with (2^n - 1), kept ADDRESS: a BYTE
         # `x AND 7' in place of `x MOD 8' would make `(x MOD 8) + 0FFH' wrap.
-        if kind == BinaryOpKind.MOD and _is_number(right):
-            r_val = _num_value(right)
-            shift = self._log2_if_power_of_2(r_val)
-            if shift is not None:
-                mask = r_val - 1
-                return self._as_address(make_binary(
-                    BinaryOpKind.AND,
-                    left,
-                    make_number_literal(mask, pos=pos),
-                    pos=pos,
-                ), pos)
+        if kind == BinaryOpKind.MOD:
+            mask = rc[0] - 1
+            return self._as_address(make_binary(
+                BinaryOpKind.AND,
+                left,
+                make_number_literal(mask, pos=pos),
+                pos=pos,
+            ), pos)
 
         return None
 
-    def _as_address(self, expr, pos):
-        """``expr`` widened, where it might not be, to the ADDRESS it replaces.
-
-        PL/M-80 has no BYTE divide: DRI's compiler zero-extends BYTE operands
-        and calls its one 16-bit routine, so a quotient or remainder is an
-        ADDRESS and the arithmetic around it is 16-bit. A rewrite of one must
-        not narrow it. DOUBLE of an ADDRESS generates no code.
-        """
-        if self._is_address_valued(expr):
-            return expr
-        return P.Call(callee=make_identifier("DOUBLE", pos=pos), args=[expr], pos=pos)
-
-    def _is_address_valued(self, expr) -> bool:
-        """Whether code generation certainly types ``expr`` ADDRESS."""
-        expr = unwrap_paren(expr)
-        if isinstance(expr, P.NumberLiteral):
-            return number_value(expr) > 0xFF
-        if isinstance(expr, P.Call):
-            callee = unwrap_paren(expr.callee)
-            return (isinstance(callee, P.Identifier)
-                    and ident_text(callee.name).upper() in ("DOUBLE", "SHL", "SHR"))
-        if isinstance(expr, P.BinaryOp):
-            kind = binop_kind(expr)
-            if kind in (BinaryOpKind.MUL, BinaryOpKind.DIV, BinaryOpKind.MOD):
-                return True
-            if kind in (BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.AND,
-                        BinaryOpKind.OR, BinaryOpKind.XOR):
-                return (self._is_address_valued(expr.left)
-                        or self._is_address_valued(expr.right))
-        return False
+    def _typed_zero(self, t: "DataType | None", pos):
+        """The constant 0 of type ``t`` (None when ``t`` is not known)."""
+        if t is None:
+            return None
+        return make_typed_const(0, t, pos, derived=True)
 
     def _algebraic_simplify(
         self, kind: BinaryOpKind, left, right, pos
@@ -1972,159 +2366,136 @@ class ASTOptimizer:
 
         Folds identities (``x + 0``, ``x * 1``, ``x - x``), constant
         absorption (``x * 0``, ``x AND 0``), and constant re-association
-        on nested add/sub chains.
+        on nested add/sub chains -- each giving the type the operation
+        had: ``b + DOUBLE(0)`` is ``DOUBLE(b)``, not ``b``, and ``w - w`` is
+        the ADDRESS 0.
         """
-        # x + 0 = x, 0 + x = x
-        if kind == BinaryOpKind.ADD:
-            if _is_number(right) and _num_value(right) == 0:
-                return left
-            if _is_number(left) and _num_value(left) == 0:
-                return right
+        lc, rc = typed_const(left), typed_const(right)
+        result_type = binary_type(kind, self._type_of(left), self._type_of(right))
 
-        # x - 0 = x; x - x = 0
-        if kind == BinaryOpKind.SUB:
-            if _is_number(right) and _num_value(right) == 0:
-                return left
-            if (_is_ident(left) and _is_ident(right)
-                    and _ident_name(left) == _ident_name(right)
-                    and self._is_side_effect_free(left)):
-                return make_number_literal(0, pos=pos)
+        def is_value(c, v) -> bool:
+            return c is not None and c[0] == v
 
-        # x * 1 = x, 1 * x = x; x * 0 = 0
+        def identity(x, c):
+            """``x`` combined with an identity element ``c``: x itself,
+            unless ``c`` is an ADDRESS that widened it."""
+            return self._as_address(x, pos) if c[1] is ADDRESS else x
+
+        same_ident = (_is_ident(left) and _is_ident(right)
+                      and _ident_name(left) == _ident_name(right)
+                      and self._is_side_effect_free(left))
+
+        # x + 0 = x, 0 + x = x; the same for OR and XOR; x - 0 = x
+        if kind in (BinaryOpKind.ADD, BinaryOpKind.OR, BinaryOpKind.XOR, BinaryOpKind.SUB):
+            if is_value(rc, 0):
+                return identity(left, rc)
+            if is_value(lc, 0) and kind != BinaryOpKind.SUB:
+                return identity(right, lc)
+
+        # x - x = 0; x XOR x = 0
+        if kind in (BinaryOpKind.SUB, BinaryOpKind.XOR) and same_ident:
+            return self._typed_zero(result_type, pos)
+
+        # x * 1 = x, 1 * x = x; x * 0 = 0 -- a product is an ADDRESS
         if kind == BinaryOpKind.MUL:
-            if _is_number(right) and _num_value(right) == 1:
-                return left
-            if _is_number(left) and _num_value(left) == 1:
-                return right
-            if _is_number(right) and _num_value(right) == 0 and self._is_side_effect_free(left):
-                return make_number_literal(0, pos=pos)
-            if _is_number(left) and _num_value(left) == 0 and self._is_side_effect_free(right):
-                return make_number_literal(0, pos=pos)
+            if is_value(rc, 1):
+                return self._as_address(left, pos)
+            if is_value(lc, 1):
+                return self._as_address(right, pos)
+            if is_value(rc, 0) and self._is_side_effect_free(left):
+                return self._typed_zero(ADDRESS, pos)
+            if is_value(lc, 0) and self._is_side_effect_free(right):
+                return self._typed_zero(ADDRESS, pos)
 
         # x / 1 = x, as an ADDRESS
-        if kind == BinaryOpKind.DIV:
-            if _is_number(right) and _num_value(right) == 1:
-                return self._as_address(left, pos)
+        if kind == BinaryOpKind.DIV and is_value(rc, 1):
+            return self._as_address(left, pos)
 
-        # x AND 0 = 0, x AND FFFF = x
+        # x AND 0 = 0, x AND 0FFFFH = x (an ADDRESS)
         if kind == BinaryOpKind.AND:
-            if _is_number(right):
-                rv = _num_value(right)
-                if rv == 0 and self._is_side_effect_free(left):
-                    return make_number_literal(0, pos=pos)
-                if rv == 0xFFFF:
-                    return left
-            if _is_number(left):
-                lv = _num_value(left)
-                if lv == 0 and self._is_side_effect_free(right):
-                    return make_number_literal(0, pos=pos)
-                if lv == 0xFFFF:
-                    return right
+            for x, c in ((left, rc), (right, lc)):
+                if is_value(c, 0) and self._is_side_effect_free(x):
+                    return self._typed_zero(result_type, pos)
+                if is_value(c, 0xFFFF):
+                    return self._as_address(x, pos)
 
-        # x OR 0 = x, x OR FFFF = FFFF
+        # x OR 0FFFFH = 0FFFFH
         if kind == BinaryOpKind.OR:
-            if _is_number(right):
-                rv = _num_value(right)
-                if rv == 0:
-                    return left
-                if rv == 0xFFFF and self._is_side_effect_free(left):
-                    return make_number_literal(0xFFFF, pos=pos)
-            if _is_number(left):
-                lv = _num_value(left)
-                if lv == 0:
-                    return right
-                if lv == 0xFFFF and self._is_side_effect_free(right):
-                    return make_number_literal(0xFFFF, pos=pos)
+            for x, c in ((left, rc), (right, lc)):
+                if is_value(c, 0xFFFF) and self._is_side_effect_free(x):
+                    return make_typed_const(0xFFFF, ADDRESS, pos, derived=True)
 
-        # x XOR 0 = x; x XOR x = 0; x XOR FFFF = NOT x
+        # x XOR 0FFFFH = NOT x, as an ADDRESS
         if kind == BinaryOpKind.XOR:
-            if _is_number(right) and _num_value(right) == 0:
-                return left
-            if _is_number(left) and _num_value(left) == 0:
-                return right
-            if (_is_ident(left) and _is_ident(right)
-                    and _ident_name(left) == _ident_name(right)
-                    and self._is_side_effect_free(left)):
-                return make_number_literal(0, pos=pos)
-            if _is_number(right) and _num_value(right) == 0xFFFF:
-                return make_unary(UnaryOpKind.NOT, left, pos=pos)
-            if _is_number(left) and _num_value(left) == 0xFFFF:
-                return make_unary(UnaryOpKind.NOT, right, pos=pos)
+            for x, c in ((left, rc), (right, lc)):
+                if is_value(c, 0xFFFF):
+                    return make_unary(UnaryOpKind.NOT, self._as_address(x, pos), pos=pos)
 
-        # (x + c1) + c2 -> x + (c1 + c2); (x - c1) + c2 -> x + (c2 - c1)
-        if kind == BinaryOpKind.ADD and _is_number(right):
-            inner = unwrap_paren(left)
-            if isinstance(inner, P.BinaryOp):
-                ikind = binop_kind(inner)
-                if ikind == BinaryOpKind.ADD and _is_number(inner.right):
-                    new_const = (_num_value(inner.right) + _num_value(right)) & 0xFFFF
-                    return make_binary(
-                        BinaryOpKind.ADD,
-                        inner.left,
-                        make_number_literal(new_const, pos=pos),
-                        pos=pos,
-                    )
-                if ikind == BinaryOpKind.SUB and _is_number(inner.right):
-                    new_const = (_num_value(right) - _num_value(inner.right)) & 0xFFFF
-                    if new_const == 0:
-                        return inner.left
-                    return make_binary(
-                        BinaryOpKind.ADD,
-                        inner.left,
-                        make_number_literal(new_const, pos=pos),
-                        pos=pos,
-                    )
-
-        # (x - c1) - c2 -> x - (c1 + c2); (x + c1) - c2 -> ...
-        if kind == BinaryOpKind.SUB and _is_number(right):
-            inner = unwrap_paren(left)
-            if isinstance(inner, P.BinaryOp):
-                ikind = binop_kind(inner)
-                if ikind == BinaryOpKind.SUB and _is_number(inner.right):
-                    new_const = (_num_value(inner.right) + _num_value(right)) & 0xFFFF
-                    return make_binary(
-                        BinaryOpKind.SUB,
-                        inner.left,
-                        make_number_literal(new_const, pos=pos),
-                        pos=pos,
-                    )
-                if ikind == BinaryOpKind.ADD and _is_number(inner.right):
-                    diff = _num_value(inner.right) - _num_value(right)
-                    if diff == 0:
-                        return inner.left
-                    if diff > 0:
-                        return make_binary(
-                            BinaryOpKind.ADD,
-                            inner.left,
-                            make_number_literal(diff & 0xFFFF, pos=pos),
-                            pos=pos,
-                        )
-                    else:
-                        return make_binary(
-                            BinaryOpKind.SUB,
-                            inner.left,
-                            make_number_literal((-diff) & 0xFFFF, pos=pos),
-                            pos=pos,
-                        )
+        # (x + c1) + c2 -> x + (c1 + c2), and the like with SUB.
+        if kind in (BinaryOpKind.ADD, BinaryOpKind.SUB) and rc is not None:
+            reassociated = self._reassociate(kind, left, rc, pos)
+            if reassociated is not None:
+                return reassociated
 
         # x MOD 1 = 0 and 0 MOD x = 0 (0 MOD 0 is 0 too: the remainder of a
         # zero divisor is the dividend), only when the operand dropped does
         # nothing. There is no `0 / x = 0': 0 / 0 is 0FFFFH.
         if kind == BinaryOpKind.MOD:
             dropped = None
-            if _is_number(right) and _num_value(right) == 1:
+            if is_value(rc, 1):
                 dropped = left
-            elif _is_number(left) and _num_value(left) == 0:
+            elif is_value(lc, 0):
                 dropped = right
             if dropped is not None and self._is_side_effect_free(dropped):
-                return make_number_literal(0, pos=pos)
+                return self._typed_zero(ADDRESS, pos)
 
         return None
+
+    def _reassociate(self, kind: BinaryOpKind, left, rc, pos):
+        """``(x op1 c1) op2 c2`` as ``x op (c)``, when the width is the same
+        throughout: a BYTE ``(x + 200) + 100`` wraps twice at 8 bits, which
+        ``x + 44`` does too, but if the outer addition is 16-bit the inner
+        wrap cannot be folded into it."""
+        inner = unwrap_paren(left)
+        if not isinstance(inner, P.BinaryOp):
+            return None
+        ikind = binop_kind(inner)
+        if ikind not in (BinaryOpKind.ADD, BinaryOpKind.SUB):
+            return None
+        ic = typed_const(inner.right)
+        if ic is None:
+            return None
+        x = inner.left
+        inner_type = binary_type(ikind, self._type_of(x), ic[1])
+        outer_type = binary_type(kind, inner_type, rc[1])
+        if inner_type is None or inner_type is not outer_type:
+            return None
+        # x + d, where d = (+/-c1) + (+/-c2) in the operation's width.
+        d = (ic[0] if ikind == BinaryOpKind.ADD else -ic[0])
+        d += rc[0] if kind == BinaryOpKind.ADD else -rc[0]
+        d = convert(d, outer_type)
+        if d == 0:
+            return self._as_address(x, pos) if outer_type is ADDRESS else x
+        # Prefer the smaller constant: x - 2 rather than x + 0FFFEH.
+        neg = convert(-d, outer_type)
+        op, c = (BinaryOpKind.ADD, d) if d <= neg else (BinaryOpKind.SUB, neg)
+        # `x op c' has to be as wide as the expression it replaces: with an
+        # ADDRESS x any literal will do, with a BYTE x the constant carries
+        # the width.
+        if self._type_of(x) is ADDRESS:
+            const = make_number_literal(c, pos=pos)
+        else:
+            const = make_typed_const(c, outer_type, pos, derived=True)
+        return make_binary(op, x, const, pos=pos)
 
     def _boolean_simplify(
         self, kind: BinaryOpKind, left, right, pos
     ):
-        """Apply boolean and comparison simplifications."""
+        """Apply boolean and comparison simplifications.
+
+        A relation is the BYTE 0FFH or 00H wherever it is used (4.4), so
+        `x = x' is the BYTE 0FFH as a value as much as in a condition.
+        """
         l_is_id = _is_ident(left)
         r_is_id = _is_ident(right)
         # `x REL x` folds only when evaluating x twice is unobservable: a
@@ -2133,49 +2504,16 @@ class ASTOptimizer:
                    and _ident_name(left) == _ident_name(right)
                    and self._is_side_effect_free(left))
 
-        if not self.in_condition and kind in (
-            BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT,
-            BinaryOpKind.GT, BinaryOpKind.LE, BinaryOpKind.GE,
-        ):
-            return None
-
-        # 0FFFFH, not 0FFH: see the note in _eval_binary_const.
-        if kind == BinaryOpKind.EQ:
-            if same_id:
-                return make_number_literal(0xFFFF, pos=pos)
-            if _is_number(left) and _is_number(right):
-                return make_number_literal(
-                    0xFFFF if _num_value(left) == _num_value(right) else 0,
-                    pos=pos,
-                )
-
-        if kind == BinaryOpKind.NE and same_id:
-            return make_number_literal(0, pos=pos)
-        if kind == BinaryOpKind.LT and same_id:
-            return make_number_literal(0, pos=pos)
-        if kind == BinaryOpKind.GT and same_id:
-            return make_number_literal(0, pos=pos)
-        if kind == BinaryOpKind.LE and same_id:
-            return make_number_literal(0xFFFF, pos=pos)
-        if kind == BinaryOpKind.GE and same_id:
-            return make_number_literal(0xFFFF, pos=pos)
+        if same_id and kind in RELATIONS:
+            holds = kind in (BinaryOpKind.EQ, BinaryOpKind.LE, BinaryOpKind.GE)
+            return make_typed_const(0xFF if holds else 0, BYTE, pos, derived=True)
 
         # (a AND b) AND b -> a AND b (idempotent). Dropping the repeated
-        # operand is only sound when evaluating it has no side effect.
-        if kind == BinaryOpKind.AND:
+        # operand is only sound when evaluating it has no side effect. The
+        # type is unchanged: b's type is already in (a AND b)'s.
+        if kind in (BinaryOpKind.AND, BinaryOpKind.OR):
             inner = unwrap_paren(left)
-            if isinstance(inner, P.BinaryOp) and binop_kind(inner) == BinaryOpKind.AND:
-                if r_is_id and self._is_side_effect_free(right):
-                    rn = _ident_name(right)
-                    if _is_ident(inner.right) and _ident_name(inner.right) == rn:
-                        return left
-                    if _is_ident(inner.left) and _ident_name(inner.left) == rn:
-                        return left
-
-        # (a OR b) OR b -> a OR b (idempotent); same side-effect rule.
-        if kind == BinaryOpKind.OR:
-            inner = unwrap_paren(left)
-            if isinstance(inner, P.BinaryOp) and binop_kind(inner) == BinaryOpKind.OR:
+            if isinstance(inner, P.BinaryOp) and binop_kind(inner) == kind:
                 if r_is_id and self._is_side_effect_free(right):
                     rn = _ident_name(right)
                     if _is_ident(inner.right) and _ident_name(inner.right) == rn:
@@ -2184,52 +2522,42 @@ class ASTOptimizer:
                         return left
 
         # x AND x = x; x OR x = x
-        if kind == BinaryOpKind.AND and same_id:
-            return left
-        if kind == BinaryOpKind.OR and same_id:
+        if kind in (BinaryOpKind.AND, BinaryOpKind.OR) and same_id:
             return left
 
         return None
 
     def _optimize_builtin_call(self, name: str, args: list, pos):
-        """Optimize calls to built-in functions with constant args."""
-        if len(args) == 0:
+        """Fold a built-in procedure of constant arguments, by type."""
+        if len(args) == 0 or not self._is_builtin(name):
             return None
-        a0 = unwrap_paren(args[0])
+        if self.restricted:
+            return self._fold_builtin_untyped(name, args, pos)
+        consts = [typed_const(a) for a in args]
+        if any(c is None for c in consts):
+            return None
+        folded = fold_builtin(name, consts)  # type: ignore[arg-type]
+        if folded is None:
+            return None
+        return make_typed_const(folded[0], folded[1], pos,
+                                derived=any(is_derived(a) for a in args))
 
-        # LOW(const) -> const & 0xFF
-        if name == "LOW" and isinstance(a0, P.NumberLiteral):
-            return make_number_literal(number_value(a0) & 0xFF, pos=pos)
-
-        # HIGH(const) -> (const >> 8) & 0xFF
-        if name == "HIGH" and isinstance(a0, P.NumberLiteral):
-            return make_number_literal((number_value(a0) >> 8) & 0xFF, pos=pos)
-
-        # DOUBLE(const) -> zero-extend byte to address
-        if name == "DOUBLE" and isinstance(a0, P.NumberLiteral):
-            return make_number_literal(number_value(a0) & 0xFFFF, pos=pos)
-
-        if len(args) == 2:
-            a1 = unwrap_paren(args[1])
-            if isinstance(a0, P.NumberLiteral) and isinstance(a1, P.NumberLiteral):
-                v0 = number_value(a0)
-                v1 = number_value(a1)
-                if name == "SHL":
-                    return make_number_literal((v0 << v1) & 0xFFFF, pos=pos)
-                if name == "SHR":
-                    return make_number_literal((v0 >> v1) & 0xFFFF, pos=pos)
-                if name == "ROL":
-                    val = v0 & 0xFF
-                    count = v1 & 7
-                    result = ((val << count) | (val >> (8 - count))) & 0xFF
-                    return make_number_literal(result, pos=pos)
-                if name == "ROR":
-                    val = v0 & 0xFF
-                    count = v1 & 7
-                    result = ((val >> count) | (val << (8 - count))) & 0xFF
-                    return make_number_literal(result, pos=pos)
-
-        return None
+    def _fold_builtin_untyped(self, name: str, args: list, pos):
+        """A built-in of constants in a restricted expression, as numbers."""
+        if not all(_is_number(a) for a in args):
+            return None
+        values = [_num_value(a) for a in args]
+        name = name.upper()
+        if len(values) == 1:
+            v = values[0]
+            result = {"LOW": v & 0xFF, "HIGH": (v >> 8) & 0xFF, "DOUBLE": v & 0xFFFF}.get(name)
+        elif len(values) == 2 and name in ("SHL", "SHR", "ROL", "ROR"):
+            folded = fold_builtin(name, [(values[0], ADDRESS if name in ("SHL", "SHR") else BYTE),
+                                         (values[1], BYTE)])
+            result = None if folded is None else folded[0]
+        else:
+            result = None
+        return None if result is None else make_number_literal(result, pos=pos)
 
     def _log2_if_power_of_2(self, n: int) -> int | None:
         """Return log2(n) if n is a power of 2, else None."""
