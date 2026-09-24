@@ -340,7 +340,7 @@ def _layout(asm: str) -> dict[str, int]:
     at = 0
     for raw in asm.splitlines():
         line = raw.split(";")[0].strip()
-        if not line or line == ".z80" or line.startswith(("public", "extrn")):
+        if not line or line in (".z80", "cseg") or line.startswith(("public", "extrn")):
             continue
         if line.endswith(":"):
             offsets[line[:-1]] = at

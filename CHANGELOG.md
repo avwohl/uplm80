@@ -334,6 +334,25 @@ Each fix has a regression test that fails without it.
   literal (`LAST(x)`, `SIZE(x)`, `-1`) is used as one. MP/M II and 80un are
   about 670 bytes smaller at `-O2`.
 
+- **A program is laid out as Intel's PL/M-80 lays it out: the variables
+  last.** The code and every constant - strings, `.(...)` lists, DATA
+  declared in a procedure - are in the code segment (`cseg`); the data
+  segment (`dseg`) holds `??AUTO`, then the stack of BARE and MP/M modes,
+  then the variables in the order the source declares them, a procedure's
+  static variables among them. ul80 puts every data segment after all the
+  code, the runtime modules' included, so nothing follows a program's last
+  variable, and `.MEMORY` is still the end of the whole program. DRI's
+  programs use everything from their last variable up to MAXB, which works
+  because DRI's layout puts nothing after it (MP/M II's `PIP.PRL` sets
+  `LXI SP,2251H`: its stack is at 21EDH to 2250H and its variables start at
+  2251H). `UTIL5/SUB.PLM` builds SUBMIT's command file at
+  `.minimum$buffer`, and `UTIL5/MSPL.PLM` reads a file into `.dummy$buffer`;
+  uplm80 put the strings, `??AUTO` and the stack after the last variable, so
+  a command file of more than about 1.1K overwrote SUBMIT's messages, and
+  SPOOL printed NULs for the first records of a file it spooled itself.
+  In MP/M II and 80un the change only moves lines: every output holds the
+  same instructions and data as before, in another order.
+
 ### Added
 
 - **`tests/plm_difftest.py`**, a differential test: random programs over

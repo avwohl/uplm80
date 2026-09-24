@@ -482,6 +482,103 @@ class CodeGenerator:
         self._emit("ds", str(size))
         self._emit_label("??STACK")   # label above the buffer: SP starts here
 
+    def _number_declarations(self, modules) -> None:
+        """Number every declaration in the order the source makes it.
+
+        Variables are laid out in that order, the way Intel's PL/M-80 lays
+        them out, whatever order code generation reaches them in: a
+        module's own declarations are generated before its procedures, and
+        a procedure's static variables (INITIAL, or not in ??AUTO) were
+        placed after every module variable, even one the source declares
+        after the procedure (see :meth:`_emit_data_segment`).
+        """
+        self._decl_seq = {}
+        self._data_order = []
+        stack: list = [iter(modules)]
+        while stack:
+            try:
+                n = next(stack[-1])
+            except StopIteration:
+                stack.pop()
+                continue
+            if isinstance(n, (P.DeclItem, P.DeclItemBasedGroup, P.ProcDecl)):
+                self._decl_seq[id(n)] = len(self._decl_seq)
+            if isinstance(n, (list, tuple)):
+                stack.append(iter(n))
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields:
+                stack.append(iter([getattr(n, f, None) for f in fields if f != "pos"]))
+
+    def _note_storage(self, decl, start: int) -> None:
+        """Record the data-segment lines from ``start`` on as ``decl``'s."""
+        end = len(self.data_segment)
+        if end > start:
+            self._data_order.append(
+                (start, end, self._decl_seq.get(id(decl), len(self._decl_seq))))
+
+    def _emit_constants(self) -> None:
+        """The constants, in the code segment after the code: DATA declared in
+        procedures, the constants of `.(...)' lists, and strings.
+
+        Intel's PL/M-80 keeps every constant with the code, and nothing but
+        variables in the data segment after it.  uplm80 put the strings and
+        `.(...)' constants, and the DATA of procedures, after the module's
+        last variable.  DRI's programs use everything from their last
+        variable up to MAXB as a buffer - UTIL5/SUB.PLM's command buffer at
+        `.minimum$buffer', UTIL5/MSPL.PLM's file buffer at `.dummy$buffer' -
+        so SUBMIT wrote a long command file over its own messages, and
+        SPOOL read the first records of a file over its own.
+        """
+        if self.const_segment:
+            self._emit()
+            self._emit(comment="Constants")
+            self.output.extend(self.const_segment)
+            self.const_segment = []
+        if self.string_literals:
+            self._emit()
+            self._emit(comment="String literals")
+            for label, value in self.string_literals:
+                self._emit_label(label)
+                self._emit("db", self._escape_string(value))
+
+    def _emit_data_segment(self) -> None:
+        """The data segment: ??AUTO, the stack of the modes that carry one,
+        and then the module's variables, in the order the source declares
+        them - so that the last variable declared is the last thing in the
+        module, as Intel's PL/M-80 lays a program out (PIP.COM's 100-byte
+        stack is at 21EDH to 2250H - `LXI SP,2251H' at 048DH of MP/M II's
+        PIP.PRL - and its variables start at 2251H).
+
+        The linker puts every module's data segment after all the code
+        segments, the runtime modules' included, so nothing follows a
+        program's last variable but the next module's variables, and
+        .MEMORY (the linker's __END__) is still the end of the whole program.
+        """
+        self._emit()
+        self._emit("dseg")
+        self._emit(comment="Data segment")
+        keyed: dict[int, int] = {}
+        for start, end, key in self._data_order:
+            for i in range(start, end):
+                keyed[i] = key
+        # What is not a declaration's storage has no storage: EXTRN, EQU.
+        header = [l for i, l in enumerate(self.data_segment) if i not in keyed]
+        variables = [self.data_segment[i]
+                     for i in sorted(keyed, key=lambda i: (keyed[i], i))]
+        if header:
+            self.output.extend(header)
+        if getattr(self, "total_auto_storage", 0) > 0:
+            self._emit()
+            self._emit(comment=f"Shared automatic storage ({self.total_auto_storage} bytes)")
+            self._emit_label("??AUTO")
+            self._emit("ds", str(self.total_auto_storage))
+        self._emit_stack_storage()
+        if variables:
+            self._emit()
+            self._emit(comment="Variables")
+            self.output.extend(variables)
+
     def _emit_at_defs(self) -> None:
         """The EQUs that define AT variables, after every symbol they can name.
 
@@ -517,7 +614,16 @@ class CodeGenerator:
         self.label_counter = 0
         self.string_counter = 0
         self.data_segment: list[AsmLine] = []
-        self.code_data_segment: list[AsmLine] = []  # DATA values emitted inline in code
+        self.code_data_segment: list[AsmLine] = []  # module-level DATA, in the code segment
+        # Constants, placed in the code segment after the code: DATA declared
+        # inside procedures and the constants of `.(...)' lists (see
+        # _emit_constants).
+        self.const_segment: list[AsmLine] = []
+        # Where each declaration comes in the source, and the storage lines
+        # each one appended to data_segment, as (start, end, position): the
+        # variables are laid out in that order (see _emit_data_segment).
+        self._decl_seq: dict[int, int] = {}
+        self._data_order: list[tuple[int, int, int]] = []
         self.at_defs: list[AsmLine] = []  # AT variables' EQUs, after all storage
         # The constants of a `.(...)' in the value list being emitted.
         self._pending_constants: list[AsmLine] = []
@@ -1878,6 +1984,7 @@ class CodeGenerator:
         self.data_segment = []
         self.at_defs = []
         self.code_data_segment = []
+        self.const_segment = []
         self.string_literals = []
         self.needs_runtime = set()
         self.needs_end_symbol = False
@@ -1885,6 +1992,7 @@ class CodeGenerator:
         self._needs_stack = False
         self.literal_macros = {}
         self._survey_aliases([module])
+        self._number_declarations([module])
 
         shape = module_shape(module)
         self._module_decl_items = [d for d in shape.decls if isinstance(d, P.DeclItem)]
@@ -1895,8 +2003,10 @@ class CodeGenerator:
         self._emit(comment="Generated by uplm80")
         self._emit()
 
-        # Emit .z80 directive for assembler
+        # Emit .z80 directive for assembler.  Code and constants go in the
+        # code segment, variables in the data segment (_emit_data_segment).
         self._emit(".z80")
+        self._emit("cseg")
         self._emit()
 
         # Origin if specified
@@ -2031,33 +2141,11 @@ class CodeGenerator:
             # End of runtime library label
             self._emit_label("??RTEND")
 
-        # Emit string literals
-        if self.string_literals:
-            self._emit()
-            self._emit(comment="String literals")
-            for label, value in self.string_literals:
-                self._emit_label(label)
-                escaped = self._escape_string(value)
-                self._emit("db", escaped)
-
-        # Emit data segment
-        if self.data_segment:
-            self._emit()
-            self._emit(comment="Data segment")
-            self.output.extend(self.data_segment)
-
-        # Emit shared automatic storage for procedure locals
-        if hasattr(self, 'total_auto_storage') and self.total_auto_storage > 0:
-            self._emit()
-            self._emit(comment=f"Shared automatic storage ({self.total_auto_storage} bytes)")
-            self._emit_label("??AUTO")
-            self._emit("ds", str(self.total_auto_storage))
-
-        # Emit stack storage for the modes that carry their own
-        self._emit_stack_storage()
-
-        # Note: For CPM mode, stack is provided by CP/M (set from BDOS address at 0006H).
-        # For BARE mode, stack storage (??STACK) is emitted above.
+        # The constants after the code, then the data segment: ??AUTO, the
+        # stack (BARE and MP/M modes; CP/M takes it from the BDOS address
+        # at 0006H) and the variables, the last declared last.
+        self._emit_constants()
+        self._emit_data_segment()
 
         # Define __END__ label if program uses .MEMORY built-in
         # __END__ marks the first free byte after all code/data
@@ -2103,6 +2191,7 @@ class CodeGenerator:
         self.data_segment = []
         self.at_defs = []
         self.code_data_segment = []
+        self.const_segment = []
         self.string_literals = []
         self.needs_runtime = set()
         self.needs_end_symbol = False
@@ -2110,6 +2199,7 @@ class CodeGenerator:
         self._needs_stack = False
         self.literal_macros = {}
         self._survey_aliases(modules)
+        self._number_declarations(modules)
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]
@@ -2123,8 +2213,10 @@ class CodeGenerator:
         self._emit(comment="Generated by uplm80")
         self._emit()
 
-        # Emit .z80 directive for assembler
+        # Emit .z80 directive for assembler.  Code and constants go in the
+        # code segment, variables in the data segment (_emit_data_segment).
         self._emit(".z80")
+        self._emit("cseg")
         self._emit()
 
         # Use origin from first module if specified
@@ -2256,30 +2348,9 @@ class CodeGenerator:
             # End of runtime library label
             self._emit_label("??RTEND")
 
-        # Emit string literals
-        if self.string_literals:
-            self._emit()
-            self._emit(comment="String literals")
-            for label, value in self.string_literals:
-                self._emit_label(label)
-                escaped = self._escape_string(value)
-                self._emit("db", escaped)
-
-        # Emit data segment
-        if self.data_segment:
-            self._emit()
-            self._emit(comment="Data segment")
-            self.output.extend(self.data_segment)
-
-        # Emit shared automatic storage
-        if hasattr(self, 'total_auto_storage') and self.total_auto_storage > 0:
-            self._emit()
-            self._emit(comment=f"Shared automatic storage ({self.total_auto_storage} bytes)")
-            self._emit_label("??AUTO")
-            self._emit("ds", str(self.total_auto_storage))
-
-        # Emit stack storage for the modes that carry their own
-        self._emit_stack_storage()
+        # The constants after the code, then the data segment (see generate).
+        self._emit_constants()
+        self._emit_data_segment()
 
         # Define __END__ label if program uses .MEMORY built-in
         # __END__ marks the first free byte after all code/data
@@ -2408,6 +2479,12 @@ class CodeGenerator:
         with multiple names emits one storage row per name with each
         getting its own symbol entry.
         """
+        start = len(self.data_segment)
+        self._gen_var_decl_names(decl)
+        self._note_storage(decl, start)
+
+    def _gen_var_decl_names(self, decl) -> None:
+        """The storage of each name :meth:`_gen_var_decl` declares."""
         if isinstance(decl, P.DeclItemBasedGroup):
             for bd in decl.based_decls or []:
                 base_name = (
@@ -2609,10 +2686,14 @@ class CodeGenerator:
             self._emit_at_decl(asm_name, at_location, sym, extra=index * size)
             return
 
-        # Generate storage
-        # DATA values can go inline in code (for module-level bootstrap) or data segment
-        target_segment = self.code_data_segment if self.emit_data_inline else self.data_segment
-        if initial_values_nodes:
+        # Generate storage.  DATA is stored with the code (PL/M-80 Programming
+        # Manual, 6.2.9): a module's own at the head of it, where DRI's
+        # sources put their `jump byte data (0c3h)', anything else among the
+        # constants after it.  INITIAL is a variable like any other.
+        if data_values_nodes:
+            target_segment = (self.code_data_segment if self.emit_data_inline
+                              else self.const_segment)
+        else:
             target_segment = self.data_segment
 
         if (data_values_nodes or initial_values_nodes) and index > 0 and first_asm:
@@ -2628,7 +2709,7 @@ class CodeGenerator:
                 self._scalar_widths(data_type or DataType.BYTE, struct_members,
                                     dimension) * n_names,
                 spare=1 if (data_type or DataType.BYTE) == DataType.BYTE else 2,
-                inline=bool(data_values_nodes) and self.emit_data_inline,
+                target=target_segment,
             )
         elif use_shared:
             # Using shared automatic storage - no individual allocation needed
@@ -2829,13 +2910,12 @@ class CodeGenerator:
             self.at_defs.append(
                 AsmLine(label=asm_name, opcode="EQU", operands=operand))
 
-    def _emit_data_values(self, values, dtype: DataType, inline: bool = False) -> None:
-        """Emit typed DATA values to the data segment or inline code segment.
+    def _emit_data_values(self, values, dtype: DataType, target: list[AsmLine]) -> None:
+        """Emit typed DATA or INITIAL values onto ``target``.
 
         Accepts the raw typed expression nodes from the AST so callers
         don't need a separate conversion pass.
         """
-        target = self.code_data_segment if inline else self.data_segment
         for val in values:
             if isinstance(val, P.NumberLiteral):
                 # A BYTE holds the low byte: -1 folds to 0FFFFH, which is
@@ -2898,7 +2978,7 @@ class CodeGenerator:
                                       operands=self._constant_list_label(val)))
             elif isinstance(val, P.ParenExpr):
                 # Parenthesised single value — unwrap and re-emit.
-                self._emit_data_values([val.inner], dtype, inline=inline)
+                self._emit_data_values([val.inner], dtype, target)
             else:
                 raise CodeGenError(
                     f"Unsupported value in DATA/INITIAL: {type(val).__name__}")
@@ -3040,17 +3120,17 @@ class CodeGenerator:
         return label
 
     def _emit_value_list(self, values, widths: list[int], spare: int,
-                         inline: bool = False) -> None:
+                         target: list[AsmLine]) -> None:
         """Emit a DATA or INITIAL value list, and reserve what it leaves unfilled.
 
         ``widths`` is the byte width of each scalar the list fills
         (:meth:`_scalar_widths`), ``spare`` the width a value past the last of
         them takes.
 
-        INITIAL goes to the data segment; DATA to the same place, or inline in
-        the code when ``inline`` is set.  DATA is INITIAL stored with the code
-        and nothing else (PL/M-80 Programming Manual, 6.2.9), so the two are
-        laid out alike.  DATA used to be emitted one value at a time at the
+        ``target`` is where the values go: the data segment for INITIAL, the
+        code segment for DATA.  DATA is INITIAL stored with the code and
+        nothing else (PL/M-80 Programming Manual, 6.2.9), so the two are laid
+        out alike.  DATA used to be emitted one value at a time at the
         declaration's width and stopped at the last value: a STRUCTURE came
         out one byte per value and short, and an array shorter than its
         dimension lost the rest.  MP/M II's UTIL2/SPRSP.PLM is nothing but
@@ -3081,7 +3161,6 @@ class CodeGenerator:
         # Past the declared scalars - a list longer than its declaration - the
         # values keep the declaration's own width (``spare``), as they always
         # have: `DECLARE MSG BYTE DATA ('HELLO$')' is an idiom.
-        target = self.code_data_segment if inline else self.data_segment
         slot = 0
         emitted = 0
         for val in values:
@@ -3102,14 +3181,13 @@ class CodeGenerator:
             width = widths[slot] if slot < len(widths) else spare
             slot += 1
             self._emit_data_values(
-                [val], DataType.BYTE if width == 1 else DataType.ADDRESS,
-                inline=inline)
+                [val], DataType.BYTE if width == 1 else DataType.ADDRESS, target)
             emitted += width
         if emitted < sum(widths):
             target.append(
                 AsmLine(opcode="ds", operands=str(sum(widths) - emitted))
             )
-        self.data_segment.extend(self._pending_constants)
+        self.const_segment.extend(self._pending_constants)
         self._pending_constants = []
 
     def _gen_proc_decl(self, decl) -> None:
@@ -3275,9 +3353,11 @@ class CodeGenerator:
                     # Fallback: individual storage
                     asm_name = f"@{name}${self._mangle_name(param)}"
                     # Allocate individual storage in data segment
+                    start = len(self.data_segment)
                     self.data_segment.append(
                         AsmLine(label=asm_name, opcode="ds", operands=str(param_size))
                     )
+                    self._note_storage(decl, start)
 
                 self.symbols.define(
                     Symbol(
@@ -7741,15 +7821,15 @@ class CodeGenerator:
 
         if isinstance(expr, P.LocationOfList):
             label = self._new_label("DATA")
-            self.data_segment.append(AsmLine(label=label))
+            self.const_segment.append(AsmLine(label=label))
             for val in expr.values or []:
                 v = unwrap_paren(val)
                 if isinstance(v, P.NumberLiteral):
-                    self.data_segment.append(
+                    self.const_segment.append(
                         AsmLine(opcode="db", operands=self._format_number(number_value(v)))
                     )
                 elif isinstance(v, P.StringLiteral):
-                    self.data_segment.append(
+                    self.const_segment.append(
                         AsmLine(opcode="db", operands=self._escape_string(string_value(v)))
                     )
             self._emit("ld", f"hl,{label}")
