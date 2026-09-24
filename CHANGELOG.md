@@ -12,6 +12,17 @@ routines, constant folding, strength reduction and DATA/INITIAL values.
 interpreter as the reference and compares a compiled table of divisions
 against it at `-O0` to `-O3`.
 
+Every expression now has the value and the type Intel's PL/M-80 Programming
+Manual gives it, at every optimization level: a constant up to 255 is a
+BYTE; `+ - AND OR XOR` of two BYTEs and `-` or `NOT` of one wrap at eight
+bits; `* / MOD` are ADDRESS; a relation is the BYTE 0FFH or 0. The optimizer
+folded constants as untyped 16-bit numbers that code generation then typed
+by magnitude, so arithmetic next to a folded, propagated or rewritten operand
+could change width. `uplm80/plm_types.py` states the rules once, the
+optimizer and the code generator follow them, and `tests/plm_difftest.py`
+checks random programs against a Python model of them. DO loops now end the
+way DRI's end, when the increment carries out of the index.
+
 ### Fixed
 
 - **`x MOD 0` was 0; PL/M-80 gives `x`.** DRI's PL/M-80 sends every `/` and
@@ -50,6 +61,93 @@ against it at `-O0` to `-O3`.
     in a BYTE list the value was a word. Such an expression is now evaluated
     the way PL/M-80 evaluates it and takes the width of its slot. An operator
     the assembler cannot evaluate is an error rather than a `+`.
+- **A folded constant was typed by its size, not by PL/M-80's rules.**
+  `(8 MOD 0FFH) + b` with `b = 0FFH` gave 7 at `-O1` and above: the remainder
+  is the ADDRESS 8, and adding 0FFH carries into the high byte (107H). The
+  same folded 7 made `(7 MOD 0) > 1000H` fail to compile as "comparison BYTE >
+  4096 is always false". Folding is typed now; an ADDRESS constant below 256
+  is carried as `DOUBLE(n)`, and a constant the optimizer derived is not held
+  against the program by the impossible-comparison check, nor is a relation
+  between two constants.
+- **`NOT` and unary `-` of a BYTE worked in sixteen bits,** even at `-O0`:
+  `(NOT 7) MOD w` divided 0FFF8H. `NOT 7` is the BYTE 0F8H, `3 - 5` the BYTE
+  0FEH and `-1` the BYTE 0FFH.
+- **`DO b = 0 TO 255` with a BYTE index ran no times.** DRI's PL/M-80 tests
+  the limit before each pass and leaves the loop when the increment carries
+  out of the index (GENSYS.COM's code for `do j = common$base to 0ffh` ends
+  `INR A / JNZ top`; LOAD.COM's `BY 128` loop, `DAD D / JNC top`), so the loop
+  runs 256 times and leaves the index 0. BYTE and ADDRESS loops now do the
+  same, a step that would wrap stops the loop, and the limit, start and step
+  are converted to the index's type (`BY -1` is `BY 0FFH`). GENSYS's two
+  loops to 0FFH ran no times when they started at 0.
+- **`-O3` lost a procedure's side effect.** `cnt = 0; rw = f; call ph(cnt)`,
+  where `f` increments `cnt`, printed 0. A call now ends everything the
+  optimizer knows about variables, and so does a store through a BASED
+  variable, a subscript or a member. What a loop body sets is not known after
+  the loop, an unrolled loop leaves its index as the loop would, `.x` after
+  `x = 5` is no longer `5`, and `-O3` inlines only a parameterless untyped
+  procedure whose names mean the same at the call.
+- **BYTE `x * 2` became the BYTE add `x + x`,** so 200 * 2 was 144 at `-O2`.
+  The product is an ADDRESS. Other rewrites kept the value but not the type
+  and are fixed the same way: `b AND 0FFFFH`, `b XOR 0FFFFH`, `b + DOUBLE(0)`
+  and `x * 1` are ADDRESS, `(b + 100) + 300` is not reassociated across the
+  change of width, and a copy `w = b` is not propagated.
+- **An element of a BYTE array member was typed ADDRESS.** Code for
+  `s.m(i)` compared and combined it in sixteen bits, and a test against 0
+  loaded the byte into A and then tested HL: SDIR (DSH.PLM:290, 294) printed
+  every file's update and create stamps whether it had them or not.
+- **`??mul16` took the carry of its own add into the product,** so any
+  product that overflowed sixteen bits was wrong: 81H * 511 gave 817FH.
+- **A nested subscript's release restored an outer claim's spill of DE,**
+  and `aw(aw(aw(i) AND 7) AND 7)` added a stale DE in place of the base.
+- **A BYTE value generated into A was read from HL** by a store through a
+  BASED ADDRESS, by `MEMORY(b)` as a value and as a target, and by `MOVE`
+  with a constant count and `TIME`; `OUTPUT(p) = b` replaced it with L.
+  BYTE `1 - x` was `x XOR 1`, right only for 0 and 1.
+- **`LOW` could take A for its operand after an unrelated embedded
+  assignment.** `(b := w) + LOW(LAST(a))` added the low byte of `w` for 7: the
+  flag that lets `LOW((b := w))` skip reloading A outlived the assignment.
+- **Shift and rotate counts of 129 or more shifted nothing:** the count loop
+  tested the sign. Counts are unsigned BYTEs now, and a constant rotate is
+  unrolled.
+- **The DJNZ form of `DO i = 0 TO n`** skipped the loop for a limit of 255,
+  took a variable limit once where PL/M-80 evaluates it every pass, ignored
+  an assignment to the index in the body (ED's and PIP's FILLSOURCE end
+  with `I = N`) and left the index unset after the loop.
+
+### Changed
+
+- **Constants in expressions are typed as PL/M-80 types them, so some
+  programs compute something else.** `w = -1` stores 00FFH, since the
+  manual makes `-1` the BYTE `0 - 1` (write 0FFFFH for all ones); `NOT 0` is
+  0FFH. Comparing a BYTE with
+  a constant from 0FF00H up used to compare the low byte and is now the
+  "always false/true" error, since the BYTE is zero-extended. An embedded
+  assignment has the type of its right half (manual 4.6.3); BYTE `PLUS` and
+  `MINUS` BYTE is a BYTE; `LENGTH` and `LAST` are BYTE when they fit; `CARRY`
+  is 0FFH when set, as DRI's code has it; `SCL` and `SCR` have their
+  pattern's type and rotate an ADDRESS in 17 bits; a two-character string is
+  an ADDRESS constant, first character high.
+- **`SHL` and `SHR` stay ADDRESS** even of a BYTE pattern, where the manual
+  and DRI's compiler shift a BYTE in eight bits: programs written for uplm80
+  rely on it (80un builds words with `lo + SHL(b, 8)`).
+
+### Added
+
+- **`tests/plm_difftest.py`**, a differential test: random programs over
+  BYTE and ADDRESS variables, constants, every operator but `PLUS` and
+  `MINUS` (whose carry-in depends on the code before them), built-ins, calls of procedures that change globals,
+  BASED stores and DO loops, compiled at `-O0` to `-O3`, run under cpmemu and
+  compared with a Python model of the manual's rules. The suite runs three
+  programs; `scripts/difftest.py --seeds N` runs more.
+
+### Known issues
+
+- **upeepz80 0.2.4 rewrites `ld a,(x) / cpl / cpl / inc a / push af /
+  ld (x),a / pop af` into `ld hl,x / inc (hl)` although A is read next.**
+  `b, w = -(NOT b)` - a BYTE and an ADDRESS assigned together - leaves `w`
+  holding A's old value at `-O1` and above. The differential test found it in
+  one of 700 random programs; main has it too. The fix belongs in upeepz80.
 
 ## 0.3.6 — 2026-09-24
 
