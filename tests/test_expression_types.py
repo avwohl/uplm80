@@ -635,6 +635,28 @@ call run;
 """, [0x39, 0x35, 0x33, 0x68, 0xCB, 0xCC, 0x68, 0x1A, 0x34, 0x34])
 
 
+def test_plus_and_minus_of_a_constant_keep_the_carry():
+    """BYTE `c PLUS x' loaded c into A first; `ld a,0' is `xor a' after
+    the peephole, which clears the carry PLUS and MINUS read."""
+    _check("""
+declare (b1, b2, b3, z, one) byte, ab(4) byte;
+run: procedure;
+  b1 = 0ffh; z = 0; one = 1; ab(1) = 7;
+  b2 = b1 + 1; b3 = 0 plus z; call ph(b3);
+  b2 = z - 1; b3 = 0 minus z; call ph(b3);
+  b2 = b1 + 1; b3 = 5 plus z; call ph(b3);
+  b2 = z - 1; b3 = 5 minus one; call ph(b3);
+  b2 = b1 + 1; b3 = 0 plus 0; call ph(b3);
+  b2 = z - 1; b3 = 0 minus 0; call ph(b3);
+  b2 = b1 + 1; b3 = 0 plus ab(one); call ph(b3);
+  b2 = z - 1; b3 = 0 minus ab(one); call ph(b3);
+  b2 = z + 1; b3 = 0 minus one; call ph(b3);
+  b2 = b1 + 1; b3 = (0 minus z) minus z; call ph(b3);
+end run;
+call run;
+""", [1, 0xFF, 6, 3, 1, 0xFF, 8, 0xF8, 0xFF, 0xFE])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])

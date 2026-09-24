@@ -6463,6 +6463,10 @@ class CodeGenerator:
         """
         mnemonic = "adc" if op == BinaryOpKind.PLUS else "sbc"
         right_const = self._get_const_byte_value(right)
+        left_const = self._get_const_byte_value(left)
+        if left_const is not None:
+            self._gen_carry_op_const_left(left_const, right, right_const, op)
+            return DataType.BYTE
         self._gen_expr_to_a(left)
         if right_const is not None:
             self._emit(mnemonic, f"a,{self._format_number(right_const)}")
@@ -6473,6 +6477,51 @@ class CodeGenerator:
         self._emit("pop", "af")
         self._emit(mnemonic, "a,b")
         return DataType.BYTE
+
+    def _gen_carry_op_const_left(self, c: int, right, right_const: int | None,
+                                 op: BinaryOpKind) -> None:
+        """``c PLUS right`` or ``c MINUS right`` of BYTEs, c a constant.
+
+        Loading c into A first, as the general form does, is `ld a,0' for
+        0, which the peephole makes the one-byte `xor a' -- clearing the
+        very carry PLUS and MINUS read: `0 PLUS z' after an add that
+        carried gave 0. So the other operand goes into A, by loads that
+        leave the flags alone, and c is added to it: c + x + carry for
+        PLUS; for MINUS, c - x - borrow is `sbc' from c when c can be
+        loaded, and c + NOT x + (1 - borrow) -- `cpl / ccf / adc a,c /
+        ccf', which also leaves the borrow -- when it is 0.
+        """
+        if right_const is not None and right_const == 0:
+            # c PLUS 0 or c MINUS 0: the carry alone.
+            if c != 0:
+                self._emit("ld", f"a,{self._format_number(c)}")
+                self._emit("adc" if op == BinaryOpKind.PLUS else "sbc", "a,0")
+            else:
+                self._emit("sbc", "a,a")          # A = -carry, carry kept
+                if op == BinaryOpKind.PLUS:
+                    self._emit("and", "1")        # 0 + 0 + carry, no carry out
+            return
+        if right_const is not None:
+            self._emit("ld", f"a,{self._format_number(right_const)}")
+        elif self._expr_preserves_hl(right):
+            self._gen_expr_to_a(right)            # a load: no flags touched
+        else:
+            self._emit("push", "af")
+            self._gen_expr_to_a(right)
+            self._emit("ld", "b,a")
+            self._emit("pop", "af")
+            self._emit("ld", "a,b")
+        if op == BinaryOpKind.PLUS:
+            self._emit("adc", f"a,{self._format_number(c)}")
+        elif c != 0:
+            self._emit("ld", "b,a")
+            self._emit("ld", f"a,{self._format_number(c)}")
+            self._emit("sbc", "a,b")
+        else:
+            self._emit("cpl")
+            self._emit("ccf")
+            self._emit("adc", "a,0")
+            self._emit("ccf")
 
     def _gen_expr_to_hl(self, expr) -> None:
         """Generate an expression into ``HL``, widening a byte result.
