@@ -3328,13 +3328,8 @@ class CodeGenerator:
 
         # For non-reentrant LOCAL procedures, store args directly to parameter memory
         # For reentrant procedures, external procedures, or indirect calls, use stack
-        use_stack = True
-        full_callee_name = None
-        if (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
-                and not sym.is_external and not sym.is_public):
-            use_stack = False
-            # Get the full procedure name (needed for storage_labels lookup)
-            full_callee_name = sym.name
+        use_stack = not (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
+                         and not sym.is_external and not sym.is_public)
 
         if use_stack:
             # Stack-based parameter passing (reentrant or indirect calls)
@@ -3345,70 +3340,7 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("push", "hl")
         else:
-            # Direct memory parameter passing (non-reentrant)
-            # Last param is passed in register (A for BYTE, HL for ADDRESS)
-            # Other params are stored to memory
-            last_param_idx = len(args) - 1
-            uses_reg = sym.uses_reg_param and len(args) > 0
-
-            for i, arg in enumerate(args):
-                if i < len(sym.params):
-                    param_name = sym.params[i]
-                    param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
-                    is_last = (i == last_param_idx)
-
-                    # Last param passed in register - just evaluate it
-                    if is_last and uses_reg:
-                        # Optimize constants for BYTE
-                        if param_type == DataType.BYTE:
-                            const = self._get_const_byte_value(arg)
-                            if const is not None:
-                                self._emit("ld", f"a,{self._format_number(const)}")
-                                continue
-                        # Evaluate arg - result in A (BYTE) or HL (ADDRESS)
-                        if param_type == DataType.BYTE:
-                            arg = self._low_byte_form(arg)
-                        arg_type = self._gen_expr(arg)
-                        if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        elif param_type == DataType.ADDRESS and arg_type == DataType.BYTE:
-                            self._emit("ld", "l,a")
-                            self._emit("ld", "h,0")
-                        continue
-
-                    # Non-last params: store to memory
-                    # Try to get param asm name from shared storage
-                    param_asm = None
-                    if (hasattr(self, 'storage_labels')
-                        and full_callee_name in self.storage_labels
-                        and param_name in self.storage_labels[full_callee_name]):
-                        param_asm = self.storage_labels[full_callee_name][param_name]
-                    else:
-                        # Fallback: build param asm name: @procname$param
-                        proc_base = sym.asm_name if sym.asm_name else callee_name_str or ""
-                        if proc_base.startswith('@'):
-                            proc_base = proc_base[1:]
-                        param_asm = f"@{proc_base}${self._mangle_name(param_name)}"
-
-                    # Optimize: for BYTE parameter with constant, use ld a,n directly
-                    if param_type == DataType.BYTE:
-                        const = self._get_const_byte_value(arg)
-                        if const is not None:
-                            self._emit("ld", f"a,{self._format_number(const)}")
-                            self._emit("ld", f"({param_asm}),a")
-                            continue
-
-                    if param_type == DataType.BYTE:
-                        arg = self._low_byte_form(arg)
-                    arg_type = self._gen_expr(arg)
-                    if param_type == DataType.BYTE or arg_type == DataType.BYTE:
-                        # BYTE param - ensure value is in A, use LD (addr),A
-                        if arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        self._emit("ld", f"({param_asm}),a")
-                    else:
-                        # ADDRESS param - use LD (addr),HL
-                        self._emit("ld", f"({param_asm}),hl")
+            self._gen_slot_args(sym, args, callee_name_str)
 
         # Call the procedure
         if callee_name_str is not None:
@@ -3434,6 +3366,108 @@ class CodeGenerator:
                 self._emit("ld", f"de,{stack_bytes}")
                 self._emit("add", "hl,sp")
                 self._emit("ld", "sp,hl")
+
+    def _param_slot(self, sym, param_name: str, callee_name: str | None) -> str:
+        """The label of parameter ``param_name`` of procedure ``sym``."""
+        labels = getattr(self, 'storage_labels', {}).get(sym.name, {})
+        if param_name in labels:
+            return labels[param_name]
+        # Fallback: @procname$param
+        proc_base = sym.asm_name if sym.asm_name else callee_name or ""
+        if proc_base.startswith('@'):
+            proc_base = proc_base[1:]
+        return f"@{proc_base}${self._mangle_name(param_name)}"
+
+    def _may_reenter(self, expr, callee: str) -> bool:
+        """Whether evaluating ``expr`` may call procedure ``callee`` (its full
+        name): a call of it, of a procedure that reaches it, or through an
+        address."""
+        stack = [expr]
+        while stack:
+            e = unwrap_paren(stack.pop())
+            target = None
+            if isinstance(e, (P.Call, P.CallNoArgs)):
+                c = unwrap_paren(e.callee)
+                if isinstance(c, P.Identifier):
+                    target = ident_text(c.name)
+                elif not isinstance(c, P.MemberAccess):   # `s.m(i)' is an element
+                    return True             # an indirect call
+            elif isinstance(e, P.Identifier):
+                target = ident_text(e.name)
+            elif isinstance(e, P.LocationOf) and isinstance(unwrap_paren(e.operand), P.Identifier):
+                continue                    # `.f' names f, it does not call it
+            if target is not None:
+                g = self._resolve_proc_name(target, self.current_proc or "")
+                if g is not None and (g == callee or callee in self._get_reachable(g, set())):
+                    return True
+            if isinstance(e, (list, tuple)):
+                stack.extend(e)
+                continue
+            fields = getattr(e, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(e, f, None) for f in fields if f != "pos")
+        return False
+
+    def _gen_slot_args(self, sym, args, callee_name: str | None) -> None:
+        """Pass ``args`` to a non-reentrant local procedure ``sym``: each is
+        stored in the procedure's own slot for its parameter, converted to
+        the parameter's type (8.2), except a last one passed in A or HL.
+
+        An argument whose evaluation calls the procedure again -- ``f(1,
+        f(2, 3))'' -- would store over the slots the arguments before it
+        already filled, so those are kept on the stack until it has run.
+        DRI's PL/M-80 passes them on the stack and lets the callee store
+        them, which comes to the same thing.
+        """
+        last_param_idx = len(args) - 1
+        uses_reg = sym.uses_reg_param and len(args) > 0
+        reenter = max((j for j in range(1, len(args))
+                       if self._may_reenter(args[j], sym.name)), default=0)
+        stashed: list[tuple[str, DataType]] = []
+
+        for i, arg in enumerate(args):
+            if i >= len(sym.params):
+                continue
+            param_name = sym.params[i]
+            param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
+
+            # Evaluate into A for a BYTE parameter, HL for an ADDRESS one.
+            if param_type == DataType.BYTE:
+                self._gen_expr_to_a(arg)
+            else:
+                self._gen_expr_to_hl(arg)
+
+            if i == last_param_idx and uses_reg:
+                continue                    # passed in the register
+            slot = self._param_slot(sym, param_name, callee_name)
+            if i < reenter:
+                self._emit("push", "af" if param_type == DataType.BYTE else "hl")
+                stashed.append((slot, param_type))
+            elif param_type == DataType.BYTE:
+                self._emit("ld", f"({slot}),a")
+            else:
+                # A BYTE argument is widened: storing A alone left the high
+                # byte of an ADDRESS parameter as the last call had left it.
+                self._emit("ld", f"({slot}),hl")
+
+        if stashed:
+            reg_type = sym.param_types[last_param_idx] if (
+                uses_reg and last_param_idx < len(sym.param_types)) else None
+            if reg_type == DataType.BYTE:
+                self._emit("ld", "e,a")
+            elif reg_type is not None:
+                self._emit("ex", "de,hl")
+            for slot, t in reversed(stashed):
+                if t == DataType.BYTE:
+                    self._emit("pop", "af")
+                    self._emit("ld", f"({slot}),a")
+                else:
+                    self._emit("pop", "hl")
+                    self._emit("ld", f"({slot}),hl")
+            if reg_type == DataType.BYTE:
+                self._emit("ld", "a,e")
+            elif reg_type is not None:
+                self._emit("ex", "de,hl")
 
     def _gen_return(self, stmt) -> None:
         """Generate code for a RETURN statement.
@@ -6908,14 +6942,11 @@ class CodeGenerator:
         # Regular function call
         sym = None
         call_name = None
-        full_callee_name = None
         name = None
         if isinstance(callee, P.Identifier):
             name = ident_text(callee.name)
             sym = self._lookup_symbol(name)
             call_name = sym.asm_name if sym and sym.asm_name else name
-            if sym:
-                full_callee_name = sym.name
 
             # CP/M BDOS optimisation: MON1/MON2(func, arg).
             if name.upper() in ('MON1', 'MON2') and len(args) == 2:
@@ -6946,58 +6977,7 @@ class CodeGenerator:
                     self._emit("ld", "h,0")
                 self._emit("push", "hl")
         else:
-            last_param_idx = len(args) - 1
-            uses_reg = sym.uses_reg_param and len(args) > 0
-
-            for i, arg in enumerate(args):
-                if sym and i < len(sym.params):
-                    param_name = sym.params[i]
-                    param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
-                    is_last = (i == last_param_idx)
-
-                    if is_last and uses_reg:
-                        if param_type == DataType.BYTE:
-                            const = self._get_const_byte_value(arg)
-                            if const is not None:
-                                self._emit("ld", f"a,{self._format_number(const)}")
-                                continue
-                        if param_type == DataType.BYTE:
-                            arg = self._low_byte_form(arg)
-                        arg_type = self._gen_expr(arg)
-                        if param_type == DataType.BYTE and arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        elif param_type == DataType.ADDRESS and arg_type == DataType.BYTE:
-                            self._emit("ld", "l,a")
-                            self._emit("ld", "h,0")
-                        continue
-
-                    param_asm = None
-                    if (hasattr(self, 'storage_labels')
-                        and full_callee_name in self.storage_labels
-                        and param_name in self.storage_labels[full_callee_name]):
-                        param_asm = self.storage_labels[full_callee_name][param_name]
-                    else:
-                        proc_base = sym.asm_name if sym.asm_name else name or ""
-                        if proc_base.startswith('@'):
-                            proc_base = proc_base[1:]
-                        param_asm = f"@{proc_base}${self._mangle_name(param_name)}"
-
-                    if param_type == DataType.BYTE:
-                        const = self._get_const_byte_value(arg)
-                        if const is not None:
-                            self._emit("ld", f"a,{self._format_number(const)}")
-                            self._emit("ld", f"({param_asm}),a")
-                            continue
-
-                    if param_type == DataType.BYTE:
-                        arg = self._low_byte_form(arg)
-                    arg_type = self._gen_expr(arg)
-                    if param_type == DataType.BYTE or arg_type == DataType.BYTE:
-                        if arg_type == DataType.ADDRESS:
-                            self._emit("ld", "a,l")
-                        self._emit("ld", f"({param_asm}),a")
-                    else:
-                        self._emit("ld", f"({param_asm}),hl")
+            self._gen_slot_args(sym, args, name)
 
         if isinstance(callee, P.Identifier):
             self._emit("call", call_name)
