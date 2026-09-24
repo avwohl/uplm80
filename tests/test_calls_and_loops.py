@@ -54,3 +54,23 @@ run: procedure;
 end run;
 call run;
 """, [0x33, 0x576, 0x336, 0x81, 8, 0x14])
+
+
+def test_a_call_of_five_stacked_arguments_leaves_the_stack_as_it_was():
+    """A CALL statement pops the arguments of a REENTRANT, PUBLIC or
+    EXTERNAL procedure off the stack; for five or more it set SP to
+    HL + SP, HL being whatever the procedure left there, not 10 + SP."""
+    _check("""
+declare (res, s0, s1) address;
+r5: procedure (a, b, c, d, e) reentrant;
+  declare (a, b, c, d, e) address;
+  res = a + b + c + d + e;
+end r5;
+run: procedure;
+  s0 = stackptr;
+  call r5(1, 2, 3, 4, 5);
+  s1 = stackptr;
+  call ph(res); call ph(s0 - s1);
+end run;
+call run;
+""", [15, 0])

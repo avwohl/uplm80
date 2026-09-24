@@ -3362,8 +3362,9 @@ class CodeGenerator:
                 for _ in range(len(args)):
                     self._emit("pop", "de")
             else:
-                # Adjust stack pointer directly
-                self._emit("ld", f"de,{stack_bytes}")
+                # Adjust the stack pointer directly. (This loaded DE and
+                # added SP to whatever the procedure left in HL.)
+                self._emit("ld", f"hl,{stack_bytes}")
                 self._emit("add", "hl,sp")
                 self._emit("ld", "sp,hl")
 
