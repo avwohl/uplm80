@@ -8,7 +8,11 @@ compiler makes -- folding, propagation, strength reduction, algebra,
 inlining -- has to leave the value and the type the unoptimized program
 computes, or the arithmetic around the rewritten operand changes width.
 
-Each case here printed something else at some level before the fix.
+Each case here printed something else, or did not compile, at some level
+before its fix -- except test_the_check_still_catches_what_was_written and
+test_restricted_expressions_are_plain_numbers, which hold what the fixes
+must not change. The last test runs random programs against a model of the
+rules (tests/plm_difftest.py); scripts/difftest.py runs many more of them.
 """
 
 import pytest
@@ -519,3 +523,23 @@ run: procedure;
 end run;
 call run;
 """, [0x77, 0x66])
+
+
+# ---- the differential test -------------------------------------------------
+
+@pytest.mark.parametrize("seed", [11, 12, 13])
+def test_random_programs_print_what_the_rules_say(seed):
+    """Random typed programs against a Python model of the manual's rules
+    (tests/plm_difftest.py), at every -O. scripts/difftest.py runs this with
+    as many seeds as you like."""
+    src, expect = generate(seed, 50)
+    for opt in LEVELS:
+        reason = tools_missing()
+        if reason:
+            pytest.skip(reason)
+        got, err = build_and_run(src, opt)
+        assert err is None, f"-O{opt}: {err}"
+        wrong = [f"{label}: got {g:04X}, model {v:04X}"
+                 for (label, v), g in zip(expect, got) if g != v]
+        assert len(got) == len(expect) and not wrong, (
+            f"seed {seed} -O{opt}:\n" + "\n".join(wrong[:10]))
