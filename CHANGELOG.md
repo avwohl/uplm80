@@ -3,6 +3,25 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## Unreleased
+
+### Fixed
+
+- **`x MOD 0` was 0; PL/M-80 gives `x`.** DRI's PL/M-80 sends every `/` and
+  `MOD` through one routine, module @P0029 of its PLM80.LIB (the same 31 bytes
+  sit at 39B0H in MP/M II's SDIR.PRL, and in DIR, ED, STAT, SHOW, TOD, SCHED,
+  MPMSTAT, GENSYS, LINK and LIB). It has no zero test: sixteen
+  shift-and-subtract steps, in which a zero divisor always fits, so the
+  quotient comes out 0FFFFH and the remainder is the dividend. `??div16`
+  tested for zero and returned a remainder of 0. SDIR's `page$len` defaults to
+  0 and UTIL7/DSH.PLM asks `cur$line mod page$len = 0`, so every SDIR built
+  from source reprinted its heading before every line of output. `??div16` and
+  `??mod16` now run the same steps without the test, and are smaller: 31 bytes
+  for the pair (50 before), 22 for `??mod16` alone. There is no BYTE divide to
+  match: DRI zero-extends BYTE operands into the same routine (SDIR loads one
+  with `LHLD` / `MVI H,00H` before `CALL 39B0H`), so a quotient or remainder
+  of two BYTEs is an ADDRESS.
+
 ## 0.3.6 — 2026-09-24
 
 Found by building every PL/M program in Digital Research's MP/M II sources and
