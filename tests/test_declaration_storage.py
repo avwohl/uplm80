@@ -612,3 +612,35 @@ call p;
 end t;
 """)
     assert out.strip() == "BD", out
+
+
+def test_a_factored_at_places_each_name_after_the_last():
+    """PL/M-80 manual, 6.2.8: `DECLARE (CHAR$A, CHAR$B, CHAR$C) BYTE AT
+    (.BUFFER)' puts CHAR$B and CHAR$C in the next two bytes.  Every name was
+    put at the one address."""
+    asm = _asm("t: do; declare buffer (8) byte; declare (a, b, c) address at (.buffer(1)); "
+               "declare y address; y = a + b + c; end t;")
+    d = _defs(asm)
+    assert "@A: EQU BUFFER+1" in d and "@B: EQU BUFFER+3" in d and "@C: EQU BUFFER+5" in d, d
+
+
+@pytest.mark.parametrize("kind", ["initial", "data"])
+def test_a_factored_initialisation_runs_across_the_names(kind):
+    """PL/M-80 manual, 6.2.9: `DECLARE (COUNTER, LIMIT, INCR) ADDRESS
+    INITIAL (0, 1024, 2)' sets COUNTER to 0, LIMIT to 1024 and INCR to 2.
+    Each name got the whole list, so LIMIT and INCR both read 0."""
+    asm = _asm(f"""
+t: do;
+declare (counter, limit, incr) address {kind} (0, 1024, 2);
+declare (pp, qq) byte {kind} ('X');
+declare after byte {kind} (0AAH);
+declare r address; r = counter + limit + incr + pp + qq + after;
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    i = lines.index("COUNTER:")
+    assert lines[i + 1:i + 4] == ["dw\t0", "dw\t0400H", "dw\t2"], lines[i + 1:i + 6]
+    assert "LIMIT:\tEQU\tCOUNTER+2" in lines and "INCR:\tEQU\tCOUNTER+4" in lines, asm
+    j = lines.index("PP:")
+    assert lines[j + 1:j + 3] == ["db\t'X'", "ds\t1"], lines[j + 1:j + 4]
+    assert "QQ:\tEQU\tPP+1" in lines, asm

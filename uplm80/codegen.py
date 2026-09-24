@@ -2205,22 +2205,38 @@ class CodeGenerator:
 
         # P.DeclItem: one or more names sharing the same tail/clauses.
         based_on, based_member = decl_item_based(decl)
-        for name in decl_item_names(decl):
+        names = decl_item_names(decl)
+        first = None
+        for index, name in enumerate(names):
             self._gen_one_var(
                 name=name,
                 based_on=based_on,
                 based_member=based_member,
                 item=decl,
+                factored=(index, len(names), first),
             )
+            if index == 0:
+                first_sym = self._lookup_scoped(name)
+                first = first_sym.asm_name if first_sym else None
 
-    def _gen_one_var(self, *, name: str, based_on, based_member, item) -> None:
+    def _gen_one_var(self, *, name: str, based_on, based_member, item,
+                     factored: tuple[int, int, str | None] = (0, 1, None)) -> None:
         """Generate storage for a single name from a typed DeclItem.
 
         Split out so a ``(A, B, C) BYTE`` decl can emit one row per
         identifier while sharing tail/attribute extraction. The legacy
         ``VarDecl`` carried only one name per node, so this used to live
         inline in :meth:`_gen_var_decl`.
+
+        ``factored`` is (this name's position, how many names, the first
+        name's assembly name).  The names of a factored declaration are
+        contiguous (PL/M-80 Programming Manual, 6.2.4), so an AT places each
+        one after the last (6.2.8), and an INITIAL or DATA list runs across
+        them in order (6.2.9): `DECLARE (COUNTER, LIMIT, INCR) ADDRESS
+        INITIAL (0, 1024, 2)' sets LIMIT to 1024.  Every name used to get the
+        first one's address, or the whole list.
         """
+        index, n_names, first_asm = factored
         attrs = decl_attrs(item)
         data_type, dimension = _decl_item_type(item)
         members_nodes = decl_item_struct_members(item)
@@ -2364,31 +2380,30 @@ class CodeGenerator:
 
         # AT variables use specified address
         if at_location is not None:
-            self._emit_at_decl(asm_name, at_location, sym)
+            self._emit_at_decl(asm_name, at_location, sym, extra=index * size)
             return
 
         # Generate storage
         # DATA values can go inline in code (for module-level bootstrap) or data segment
         target_segment = self.code_data_segment if self.emit_data_inline else self.data_segment
+        if initial_values_nodes:
+            target_segment = self.data_segment
 
-        if data_values_nodes:
+        if (data_values_nodes or initial_values_nodes) and index > 0 and first_asm:
+            # A later name of a factored declaration: the first name's list
+            # already covers it.
+            target_segment.append(AsmLine(label=asm_name, opcode="EQU",
+                                          operands=self._sym_offset(first_asm, index * size)))
+        elif data_values_nodes or initial_values_nodes:
+            # A factored list is laid out once, for all the names in turn.
             target_segment.append(AsmLine(label=asm_name))
             self._emit_value_list(
-                data_values_nodes,
+                data_values_nodes or initial_values_nodes,
                 data_type or DataType.BYTE,
                 struct_members=struct_members,
-                dimension=dimension,
-                size=size,
-                inline=self.emit_data_inline,
-            )
-        elif initial_values_nodes:
-            self.data_segment.append(AsmLine(label=asm_name))
-            self._emit_value_list(
-                initial_values_nodes,
-                data_type or DataType.BYTE,
-                struct_members=struct_members,
-                dimension=dimension,
-                size=size,
+                dimension=(dimension or 1) * n_names if struct_members else dimension,
+                size=size * n_names,
+                inline=bool(data_values_nodes) and self.emit_data_inline,
             )
         elif use_shared:
             # Using shared automatic storage - no individual allocation needed
@@ -2534,7 +2549,8 @@ class CodeGenerator:
             self.data_segment.append(AsmLine(opcode="extrn", operands="__END__"))
         self.needs_end_symbol = True
 
-    def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol) -> None:
+    def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol,
+                      extra: int = 0) -> None:
         """Define the name of a ``DECLARE ... AT(addr)`` variable.
 
         The address is a number, or a symbol and a single signed offset
@@ -2546,6 +2562,7 @@ class CodeGenerator:
         DECLARE that goes on to declare `a$buff ... AT(.tbuff)'.
         """
         root, offset = self._at_address(at_expr)
+        offset += extra
         if root is None:
             operand = self._format_number(offset & 0xFFFF)
         else:
