@@ -5231,9 +5231,12 @@ class CodeGenerator:
         Returns the type of the expression.
         """
         expr = unwrap_paren(expr)
-        # Clear a_has_l for most expression types (embedded assign sets it)
-        if not isinstance(expr, (P.EmbeddedAssign, P.Call, P.CallNoArgs)):
-            self.a_has_l = False
+        # a_has_l says that A holds L of the value generated last: an
+        # embedded assignment of an ADDRESS to a BYTE sets it when it
+        # returns, and LOW reads it straight after generating its operand.
+        # Anything generated since makes it stale -- `(b := w * 5) XOR
+        # LOW(LAST(a))' took A for LAST's L.
+        self.a_has_l = False
 
         if isinstance(expr, P.NumberLiteral):
             self._emit("ld", f"hl,{self._format_number(number_value(expr))}")

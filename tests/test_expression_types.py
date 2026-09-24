@@ -525,6 +525,21 @@ call run;
 """, [0x77, 0x66])
 
 
+
+def test_low_reads_its_own_operand():
+    """LOW((b := w)) knows A already holds L; the flag saying so outlived the
+    embedded assignment, so `(b := w) + LOW(LAST(a))' added L of w, not 7."""
+    _check("""
+declare b byte, (w, r) address;
+declare ab(8) byte;
+run: procedure;
+  w = 1234h;
+  r = (b := w) + low(last(ab)); call ph(r); call ph(b);
+  r = low((b := w)) + 1; call ph(r);
+end run;
+call run;
+""", [0x123B, 0x34, 0x35])
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])
