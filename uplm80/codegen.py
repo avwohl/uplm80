@@ -6647,15 +6647,14 @@ class CodeGenerator:
                         self._emit("ld", "l,a")
                         self._emit("ld", "h,0")
                 elif shift_count == 7:
-                    # Special case for shift by 7: result = (H << 1) | (L >> 7)
-                    # This is faster than 7 iterations
-                    # RLC sets carry from bit 7, so no need to clear carry first
-                    self._emit("ld", "a,l")
-                    self._emit("rlca")        # Carry = bit 7 of L (A also rotated but we discard it)
-                    self._emit("ld", "a,h")
-                    self._emit("rla")        # A = (H << 1) | carry
-                    self._emit("ld", "l,a")
+                    # Shift by 7 is a shift left by 1 and a byte move. The
+                    # result has nine bits: bit 15 comes down to bit 8, which
+                    # `(H << 1) | (L >> 7)' alone dropped, so 8000H / 128
+                    # (strength-reduced to this) came out 0 instead of 100H.
+                    self._emit("add", "hl,hl")  # carry = bit 15
+                    self._emit("ld", "l,h")     # L = bits 14..7
                     self._emit("ld", "h,0")
+                    self._emit("rl", "h")       # H = bit 15
                 elif shift_count <= 3:
                     # Small shifts: inline the loop (SRL/RR — 2 insns per shift).
                     for _ in range(shift_count):

@@ -292,3 +292,19 @@ def test_runtime_divisions_match_dri(opt):
     src, expect = _program()
     _compare(expect, _run(src, opt))
 
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_shr_by_seven_keeps_bit_15(opt):
+    """`a / 128' is SHR(a, 7), whose result has nine bits."""
+    values = [0x7F, 0x80, 0x7FFF, 0x8000, 0x8001, 0xC07F, 0xFFFF]
+    src = "\n".join([
+        *_PRELUDE,
+        "declare (a, i) address;",
+        "declare av(*) address data (" + ", ".join(_hex(v) for v in values) + ");",
+        f"do i = 0 to {len(values) - 1};",
+        "  a = av(i); call ph(shr(a, 7)); call ph(a / 128);",
+        "end;",
+        *_POSTLUDE,
+    ])
+    expect = [(f"{label}({v:#x})", v >> 7) for v in values for label in ("shr", "/128")]
+    _compare(expect, _run(src, opt))

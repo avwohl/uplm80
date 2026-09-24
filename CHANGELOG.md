@@ -21,6 +21,9 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
   match: DRI zero-extends BYTE operands into the same routine (SDIR loads one
   with `LHLD` / `MVI H,00H` before `CALL 39B0H`), so a quotient or remainder
   of two BYTEs is an ADDRESS.
+- **`SHR(x, 7)` lost bit 15,** and with it `x / 128`, which strength reduction
+  turns into that shift: 8000H / 128 came out 0 instead of 100H. The result of
+  a shift right by 7 has nine bits.
 
 ## 0.3.6 — 2026-09-24
 
