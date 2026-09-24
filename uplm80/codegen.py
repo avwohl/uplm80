@@ -518,7 +518,8 @@ class CodeGenerator:
                 (start, end, self._decl_seq.get(id(decl), len(self._decl_seq))))
 
     def _emit_constants(self) -> None:
-        """The constants, in the code segment after the code: DATA declared in
+        """The constants, in the code segment after the code: a CP/M-mode
+        module's own DATA (see :meth:`_module_data_leads`), DATA declared in
         procedures, the constants of `.(...)' lists, and strings.
 
         Intel's PL/M-80 keeps every constant with the code, and nothing but
@@ -530,6 +531,11 @@ class CodeGenerator:
         so SUBMIT wrote a long command file over its own messages, and
         SPOOL read the first records of a file over its own.
         """
+        if self.code_data_segment:
+            self._emit()
+            self._emit(comment="Module DATA")
+            self.output.extend(self.code_data_segment)
+            self.code_data_segment = []
         if self.const_segment:
             self._emit()
             self._emit(comment="Constants")
@@ -578,6 +584,21 @@ class CodeGenerator:
             self._emit()
             self._emit(comment="Variables")
             self.output.extend(variables)
+
+    def _module_data_leads(self) -> bool:
+        """Whether a module's own DATA goes at the head of its code.
+
+        In DRI's layout it does: MP/M II's transients begin with
+        `declare jump byte data (0c3h), jadr address data (.start-3)', which
+        is the first instruction the program runs, and BARE and MP/M modes
+        keep that.  CP/M mode starts the program with its own entry code, and
+        a module's DATA ahead of it was run as code: `DECLARE t (2) BYTE DATA
+        (0C9H, 42H)' returned to CP/M before the first statement.  There the
+        DATA goes among the constants after the code, where a DRI source's
+        jump is harmless: the entry code at 100H sets the stack from 0006H and
+        runs the program, as CP/M mode promises.
+        """
+        return self.mode != Mode.CPM
 
     def _emit_at_defs(self) -> None:
         """The EQUs that define AT variables, after every symbol they can name.
@@ -2057,13 +2078,13 @@ class CodeGenerator:
         self._compute_active_together()
         self._allocate_shared_storage()
 
-        # Emit module-level DATA declarations first (before entry point)
-        # This is how PL/M-80 handles the startup jump bootstrap
+        # Module-level DATA declarations: at the head of the code, before the
+        # entry point, which is how DRI's programs place their startup jump -
+        # or, in CP/M mode, among the constants after the code.
         self.emit_data_inline = True
         for decl in data_decls:
             self._gen_var_decl(decl)
-        # Emit any inline data that was collected
-        if self.code_data_segment:
+        if self.code_data_segment and self._module_data_leads():
             self.output.extend(self.code_data_segment)
             self.code_data_segment = []
         self.emit_data_inline = False
@@ -2270,11 +2291,12 @@ class CodeGenerator:
                 else:
                     all_other_decls.append((module, decl))
 
-        # Emit module-level DATA declarations first (at start of code segment)
+        # Module-level DATA declarations: at the head of the code segment, or
+        # in CP/M mode among the constants after the code (see generate).
         self.emit_data_inline = True
         for module, decl in all_data_decls:
             self._gen_var_decl(decl)
-        if self.code_data_segment:
+        if self.code_data_segment and self._module_data_leads():
             self.output.extend(self.code_data_segment)
             self.code_data_segment = []
         self.emit_data_inline = False
@@ -2688,8 +2710,9 @@ class CodeGenerator:
 
         # Generate storage.  DATA is stored with the code (PL/M-80 Programming
         # Manual, 6.2.9): a module's own at the head of it, where DRI's
-        # sources put their `jump byte data (0c3h)', anything else among the
-        # constants after it.  INITIAL is a variable like any other.
+        # sources put their `jump byte data (0c3h)' (but see
+        # _module_data_leads), anything else among the constants after it.
+        # INITIAL is a variable like any other.
         if data_values_nodes:
             target_segment = (self.code_data_segment if self.emit_data_inline
                               else self.const_segment)

@@ -3,10 +3,10 @@
  *
  * Tests DATA declarations at both module level and procedure level.
  *
- * Bug 4: DATA declarations at module level cause incorrect address
- * calculations. Strings and data tables end up at wrong addresses.
- *
- * Current workaround: Place all DATA declarations inside procedures.
+ * Bug 4: in CP/M mode, module-level DATA was placed at the start of the
+ * program, ahead of the entry code, and ran as instructions; this program
+ * got through only because its tables decode to harmless ones.  It now
+ * follows the code (tests/test_layout.py).
  *
  * BUILD:
  *   python -m uplm80.compiler tests/test_data_decl.plm -o tests/test_data_decl.mac
@@ -84,7 +84,6 @@ END PRINT$TEST;
  * MODULE-LEVEL DATA DECLARATIONS (Bug 4 area)
  *
  * Note: These are placed at module level to test Bug 4.
- * If Bug 4 is not fixed, these may have wrong addresses.
  * ================================================================ */
 
 /* Module-level DATA - string */

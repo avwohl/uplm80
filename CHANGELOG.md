@@ -305,6 +305,12 @@ Each fix has a regression test that fails without it.
   be one. A circle of ATs is an error.
 - **`AT` with `INITIAL` or `DATA` dropped the values without a word.** It is
   now an error.
+- **In CP/M mode a module's DATA ran as code.** Module-level DATA was placed
+  at the head of the program, where DRI's programs keep the jump they enter
+  themselves by, but CP/M mode starts at 100H with its own entry code, and
+  the DATA came first: `DECLARE t (2) BYTE DATA (0C9H, 42H)` returned to
+  CP/M before the first statement. In CP/M mode it now follows the code;
+  BARE and MP/M modes keep DRI's layout.
 
 ### Changed
 

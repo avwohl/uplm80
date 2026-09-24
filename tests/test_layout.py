@@ -34,7 +34,8 @@ def _asm(src: str, mode: Mode = Mode.CPM, opt: int = 2) -> str:
 
 
 def _segments(asm: str) -> tuple[list[str], list[str]]:
-    """The code and data segments' lines, stripped, without comments."""
+    """The code and data segments' lines, stripped, without comments or
+    directives (.z80, extrn, public)."""
     code: list[str] = []
     data: list[str] = []
     into = code
@@ -44,7 +45,7 @@ def _segments(asm: str) -> tuple[list[str], list[str]]:
             into = data
         elif line == "cseg":
             into = code
-        elif line:
+        elif line and not line.startswith((".", "extrn", "public")):
             into.append(line)
     return code, data
 
@@ -192,3 +193,35 @@ call mon1(2, s(1));
 end t;
 """)
     assert out.strip().endswith("3Y"), out
+
+
+MODULE_DATA_SRC = """
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare t (2) byte data (0c9h, 42h);
+declare jump byte data (0c3h), jadr address data (.start-3);
+start:
+call mon1(2, t(1));
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_a_cp_m_program_starts_with_its_entry_code_not_its_data(opt):
+    """CP/M mode's program starts at 100H with its own entry code, which
+    sets the stack from 0006H.  A module's DATA went ahead of it, at 100H,
+    and ran: 0C9H is RET, and the program returned to CP/M before its first
+    statement (the verification's f7_module_data_first). DRI's own
+    `jump byte data (0c3h)' at the head, in a program compiled for CP/M,
+    jumped into the middle of the four-byte entry code."""
+    assert run_plm(MODULE_DATA_SRC, opt).strip().endswith("B")
+    code, _ = _segments(_asm(MODULE_DATA_SRC))
+    assert code[0:2] == ["ld\thl,(6)", "ld\tsp,hl"], code
+
+
+def test_bare_and_mp_m_programs_keep_their_data_at_the_head():
+    """DRI's layout, which BARE and MP/M modes keep: the program's first
+    bytes are its DATA, the `jump byte data (0c3h)' it enters itself by."""
+    for mode in (Mode.BARE, Mode.MPM):
+        code, _ = _segments(_asm(MODULE_DATA_SRC, mode))
+        assert code[0:3] == ["T:", "db\t0C9H", "db\t42H"], (mode, code)
