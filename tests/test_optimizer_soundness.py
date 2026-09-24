@@ -5,8 +5,12 @@ miscompilation of MP/M II's STAT.PLM, and each was reduced to a few lines of
 PL/M and confirmed against the emitted Z80.
 """
 
+import pytest
+
 from uplm80.codegen import Mode
 from uplm80.compiler import Compiler
+
+from ._toolchain import run_plm
 
 
 def _asm(src: str, opt: int = 2, mode: Mode = Mode.CPM) -> str:
@@ -101,3 +105,71 @@ r = mon2(2,c) + 1;
 end t;
 """)
     assert "??BDOS" not in asm, asm
+
+
+O3_SRC = """
+0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare (i, j, c, k) byte;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+/* a RETURN inside a loop, and inside an IF */
+ru: procedure;
+    do i = 0 to 3; c = c + 1; if c = 2 then return; end;
+    c = 0;
+end ru;
+rv: procedure; c = c + 1; if c = 1 then return; c = 9; end rv;
+/* a label, which inlining twice defines twice */
+rl: procedure; lab: c = c + 1; if c < 3 then goto lab; end rl;
+/* the module's c, which q's own c hides */
+rc: procedure; c = c + 1; end rc;
+q: procedure; declare c byte; c = 5; call rc; call putc('0' + c); end q;
+/* three procedures called zn */
+p1: procedure; zn: procedure; c = 1; end zn; call zn; end p1;
+p2: procedure; zn: procedure; c = 2; end zn; call zn; end p2;
+zn: procedure; c = 3; end zn;
+g: procedure byte; k = k + 1; return k; end g;
+r2: procedure (x); declare x byte; c = x + x; end r2;
+setv: procedure (a); declare a address, v based a byte; v = 7; end setv;
+
+c = 0; call rv; call putc('0' + c);
+c = 0; call ru; call putc('0' + c);
+c = 0; call rl; call putc('0' + c); c = 0; call rl; call putc('0' + c);
+c = 0; call q; call putc('0' + c);
+call p1; call putc('0' + c); call p2; call putc('0' + c); call zn; call putc('0' + c);
+call putc('.');
+/* what a call assigns */
+k = 0; c = 0; call r2(g); call putc('0' + c); call putc('0' + k);
+c = 0; k = 0; j = g; call putc('0' + k);
+k = 0; if g then call putc('0' + k);
+call putc('.');
+/* an unrolled loop leaves its index one past the bound */
+do i = 0 to 1; c = c + 1; end; call putc('0' + i);
+do i = 0 to 1; lab2: c = c + 1; end; call putc('0' + i);
+call putc('.');
+/* `.c' is where c is */
+c = 1; call setv(.c); call putc('0' + c);
+call putc('.');
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [2, 3])
+def test_o3_inlining_and_propagation_keep_what_the_program_does(opt):
+    """-O3 inlines small procedures, unrolls short loops and propagates
+    constants, and each of those changed what this program does:
+
+      - the inliner dropped a top-level RETURN and kept any other, which
+        then returned from the caller: nothing after `call ru' ran;
+      - a label in an inlined procedure, or an unrolled loop, was defined
+        once per copy, and the program did not assemble;
+      - an inlined body named the caller's local where it meant the
+        module's variable, and a nested procedure was inlined for another
+        of the same name;
+      - nothing learned before a CALL was forgotten after it, so `c' and
+        `k' still read 0 after procedures that assign them;
+      - an unrolled loop left its index at the last value, not one past;
+      - `c = 1; CALL setv(.c)' passed setv the address 1.
+
+    -O2 is the reference."""
+    assert run_plm(O3_SRC, opt).strip() == "123351123.2111.22.7.", opt

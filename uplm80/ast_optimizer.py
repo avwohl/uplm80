@@ -29,6 +29,8 @@ from .ast_view import (
     binop_kind,
     block_items_split,
     DataType,
+    decl_attrs,
+    decl_item_based,
     decl_item_names,
     decl_item_type,
     ident_text,
@@ -231,8 +233,13 @@ class ASTOptimizer:
         self.expr_vars: dict[str, set[str]] = {}  # expr_key -> set of var names
         # Copy propagation: x = y means copies[x] = y
         self.copies: dict[str, str] = {}
-        # Procedure inlining: track small procedures that can be inlined
-        self.inlinable_procs: dict[str, P.ProcDecl] = {}
+        # Procedure inlining: track small procedures that can be inlined,
+        # with how many scopes deep each was declared.
+        self.inlinable_procs: dict[str, tuple[P.ProcDecl, int]] = {}
+        # The names each enclosing procedure or block declares, outermost
+        # first.  An inlined body must not land where one of them hides a
+        # name it uses.
+        self._scope_names: list[set[str]] = []
         # Every procedure name in the module. A bare identifier that
         # names one is a PL/M parameterless call, not a variable read.
         self.proc_names: set[str] = set()
@@ -248,6 +255,10 @@ class ASTOptimizer:
         self.in_condition: bool = False
         self.byte_vars: set[str] = set()
         self.nonbyte_vars: set[str] = set()
+        # Names whose value can change without an assignment to the name:
+        # a variable whose address is taken, a BASED one, and one AT
+        # another's address.  Nothing is propagated for them.
+        self.unstable_vars: set[str] = set()
 
     def _parse_plm_number(self, s: str) -> int | None:
         """Parse a PL/M-style numeric literal (handles $ separators and B/H/O/Q/D suffixes)."""
@@ -342,6 +353,64 @@ class ASTOptimizer:
                 stack.append(getattr(n, f, None))
         return False
 
+    @staticmethod
+    def _walk(node):
+        """Every node under ``node``, ``node`` included."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            yield n
+            for f in fields:
+                if f != "pos":
+                    stack.append(getattr(n, f, None))
+
+    def _contains_any(self, node, kinds) -> bool:
+        return any(isinstance(n, kinds) for n in self._walk(node))
+
+    def _names_in(self, node) -> set[str]:
+        return {ident_text(n.name) for n in self._walk(node) if isinstance(n, P.Identifier)}
+
+    @staticmethod
+    def _declared_names(decls) -> set[str]:
+        """The names a list of declarations (and parameters) declares."""
+        names: set[str] = set()
+        for d in decls:
+            if isinstance(d, P.DeclareStmt):
+                names |= ASTOptimizer._declared_names(d.declarations)
+            elif isinstance(d, P.ProcDecl):
+                names.add(proc_name(d))
+            elif isinstance(d, P.DeclItem):
+                names.update(decl_item_names(d))
+            elif isinstance(d, P.DeclItemBasedGroup):
+                names.update(ident_text(bd.name) for bd in d.based_decls or [])
+            elif isinstance(d, P.LiterallyDecl):
+                names.update(ident_text(n.name) for n in ASTOptimizer._walk(d)
+                             if isinstance(n, P.Identifier))
+        return names
+
+    def _enter_scope(self, names: set[str]) -> dict:
+        """Open a scope declaring `names'; returns what _leave_scope needs.
+
+        A procedure declared in the scope is inlinable only inside it, and
+        one it hides from outside is not inlinable in it at all: MP/M-style
+        sources declare a helper of the same name in several procedures.
+        """
+        saved = dict(self.inlinable_procs)
+        for n in names:
+            self.inlinable_procs.pop(n, None)
+        self._scope_names.append(names)
+        return saved
+
+    def _leave_scope(self, saved: dict) -> None:
+        self._scope_names.pop()
+        self.inlinable_procs = saved
+
     def _collect_declared_widths(self, node) -> None:
         """Record which names are declared BYTE and which are not."""
         stack = [node]
@@ -363,6 +432,22 @@ class ASTOptimizer:
                 if f == "pos":
                     continue
                 stack.append(getattr(n, f, None))
+
+    def _collect_unstable_vars(self, node) -> None:
+        """Record the names a pointer or another name can change (see
+        :attr:`unstable_vars`)."""
+        for n in self._walk(node):
+            if isinstance(n, P.LocationOf):
+                root = unwrap_paren(n.operand)
+                while isinstance(root, (P.Call, P.MemberAccess)):
+                    root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
+                if isinstance(root, P.Identifier):
+                    self.unstable_vars.add(ident_text(root.name))
+            elif isinstance(n, P.DeclItem):
+                if decl_item_based(n)[0] or decl_attrs(n).at_location is not None:
+                    self.unstable_vars.update(decl_item_names(n))
+            elif isinstance(n, P.DeclItemBasedGroup):
+                self.unstable_vars.update(ident_text(bd.name) for bd in n.based_decls or [])
 
     def _optimize_condition(self, expr):
         """Optimize an expression that is only ever tested for truth.
@@ -529,6 +614,8 @@ class ASTOptimizer:
         self.byte_vars.clear()
         self.nonbyte_vars.clear()
         self._collect_declared_widths(module.items)
+        self.unstable_vars.clear()
+        self._collect_unstable_vars(module.items)
 
         # Multiple passes for iterative improvement
         changed = True
@@ -585,6 +672,7 @@ class ASTOptimizer:
         """
         attrs = proc_attrs(decl)
         local_decls, body_stmts = proc_local_decls_stmts(decl)
+        scope = self._enter_scope(set(proc_param_names(decl)) | self._declared_names(local_decls))
 
         # A procedure body is its own flow region.
         self._reset_flow_state()
@@ -611,6 +699,7 @@ class ASTOptimizer:
         # Nothing learned inside this body is valid outside it.
         self._reset_flow_state()
         self.flag_sensitive = outer_flag_sensitive
+        self._leave_scope(scope)
 
         # Rebuild body items: keep nested ProcDecls and LiterallyDecls as
         # standalone items; group the rest into a DeclareStmt as the
@@ -647,7 +736,8 @@ class ASTOptimizer:
         )
         # Level 3: Track inlinable procedures
         if self.opt_level >= 3 and self._is_inlinable(optimized_proc, attrs, local_decls):
-            self.inlinable_procs[proc_name(optimized_proc)] = optimized_proc
+            self.inlinable_procs[proc_name(optimized_proc)] = (optimized_proc,
+                                                               len(self._scope_names))
         return optimized_proc
 
     def _optimize_decl_in_body(self, decl):
@@ -992,6 +1082,15 @@ class ASTOptimizer:
             return False
         if len(proc_param_names(proc)) > 3:
             return False
+        # Copied into the caller, a RETURN returns from the caller - only a
+        # plain one at the very end can be dropped - a label is defined once
+        # per call site, and a GOTO goes to one of those.
+        for i, stmt in enumerate(body_stmts):
+            if i == len(body_stmts) - 1 and isinstance(stmt, P.ReturnStmt):
+                continue
+            if self._contains_any(stmt, (P.ReturnStmt, P.ReturnStmtValue,
+                                         P.LabeledStmt, P.GotoStmt)):
+                return False
         return True
 
     def _inline_procedure(self, proc: P.ProcDecl, args: list, pos):
@@ -1184,6 +1283,9 @@ class ASTOptimizer:
         if isinstance(stmt, P.AssignStmt):
             opt_value = self._optimize_expr(stmt.value)
             opt_targets = [self._optimize_target(t) for t in stmt.targets]
+            if self._contains_call([stmt.value, stmt.targets]):
+                # A call may assign any global.
+                self._reset_flow_state()
 
             # Track modified variables and invalidate caches
             for target in opt_targets:
@@ -1199,12 +1301,13 @@ class ASTOptimizer:
             if self.opt_level >= 3 and len(opt_targets) == 1:
                 t = unwrap_paren(opt_targets[0])
                 v = unwrap_paren(opt_value)
-                if isinstance(t, P.Identifier):
+                if isinstance(t, P.Identifier) and ident_text(t.name) not in self.unstable_vars:
                     tname = ident_text(t.name)
                     if isinstance(v, P.NumberLiteral):
                         self.constants[tname] = self._narrow_to_declared_width(
                             tname, number_value(v))
-                    elif isinstance(v, P.Identifier) and self._is_side_effect_free(v):
+                    elif (isinstance(v, P.Identifier) and self._is_side_effect_free(v)
+                          and ident_text(v.name) not in self.unstable_vars):
                         # Not when the source names a procedure: `k = rd`
                         # is a call, and propagating `k` into a later use
                         # would call RD a second time.
@@ -1240,11 +1343,18 @@ class ASTOptimizer:
             ):
                 name = ident_text(unwrap_paren(opt_callee).name)
                 if name in self.inlinable_procs:
-                    proc = self.inlinable_procs[name]
-                    if len(opt_args) == len(proc_param_names(proc)):
+                    proc, depth = self.inlinable_procs[name]
+                    # Not where a scope between the procedure's and this
+                    # call hides a name the body uses: `c = c + 1' would
+                    # assign the caller's local instead.
+                    hidden = set().union(*self._scope_names[depth:])
+                    if (len(opt_args) == len(proc_param_names(proc))
+                            and not hidden & self._names_in(proc_local_decls_stmts(proc)[1])):
                         inlined = self._inline_procedure(proc, opt_args, stmt.pos)
                         if inlined is not None:
                             self.stats.procedures_inlined += 1
+                            # What the body assigns is not what it was.
+                            self._invalidate_modified([inlined])
                             return inlined
 
             # Repack into the original call shape.
@@ -1256,6 +1366,8 @@ class ASTOptimizer:
                 new_inner = P.CallNoArgs(callee=opt_callee, pos=inner_pos)
             else:
                 new_inner = opt_callee
+            # A call may assign any global.
+            self._reset_flow_state()
             return P.CallStmt(callee=new_inner, pos=stmt.pos)
 
         if isinstance(stmt, P.ReturnStmt):
@@ -1312,6 +1424,8 @@ class ASTOptimizer:
         whose else-branch optimizes away into :class:`P.IfStmt`.
         """
         opt_cond = self._optimize_condition(stmt.condition)
+        if self._contains_call(stmt.condition):
+            self._reset_flow_state()    # a call may assign any global
 
         # Constant condition elimination (level 2+). Not when either arm
         # declares a label: a GOTO elsewhere in the procedure still names it.
@@ -1367,6 +1481,7 @@ class ASTOptimizer:
         """
         new_items: list = []
         decl_buf: list = []
+        scope = self._enter_scope(self._declared_names(items))
 
         def flush() -> None:
             if decl_buf:
@@ -1398,6 +1513,7 @@ class ASTOptimizer:
                 if opt is not None:
                     new_items.append(opt)
         flush()
+        self._leave_scope(scope)
         return new_items
 
     def _optimize_do_block(self, stmt: P.DoBlock) -> P.DoBlock:
@@ -1453,6 +1569,8 @@ class ASTOptimizer:
         # back edge, so it cannot use a fact the body invalidates.
         self._invalidate_modified(stmt.items)
         opt_cond = self._optimize_condition(stmt.condition)
+        if self._contains_call(stmt.condition):
+            self._reset_flow_state()    # a call may assign any global
 
         # A DO WHILE whose condition has bit 0 clear never executes -- but
         # only drop the loop when its body declares no label.
@@ -1497,6 +1615,8 @@ class ASTOptimizer:
         opt_start = self._optimize_expr(stmt.start)
         opt_bound = self._optimize_expr(stmt.bound)
         opt_step = self._optimize_expr(stmt.step) if is_by else None
+        if self._contains_call([stmt.start, stmt.bound, stmt.step if is_by else None]):
+            self._reset_flow_state()    # a call may assign any global
 
         # Check for empty loop (start > bound with positive step).
         if (
@@ -1526,19 +1646,25 @@ class ASTOptimizer:
                 bound_v = _num_value(opt_bound)
                 iterations = (bound_v - start_v) // step_val + 1
                 max_iter = 4 if self.optimize_for == OptimizeFor.SPEED else 2
-                _, body_stmts = block_items_split(stmt.items)
-                if 1 <= iterations <= max_iter and len(body_stmts) <= 3:
+                body_decls, body_stmts = block_items_split(stmt.items)
+                # Not a body that declares anything, which the copies would
+                # drop, or a label, which each copy would define again.
+                if (1 <= iterations <= max_iter and len(body_stmts) <= 3
+                        and not body_decls and not self._contains_label(body_stmts)):
                     index_name = ident_text(stmt.index)
                     unrolled: list = []
-                    for i in range(iterations):
+                    for i in range(iterations + 1):
                         val = start_v + i * step_val
                         unrolled.append(P.AssignStmt(
                             targets=[make_identifier(index_name, pos=stmt.pos)],
                             value=make_number_literal(val, pos=stmt.pos),
                             pos=stmt.pos,
                         ))
-                        for s in body_stmts:
-                            unrolled.append(deepcopy(s))
+                        # The last assignment is where the loop leaves the
+                        # index: one step past the last pass.
+                        if i < iterations:
+                            for s in body_stmts:
+                                unrolled.append(deepcopy(s))
                     self.stats.loops_unrolled += 1
                     block = P.DoBlock(
                         items=unrolled, end_label=stmt.end_label, pos=stmt.pos
@@ -1579,6 +1705,8 @@ class ASTOptimizer:
     def _optimize_do_case(self, stmt: P.DoCaseBlock):
         """Optimize a ``DO CASE selector ... END`` block."""
         opt_selector = self._optimize_expr(stmt.selector)
+        if self._contains_call(stmt.selector):
+            self._reset_flow_state()    # a call may assign any global
 
         # If selector is constant, keep only that case (level 2+) -- unless
         # a discarded case declares a label a GOTO still names.
@@ -1674,7 +1802,9 @@ class ASTOptimizer:
             return P.CallNoArgs(callee=opt_callee, pos=expr.pos)
 
         if isinstance(expr, P.LocationOf):
-            opt_operand = self._optimize_expr(expr.operand)
+            # `.x' is where x is, not its value: `c = 1; CALL setv(.c)'
+            # passed setv the address 1.
+            opt_operand = self._optimize_target(expr.operand)
             return P.LocationOf(operand=opt_operand, pos=expr.pos)
 
         if isinstance(expr, P.LocationOfString):
