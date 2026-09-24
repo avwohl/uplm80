@@ -1271,6 +1271,17 @@ class CodeGenerator:
             attrs = proc_attrs(decl)
             if not attrs.is_external:
                 self._analyze_proc_calls(decl, None)
+        self._note_main_arg_overlaps(shape.stmts)
+
+    def _note_main_arg_overlaps(self, stmts) -> None:
+        """Record the argument overlaps of the calls in the main program.
+
+        The main program is not a procedure, so _analyze_proc_calls never
+        sees its statements; but a call there fills its callee's slots just
+        as a call in a procedure does, and `CALL p2(5, g(1, 2))' at module
+        level put g's frame over p2's first argument (see _note_arg_overlap).
+        """
+        self._find_calls_in_stmts(list(stmts), "", set())
 
     def _collect_proc_names(self, decls: list, parent_proc: str | None, all_procs: set[str]) -> None:
         """Recursively collect all procedure names."""
@@ -2319,6 +2330,8 @@ class CodeGenerator:
             attrs = proc_attrs(decl)
             if not attrs.is_external:
                 self._analyze_proc_calls(decl, None)
+        for shape in shapes:
+            self._note_main_arg_overlaps(shape.stmts)
 
     def _escape_string(self, s: str) -> str:
         """Escape a string for assembly output."""

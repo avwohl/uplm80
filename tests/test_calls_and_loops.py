@@ -237,3 +237,23 @@ run: procedure;
 end run;
 call run;
 """, [251, 251, 7, 7])
+
+
+def test_a_call_in_the_main_program_whose_argument_calls_another():
+    """A call's arguments go into the callee's own slots one at a time, so
+    the callee's frame is live while the later ones are evaluated, and a
+    procedure they call must not be given storage that overlaps it. That
+    was recorded for calls inside procedures but not for the main program:
+    `CALL p2(5, g(1, 2))' at module level printed 1 3, g's parameter having
+    landed on p2's first argument."""
+    _check("""
+declare (r1, r2, r3) address;
+g: procedure (x, y) byte; declare (x, y) byte; return x + y; end g;
+p2: procedure (a, b); declare (a, b) byte; r1 = a; r2 = b; end p2;
+p3: procedure (a, b, c); declare (a, b, c) byte; r1 = a; r2 = b; r3 = c; end p3;
+f2: procedure (a, b) address; declare (a, b) byte; return a * 16 + b; end f2;
+call p2(5, g(1, 2)); call ph(r1); call ph(r2);
+call p3(4, 6, g(1, 1)); call ph(r1); call ph(r2); call ph(r3);
+call p3(g(3, 4), 1, g(1, 1)); call ph(r1); call ph(r2); call ph(r3);
+r1 = f2(5, g(1, 2)); call ph(r1);
+""", [5, 3, 4, 6, 2, 7, 1, 2, 0x53])

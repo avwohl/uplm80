@@ -145,6 +145,11 @@ Each fix has a regression test that fails without it.
   the call. They now wait on the stack until it has run.
 - **A `CALL` with five or more stacked arguments** (a REENTRANT, PUBLIC or
   EXTERNAL procedure) set SP to SP + HL instead of SP + 2n.
+- **A call in the main program whose later argument calls a procedure** lost
+  the earlier arguments: `CALL p2(5, g(1, 2))` passed 1 for 5. The earlier
+  arguments are already in `p2`'s own storage, and the storage allocator,
+  which keeps `g` out of it for such a call in a procedure, never looked at
+  the main program's calls.
 
 #### DO loops
 
