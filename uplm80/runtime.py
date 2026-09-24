@@ -26,13 +26,17 @@ def plm_mod(dividend: int, divisor: int) -> int:
     return dividend % divisor if divisor else dividend
 
 
-# 16-bit unsigned multiply: HL = HL * DE
-# Uses BC as temp
+# 16-bit unsigned multiply: HL = HL * DE, the low sixteen bits of the product
+# (DRI's PLM80.LIB @P0034 computes the same, most significant bit first).
+# The shifts shift in zeros: the rotates through carry this used to do took in
+# the carry of the add before them, and of the multiplicand's top bit, so a
+# product that overflowed came out wrong -- 81H * 511 gave 817FH, not 017FH.
+# DE is 0 on return.
 RUNTIME_MUL16 = """\
 ??mul16:
 	; 16-bit multiply: HL = HL * DE
 	; Input: HL = multiplicand, DE = multiplier
-	; Output: HL = product (low 16 bits)
+	; Output: HL = product (low 16 bits), DE = 0
 	; Destroys: A, B, C, D, E
 	ld	b,h
 	ld	c,l		; BC = multiplicand
@@ -41,25 +45,13 @@ RUNTIME_MUL16 = """\
 	ld	a,e
 	or	d		; DE == 0?
 	ret	z		; Yes, done
-	ld	a,e
-	rra			; LSB of multiplier into carry
+	srl	d
+	rr	e		; multiplier >>= 1, its low bit into carry
 	jp	nc,??mul16s	; If bit 0 clear, skip add
 	add	hl,bc		; HL = HL + BC
 ??mul16s:
-	; Shift multiplicand left
-	ld	a,c
-	rla
-	ld	c,a
-	ld	a,b
-	rla
-	ld	b,a
-	; Shift multiplier right
-	ld	a,d
-	rra
-	ld	d,a
-	ld	a,e
-	rra
-	ld	e,a
+	sla	c
+	rl	b		; multiplicand <<= 1
 	jp	??mul16l
 """
 
