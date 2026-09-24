@@ -6,7 +6,7 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 ## Unreleased
 
 Two sets of fixes, each checked against what Digital Research's own PL/M-80
-does.
+does, and a program layout that is Intel's.
 
 The first began with six defects found while rebuilding MP/M II's resident
 system processes from DRI's sources, each worked around in those sources until
@@ -32,7 +32,13 @@ or rewritten operand could change width. `uplm80/plm_types.py` states the
 rules once, the optimizer and the code generator follow them, and
 `tests/plm_difftest.py` checks random programs against a Python model of them.
 DO loops now end the way DRI's end, when the increment carries out of the
-index.
+index, and are laid out as DRI lays them out.
+
+The layout puts a program's variables last, after its code, its constants,
+the procedures' shared locals and the stack, as Intel's PL/M-80 does (see
+Changed). DRI's programs use everything past their last variable as a
+buffer, and MP/M II's SUBMIT and SPOOL now build from DRI's own sources and
+behave as DRI's binaries do.
 
 Each fix has a regression test that fails without it.
 
@@ -337,8 +343,9 @@ Each fix has a regression test that fails without it.
   `INC`, `jr nc` after an `ADD`, so there is no jump to a test at the bottom
   and no separate wrap exit. A variable BYTE limit is compared in place,
   `ld hl,i / cp (hl)`. A limit, start or step that is a constant but not a
-  literal (`LAST(x)`, `SIZE(x)`, `-1`) is used as one. MP/M II and 80un are
-  about 670 bytes smaller at `-O2`.
+  literal (`LAST(x)`, `SIZE(x)`, `-1`) is used as one. With this layout and
+  constants loaded straight into the register they are wanted in, MP/M II
+  and 80un went from 225,929 bytes to 224,925 at `-O2`.
 
 - **A program is laid out as Intel's PL/M-80 lays it out: the variables
   last.** The code and every constant - strings, `.(...)` lists, DATA
@@ -416,16 +423,37 @@ Each fix has a regression test that fails without it.
 - Every PL/M source in MP/M II (the 41 in DRI's tree and the 14 overrides,
   each in the mode `tools/build.py` uses) and in 80un (35 files one at a time,
   and `80un.com` and `80unbas.com` as their Makefile compiles them) compiles
-  at -O0, -O2 and -O3. At -O2, 65 of the 92 outputs change from 0.3.6, and
-  each change is one of the fixes above. The same 82 of 92 assemble with
-  um80 0.3.48 as with 0.3.6 (the rest are single modules of multi-module
-  programs, and MSCMN.PLM, which is only ever included). `80un.com` and
-  `80unbas.com` change; `80un.com` extracts the same files, with the same
-  console output, from all 17 sample archives as 0.3.6's, and `80unbas.com`
-  detokenises `PALLOPS.BAS` the same.
-- `scripts/difftest.py --seeds 320 --first 1000`: 319 of the 320 random
-  programs print what the model says at `-O0` to `-O3`; seed 1063 differs at
-  `-O1` and above, by the second upeepz80 defect above.
+  at -O0, -O2 and -O3, and the same 82 of the 92 outputs assemble with um80
+  0.3.49 as with 0.3.6 (the rest are single modules of multi-module programs,
+  and MSCMN.PLM, which is only ever included). At -O2 every output changes
+  from 0.3.6, if only by the layout, and every change is one of the entries
+  above. The 82 come to 224,925 bytes, against 227,511 with 0.3.6. `80un.com`
+  extracts the same files, with the same console output, from all 17 sample
+  archives as 0.3.6's, at -O2 and -O3, and `80unbas.com` detokenises
+  `PALLOPS.BAS` the same.
+- MP/M II built from source with this release - `tools/build.py` for V2.0
+  and V2.1, 44 of 44 targets each - passes mpm2's `scripts/run_tests.sh all`
+  on the V2.1 system and `scripts/run_tests.sh src`. SUBMIT and SPOOL were
+  built from DRI's own `SUB.PLM` and `MSPL.PLM`, without the workarounds
+  mpm2 carried for the old layout, and compared on the emulator with DRI's
+  V2.0 `SUBMIT.PRL` and `SPOOL.PRL`: SUBMIT runs two 300-line command files
+  (3968 and 3328 bytes), a 250-line one of 15K, and one with parameters,
+  printing exactly what DRI's does, where the release before the layout
+  change printed its own messages over the 3968-byte file and ran none of
+  it; SPOOL, printing files itself on a system without the spooler RSP,
+  prints a 150-line file and a 7936-byte one as DRI's does, where before it
+  printed 512 NULs in place of their first records. `stat usr:` now prints
+  what DRI's STAT prints. GENSYS built from source, whose DATA now follows
+  its code, makes the same MPM.SYS and SYSTEM.DAT under cpmemu as DRI's
+  GENSYS, with the same console output (V2.1 differs in the six bytes of
+  the serial number, which the build leaves as DRI's placeholder).
+- The differential tests: `scripts/difftest.py --seeds 400 --first 1000`,
+  all 400 random programs as the model says at `-O0` to `-O3` (seed 1063,
+  which the second upeepz80 defect above broke, no longer meets it); and the
+  integration verification's own generator, which covers DATA, INITIAL, AT,
+  BASED, DO loops whose body moves the index or the bound, calls in
+  arguments and module-level code: 497 programs at `-O0` to `-O3`, all as its
+  model says.
 - The run tests compile with the checkout under test: they used to start the
   compiler with `python -P`, which found whatever uplm80 was installed. Every
   test that runs a program - the run tests, the differential test and the

@@ -552,9 +552,9 @@ class CodeGenerator:
         """The data segment: ??AUTO, the stack of the modes that carry one,
         and then the module's variables, in the order the source declares
         them - so that the last variable declared is the last thing in the
-        module, as Intel's PL/M-80 lays a program out (PIP.COM's 100-byte
-        stack is at 21EDH to 2250H - `LXI SP,2251H' at 048DH of MP/M II's
-        PIP.PRL - and its variables start at 2251H).
+        module, as Intel's PL/M-80 lays a program out (MP/M II's PIP.PRL
+        sets `LXI SP,2251H' at 048DH: its 100-byte stack is at 21EDH to
+        2250H, and its variables start at 2251H).
 
         The linker puts every module's data segment after all the code
         segments, the runtime modules' included, so nothing follows a

@@ -225,11 +225,7 @@ convention of jumping to *start − 3* to skip over a local stack area:
 - Entry preamble (auto-generated):
 
   ```asm
-  jp   ??START      ; skip over the stack buffer
-  ds   64           ; 64-byte local stack
-  ??STACK:          ; top of stack
-  ??START:
-  ld   sp,??STACK   ; use the local stack
+  ld   sp,??STACK   ; a 64-byte stack in the data segment (see Memory Layout)
   jp   MAIN         ; jump (not call) into MAIN
   ```
 - The program controls its own exit — no automatic warm boot. Original DR
@@ -257,10 +253,31 @@ resolved *symbol* reference reaches a `.PRL` relocation bitmap.
   emitted — DRI's sources enter themselves by a jump to `.start-3`:
 
   ```asm
-  ld   sp,??STACK   ; 512-byte stack carried in the image
+  ld   sp,??STACK   ; 512-byte stack carried in the image, before the variables
   ```
 - `AT(.MEMORY)` storage lies past the image; give the `.PRL` the memory it
   needs with `ul80 --extra`, as DRI did with GENMOD's third argument.
+
+### Memory Layout
+
+A module is laid out the way Intel's PL/M-80 lays a program out, with the
+variables last:
+
+- **Code segment (`cseg`):** a BARE or MP/M module's own `DATA` first (DRI's
+  programs begin with the `jump byte data (0c3h)` they enter themselves by),
+  then the entry code, the procedures and the runtime routines, then every
+  constant: string literals, `.(...)` lists, `DATA` declared in a procedure
+  and, in CP/M mode, the module's own `DATA`, which there must not come
+  before the entry code at 100H.
+- **Data segment (`dseg`):** `??AUTO`, the procedures' shared locals; then the
+  stack of BARE and MP/M modes (`??STACK`); then the variables, in the order
+  the source declares them.
+
+`ul80` places every module's data segment after all the code segments,
+including those of the runtime modules linked after it, so nothing follows a
+program's last variable and `.MEMORY` (the linker's `__END__`) is one past it.
+DRI's programs rely on that: MP/M II's `SUB.PLM` and `MSPL.PLM` use everything
+from their last variable up to `MAXB` as a buffer.
 
 ## Project Structure
 
