@@ -822,3 +822,32 @@ end t;
     assert body("N", 2) == ["db 0FFH", "db 0FFH"], lines
     assert body("S", 3) == ["db 5", "dw 4", "db 7"], lines
     assert body("Z", 1) == ["db (X-1)"], lines
+
+
+CONSTANT_LIST_SRC = """
+0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare msgs (3) address data (.('one$'), .('two$'), .'three$');
+declare tbl structure (p address, b byte) initial (.(1, 2, 'XY'), 0AAH);
+declare after byte data (0EEH);
+declare pb address, b based pb byte;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+call mon1(9, msgs(1));
+call mon1(9, msgs(2));
+pb = tbl.p; call putc('0' + b); pb = pb + 1; call putc('0' + b);
+pb = pb + 1; call putc(b); pb = pb + 1; call putc(b);
+call putc('0' + (tbl.b = 0AAH) + 1);
+call putc('0' + (after = 0EEH) + 1);
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2])
+def test_a_constant_list_in_data_is_its_address(opt):
+    """PL/M-80 manual, 4.1.3: `.(constant, ...)' is the location of the
+    constants, stored somewhere.  In DATA and INITIAL the constants were laid
+    out in place of it, so `msgs (3) ADDRESS DATA (.('one$'), ...)' held the
+    characters, and `CALL mon1(9, msgs(2))' printed whatever they pointed
+    at.  `.'string'' was not accepted at all."""
+    assert run_plm(CONSTANT_LIST_SRC, opt).strip() == "twothree12XY00", opt

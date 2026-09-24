@@ -498,6 +498,8 @@ class CodeGenerator:
         self.data_segment: list[AsmLine] = []
         self.code_data_segment: list[AsmLine] = []  # DATA values emitted inline in code
         self.at_defs: list[AsmLine] = []  # AT variables' EQUs, after all storage
+        # The constants of a `.(...)' in the value list being emitted.
+        self._pending_constants: list[AsmLine] = []
         self.string_literals: list[tuple[str, str]] = []  # (label, value)
         self.current_proc: str | None = None
         # ``current_proc_decl`` now holds a typed :class:`P.ProcDecl`; its
@@ -2815,10 +2817,14 @@ class CodeGenerator:
                 else:
                     operand = self._data_expr_to_string(val)
                 target.append(AsmLine(opcode=directive, operands=operand))
-            elif isinstance(val, P.LocationOfList):
-                # Nested address-of list: .(a, b, c)
-                for v in val.values or []:
-                    self._emit_data_values([v], dtype, inline=inline)
+            elif isinstance(val, (P.LocationOfList, P.LocationOfString)):
+                # `.(a, b, ...)' and `.'text'' are where the constants are
+                # (PL/M-80 manual, 4.1.3): an address, with the constants
+                # stored elsewhere, as they are in an expression.  They were
+                # laid out in place of it, so `msgs (3) ADDRESS DATA
+                # (.('one$'), ...)' held characters, not pointers.
+                target.append(AsmLine(opcode="db" if dtype == DataType.BYTE else "dw",
+                                      operands=self._constant_list_label(val)))
             elif isinstance(val, P.ParenExpr):
                 # Parenthesised single value — unwrap and re-emit.
                 self._emit_data_values([val.inner], dtype, inline=inline)
@@ -2913,7 +2919,7 @@ class CodeGenerator:
         """
         width = 1 if dtype == DataType.BYTE else 2
         count = 0
-        for val in self._flatten_values(values):
+        for val in values:
             inner = unwrap_paren(val)
             if isinstance(inner, P.StringLiteral):
                 count += -(-len(string_value(inner)) // width)
@@ -2933,16 +2939,30 @@ class CodeGenerator:
             one.extend([width] * (m.dimension or 1))
         return one * (dimension or 1)
 
-    @staticmethod
-    def _flatten_values(values) -> list:
-        """The value list with any `.(a, b, ...)' spliced in, as it is emitted."""
-        flat = []
-        for val in values:
-            if isinstance(unwrap_paren(val), P.LocationOfList):
-                flat.extend(CodeGenerator._flatten_values(unwrap_paren(val).values or []))
+    def _constant_list_label(self, val) -> str:
+        """A label for the constants of `.(a, b, ...)' or `.'text'' in a value
+        list.  They go after the list (:attr:`_pending_constants`), since
+        they are not part of what is being declared."""
+        if isinstance(val, P.LocationOfString):
+            raw = val.value.text
+            if raw.startswith("'") and raw.endswith("'"):
+                raw = raw[1:-1]
+            label = self._new_string_label()
+            self.string_literals.append((label, raw.replace("''", "'")))
+            return label
+        label = self._new_label("DATA")
+        self._pending_constants.append(AsmLine(label=label))
+        for v in val.values or []:
+            v = unwrap_paren(v)
+            if isinstance(v, P.StringLiteral):
+                operand = self._escape_string(string_value(v))
             else:
-                flat.append(val)
-        return flat
+                value = self._try_eval_const(v)
+                if value is None:
+                    raise CodeGenError(f"`.(...)' holds constants, not {type(v).__name__}")
+                operand = self._format_number(value & 0xFF)
+            self._pending_constants.append(AsmLine(opcode="db", operands=operand))
+        return label
 
     def _emit_value_list(self, values, widths: list[int], spare: int,
                          inline: bool = False) -> None:
@@ -2989,7 +3009,7 @@ class CodeGenerator:
         target = self.code_data_segment if inline else self.data_segment
         slot = 0
         emitted = 0
-        for val in self._flatten_values(values):
+        for val in values:
             inner = unwrap_paren(val)
             if isinstance(inner, P.StringLiteral):
                 text = string_value(inner)
@@ -3014,6 +3034,8 @@ class CodeGenerator:
             target.append(
                 AsmLine(opcode="ds", operands=str(sum(widths) - emitted))
             )
+        self.data_segment.extend(self._pending_constants)
+        self._pending_constants = []
 
     def _gen_proc_decl(self, decl) -> None:
         """Generate code for a procedure declaration.
