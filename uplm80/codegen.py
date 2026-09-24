@@ -2535,6 +2535,13 @@ class CodeGenerator:
 
         # AT variables use specified address
         if at_location is not None:
+            if data_values_nodes or initial_values_nodes:
+                # The values belong at the AT address, which is somewhere
+                # else's storage or no storage at all; they were dropped
+                # without a word.
+                raise CodeGenError(
+                    f"{name}: AT with {'DATA' if data_values_nodes else 'INITIAL'} is not "
+                    "supported; assign the values at run time")
             self._emit_at_decl(asm_name, at_location, sym, extra=index * size)
             return
 

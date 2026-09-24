@@ -851,3 +851,13 @@ def test_a_constant_list_in_data_is_its_address(opt):
     characters, and `CALL mon1(9, msgs(2))' printed whatever they pointed
     at.  `.'string'' was not accepted at all."""
     assert run_plm(CONSTANT_LIST_SRC, opt).strip() == "twothree12XY00", opt
+
+
+@pytest.mark.parametrize("kind", ["initial", "data"])
+def test_at_with_initial_or_data_is_an_error_not_dropped(kind):
+    """`DECLARE x (2) BYTE AT (.buf) INITIAL (5, 6)' compiled to `X EQU BUF'
+    and nothing else: the values were dropped without a word.  They belong
+    in someone else's storage, or at an address with none, which this
+    compiler cannot lay out; saying so is better than losing them."""
+    src = f"t: do; declare buf (4) byte; declare x (2) byte at (.buf) {kind} (5, 6); end t;"
+    assert Compiler().compile(src, "<test>") is None
