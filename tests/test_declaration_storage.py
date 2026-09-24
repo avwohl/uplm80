@@ -468,3 +468,26 @@ end sched;
 """))
     i = lines.index("STK:")
     assert lines[i + 1:i + 21] == ["dw\t0C7C7H"] * 19 + ["dw\tSCHED"], lines[i + 1:i + 21]
+
+
+def test_at_a_negative_subscript_is_a_negative_offset():
+    """`AT (.tbuff(-1))' is TBUFF-1.  The index was taken modulo 65536 and
+    written `TBUFF+65535', which um80 0.3.48 assembles without the external's
+    relocation; one signed offset is what every assembler reads right."""
+    asm = _asm("""
+t: do;
+declare tbuff (4) byte external;
+declare m (1) byte at (.tbuff(-1));
+declare w (2) address external;
+declare n address at (.w(-2));
+declare y byte, z address;
+y = m(0);
+y = m(1);
+z = n;
+end t;
+""")
+    assert "65535" not in asm and "65532" not in asm, asm
+    lines = [l.strip() for l in asm.splitlines()]
+    # m(0), m(1) and n name the externals with one signed offset each.
+    assert "ld\thl,TBUFF-1" in lines and "ld\thl,TBUFF" in lines, asm
+    assert "ld\thl,(W-4)" in lines, asm

@@ -5,6 +5,7 @@ Generates Z80 assembly code from the optimized AST.
 Outputs MACRO-80 compatible .MAC files.
 """
 
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -494,6 +495,8 @@ class CodeGenerator:
         # pushed while their bodies run.  A RETURN from inside one has to pop
         # them first, or its RET takes a loop count for the return address.
         self._loop_words = 0
+        # Assembly names declared EXTRN, which _sym_offset folds offsets onto.
+        self._extern_names: set[str] = set()
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
@@ -2293,6 +2296,7 @@ class CodeGenerator:
             )
             if is_external:
                 self._emit("extrn", base_name)
+                self._extern_names.add(base_name)
             elif is_public:
                 self._emit("public", base_name)
             return
@@ -2317,6 +2321,7 @@ class CodeGenerator:
         # External variables don't get storage here
         if is_external:
             self._emit("extrn", asm_name)
+            self._extern_names.add(asm_name)
             return
 
         # Public declaration
@@ -2502,7 +2507,7 @@ class CodeGenerator:
                     f"AT(...) needs a constant address expression; got "
                     f"{type(loc_operand).__name__}")
             base_sym, base_asm, offset, _ = resolved
-            operand = base_asm if offset == 0 else f"{base_asm}+{offset}"
+            operand = self._sym_offset(base_asm, offset)
             # An external base is aliased rather than defined, so that
             # references name the external and the linker resolves them.
             is_base_external = bool(base_sym and base_sym.is_external)
@@ -2603,14 +2608,12 @@ class CodeGenerator:
                 raise CodeGenError(
                     f"Unsupported subscript in DATA location expression: {operand}")
             index = number_value(args[0])
-            if index == 0:
-                return base
             width = 1
             if isinstance(operand.callee, P.Identifier):
                 sym = self._lookup_scoped(ident_text(operand.callee.name))
                 if sym is not None and sym.data_type != DataType.BYTE:
                     width = 2
-            return f"{base}+{self._format_number(index * width)}"
+            return self._sym_offset(base, index * width)
         raise CodeGenError(f"Unsupported operand in DATA location expression: {operand}")
 
     def _lookup_scoped(self, name: str):
@@ -2838,6 +2841,7 @@ class CodeGenerator:
 
         if attrs.is_external:
             self._emit("extrn", proc_asm_name)
+            self._extern_names.add(proc_asm_name)
             self.deferred_block_procs = saved_block_procs
             self.current_proc = old_proc
             self.current_proc_decl = old_proc_decl
@@ -4954,6 +4958,33 @@ class CodeGenerator:
             sym = self.symbols.lookup(name)
         return sym
 
+    @staticmethod
+    def _split_offset(operand: str) -> tuple[str, int]:
+        """`NAME', `NAME+n' or `NAME-n' as (NAME, n)."""
+        m = re.fullmatch(r"(.+?)([+-]\d+)", operand)
+        if m is None:
+            return operand, 0
+        return m.group(1), int(m.group(2))
+
+    def _sym_offset(self, base: str, offset: int) -> str:
+        """The operand for `base' plus a constant byte offset.
+
+        The offset is written signed, since it is taken modulo 65536: an
+        address one below NAME is NAME-1, not NAME+65535.  Where `base' is an
+        external, or stands for one plus an offset (a variable declared AT an
+        external), the offsets are added up into one: the object format
+        carries an external's reference with a single offset, and um80 0.3.48
+        assembles EXT+c1+c2 as EXT+c2 and drops the relocation of EXT+65535.
+        """
+        offset = ((offset + 0x8000) & 0xFFFF) - 0x8000
+        root, base_offset = self._split_offset(base)
+        if root in self._extern_names:
+            base = root
+            offset = ((base_offset + offset + 0x8000) & 0xFFFF) - 0x8000
+        if offset == 0:
+            return base
+        return f"{base}+{offset}" if offset > 0 else f"{base}-{-offset}"
+
     def _based_ptr_operand(self, sym) -> str:
         """Where the pointer behind a BASED variable lives.
 
@@ -4978,7 +5009,7 @@ class CodeGenerator:
             offset += width * (m.dimension or 1)
         else:
             return base_asm
-        return base_asm if offset == 0 else f"{base_asm}+{offset}"
+        return self._sym_offset(base_asm, offset)
 
     def _gen_expr(self, expr) -> DataType:
         """Generate code for a typed expression.
@@ -5462,7 +5493,7 @@ class CodeGenerator:
                             if offset == 0:
                                 self._emit("ld", f"({asm_name}),hl")
                             else:
-                                self._emit("ld", f"de,{asm_name}+{offset}")
+                                self._emit("ld", f"de,{self._sym_offset(asm_name, offset)}")
                                 self._emit("ex", "de,hl")
                                 self._emit("ld", "(hl),e")
                                 self._emit("inc", "hl")
@@ -5473,7 +5504,7 @@ class CodeGenerator:
                             if offset == 0:
                                 self._emit("ld", f"({asm_name}),a")
                             else:
-                                self._emit("ld", f"({asm_name}+{offset}),a")
+                                self._emit("ld", f"({self._sym_offset(asm_name, offset)}),a")
                     else:
                         elem_type = sym.data_type if sym else DataType.BYTE
                         if elem_type == DataType.ADDRESS:
@@ -6248,10 +6279,7 @@ class CodeGenerator:
             if sym and not sym.based_on:
                 asm_name = sym.asm_name if sym.asm_name else self._mangle_name(ident_text(base.name))
                 offset = number_value(index) * elem_size
-                if offset == 0:
-                    self._emit("ld", f"hl,{asm_name}")
-                else:
-                    self._emit("ld", f"hl,{asm_name}+{offset}")
+                self._emit("ld", f"hl,{self._sym_offset(asm_name, offset)}")
                 return
 
         # Optimised BYTE-index path with identifier base.
