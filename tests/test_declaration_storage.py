@@ -270,8 +270,8 @@ end t;
 """, opt=0)
     lines = [l.strip() for l in asm.splitlines()]
     # 8 characters plus 4 bytes = 12 elements, so LAST is 11: a BYTE, loaded
-    # into A, or compared with as the loop's limit.
-    assert {"ld\thl,11", "ld\ta,0BH", "cp\t0CH"} & set(lines), asm
+    # into A, or the loop's limit (compared with 11 + 1, or 12 passes).
+    assert {"ld\thl,11", "ld\ta,0BH", "cp\t0CH", "ld\tb,0CH"} & set(lines), asm
     assert "ld\thl,-2" not in lines, asm
 
 
@@ -279,4 +279,4 @@ def test_last_of_a_fixed_array_is_unchanged():
     asm = _asm("t: do; declare a (15) byte, i byte, n byte; n=0; "
                "do i = 0 to last(a); n=n+1; end; end t;", opt=0)
     lines = {l.strip() for l in asm.splitlines()}
-    assert {"ld\thl,14", "ld\ta,0EH", "cp\t0FH"} & lines, asm
+    assert {"ld\thl,14", "ld\ta,0EH", "cp\t0FH", "ld\tb,0FH"} & lines, asm

@@ -4272,32 +4272,26 @@ class CodeGenerator:
         if sym and sym.data_type == DataType.BYTE:
             index_type = DataType.BYTE
 
-        # The limit (like the start and the step) is converted to the
-        # index's type (5.1.4), so a BYTE index makes a byte loop whatever
-        # the limit is: `DO b = 0 TO 300' runs to 44.
+        # The start, the limit and the step are converted to the index's
+        # type (5.1.4), so a BYTE index makes a byte loop whatever the limit
+        # is: `DO b = 0 TO 300' runs to 44, and BY -1 is BY 0FFH.
         both_bytes = index_type == DataType.BYTE
+        width = 0xFF if both_bytes else 0xFFFF
 
-        # Get step value (default +1 when no BY clause; only constant
-        # NumberLiteral steps drive the byte-loop optimisations).
+        def const(expr) -> int | None:
+            value = self._const_value(expr)
+            return None if value is None else value & width
+
+        start_val = const(stmt.start)
+        bound_val = const(stmt.bound)
         # A BY clause whose step is not a constant has to be evaluated each
-        # time round.  Defaulting step_val to 1 for it silently turned
-        # `DO J = A TO B BY I' into `BY 1': MP/M II's UTIL7/DSE.PLM walks an
-        # FCB disk map `BY i', where i is 1 or 2 according to whether the disk
-        # uses byte or word block numbers, and counted every allocated block
-        # twice on a disk with word numbers.
-        step_val = 1
-        step_is_const = True
-        if step_expr is not None:
-            if isinstance(step_expr, P.NumberLiteral):
-                step_val = number_value(step_expr)
-            else:
-                step_is_const = False
-
-        # Check if loop index is used in body - if not, we can use DJNZ on Z80.
-        # _index_used_in_body still walks the legacy AST shape; it recurses
-        # via isinstance and returns False for unrecognised typed nodes,
-        # which is conservative (forces the safe fallback path).
-        index_used = self._index_used_in_body(index_var, body_stmts)
+        # time round.  Defaulting it to 1 silently turned `DO J = A TO B BY I'
+        # into `BY 1': MP/M II's UTIL7/DSE.PLM walks an FCB disk map `BY i',
+        # where i is 1 or 2 according to whether the disk uses byte or word
+        # block numbers, and counted every allocated block twice on a disk
+        # with word numbers.
+        step_val = 1 if step_expr is None else const(step_expr)
+        step_is_const = step_val is not None
 
         # Whether the body can move the index: an assignment, an embedded
         # one, a DO over it, a call that reaches it, or a store through a
@@ -4312,166 +4306,115 @@ class CodeGenerator:
         # be able to change or read it -- nor, since nothing here follows a
         # pointer, may a pointer reach it; and BC is on the stack while the
         # body runs, so it must not leave by a GOTO or a RETURN.
-        bound_fixed = self._limit_is_fixed(stmt.bound, body_stmts)
         if (
             both_bytes
-            and step_is_const
             and step_val == 1
-            and not index_used
-            and not self._stmts_leave_block(body_stmts)
-            and bound_fixed
+            and start_val == 0
             and not index_moves
             and not self._reachable_by_pointer(index_name)
-            and isinstance(stmt.start, P.NumberLiteral)
-            and number_value(stmt.start) == 0
+            and not self._index_used_in_body(index_var, body_stmts)
+            and not self._stmts_leave_block(body_stmts)
+            and (bound_val is not None or self._limit_is_fixed(stmt.bound, body_stmts))
         ):
-            # Calculate iteration count = bound + 1
-            # If bound is constant, emit LD B,bound+1
-            # If bound is variable, emit: load bound; INC A; LD B,A
-            # The index is not stored while the loop runs; after it, it is
-            # given the value the loop leaves in it, limit + 1 -- unless
-            # nothing reads it later.
-            index_live = self._read_outside(index_name, stmt)
-            if isinstance(stmt.bound, P.NumberLiteral):
-                bound_const = number_value(stmt.bound) & 0xFF
-                iter_count = bound_const + 1
-                if iter_count <= 255:
-                    self._emit("ld", f"b,{self._format_number(iter_count)}")
-                else:
-                    # Too many iterations for DJNZ
-                    pass  # Fall through to regular loop
+            # The count is limit + 1; for a limit of 255 that is 0, which
+            # DJNZ takes as 256 -- the index runs 0..255 and wraps to 0,
+            # where the loop stops.
+            if bound_val is not None:
+                self._emit("ld", f"b,{self._format_number((bound_val + 1) & 0xFF)}")
             else:
-                # Variable bound: A = bound; A++; B = A. A limit of 255
-                # makes the count 0, which DJNZ takes as 256 -- the index
-                # runs 0..255 and wraps to 0, where the loop stops.
-                bt = self._gen_expr(stmt.bound)
-                if bt == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("inc", "a")  # A = bound + 1 = iteration count
-                self._emit("ld", "b,a")  # B = iteration count
-
-            # Only proceed with B-counter loop if we set up B
-            if (
-                isinstance(stmt.bound, P.NumberLiteral)
-                and (number_value(stmt.bound) & 0xFF) + 1 <= 255
-            ):
-                # Loop body - save B since body may clobber it
-                self._emit_label(loop_label)
-                self._emit("push", "bc")
-                for s in body_stmts:
-                    self._gen_stmt(s)
-                self._emit("pop", "bc")
-
-                # Decrement B and jump if not zero
-                # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
-                self._emit_label(incr_label)
-                self._emit("dec", "b")
-                self._emit("jp", f"nz,{loop_label}")
-
-                self._emit_label(end_label)
-                if index_live:
-                    self._emit("ld", f"a,{self._format_number(iter_count)}")
-                    self._gen_store(index_var, DataType.BYTE)
-                self.loop_stack.pop()
-                return
-            elif not isinstance(stmt.bound, P.NumberLiteral):
-                # Variable bound case - we set up B above.
-                # Loop body - save B since body may clobber it
-                self._emit_label(loop_label)
-                self._emit("push", "bc")
-                for s in body_stmts:
-                    self._gen_stmt(s)
-                self._emit("pop", "bc")
-
-                # Decrement B and jump if not zero
-                # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
-                self._emit_label(incr_label)
-                self._emit("dec", "b")
-                self._emit("jp", f"nz,{loop_label}")
-
-                self._emit_label(end_label)
-                if index_live:
-                    # The limit is one the body cannot change.
-                    self._gen_expr_to_a(stmt.bound)
+                self._gen_expr_to_a(stmt.bound)
+                self._emit("inc", "a")
+                self._emit("ld", "b,a")
+            # Loop body - save B since body may clobber it
+            self._emit_label(loop_label)
+            self._emit("push", "bc")
+            for s in body_stmts:
+                self._gen_stmt(s)
+            self._emit("pop", "bc")
+            # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
+            self._emit_label(incr_label)
+            self._emit("dec", "b")
+            self._emit("jp", f"nz,{loop_label}")
+            self._emit_label(end_label)
+            # The index was not stored while the loop ran; after it, it has
+            # the value the loop leaves in it, limit + 1 -- unless nothing
+            # reads it later.
+            if self._read_outside(index_name, stmt):
+                if bound_val is not None:
+                    self._emit("ld", f"a,{self._format_number((bound_val + 1) & 0xFF)}")
+                else:
+                    self._gen_expr_to_a(stmt.bound)  # one the body cannot change
                     self._emit("inc", "a")
-                    self._gen_store(index_var, DataType.BYTE)
-                self.loop_stack.pop()
-                return
+                self._gen_store(index_var, DataType.BYTE)
+            self.loop_stack.pop()
+            return
 
-        # PL/M-80's iterative DO, as DRI's compiler codes it (UTIL4/ERAQ.PRL,
-        # UTIL3/LOAD.COM): the index is compared with the limit before each
-        # pass, and the loop ends when the increment carries out of the
-        # index's width -- `INR A / JNZ top' for a BYTE step of 1,
-        # `DAD D / JNC top' for a BY step. So `DO b = 0 TO 255' runs 256
-        # times and leaves b = 0, and a step that would wrap past the limit
-        # stops the loop instead. A step of 0FFH (or -1) is 255, not a
-        # count downwards (5.1.4).
+        # PL/M-80's iterative DO, laid out the way DRI's compiler lays it out
+        # (MPMLDR/GENSYS.COM 106BH, UTIL4/STAT.PRL 133AH, UTIL3/LOAD.COM
+        # 0487H): the index is compared with the limit at the top, before
+        # every pass, and the step jumps back to that test only if it did
+        # not carry out of the index's width -- `INR A / JNZ top' for a BYTE
+        # step of 1, `DAD D / JNC top' for a BY step. So `DO b = 0 TO 255'
+        # runs 256 times and leaves b = 0, and a step that would wrap past
+        # the limit stops the loop instead (5.1.4, step 4) -- even when the
+        # body has moved the index. A limit of 0FFH (0FFFFH) passes every
+        # index, so it needs no test at all.
         if both_bytes:
-            bound_val = (number_value(stmt.bound) & 0xFF
-                         if isinstance(stmt.bound, P.NumberLiteral) else None)
-            step_byte = step_val & 0xFF if step_is_const else None
-
-            # Initialize index variable
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
+            self._gen_expr_to_a(stmt.start)
             self._gen_store(index_var, DataType.BYTE)
 
-            # A limit of 255 passes every index, so there is nothing to test.
-            if bound_val != 0xFF:
-                self._emit("jp", test_label)
+            self._emit_label(test_label)
+            if bound_val is not None and bound_val != 0xFF:
+                self._gen_load(index_var)  # A = index
+                self._emit("cp", self._format_number(bound_val + 1))
+                self._emit("jp", f"nc,{end_label}")    # index > limit
+            elif bound_val is None:
+                # The limit is evaluated on every pass, converted to a BYTE:
+                # leave if limit - index borrows.
+                self._gen_expr_to_a(stmt.bound)
+                operand = self._byte_var_operand(index_var)
+                if operand is None:
+                    self._emit("ld", "b,a")
+                    self._gen_load(index_var)
+                    self._emit("ld", "c,a")
+                    self._emit("ld", "a,b")
+                    operand = "c"
+                self._emit("cp", operand)
+                self._emit("jp", f"c,{end_label}")
 
-            # Loop body
             self._emit_label(loop_label)
             for s in body_stmts:
                 self._gen_stmt(s)
 
-            # Increment, and stop when it carries out.
+            # Step, and go round again unless it carried out. INC sets Z
+            # when it wraps, ADD sets carry; storing a BYTE is all loads, so
+            # the flags survive the store.
             self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-                wrap = "c"
-            elif step_byte == 1:
-                self._emit("inc", "a")
-                wrap = "z"
+            operand = self._byte_var_operand(index_var) if step_val == 1 else None
+            if operand is not None:
+                # `inc (hl)' or `inc (ix+n)': in place. (The peephole makes
+                # `ld a,(x) / inc a / ld (x),a' into `ld hl,x / inc (hl)',
+                # and did so to `(ix+n)' as well: `ld hl,ix+-1', which does
+                # not assemble -- a REENTRANT procedure's BYTE loop.)
+                self._emit("inc", operand)
+                again = "nz"
             else:
-                self._emit("add", f"a,{self._format_number(step_byte)}")
-                wrap = "c"
-            self._gen_store(index_var, DataType.BYTE)
-            # With a constant limit the index is at most the limit before
-            # the step, so if limit + step fits in a byte it cannot wrap --
-            # unless the body can move the index past the limit.
-            can_wrap = (bound_val is None or not step_is_const or index_moves
-                        or bound_val + step_byte > 0xFF)
-            if bound_val == 0xFF:
-                self._emit("jp", f"n{wrap},{loop_label}")
-                self._emit_label(test_label)
-            else:
-                if can_wrap:
-                    self._emit("jp", f"{wrap},{end_label}")
-                self._emit_label(test_label)
-                if bound_val is not None:
+                if step_is_const:
                     self._gen_load(index_var)  # A = index
-                    self._emit("cp", self._format_number(bound_val + 1))
-                    self._emit("jp", f"C,{loop_label}")  # index <= limit
+                    if step_val == 1:
+                        self._emit("inc", "a")
+                        again = "nz"
+                    else:
+                        self._emit("add", f"a,{self._format_number(step_val)}")
+                        again = "nc"
                 else:
-                    # The limit is evaluated on every pass, converted to a
-                    # BYTE. Continue while index <= limit.
-                    bound_result = self._gen_expr(stmt.bound)
-                    if bound_result == DataType.ADDRESS:
-                        self._emit("ld", "a,l")
-                    self._emit("ld", "b,a")  # B = limit
-                    self._gen_load(index_var)  # A = index
-                    self._emit("cp", "b")
-                    self._emit("jp", f"c,{loop_label}")
-                    self._emit("jp", f"z,{loop_label}")
+                    self._gen_expr_to_a(step_expr)
+                    self._emit("ld", "b,a")
+                    self._gen_load(index_var)
+                    self._emit("add", "a,b")
+                    again = "nc"
+                self._gen_store(index_var, DataType.BYTE)
+            self._emit("jp", f"{again},{test_label}")
 
             self._emit_label(end_label)
             self.loop_stack.pop()
@@ -4489,25 +4432,40 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
-        bound_val = (number_value(stmt.bound) & 0xFFFF
-                     if isinstance(stmt.bound, P.NumberLiteral) else None)
-        step_word = step_val & 0xFFFF if step_is_const else None
-
-        # Initialize index variable
         self._gen_expr_to_hl(stmt.start)
         self._gen_store(index_var, DataType.ADDRESS)
 
-        # Jump to test (a limit of 0FFFFH passes every index)
-        if bound_val != 0xFFFF:
-            self._emit("jp", test_label)
+        self._emit_label(test_label)
+        if bound_val is not None and bound_val != 0xFFFF:
+            _index_to_hl()
+            # index - (limit + 1) does not borrow: index > limit.
+            self._emit("ld", f"de,{self._format_number(bound_val + 1)}")
+            self._emit_sub16()
+            self._emit("jp", f"nc,{end_label}")
+        elif bound_val is None:
+            _index_to_hl()
+            if self._expr_preserves_de(stmt.bound):
+                self._emit("ex", "de,hl")        # DE = index
+                self._gen_expr_to_hl(stmt.bound)  # HL = bound, DE untouched
+            else:
+                # The bound is free to use DE (a call, a 16-bit subexpression,
+                # `ld de,nn`), so the index has to survive on the stack.
+                self._emit("push", "hl")
+                self._gen_expr_to_hl(stmt.bound)  # HL = bound
+                self._emit("pop", "de")           # DE = index
+            self._emit_sub16()                    # limit - index borrows: done
+            self._emit("jp", f"c,{end_label}")
 
-        # Loop body
         self._emit_label(loop_label)
         for s in body_stmts:
             self._gen_stmt(s)
 
-        # Increment, and stop when it carries out.
+        # Step, and go round again unless it carried out. A constant step
+        # from at most a constant limit cannot carry when limit + step fits
+        # -- unless the body can move the index past the limit.
         self._emit_label(incr_label)
+        can_wrap = (bound_val is None or not step_is_const or index_moves
+                    or bound_val + step_val > 0xFFFF)
         _index_to_hl()
         if not step_is_const:
             self._emit("push", "hl")
@@ -4515,57 +4473,74 @@ class CodeGenerator:
             self._emit("ex", "de,hl")
             self._emit("pop", "hl")
             self._emit("add", "hl,de")
-            wrap = "c"
-        elif step_word == 1:
+            again = "nc"
+        elif step_val == 1:
             self._emit("inc", "hl")
-            wrap = "z"
+            again = "nz"
         else:
-            # BC, not DE: the peephole turns `ld de,1..3 / add hl,de' into
-            # `inc hl', which sets no carry.
-            can_carry = (bound_val is None or index_moves
-                         or bound_val + step_word > 0xFFFF)
-            pair = "bc" if can_carry else "de"
-            self._emit("ld", f"{pair},{self._format_number(step_word)}")
+            # BC, not DE, where the carry is read: the peephole turns
+            # `ld de,1..3 / add hl,de' into `inc hl', which sets no carry.
+            pair = "bc" if can_wrap else "de"
+            self._emit("ld", f"{pair},{self._format_number(step_val)}")
             self._emit("add", f"hl,{pair}")
-            wrap = "c"
+            again = "nc"
         self._gen_store(index_var, DataType.ADDRESS)
-        can_wrap = (bound_val is None or not step_is_const or index_moves
-                    or bound_val + step_word > 0xFFFF)
-        if can_wrap:
-            if wrap == "z":
+        if not can_wrap:
+            self._emit("jp", test_label)
+        else:
+            if again == "nz":
                 # `inc hl' sets no flags: the index wrapped if it is now 0.
                 self._emit("ld", "a,h")
                 self._emit("or", "l")
-            if bound_val == 0xFFFF:
-                self._emit("jp", f"n{wrap},{loop_label}")
-                self._emit_label(test_label)
-                self._emit_label(end_label)
-                self.loop_stack.pop()
-                return
-            self._emit("jp", f"{wrap},{end_label}")
-
-        # Test condition
-        self._emit_label(test_label)
-        _index_to_hl()
-        if self._expr_preserves_de(stmt.bound):
-            self._emit("ex", "de,hl")        # DE = index
-            self._gen_expr_to_hl(stmt.bound)  # HL = bound, DE untouched
-        else:
-            # The bound is free to use DE (a call, a 16-bit subexpression,
-            # `ld de,nn`), so the index has to survive on the stack.
-            self._emit("push", "hl")
-            self._gen_expr_to_hl(stmt.bound)  # HL = bound
-            self._emit("pop", "de")           # DE = index
-
-        # Compare: if index > bound, exit (for positive step)
-        # HL - DE: if negative (carry), index > bound
-        self._emit_sub16()
-
-        # If no borrow (NC), bound >= index, continue
-        self._emit("jp", f"nc,{loop_label}")
+            self._emit("jp", f"{again},{test_label}")
 
         self._emit_label(end_label)
         self.loop_stack.pop()
+
+    def _const_value(self, expr) -> int | None:
+        """``expr`` as a constant, typed the way PL/M-80 types it (so `-1'
+        is 0FFH), or None. LENGTH, LAST and SIZE of a declared variable are
+        constants too: `DO i = 0 TO LAST(a)' has a limit known here."""
+        typed = eval_typed(expr, self._literal_macro_value)
+        if typed is not None:
+            return typed[0]
+        e = unwrap_paren(expr)
+        if isinstance(e, P.Call) and len(e.args) == 1:
+            callee = unwrap_paren(e.callee)
+            if isinstance(callee, P.Identifier):
+                name = ident_text(callee.name).upper()
+                sym = self._lookup_symbol(ident_text(callee.name))
+                if sym is not None and sym.kind != SymbolKind.BUILTIN:
+                    return None
+                if name in ("LENGTH", "LAST"):
+                    extent = self._array_extent(e.args[0])
+                    if extent:
+                        return extent if name == "LENGTH" else extent - 1
+                elif name == "SIZE":
+                    arg = unwrap_paren(e.args[0])
+                    if isinstance(arg, P.Identifier):
+                        var = self._lookup_scoped(ident_text(arg.name))
+                        if var is not None:
+                            return var.size
+        return None
+
+    def _byte_var_operand(self, var) -> str | None:
+        """An operand `cp' can compare A with, for the BYTE scalar ``var``:
+        `(hl)' once HL is loaded with its address, or `(ix+n)'. None when
+        it is none of those."""
+        sym = self._lookup_symbol(ident_text(var.name)) if isinstance(var, P.Identifier) else None
+        if sym is None or sym.kind not in (SymbolKind.VARIABLE, SymbolKind.PARAMETER):
+            return None
+        if sym.stack_offset is not None:
+            return f"(ix+{sym.stack_offset})"
+        if sym.based_on:
+            self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+            return "(hl)"
+        name = ident_text(var.name)
+        if name in self.literal_macros or name.upper() == "STACKPTR":
+            return None
+        self._emit("ld", f"hl,{sym.asm_name if sym.asm_name else self._mangle_name(name)}")
+        return "(hl)"
 
     def _stmts_leave_block(self, stmts) -> bool:
         """Whether ``stmts`` can leave the block they are in other than at
@@ -4596,9 +4571,9 @@ class CodeGenerator:
             n = stack.pop()
             if n is loop:
                 continue
+            # (Another DO over the same index assigns it before anything in
+            # it reads it, so it does not count.)
             if isinstance(n, P.Identifier) and ident_text(n.name) == name:
-                return True
-            if isinstance(n, (P.DoIterBlock, P.DoIterByBlock)) and ident_text(n.index) == name:
                 return True
             if isinstance(n, (list, tuple)):
                 stack.extend(n)

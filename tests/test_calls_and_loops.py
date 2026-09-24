@@ -149,3 +149,25 @@ call run;
 """, [7, 3])
 
 
+def test_loops_over_every_kind_of_index_and_limit():
+    """The limit is compared with the index where the index lives -- a
+    plain variable, one BASED on a pointer, a REENTRANT procedure's local
+    -- and LAST is a constant limit like any other."""
+    _check("""
+declare (i, lim) byte, (n, w) address, ab(8) byte, big(1024) byte;
+declare pb address, bi based pb byte;
+rl: procedure (top) byte reentrant;
+  declare top byte, (j, c) byte;
+  c = 0; do j = 1 to top; c = c + j; end;
+  return c;
+end rl;
+run: procedure;
+  n = 0; do i = 0 to last(ab); n = n + 1; end; call ph(n); call ph(i);
+  n = 0; do i = 0 to last(ab); n = n + i; end; call ph(n); call ph(i);
+  n = 0; do w = 0 to last(big) by 128; n = n + 1; end; call ph(n); call ph(w);
+  pb = .ab(2); lim = 3;
+  n = 0; do bi = 0 to lim; n = n + 1; end; call ph(n); call ph(ab(2));
+  call ph(rl(4)); call ph(rl(0));
+end run;
+call run;
+""", [8, 8, 28, 8, 8, 1024, 4, 4, 10, 0])
