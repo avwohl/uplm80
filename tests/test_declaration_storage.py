@@ -567,7 +567,7 @@ end t;
     assert "ld\thl,(W-4)" in lines, asm
 
 
-NEGATIVE_SUBSCRIPT_SRC = """
+WRAPPING_SUBSCRIPT_SRC = """
 0100H:
 t: do;
 mon1: procedure (f, a) external; declare f byte, a address; end mon1;
@@ -590,16 +590,17 @@ end t;
 """
 
 
-@pytest.mark.parametrize("opt", [0, 2])
-def test_a_negative_subscript_is_below_the_array_when_run(opt):
-    """A subscript of 0FFFFH is the element before the array, and every level
-    agrees on it.  At -O0 the BYTE-index path took A for an index that had
-    come out in HL, so what `buf(-1)' addressed depended on the level.
+@pytest.mark.parametrize("opt", [0, 1, 2, 3])
+def test_a_subscript_of_0ffffh_is_below_the_array_and_one_of_minus_1_is_255(opt):
+    """An ADDRESS subscript of 0FFFFH is the element before the array, and
+    every level agrees on it.  At -O0 the BYTE-index path took A for an index
+    that had come out in HL, so what `buf(-1)' addressed depended on the
+    level.
 
     `-1' itself is the BYTE 0 - 1 (PL/M-80 manual, 4.2.2), 0FFH, as
     tests/test_expression_types.py has it for MEMORY(-1): `buf(-1)' is
-    buf(255), at every level."""
-    assert run_plm(NEGATIVE_SUBSCRIPT_SRC, opt).strip() == "YYYYYY", opt
+    buf(255), not the element before buf, at every level."""
+    assert run_plm(WRAPPING_SUBSCRIPT_SRC, opt).strip() == "YYYYYY", opt
 
 
 def test_at_a_variable_declared_further_down_is_defined_after_it():
