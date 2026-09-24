@@ -614,6 +614,28 @@ call run;
 """, [0xFF, 0xFF, 0, 0x1234])
 
 
+def test_a_relation_in_a_structure_or_remainder_subscript():
+    """The same stale DE in a structure array's subscript, and in a BYTE
+    array's whose subscript goes through MOD: the verification's
+    f1_rel_in_wide_subscript, wrong at -O0 to -O2 in 0.3.6 and on both
+    branches' heads before the fix above."""
+    _check("""
+declare (x, y, w) address;
+declare aw(2) address initial (1111h, 2222h);
+declare ib(6) byte initial (10, 11, 12, 13, 14, 15);
+declare st(2) structure (a byte, b address) initial (1, 1111h, 2, 2222h);
+run: procedure;
+  x = 1000; y = 2000;
+  w = aw((x < y) and 1); call ph(w);
+  w = aw((y < x) and 1); call ph(w);
+  w = st((x < y) and 1).b; call ph(w);
+  st((x > y) and 1).b = 7; call ph(st(0).b);
+  call ph(ib((x > y) mod 6));
+end run;
+call run;
+""", [0x2222, 0x1111, 0x2222, 7, 10])
+
+
 def test_low_of_arithmetic_on_an_embedded_assignment():
     """The embedded assignment to a BYTE sets a flag saying A holds L, for
     LOW((b := w)); arithmetic on it that never goes back through _gen_expr
