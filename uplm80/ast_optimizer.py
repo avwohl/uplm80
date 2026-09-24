@@ -348,6 +348,9 @@ class ASTOptimizer:
         # Every procedure name in the module. A bare identifier that
         # names one is a PL/M parameterless call, not a variable read.
         self.proc_names: set[str] = set()
+        # Names a store through a pointer may reach: their address is taken
+        # (`.x'), they are AT something, or another module sees them.
+        self.pointer_reachable: set[str] = set()
         # True while optimizing a region that reads CARRY / ZERO /
         # SIGN / PARITY, or uses PLUS / MINUS, where an arithmetic
         # operation's flag side effect is observable and must not be
@@ -781,6 +784,7 @@ class ASTOptimizer:
 
         self.proc_names.clear()
         self._collect_proc_names(module.items)
+        self.pointer_reachable = self._pointer_reachable_names(module.items)
 
         # Multiple passes for iterative improvement
         changed = True
@@ -1097,6 +1101,33 @@ class ASTOptimizer:
         if isinstance(e, P.LocationOf):
             return isinstance(unwrap_paren(e.operand), P.Identifier)
         return isinstance(e, P.LocationOfString)
+
+    def _pointer_reachable_names(self, items) -> set[str]:
+        """Every name whose address is taken, or that is AT something,
+        PUBLIC or EXTERNAL, anywhere in ``items``."""
+        names: set[str] = set()
+        for n in self._walk(items):
+            if isinstance(n, P.LocationOf):
+                base = unwrap_paren(n.operand)
+                while isinstance(base, (P.Call, P.MemberAccess)):
+                    base = unwrap_paren(base.callee if isinstance(base, P.Call) else base.base)
+                if isinstance(base, P.Identifier):
+                    names.add(ident_text(base.name))
+            elif isinstance(n, P.DeclItem):
+                attrs = decl_attrs(n)
+                if attrs.at_location is not None or attrs.is_public or attrs.is_external:
+                    names.update(decl_item_names(n))
+        return names
+
+    def _body_may_move(self, name: str, stmts) -> bool:
+        """Whether running ``stmts`` may change the variable ``name``: they
+        assign it, call something (which may assign anything), or store
+        through a pointer while ``name`` is one a pointer may reach."""
+        if name in self._get_modified_vars_in_stmts(stmts) or self._contains_call(stmts):
+            return True
+        d = self._lookup(name)
+        reachable = d is None or not d.plain or name in self.pointer_reachable
+        return reachable and self._stores_indirectly(stmts)
 
     def _get_modified_vars_in_stmts(self, stmts: list) -> set[str]:
         """Every variable the statements assign, anywhere inside them.
@@ -1929,7 +1960,7 @@ class ASTOptimizer:
             run is not None
             and run[0]
             and len(body_stmts) <= 3
-            and index_name not in self._get_modified_vars_in_stmts(body_stmts)
+            and not self._body_may_move(index_name, body_stmts)
             and not any(self._contains_label(i) for i in stmt.items)
             and not any(isinstance(n, (P.DeclareStmt, P.ProcDecl, P.DeclItem))
                         for n in self._walk(stmt.items))

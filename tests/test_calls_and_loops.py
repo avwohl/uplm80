@@ -115,6 +115,23 @@ call run;
 """, [1, 2, 45])
 
 
+def test_an_unrolled_loop_sees_what_calls_and_pointers_change():
+    """-O3 unrolls a loop of two passes into two copies of the body, each
+    after an assignment of the index -- which a call, or a store through a
+    pointer to the index, in the body would have changed."""
+    _check("""
+declare i byte, n address;
+declare p address, x based p byte;
+bump: procedure; i = 10; end bump;
+run: procedure;
+  n = 0; do i = 0 to 1; call bump; n = n + 1; end; call ph(n); call ph(i);
+  p = .i;
+  n = 0; do i = 0 to 1; x = 20; n = n + 1; end; call ph(n); call ph(i);
+end run;
+call run;
+""", [1, 0x0B, 1, 0x15])
+
+
 def test_a_return_from_inside_a_counted_loop():
     """The DJNZ form keeps its count on the stack while the body runs; a
     RETURN from the body returned through it."""
