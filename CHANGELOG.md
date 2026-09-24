@@ -3,6 +3,144 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## Unreleased
+
+Six defects found while rebuilding MP/M II's resident system processes from
+DRI's sources, each worked around in those sources until now, three more
+found in the same code on the way, and the rest found by an independent
+verification of those fixes. DRI's binaries settle what is right: the
+`SPOOL.RSP`, `SCHED.RSP` and `MPMSTAT.RSP` built from source now match DRI's in
+layout and in every initialised byte, and each resident process's stack holds
+what DRI's `SCHED.BRS` holds. Each fix has a regression test that fails
+without it.
+
+### Fixed
+
+- **`DATA` ignored member types and did not reserve the variable.** The 0.3.6
+  fix that placed a STRUCTURE's `INITIAL` values member by member never
+  reached `DATA`, which still emitted one byte per value and stopped at the
+  last one; an array shorter than its dimension lost the rest too. `DATA` is
+  `INITIAL` stored with the code (PL/M-80 Programming Manual, 6.2.9), and the
+  two now share one emitter. `SPRSP.PLM`, `SCRSP.PLM` and `MSRSP.PLM` are the
+  resident halves of the spooler, scheduler and status processes, nothing but a
+  process descriptor and queues found by offset: SPOOL.RSP's queues were at 11H
+  and 1CH, and are at 36H and 0CEH as in DRI's binary.
+- **A string in a STRUCTURE initialiser filled one member.** A string fills one
+  BYTE scalar per character and one ADDRESS scalar per two, and the width of
+  each later value was taken from its position in the list instead. The queue
+  control blocks in `SCRSP.PLM` and `MSRSP.PLM` got `msglen` and `nmbmsgs` as
+  bytes.
+- **A `LITERALLY` list stood for its first element inside `INITIAL`/`DATA`.**
+  A special case added to match an earlier uplm80 cut the body at its first
+  comma. MP/M's `restarts`, the case its comment cited, is nineteen `0C7C7H`
+  words, and `SCBRS.PLM`, `MSBRS.PLM` and `SPBRS.PLM` build each process's
+  stack as `initial (restarts,.entry)` with SP at `.stk+38`: the entry point
+  landed in the second word and SP pointed at a zero.
+- **A `RETURN` inside a counted `DO` loop left the count on the stack.** A loop
+  whose body does not use its index counts in B and pushes B around the body,
+  and the RET took the count for its return address. A `RETURN` now pops what
+  the loops around it pushed. Live in `SPBRS.PLM` (the spooler's stop request
+  at the end of a line) and 80un's `lzh.plm` (a failed write).
+- **A counted `DO` loop ignored its index being written or read in a
+  target.** `s(i).x = 0` and `i = n` in the body went unseen, so the index was
+  never stored or its assignment ignored: `SCBRS.PLM` cleared one entry of its
+  table four times, and `PIP.PLM` and `ED.PLM` kept reading past end of file.
+  A variable bound of 255 skipped the loop instead of running it 256 times.
+- **`AT (.external +/- constant)` compiled to `EQU $`.** The catch-all at the
+  end of `_emit_at_decl` was still there. `MSPL.PLM`'s
+  `spool$msg (1) byte at (.tbuff-1)` sat on the queue control block after it.
+  An AT address is now resolved as the manual defines it - a constant, or a
+  location plus or minus constants - and anything else is an error. A location
+  reference to a variable declared further down, which DRI's compiler
+  accepted, is measured from that declaration instead of taken to be a byte.
+- **A negative constant offset was written as `+65535`.** `.tbuff(-1)` was
+  `TBUFF+65535`, whose relocation um80 0.3.48 drops, and a subscript of a
+  variable AT an external was `EXT+c1+c2`, which it assembles as `EXT+c2`.
+  Offsets from a symbol are written signed, and folded into one where the
+  symbol is external.
+- **An `AT` naming something declared further down was placed at 0.** An EQU
+  is evaluated where it stands, and um80 0.3.48 takes a symbol it has not
+  reached as zero; AT variables were defined in the data segment ahead of
+  later declarations and of `??AUTO`. `SUB.PLM`'s `rbuff` at
+  `.minimum$buffer` made SUBMIT build its command file at address 0. AT
+  definitions now come after all storage.
+- **An `AT` naming a later `AT` variable, or a later `EXTERNAL`, was still
+  wrong.** `a1 AT (.b1 + 1)` above `b1 AT (.buf(2))` became `A1 EQU B1+1`
+  ahead of B1's own EQU, so A1 was 0001H; the same for a later variable AT
+  `.MEMORY`. A variable AT a later EXTERNAL was not aliased to it, and um80
+  0.3.48 assembles `@A+2` with `@A EQU E1+1` as `E1+2`. A later declaration's
+  own `AT` is now resolved down to its root, and a later EXTERNAL is known to
+  be one. A circle of ATs is an error.
+- **A counted `DO` loop's index was stale to everything but its body.** An
+  inner `DO` over the same index left it where it was, so
+  `DO i = 0 TO 9; ...; DO i = 0 TO 9; END; END;` ran the outer body ten times
+  instead of once; the code after the loop, a procedure the body calls, and
+  the caller after a `RETURN` all read a stale index; and the bound was
+  evaluated once, where PL/M-80 evaluates it at every test. The index now gets
+  its final value before the loop starts, and a loop is counted only when
+  nothing else can see its index or change its bound.
+- **A BYTE loop to 255 ran no times.** The test was `index < bound + 1`, and
+  bound + 1 is 0: `DO j = 0 TO 255` with a constant bound, or a variable one
+  that is 255 in a loop that reads its index, never ran - and at -O3 constant
+  propagation turns the variable form into the constant one. The loop now ends
+  when stepping the index carries out of the byte, as the manual says (5.1.4).
+  MPMLDR's `GENSYS.PLM` has two `TO 0FFH` loops that ran no times from 0.
+- **An expression in `DATA` was always a word.** At -O0, where nothing folds it
+  first, `x (4) BYTE DATA (68H+80H, k+1, 6)` took six bytes and moved
+  everything after it, and a unary minus was not accepted: `SET.PLM` did not
+  compile at -O0. An expression now fills its scalar at the scalar's width.
+- **`.(constant list)` in `DATA` or `INITIAL` was laid out in place.** It is the
+  location of the constants (manual, 4.1.3), as it is in an expression, so
+  `msgs (3) ADDRESS DATA (.('one$'), ...)` held characters, not pointers.
+  `.'text'` in a list was not accepted at all.
+- **A negative constant subscript on a BYTE array was +255 at -O0.**
+  `buf(-1)` read and wrote BUF+255: the index came out in HL and was taken
+  from A.
+- **`AT` with `INITIAL` or `DATA` dropped the values without a word.** It is
+  now an error.
+- **-O3 changed what programs do.** The inliner kept a `RETURN` that was not
+  the last statement, which then returned from the caller - `ED.PLM`'s
+  BACKSPACE, `PIP.PLM`'s and `SHOW.PLM`'s user checks and `TOD.PLM`'s
+  COMPUTE$MONTH among them - defined a label once per call site, captured the
+  caller's locals, and could inline another procedure of the same name.
+  Nothing learned before a `CALL` was forgotten after it (`GENSYS.PLM` lost a
+  whole `IF` after `get$response(.accept)`); `.x` was folded like a value, so
+  `c = 1; CALL setv(.c)` passed the address 1; a copy was propagated for a
+  BASED variable, so 80un's `read16` returned its high byte twice; and an
+  unrolled loop left its index at the last value.
+- **Every name in a factored declaration got the first one's `AT` or values.**
+  `DECLARE (A, B, C) BYTE AT (.BUF)` put all three at BUF, and
+  `DECLARE (COUNTER, LIMIT, INCR) ADDRESS INITIAL (0, 1024, 2)` gave each name
+  the whole list. Neither MP/M II nor 80un writes either form, but Intel's
+  LINK does: `tests/link1a.plm`, from Mark Ogden's reconstruction, declares
+  `(s, e) ADDRESS AT(.inRecord$p)` to reach the record pointer and the one
+  after it, and `e = s + inRecord.len + 2` wrote over the record pointer.
+
+### Known issues
+
+- An ADDRESS loop to 0FFFFH does not end: `DO w = 0FFF0H TO 0FFFFH` goes on
+  past the wrap, where a BYTE loop to 255 now stops. `DO I = N TO 0 BY 255`
+  still counts down N+1 times, where PL/M-80 has no downward step. Neither
+  form occurs in MP/M II or 80un.
+- -O3 is still less trustworthy than -O2, which is what MP/M II and 80un are
+  built with: a constant known before a call in an expression is still used
+  for an operand evaluated after that call, and common subexpressions are not
+  forgotten when a pointer is written through.
+- `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
+  non-zero truth test, and fails against 0.3.6 and this release alike.
+
+### Verified
+
+- Every PL/M source in MP/M II (41, in the mode `tools/build.py` uses, and the
+  13 overrides) and in 80un (38) compiled with 0.3.6 and with this release at
+  -O0, -O2 and -O3: at -O2, 33 of the 79 non-override outputs change, and every
+  change is accounted for in the commit that makes it. The same 82 of 92
+  assemble with um80 0.3.48, and no EQU names a symbol defined after it.
+  `80unbas.com` does not change. `80un.com` does, in `lzh.plm`, and extracts
+  the same files, with the same console output, from all 17 sample archives.
+- The run tests compile with the checkout under test: they used to start the
+  compiler with `python -P`, which found whatever uplm80 was installed.
+
 ## 0.3.6 — 2026-09-24
 
 Found by building every PL/M program in Digital Research's MP/M II sources and

@@ -5,6 +5,7 @@ Generates Z80 assembly code from the optimized AST.
 Outputs MACRO-80 compatible .MAC files.
 """
 
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -38,7 +39,6 @@ from .ast_view import (
     binop_kind,
     unop_kind,
     ident_text,
-    parse_plm_number,
     number_value,
     string_value,
     string_bytes,
@@ -461,6 +461,23 @@ class CodeGenerator:
         self._emit("ds", str(size))
         self._emit_label("??STACK")   # label above the buffer: SP starts here
 
+    def _emit_at_defs(self) -> None:
+        """The EQUs that define AT variables, after every symbol they can name.
+
+        An EQU is evaluated where it stands, and um80 0.3.48 takes a symbol it
+        has not reached yet as zero.  In the data segment an AT stood before
+        whatever was declared after it, and before ??AUTO: UTIL5/SUB.PLM
+        declares `rbuff(1) byte at (.minimum$buffer)' two hundred lines above
+        minimum$buffer, and SUBMIT built its command file at address 0.  A
+        reference to an EQU'd name from further up is fine; only the EQU's own
+        operand has to be defined first.
+        """
+        if not self.at_defs:
+            return
+        self._emit()
+        self._emit(comment="AT declarations")
+        self.output.extend(self.at_defs)
+
     def _pz(self, addr: int) -> str:
         """Render a page-zero address: a literal, or an extern under MP/M."""
         if self.mode != Mode.MPM:
@@ -480,6 +497,9 @@ class CodeGenerator:
         self.string_counter = 0
         self.data_segment: list[AsmLine] = []
         self.code_data_segment: list[AsmLine] = []  # DATA values emitted inline in code
+        self.at_defs: list[AsmLine] = []  # AT variables' EQUs, after all storage
+        # The constants of a `.(...)' in the value list being emitted.
+        self._pending_constants: list[AsmLine] = []
         self.string_literals: list[tuple[str, str]] = []  # (label, value)
         self.current_proc: str | None = None
         # ``current_proc_decl`` now holds a typed :class:`P.ProcDecl`; its
@@ -490,6 +510,17 @@ class CodeGenerator:
         self.current_proc_attrs = None  # type: ignore[var-annotated]
         self.current_proc_return_type: DataType | None = None
         self.loop_stack: list[tuple[str, str]] = []  # (continue_label, break_label)
+        # Words the loops around this point in the current procedure keep
+        # pushed while their bodies run.  A RETURN from inside one has to pop
+        # them first, or its RET takes a loop count for the return address.
+        self._loop_words = 0
+        # Assembly names declared EXTRN, which _sym_offset folds offsets onto.
+        self._extern_names: set[str] = {"__END__"}
+        # Every module-level DeclItem, for an AT that names a variable declared
+        # further down (see _declared_later).
+        self._module_decl_items: list = []
+        # Names whose AT _declared_later is resolving, to stop a circle.
+        self._resolving_at: set[str] = set()
         self.needs_runtime: set[str] = set()  # Which runtime routines are needed
         self.needs_end_symbol = False  # Whether __END__ (linker symbol) is needed
         # Page-zero symbols referenced under MP/M; emitted as extrn.
@@ -506,6 +537,9 @@ class CodeGenerator:
         self.emit_data_inline = False  # If True, DATA goes to code segment
         # Call graph for parameter sharing optimization
         self.call_graph: dict[str, set[str]] = {}  # proc -> set of procs it calls
+        self._reset_proc_facts()
+        # callee -> procedures called while evaluating that callee's arguments
+        self.arg_overlaps: dict[str, set[str]] = {}
         self.can_be_active_together: dict[str, set[str]] = {}  # proc -> procs that can be on stack with it
         self.param_slots: dict[str, int] = {}  # param_key -> slot number
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
@@ -772,18 +806,13 @@ class CodeGenerator:
         return False
 
     def _var_used_in_stmt(self, var_name: str, stmt) -> bool:
-        """Check if variable is referenced in a typed statement node."""
+        """Check if variable is referenced - read or written - in a typed statement node."""
         if isinstance(stmt, P.AssignStmt):
             if self._var_used_in_expr(var_name, stmt.value):
                 return True
-            for target in stmt.targets:
-                t = unwrap_paren(target)
-                # Subscript-as-Call: var in index counts as use.
-                if isinstance(t, P.Call):
-                    for arg in t.args:
-                        if self._var_used_in_expr(var_name, arg):
-                            return True
-            return False
+            # Anywhere in a target: assigned itself, or in a subscript, which
+            # can sit under a member - `s(i).x = 0'.
+            return any(self._var_used_in_expr(var_name, t) for t in stmt.targets)
         elif isinstance(stmt, P.CallStmt):
             inner = stmt.callee
             if isinstance(inner, P.Call):
@@ -825,7 +854,8 @@ class CodeGenerator:
                     return True
             return False
         elif isinstance(stmt, (P.DoIterBlock, P.DoIterByBlock)):
-            # Don't recurse into nested DO-ITER as inner loop var shadows outer
+            if ident_text(stmt.index) == var_name:
+                return True
             if self._var_used_in_expr(var_name, stmt.start):
                 return True
             if self._var_used_in_expr(var_name, stmt.bound):
@@ -858,6 +888,145 @@ class CodeGenerator:
                 if self._var_used_in_stmt(var_name, stmt):
                     return True
         return False
+
+    def _stmts_contain_return(self, stmts) -> bool:
+        """Whether any statement in the tree is a RETURN."""
+        return any(self._stmt_contains(s, (P.ReturnStmt, P.ReturnStmtValue)) for s in stmts)
+
+    def _stmt_contains(self, stmt, kinds) -> bool:
+        if isinstance(stmt, kinds):
+            return True
+        if isinstance(stmt, P.LabeledStmt):
+            return self._stmt_contains(stmt.stmt, kinds)
+        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
+            return (self._stmt_contains(stmt.then_stmt, kinds)
+                    or (isinstance(stmt, P.IfStmtElse)
+                        and self._stmt_contains(stmt.else_stmt, kinds)))
+        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
+            _, body_stmts = block_items_split(stmt.items)
+            return any(self._stmt_contains(s, kinds) for s in body_stmts)
+        if isinstance(stmt, P.DoCaseBlock):
+            return any(self._stmt_contains(s, kinds) for s in stmt.items or [])
+        return False
+
+    def _callees_of(self, stmts) -> set[str]:
+        """Every procedure the statements call, directly or through another."""
+        saved, self.arg_overlaps = self.arg_overlaps, {}
+        calls: set[str] = set()
+        try:
+            self._find_calls_in_stmts(stmts, self.current_proc or "", calls)
+        finally:
+            self.arg_overlaps = saved
+        work = list(calls)
+        while work:
+            for callee in self.call_graph.get(work.pop(), ()):
+                if callee not in calls:
+                    calls.add(callee)
+                    work.append(callee)
+        return calls
+
+    _UNKNOWN_OWNER = "?"
+
+    def _var_owner(self, sym: Symbol, name: str) -> str | None:
+        """The procedure that declares variable `sym', None at module level.
+
+        Read from the assembly name: a local is `@proc$name', or a slot in
+        ??AUTO that storage_labels gives the procedure.  _UNKNOWN_OWNER if it
+        is neither and not a plain module-level name.
+        """
+        if sym.stack_offset is not None:
+            return self.current_proc
+        asm = sym.asm_name or ""
+        if asm.startswith("??AUTO"):
+            parts = (self.current_proc or "").split("$")
+            for i in range(len(parts), 0, -1):
+                proc = "$".join(parts[:i])
+                if self.storage_labels.get(proc, {}).get(name) == asm:
+                    return proc
+            return self._UNKNOWN_OWNER
+        if asm.startswith("@") and "$" in asm:
+            return asm[1:asm.rindex("$")]
+        if "$" in asm or "+" in asm or "-" in asm:
+            return self._UNKNOWN_OWNER
+        return None
+
+    def _proc_sees(self, proc: str, name: str, owner: str | None) -> bool:
+        """Whether procedure `proc' names the `name' that `owner' declares."""
+        if not any(self._var_used_in_stmt(name, s) for s in self.proc_body.get(proc, ())):
+            return False
+        scope: str | None = proc
+        while scope is not None:
+            if name in self.proc_declared.get(scope, ()):
+                return scope == owner
+            scope = self.proc_parent.get(scope)
+        return owner is None
+
+    def _only_the_loop_sees(self, name: str, body_stmts, after_return: bool) -> bool:
+        """Whether nothing but the loop's own code can read or write `name'
+        while the loop runs - no procedure the body calls names it - and, if
+        `after_return', nothing can read it after a RETURN from the body.
+
+        A counted loop keeps its count in B and gives the index its final
+        value before it starts, and evaluates its bound once; both are only
+        right if no one else looks.
+        """
+        sym = self._lookup_symbol(name)
+        if sym is None or sym.kind != SymbolKind.VARIABLE or sym.based_on:
+            return False
+        owner = self._var_owner(sym, name)
+        if owner == self._UNKNOWN_OWNER:
+            return False
+        if after_return and owner != self.current_proc and self._stmts_contain_return(body_stmts):
+            return False    # whoever this returns to can read it
+        shared = sym.is_public or sym.is_external
+        for callee in self._callees_of(body_stmts):
+            if callee in self.proc_body:
+                if self._proc_sees(callee, name, owner):
+                    return False
+            elif shared:
+                return False    # another module's procedure, which may name it
+        return True
+
+    def _bound_is_fixed(self, bound, body_stmts) -> bool:
+        """Whether a loop's bound is the same every time round.
+
+        PL/M-80 evaluates the bound at every test; a counted loop evaluates
+        it once.  That is the same only if the bound calls nothing and none
+        of its variables is named in the body or by what the body calls.
+        """
+        names: set[str] = set()
+
+        def walk(e) -> bool:
+            e = unwrap_paren(e)
+            if isinstance(e, P.NumberLiteral):
+                return True
+            if isinstance(e, P.Identifier):
+                n = ident_text(e.name)
+                if n in self.literal_macros:
+                    return True
+                sym = self._lookup_symbol(n)
+                if sym is None or sym.kind != SymbolKind.VARIABLE:
+                    return False
+                names.add(n)
+                return True
+            if isinstance(e, P.BinaryOp):
+                return walk(e.left) and walk(e.right)
+            if isinstance(e, P.UnaryOp):
+                return walk(e.operand)
+            if isinstance(e, P.Call) and isinstance(e.callee, P.Identifier):
+                n = ident_text(e.callee.name).upper()
+                if n in ("LAST", "LENGTH", "SIZE"):
+                    return True
+                if n in ("LOW", "HIGH", "DOUBLE"):
+                    return all(walk(a) for a in e.args or [])
+                return walk(e.callee) and all(walk(a) for a in e.args or [])
+            return False
+
+        if not walk(bound):
+            return False
+        return all(not any(self._var_used_in_stmt(n, s) for s in body_stmts)
+                   and self._only_the_loop_sees(n, body_stmts, after_return=False)
+                   for n in names)
 
     def _stmts_contain_goto(self, stmts) -> bool:
         """Recursively check whether any statement in the tree is a GotoStmt.
@@ -1021,9 +1190,16 @@ class CodeGenerator:
     # Call Graph Analysis and Storage Sharing
     # ========================================================================
 
+    def _reset_proc_facts(self) -> None:
+        """Forget what _analyze_proc_calls recorded about each procedure."""
+        self.proc_body: dict[str, list] = {}           # statements of its body
+        self.proc_parent: dict[str, str | None] = {}   # the procedure it is nested in
+        self.proc_declared: dict[str, set[str]] = {}   # its parameters and locals
+
     def _build_call_graph(self, module) -> None:
         """Build call graph by analyzing all procedure bodies."""
         self.call_graph = {}
+        self._reset_proc_facts()
         # callee -> procedures called while evaluating that callee's arguments
         self.arg_overlaps: dict[str, set[str]] = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}  # proc -> [(var_name, size, type)]
@@ -1117,6 +1293,12 @@ class CodeGenerator:
         calls: set[str] = set()
         self._find_calls_in_stmts(stmt_items, full_name, calls)
         self.call_graph[full_name] = calls
+        # What a counted loop needs to know about a procedure its body calls:
+        # which names it declares, what it says, and where it is nested.
+        self.proc_body[full_name] = stmt_items
+        self.proc_parent[full_name] = parent_proc
+        self.proc_declared[full_name] = set(params) | {
+            n for d in decl_items if isinstance(d, P.DeclItem) for n in decl_item_names(d)}
 
         # Index DeclItems by declared name for parameter type lookup.
         decl_by_name: dict[str, tuple[DataType | None, int | None]] = {}
@@ -1634,6 +1816,7 @@ class CodeGenerator:
         """Generate assembly code for a module."""
         self.output = []
         self.data_segment = []
+        self.at_defs = []
         self.code_data_segment = []
         self.string_literals = []
         self.needs_runtime = set()
@@ -1643,6 +1826,7 @@ class CodeGenerator:
         self.literal_macros = {}
 
         shape = module_shape(module)
+        self._module_decl_items = [d for d in shape.decls if isinstance(d, P.DeclItem)]
 
         # Header
         self._emit(comment=f"PL/M-80 Compiler Output - {shape.name}")
@@ -1829,6 +2013,8 @@ class CodeGenerator:
             for name in sorted(self._page_zero_refs):
                 self._emit("extrn", name)
 
+        self._emit_at_defs()
+
         # End directive
         self._emit()
         self._emit("end")
@@ -1854,6 +2040,7 @@ class CodeGenerator:
 
         self.output = []
         self.data_segment = []
+        self.at_defs = []
         self.code_data_segment = []
         self.string_literals = []
         self.needs_runtime = set()
@@ -1864,6 +2051,8 @@ class CodeGenerator:
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]
+        self._module_decl_items = [d for sh in shapes for d in sh.decls
+                                   if isinstance(d, P.DeclItem)]
 
         # Header
         module_names = ', '.join(s.name for s in shapes)
@@ -2045,6 +2234,8 @@ class CodeGenerator:
             for name in sorted(self._page_zero_refs):
                 self._emit("extrn", name)
 
+        self._emit_at_defs()
+
         # End directive
         self._emit()
         self._emit("end")
@@ -2054,6 +2245,7 @@ class CodeGenerator:
     def _build_call_graph_multi(self, modules: list) -> None:
         """Build call graph by analyzing all procedures across multiple modules."""
         self.call_graph = {}
+        self._reset_proc_facts()
         self.arg_overlaps = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}
 
@@ -2168,22 +2360,38 @@ class CodeGenerator:
 
         # P.DeclItem: one or more names sharing the same tail/clauses.
         based_on, based_member = decl_item_based(decl)
-        for name in decl_item_names(decl):
+        names = decl_item_names(decl)
+        first = None
+        for index, name in enumerate(names):
             self._gen_one_var(
                 name=name,
                 based_on=based_on,
                 based_member=based_member,
                 item=decl,
+                factored=(index, len(names), first),
             )
+            if index == 0:
+                first_sym = self._lookup_scoped(name)
+                first = first_sym.asm_name if first_sym else None
 
-    def _gen_one_var(self, *, name: str, based_on, based_member, item) -> None:
+    def _gen_one_var(self, *, name: str, based_on, based_member, item,
+                     factored: tuple[int, int, str | None] = (0, 1, None)) -> None:
         """Generate storage for a single name from a typed DeclItem.
 
         Split out so a ``(A, B, C) BYTE`` decl can emit one row per
         identifier while sharing tail/attribute extraction. The legacy
         ``VarDecl`` carried only one name per node, so this used to live
         inline in :meth:`_gen_var_decl`.
+
+        ``factored`` is (this name's position, how many names, the first
+        name's assembly name).  The names of a factored declaration are
+        contiguous (PL/M-80 Programming Manual, 6.2.4), so an AT places each
+        one after the last (6.2.8), and an INITIAL or DATA list runs across
+        them in order (6.2.9): `DECLARE (COUNTER, LIMIT, INCR) ADDRESS
+        INITIAL (0, 1024, 2)' sets LIMIT to 1024.  Every name used to get the
+        first one's address, or the whole list.
         """
+        index, n_names, first_asm = factored
         attrs = decl_attrs(item)
         data_type, dimension = _decl_item_type(item)
         members_nodes = decl_item_struct_members(item)
@@ -2289,6 +2497,7 @@ class CodeGenerator:
             )
             if is_external:
                 self._emit("extrn", base_name)
+                self._extern_names.add(base_name)
             elif is_public:
                 self._emit("public", base_name)
             return
@@ -2313,6 +2522,7 @@ class CodeGenerator:
         # External variables don't get storage here
         if is_external:
             self._emit("extrn", asm_name)
+            self._extern_names.add(asm_name)
             return
 
         # Public declaration
@@ -2325,28 +2535,36 @@ class CodeGenerator:
 
         # AT variables use specified address
         if at_location is not None:
-            self._emit_at_decl(asm_name, at_location, sym)
+            if data_values_nodes or initial_values_nodes:
+                # The values belong at the AT address, which is somewhere
+                # else's storage or no storage at all; they were dropped
+                # without a word.
+                raise CodeGenError(
+                    f"{name}: AT with {'DATA' if data_values_nodes else 'INITIAL'} is not "
+                    "supported; assign the values at run time")
+            self._emit_at_decl(asm_name, at_location, sym, extra=index * size)
             return
 
         # Generate storage
         # DATA values can go inline in code (for module-level bootstrap) or data segment
         target_segment = self.code_data_segment if self.emit_data_inline else self.data_segment
+        if initial_values_nodes:
+            target_segment = self.data_segment
 
-        if data_values_nodes:
+        if (data_values_nodes or initial_values_nodes) and index > 0 and first_asm:
+            # A later name of a factored declaration: the first name's list
+            # already covers it.
+            target_segment.append(AsmLine(label=asm_name, opcode="EQU",
+                                          operands=self._sym_offset(first_asm, index * size)))
+        elif data_values_nodes or initial_values_nodes:
+            # A factored list is laid out once, for all the names in turn.
             target_segment.append(AsmLine(label=asm_name))
-            self._emit_data_values(
-                data_values_nodes,
-                data_type or DataType.BYTE,
-                inline=self.emit_data_inline,
-            )
-        elif initial_values_nodes:
-            self.data_segment.append(AsmLine(label=asm_name))
-            self._emit_initial_values(
-                initial_values_nodes,
-                data_type or DataType.BYTE,
-                struct_members=struct_members,
-                dimension=dimension,
-                size=size,
+            self._emit_value_list(
+                data_values_nodes or initial_values_nodes,
+                self._scalar_widths(data_type or DataType.BYTE, struct_members,
+                                    dimension) * n_names,
+                spare=1 if (data_type or DataType.BYTE) == DataType.BYTE else 2,
+                inline=bool(data_values_nodes) and self.emit_data_inline,
             )
         elif use_shared:
             # Using shared automatic storage - no individual allocation needed
@@ -2360,7 +2578,67 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
-    def _at_designator(self, expr):
+    def _declared_later(self, name: str) -> tuple[Symbol, tuple[str | None, int] | None] | None:
+        """A module-level variable an AT names before the DECLARE that makes it.
+
+        PL/M-80 asks for the variable to be declared first, and DRI's compiler
+        did not insist: UTIL5/SUB.PLM declares `rbuff(1) byte at
+        (.minimum$buffer)' two hundred lines above minimum$buffer, and
+        UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.  A subscript or a
+        member needs the variable's shape, so it is read from the declaration
+        itself rather than guessed.
+
+        Returns the symbol, and where it is if it is itself AT: the (root,
+        offset) of :meth:`_at_address`.  An AT is defined by an EQU, and the
+        EQUs go out in declaration order, so naming the later variable would
+        name a symbol um80 has not reached yet and reads as zero.  An
+        EXTERNAL further down is entered in `_extern_names' now, so a
+        variable AT it is aliased to it (see :meth:`_emit_at_decl`).
+        """
+        for item in self._module_decl_items:
+            names = decl_item_names(item)
+            if name not in names:
+                continue
+            attrs = decl_attrs(item)
+            data_type, dimension = _decl_item_type(item)
+            members = decl_item_struct_members(item)
+            struct_members = None
+            if members is not None:
+                struct_members = [
+                    _ast_nodes.StructMember(name=sn, data_type=_legacy_dt(struct_member_type(m)),
+                                            dimension=struct_member_dim(m))
+                    for m in members for sn in struct_member_names(m)
+                ]
+            based_on, _ = decl_item_based(item)
+            sym = Symbol(name=name, kind=SymbolKind.VARIABLE, data_type=data_type,
+                         dimension=dimension, struct_members=struct_members,
+                         based_on=based_on, is_external=attrs.is_external,
+                         asm_name=self._mangle_name(name))
+            if attrs.is_external:
+                self._extern_names.add(sym.asm_name)
+            if attrs.at_location is None or based_on:
+                return sym, None
+            if name in self._resolving_at:
+                raise CodeGenError(f"AT(.{name}): the AT addresses name each other in a circle")
+            self._resolving_at.add(name)
+            try:
+                root, offset = self._at_address(attrs.at_location)
+            finally:
+                self._resolving_at.discard(name)
+            # A factored AT places each name after the last (6.2.8).
+            size = self._element_width(sym) * max(dimension or 1, 1)
+            return sym, (root, offset + names.index(name) * size)
+        return None
+
+    @staticmethod
+    def _element_width(sym: Symbol) -> int:
+        """Bytes in one element of `sym' - what a subscript steps by."""
+        if sym.struct_members:
+            return sum((m.dimension or 1) * (1 if m.data_type == DataType.BYTE else 2)
+                       for m in sym.struct_members)
+        return 1 if sym.data_type == DataType.BYTE else 2
+
+    def _at_designator(self, expr) -> tuple[Symbol | None, str, int, int]:
         """Resolve a constant `.designator' to (base symbol, name, offset, elem).
 
         Handles NAME, NAME(const), STRUCT.MEMBER and any chain of those, which
@@ -2369,153 +2647,123 @@ class CodeGenerator:
         ``code$size ADDRESS AT (.buffer(0).sector(1))``.  ``elem`` is the width
         of one element of whatever a further subscript would index.
 
-        Returns None when any part is not a compile-time constant.
+        Raises CodeGenError for anything that is not a constant address.
         """
         expr = unwrap_paren(expr)
         if isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
+            if name.upper() == "MEMORY":
+                self._use_end_symbol()
+                return None, "__END__", 0, 1
             base_sym = self._lookup_scoped(name)
-            asm = (base_sym.asm_name if base_sym and base_sym.asm_name
-                   else self._mangle_name(name))
-            if base_sym is not None and base_sym.struct_members:
-                elem = sum((m.dimension or 1)
-                           * (1 if m.data_type == DataType.BYTE else 2)
-                           for m in base_sym.struct_members)
-            elif base_sym is not None and base_sym.data_type != DataType.BYTE:
-                elem = 2
-            else:
-                elem = 1
-            return base_sym, asm, 0, elem
+            if base_sym is None:
+                later = self._declared_later(name)
+                if later is None:
+                    raise CodeGenError(f"AT(.{name}): {name} is not declared")
+                base_sym, at = later
+                if at is not None:
+                    # Itself AT, further down: where it is, not its name.
+                    root, offset = at
+                    return base_sym, root or "", offset, self._element_width(base_sym)
+            if base_sym.based_on or base_sym.stack_offset is not None:
+                raise CodeGenError(
+                    f"AT(.{name}): {name} has no fixed address "
+                    f"({'BASED' if base_sym.based_on else 'a REENTRANT local'})")
+            asm = base_sym.asm_name or self._mangle_name(name)
+            return base_sym, asm, 0, self._element_width(base_sym)
         if isinstance(expr, P.MemberAccess):
-            base = self._at_designator(expr.base)
-            if base is None:
-                return None
-            base_sym, asm, off, _ = base
-            m_off, m_type = self._get_member_info(expr)
-            return base_sym, asm, off + m_off, (1 if m_type == DataType.BYTE else 2)
+            base_sym, asm, off, _ = self._at_designator(expr.base)
+            member = ident_text(expr.member)
+            m_off = 0
+            for m in (base_sym.struct_members if base_sym else None) or []:
+                width = 1 if m.data_type == DataType.BYTE else 2
+                if m.name == member:
+                    return base_sym, asm, off + m_off, width
+                m_off += width * (m.dimension or 1)
+            raise CodeGenError(f"AT(...): no member {member} in the structure")
         if isinstance(expr, P.Call):
             args = list(expr.args or [])
-            if len(args) != 1:
-                return None
-            index = self._try_eval_const(args[0])
+            index = self._try_eval_const(args[0]) if len(args) == 1 else None
             if index is None:
-                return None
-            base = self._at_designator(expr.callee)
-            if base is None:
-                return None
-            base_sym, asm, off, elem = base
+                raise CodeGenError("AT(...): a subscript in an AT address must be a constant")
+            base_sym, asm, off, elem = self._at_designator(expr.callee)
             return base_sym, asm, off + index * elem, elem
-        return None
+        raise CodeGenError(
+            f"AT(...): cannot take the location of a {type(expr).__name__}")
 
-    def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol) -> None:
-        """Emit the EQU/SET line(s) for a ``DECLARE ... AT(addr)`` clause.
+    def _at_address(self, expr) -> tuple[str | None, int]:
+        """An AT address as (symbol, offset), or (None, address) for a number.
 
-        ``at_expr`` is a typed expression node. A bare ``NUMBER`` is
-        emitted as a direct EQU; a ``.NAME`` (LocationOf) becomes a SET
-        to the referenced symbol; ``.ARR(i)`` resolves to a SET with the
-        appropriate element offset when the index is a constant.
+        The PL/M-80 manual (6.2.8) allows a constant, or a location reference
+        followed by constants added or subtracted.  Anything else is an error:
+        it used to fall through to `EQU $', the location counter, and
+        UTIL5/MSPL.PLM's `spool$msg (1) byte at (.tbuff-1)' landed on the
+        queue control block after it.
         """
-        # AT(<number>): direct address EQU.
-        if isinstance(at_expr, P.NumberLiteral):
-            addr = parse_plm_number(at_expr.value.text)
-            self.data_segment.append(
-                AsmLine(label=asm_name, opcode="EQU", operands=self._format_number(addr))
-            )
-            return
+        expr = unwrap_paren(expr)
+        value = self._try_eval_const(expr)
+        if value is not None:
+            return None, value
+        if isinstance(expr, P.LocationOf):
+            _, asm, offset, _ = self._at_designator(expr.operand)
+            if not asm:
+                return None, offset     # AT a later variable AT a number
+            root, base_offset = self._split_offset(asm)
+            return root, base_offset + offset
+        if isinstance(expr, P.BinaryOp) and binop_kind(expr) in (BinaryOpKind.ADD,
+                                                                  BinaryOpKind.SUB):
+            left, left_off = self._at_address(expr.left)
+            right, right_off = self._at_address(expr.right)
+            if binop_kind(expr) == BinaryOpKind.ADD and not (left and right):
+                return left or right, left_off + right_off
+            if binop_kind(expr) == BinaryOpKind.SUB and right is None:
+                return left, left_off - right_off
+        raise CodeGenError(
+            "AT(...) needs a constant, or a location plus or minus constants")
 
-        if isinstance(at_expr, P.LocationOf):
-            loc_operand = at_expr.operand
-            # AT(.NAME)
-            if isinstance(loc_operand, P.Identifier):
-                ref_name_text = ident_text(loc_operand.name)
-                if ref_name_text.upper() == "MEMORY":
-                    # .MEMORY is the first free byte after the whole PROGRAM,
-                    # and only the linker knows where that is.  A label at the
-                    # end of this module marks the end of the MODULE, which in
-                    # a program linked from several of them is somewhere in the
-                    # middle: SDIR is eight modules, and its 128-entry hash
-                    # table, declared AT (.MEMORY) in UTIL7/DSE.PLM, landed on
-                    # top of another module's strings and cleared them.
-                    # __END__ is the linker's own symbol, so name it as one.
-                    # The EXTRN has to come first: an EQU is evaluated where
-                    # it stands, and if __END__ is not known to be external by
-                    # then the symbol silently takes the value zero.
-                    if not self.needs_end_symbol:
-                        self.data_segment.append(
-                            AsmLine(opcode="extrn", operands="__END__")
-                        )
-                    self.needs_end_symbol = True
-                    self.data_segment.append(
-                        AsmLine(label=asm_name, opcode="EQU", operands="__END__")
-                    )
-                else:
-                    ref_sym = self.symbols.lookup(ref_name_text)
-                    if ref_sym and ref_sym.is_external:
-                        # AT(.external) — alias the external's name, so later
-                        # references name the external directly.
-                        ref_asm = (
-                            ref_sym.asm_name if ref_sym.asm_name
-                            else self._mangle_name(ref_name_text)
-                        )
-                        sym.asm_name = ref_asm
-                        # An EQU as well, because a reference can come BEFORE
-                        # the declaration: UTIL5/SUB.PLM initialises a
-                        # structure with `.a$buff' in the same DECLARE that
-                        # goes on to declare `a$buff ... AT(.tbuff)'.  Without
-                        # it that forward reference has no definition at all.
-                        if asm_name and asm_name != ref_asm:
-                            self.data_segment.append(
-                                AsmLine(label=asm_name, opcode="EQU",
-                                        operands=ref_asm)
-                            )
-                    else:
-                        ref_asm = (
-                            ref_sym.asm_name if ref_sym and ref_sym.asm_name
-                            else self._mangle_name(ref_name_text)
-                        )
-                        # EQU: one value everywhere, forward reference or
-                        # not.  A SET symbol would read as zero above its
-                        # definition.
-                        self.data_segment.append(
-                            AsmLine(label=asm_name, opcode="EQU", operands=ref_asm)
-                        )
-                return
+    def _use_end_symbol(self) -> None:
+        """Declare __END__, the linker's end of the whole program, as EXTRN.
 
-            # Anything else: a constant designator - NAME(i), STRUCT.MEMBER,
-            # or a chain of them.  Previously only a bare NAME(<literal>) was
-            # understood and everything else silently became `EQU $', the
-            # assembler's location counter, which pointed the variable at a
-            # arbitrary spot: UTIL4/STAT.PLM's
-            #     dolla literally '.fcb(6dh-5ch)',  doll byte at (dolla),
-            # read a stray byte as its `$' parameter, so `stat <file>' was
-            # taken for a request to change the file's attributes.
-            resolved = self._at_designator(loc_operand)
-            if resolved is None:
-                raise CodeGenError(
-                    f"AT(...) needs a constant address expression; got "
-                    f"{type(loc_operand).__name__}")
-            base_sym, base_asm, offset, _ = resolved
-            operand = base_asm if offset == 0 else f"{base_asm}+{offset}"
-            # An external base is aliased rather than defined, so that
-            # references name the external and the linker resolves them.
-            is_base_external = bool(base_sym and base_sym.is_external)
-            if not is_base_external and base_sym and base_sym.asm_name:
-                root = base_sym.asm_name.split('+')[0].strip()
-                root_sym = self.symbols.lookup(root)
-                if root_sym and root_sym.is_external:
-                    is_base_external = True
-            if is_base_external:
+        .MEMORY is the first free byte after the whole PROGRAM, and only the
+        linker knows where that is.  A label at the end of this module marks
+        the end of the MODULE, which in a program linked from several of them
+        is somewhere in the middle: SDIR is eight modules, and its 128-entry
+        hash table, declared AT (.MEMORY) in UTIL7/DSE.PLM, landed on top of
+        another module's strings and cleared them.  The EXTRN has to come
+        before the EQU that names it: an EQU is evaluated where it stands, and
+        if __END__ is not known to be external by then it silently takes the
+        value zero.
+        """
+        if not any(l.opcode == "extrn" and l.operands == "__END__"
+                   for l in self.data_segment):
+            self.data_segment.append(AsmLine(opcode="extrn", operands="__END__"))
+        self.needs_end_symbol = True
+
+    def _emit_at_decl(self, asm_name: str | None, at_expr, sym: Symbol,
+                      extra: int = 0) -> None:
+        """Define the name of a ``DECLARE ... AT(addr)`` variable.
+
+        The address is a number, or a symbol and a single signed offset
+        (:meth:`_at_address`), and the name is an EQU for it.  A variable at an
+        external's address is also aliased to that address, so references
+        name the external with one offset (:meth:`_sym_offset`); the EQU is
+        still needed for a reference that comes before the declaration -
+        UTIL5/SUB.PLM initialises a structure with `.a$buff' in the same
+        DECLARE that goes on to declare `a$buff ... AT(.tbuff)'.
+        """
+        root, offset = self._at_address(at_expr)
+        offset += extra
+        if root is None:
+            operand = self._format_number(offset & 0xFFFF)
+        else:
+            if root == asm_name:
+                raise CodeGenError(f"AT(...): {sym.name} is declared at its own address")
+            operand = self._sym_offset(root, offset)
+            if root in self._extern_names:
                 sym.asm_name = operand
-            else:
-                self.data_segment.append(
-                    AsmLine(label=asm_name, opcode="EQU", operands=operand)
-                )
-            return
-
-        # Catch-all: evaluate at assembly time.
-        self.data_segment.append(
-            AsmLine(label=asm_name, opcode="EQU", operands="$")
-        )
+        if asm_name and asm_name != operand:
+            self.at_defs.append(
+                AsmLine(label=asm_name, opcode="EQU", operands=operand))
 
     def _emit_data_values(self, values, dtype: DataType, inline: bool = False) -> None:
         """Emit typed DATA values to the data segment or inline code segment.
@@ -2526,9 +2774,12 @@ class CodeGenerator:
         target = self.code_data_segment if inline else self.data_segment
         for val in values:
             if isinstance(val, P.NumberLiteral):
+                # A BYTE holds the low byte: -1 folds to 0FFFFH, which is
+                # 0FFH here, not `db 0FFFFH'.
                 directive = "db" if dtype == DataType.BYTE else "dw"
+                mask = 0xFF if directive == "db" else 0xFFFF
                 target.append(
-                    AsmLine(opcode=directive, operands=self._format_number(number_value(val)))
+                    AsmLine(opcode=directive, operands=self._format_number(number_value(val) & mask))
                 )
             elif isinstance(val, P.StringLiteral):
                 target.append(
@@ -2560,16 +2811,27 @@ class CodeGenerator:
                 target.append(
                     AsmLine(opcode="dw", operands=self._location_operand(operand))
                 )
-            elif isinstance(val, P.BinaryOp):
-                # Binary expression like .name-3 or name+offset
-                expr_str = self._data_expr_to_string(val)
-                target.append(
-                    AsmLine(opcode="dw", operands=expr_str)
-                )
-            elif isinstance(val, P.LocationOfList):
-                # Nested address-of list: .(a, b, c)
-                for v in val.values or []:
-                    self._emit_data_values([v], dtype, inline=inline)
+            elif isinstance(val, (P.BinaryOp, P.UnaryOp)):
+                # An expression - `68H+80H', `-1', `.name-3' - at the width
+                # of the scalar it fills.  It was always a word, so at -O0,
+                # where nothing folds it first, `x (4) BYTE DATA (68H+80H,
+                # 6)' took six bytes and moved everything after it, and a
+                # unary minus was not accepted at all (UTIL4/SET.PLM).
+                directive = "db" if dtype == DataType.BYTE else "dw"
+                value = self._try_eval_const(val)
+                if value is not None:
+                    operand = self._format_number(value & (0xFF if directive == "db" else 0xFFFF))
+                else:
+                    operand = self._data_expr_to_string(val)
+                target.append(AsmLine(opcode=directive, operands=operand))
+            elif isinstance(val, (P.LocationOfList, P.LocationOfString)):
+                # `.(a, b, ...)' and `.'text'' are where the constants are
+                # (PL/M-80 manual, 4.1.3): an address, with the constants
+                # stored elsewhere, as they are in an expression.  They were
+                # laid out in place of it, so `msgs (3) ADDRESS DATA
+                # (.('one$'), ...)' held characters, not pointers.
+                target.append(AsmLine(opcode="db" if dtype == DataType.BYTE else "dw",
+                                      operands=self._constant_list_label(val)))
             elif isinstance(val, P.ParenExpr):
                 # Parenthesised single value — unwrap and re-emit.
                 self._emit_data_values([val.inner], dtype, inline=inline)
@@ -2596,14 +2858,12 @@ class CodeGenerator:
                 raise CodeGenError(
                     f"Unsupported subscript in DATA location expression: {operand}")
             index = number_value(args[0])
-            if index == 0:
-                return base
             width = 1
             if isinstance(operand.callee, P.Identifier):
                 sym = self._lookup_scoped(ident_text(operand.callee.name))
                 if sym is not None and sym.data_type != DataType.BYTE:
                     width = 2
-            return f"{base}+{self._format_number(index * width)}"
+            return self._sym_offset(base, index * width)
         raise CodeGenError(f"Unsupported operand in DATA location expression: {operand}")
 
     def _lookup_scoped(self, name: str):
@@ -2659,35 +2919,76 @@ class CodeGenerator:
             raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
 
     def _data_element_count(self, values, dtype: DataType) -> int:
-        """How many elements a DATA/INITIAL list supplies."""
-        total = sum(self._initial_value_width(v, dtype) for v in values)
-        width = 1 if dtype == DataType.BYTE else 2
-        return max(1, total // width)
+        """How many elements a DATA/INITIAL list supplies.
 
-    def _initial_member_widths(self, struct_members, dimension):
-        """Byte width of each slot a STRUCTURE initialiser fills, in order."""
+        A string supplies one BYTE element per character and one ADDRESS
+        element per two, the way :meth:`_emit_value_list` places it.
+        """
+        width = 1 if dtype == DataType.BYTE else 2
+        count = 0
+        for val in values:
+            inner = unwrap_paren(val)
+            if isinstance(inner, P.StringLiteral):
+                count += -(-len(string_value(inner)) // width)
+            else:
+                count += 1
+        return max(1, count)
+
+    @staticmethod
+    def _scalar_widths(dtype: DataType, struct_members, dimension) -> list[int]:
+        """Byte width of each scalar a declaration holds, in order - the slots a
+        DATA or INITIAL list fills."""
         if not struct_members:
-            return None
+            return [1 if dtype == DataType.BYTE else 2] * (dimension or 1)
         one = []
         for m in struct_members:
             width = 1 if m.data_type == DataType.BYTE else 2
             one.extend([width] * (m.dimension or 1))
         return one * (dimension or 1)
 
-    def _initial_value_width(self, val, dtype: DataType) -> int:
-        """Bytes a single INITIAL value occupies once emitted."""
-        if isinstance(val, P.StringLiteral):
-            return len(string_value(val))
-        if isinstance(val, P.ParenExpr):
-            return self._initial_value_width(val.inner, dtype)
-        if isinstance(val, P.LocationOfList):
-            return 2 * len(val.values or [])
-        return 1 if dtype == DataType.BYTE else 2
+    def _constant_list_label(self, val) -> str:
+        """A label for the constants of `.(a, b, ...)' or `.'text'' in a value
+        list.  They go after the list (:attr:`_pending_constants`), since
+        they are not part of what is being declared."""
+        if isinstance(val, P.LocationOfString):
+            raw = val.value.text
+            if raw.startswith("'") and raw.endswith("'"):
+                raw = raw[1:-1]
+            label = self._new_string_label()
+            self.string_literals.append((label, raw.replace("''", "'")))
+            return label
+        label = self._new_label("DATA")
+        self._pending_constants.append(AsmLine(label=label))
+        for v in val.values or []:
+            v = unwrap_paren(v)
+            if isinstance(v, P.StringLiteral):
+                operand = self._escape_string(string_value(v))
+            else:
+                value = self._try_eval_const(v)
+                if value is None:
+                    raise CodeGenError(f"`.(...)' holds constants, not {type(v).__name__}")
+                operand = self._format_number(value & 0xFF)
+            self._pending_constants.append(AsmLine(opcode="db", operands=operand))
+        return label
 
-    def _emit_initial_values(self, values, dtype: DataType,
-                             struct_members=None, dimension=None,
-                             size: int | None = None) -> None:
-        """Emit typed INITIAL values to the data segment.
+    def _emit_value_list(self, values, widths: list[int], spare: int,
+                         inline: bool = False) -> None:
+        """Emit a DATA or INITIAL value list, and reserve what it leaves unfilled.
+
+        ``widths`` is the byte width of each scalar the list fills
+        (:meth:`_scalar_widths`), ``spare`` the width a value past the last of
+        them takes.
+
+        INITIAL goes to the data segment; DATA to the same place, or inline in
+        the code when ``inline`` is set.  DATA is INITIAL stored with the code
+        and nothing else (PL/M-80 Programming Manual, 6.2.9), so the two are
+        laid out alike.  DATA used to be emitted one value at a time at the
+        declaration's width and stopped at the last value: a STRUCTURE came
+        out one byte per value and short, and an array shorter than its
+        dimension lost the rest.  MP/M II's UTIL2/SPRSP.PLM is nothing but
+        DATA - the spooler's process descriptor and two queues, which GENSYS
+        and the XDOS find by offset - and the stop queue landed at 1CH where
+        DRI's SPOOL.RSP has it at 0CEH.
 
         A STRUCTURE initialiser supplies one value per member and the members
         have their own widths, so the list cannot be emitted at a single width
@@ -2698,22 +2999,50 @@ class CodeGenerator:
         scanned its command line through a null pointer and blanked the BDOS
         entry in page zero.
 
+        The values fill the scalars being declared in order, and a string
+        fills as many of them as it takes (PL/M-80 Programming Manual, 6.2.9:
+        one character to each BYTE scalar, two to each ADDRESS scalar).  Taking
+        a value's width from its position in the LIST put every value after a
+        string at the width of the wrong member: UTIL2/SCRSP.PLM's
+        `initial (0,'Sched   ',69,1)' emitted the queue's two ADDRESS fields
+        as bytes.
+
         Whatever the list does not fill is reserved, so the next declaration
         still lands where it should.
         """
-        widths = self._initial_member_widths(struct_members, dimension)
+        # Past the declared scalars - a list longer than its declaration - the
+        # values keep the declaration's own width (``spare``), as they always
+        # have: `DECLARE MSG BYTE DATA ('HELLO$')' is an idiom.
+        target = self.code_data_segment if inline else self.data_segment
+        slot = 0
         emitted = 0
-        for i, val in enumerate(values):
-            if widths is not None and i < len(widths):
-                slot = DataType.BYTE if widths[i] == 1 else DataType.ADDRESS
-            else:
-                slot = dtype
-            self._emit_data_values([val], slot)
-            emitted += self._initial_value_width(val, slot)
-        if size is not None and emitted < size:
-            self.data_segment.append(
-                AsmLine(opcode="ds", operands=str(size - emitted))
+        for val in values:
+            inner = unwrap_paren(val)
+            if isinstance(inner, P.StringLiteral):
+                text = string_value(inner)
+                used = 0
+                while used < len(text):
+                    used += widths[slot] if slot < len(widths) else spare
+                    slot += 1
+                target.append(AsmLine(opcode="db", operands=self._escape_string(text)))
+                if used > len(text):
+                    # An odd character left in an ADDRESS scalar: it is the
+                    # scalar's low byte, the way 'A' is 0041H.
+                    target.append(AsmLine(opcode="db", operands="0"))
+                emitted += used
+                continue
+            width = widths[slot] if slot < len(widths) else spare
+            slot += 1
+            self._emit_data_values(
+                [val], DataType.BYTE if width == 1 else DataType.ADDRESS,
+                inline=inline)
+            emitted += width
+        if emitted < sum(widths):
+            target.append(
+                AsmLine(opcode="ds", operands=str(sum(widths) - emitted))
             )
+        self.data_segment.extend(self._pending_constants)
+        self._pending_constants = []
 
     def _gen_proc_decl(self, decl) -> None:
         """Generate code for a procedure declaration.
@@ -2729,6 +3058,8 @@ class CodeGenerator:
         old_proc_decl = self.current_proc_decl
         old_proc_attrs = self.current_proc_attrs
         old_proc_return_type = self.current_proc_return_type
+        old_loop_words = self._loop_words
+        self._loop_words = 0
 
         attrs = proc_attrs(decl)
         name = proc_name(decl)
@@ -2778,11 +3109,13 @@ class CodeGenerator:
 
         if attrs.is_external:
             self._emit("extrn", proc_asm_name)
+            self._extern_names.add(proc_asm_name)
             self.deferred_block_procs = saved_block_procs
             self.current_proc = old_proc
             self.current_proc_decl = old_proc_decl
             self.current_proc_attrs = old_proc_attrs
             self.current_proc_return_type = old_proc_return_type
+            self._loop_words = old_loop_words
             return
 
         self._emit()
@@ -2984,6 +3317,7 @@ class CodeGenerator:
         self.current_proc_decl = old_proc_decl
         self.current_proc_attrs = old_proc_attrs
         self.current_proc_return_type = old_proc_return_type
+        self._loop_words = old_loop_words
 
     def _gen_proc_epilogue(self, decl) -> None:
         """Generate procedure epilogue for a typed :class:`P.ProcDecl`."""
@@ -3425,6 +3759,11 @@ class CodeGenerator:
                 elif return_type == DataType.ADDRESS and result_type == DataType.BYTE:
                     self._emit("ld", "l,a")
                     self._emit("ld", "h,0")
+
+        # Leaving from inside a counted loop's body: its count is still on the
+        # stack.  POP BC leaves the result alone - it is in A or HL.
+        for _ in range(self._loop_words):
+            self._emit("pop", "bc")
 
         if proc_attrs_view is not None and proc_attrs_view.interrupt_num is not None:
             # Interrupt handler return
@@ -4214,10 +4553,11 @@ class CodeGenerator:
                 step_is_const = False
 
         # Check if loop index is used in body - if not, we can use DJNZ on Z80.
-        # _index_used_in_body / _stmts_contain_goto still walk the
-        # legacy AST shape; they recurse via isinstance and return
-        # False for unrecognised typed nodes, which is conservative
-        # (forces the safe fallback path).
+        # The count in B stands in for the index, which is then never stored,
+        # so a body that reads OR writes it cannot be counted: UTIL2/SCBRS.PLM
+        # clears its table with `sched$table(tindx).date = 0', which cleared
+        # one entry four times, and UTIL6/PIP.PLM and ED.PLM end their
+        # read loops at end of file with `I = N', which the count ignored.
         index_used = self._index_used_in_body(index_var, body_stmts)
 
         # Skip DJNZ optimization when the body has a GOTO — the pattern
@@ -4227,6 +4567,10 @@ class CodeGenerator:
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
+        # The count stands in for the index, so nothing else may look at the
+        # index while the loop runs: not a procedure the body calls, and not
+        # the caller after a RETURN from the body.  The bound is evaluated
+        # once, so nothing may change it either.
         if (
             both_bytes
             and step_is_const
@@ -4235,71 +4579,28 @@ class CodeGenerator:
             and not body_has_goto
             and isinstance(stmt.start, P.NumberLiteral)
             and number_value(stmt.start) == 0
+            and self._only_the_loop_sees(index_name, body_stmts, after_return=True)
+            and self._bound_is_fixed(stmt.bound, body_stmts)
         ):
-            # Calculate iteration count = bound + 1
-            # If bound is constant, emit LD B,bound+1
-            # If bound is variable, emit: load bound; INC A; LD B,A
+            # A = the number of passes, bound + 1.  A bound of 255 is 256
+            # passes, a count of 0 in B, which is where DJNZ counts 256 from
+            # - a DO from 0 runs at least once whatever its bound (PL/M-80
+            # manual, 5.1.4).
             if isinstance(stmt.bound, P.NumberLiteral):
-                bound_const = number_value(stmt.bound)
-                iter_count = bound_const + 1
-                if iter_count <= 255:
-                    self._emit("ld", f"b,{self._format_number(iter_count)}")
-                else:
-                    # Too many iterations for DJNZ
-                    pass  # Fall through to regular loop
+                self._emit("ld", f"a,{self._format_number((number_value(stmt.bound) + 1) & 0xFF)}")
             else:
-                # Variable bound: A = bound; A++; B = A
-                bt = self._gen_expr(stmt.bound)
-                if bt == DataType.ADDRESS:
+                if self._gen_expr(stmt.bound) == DataType.ADDRESS:
                     self._emit("ld", "a,l")
-                self._emit("inc", "a")  # A = bound + 1 = iteration count
-                self._emit("ld", "b,a")  # B = iteration count
-
-            # Only proceed with B-counter loop if we set up B
-            if (
-                isinstance(stmt.bound, P.NumberLiteral)
-                and number_value(stmt.bound) + 1 <= 255
-            ):
-                # Loop body - save B since body may clobber it
-                self._emit_label(loop_label)
-                self._emit("push", "bc")
-                for s in body_stmts:
-                    self._gen_stmt(s)
-                self._emit("pop", "bc")
-
-                # Decrement B and jump if not zero
-                # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
-                self._emit_label(incr_label)
-                self._emit("dec", "b")
-                self._emit("jp", f"nz,{loop_label}")
-
-                self._emit_label(end_label)
-                self.loop_stack.pop()
-                return
-            elif not isinstance(stmt.bound, P.NumberLiteral):
-                # Variable bound case - we set up B above
-                # But need to handle the case where bound might be 255 (iter count = 256 = 0 in byte)
-                # Skip loop if B is 0 (this handles bound = 255 case)
-                self._emit("ld", "a,b")
-                self._emit("or", "a")
-                self._emit("jp", f"z,{end_label}")  # Skip if iteration count is 0
-
-                # Loop body - save B since body may clobber it
-                self._emit_label(loop_label)
-                self._emit("push", "bc")
-                for s in body_stmts:
-                    self._gen_stmt(s)
-                self._emit("pop", "bc")
-
-                # Decrement B and jump if not zero
-                # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
-                self._emit_label(incr_label)
-                self._emit("dec", "b")
-                self._emit("jp", f"nz,{loop_label}")
-
-                self._emit_label(end_label)
-                self.loop_stack.pop()
-                return
+                self._emit("inc", "a")
+            # That is also where the index ends up, one past the bound, and
+            # nothing reads it until the loop is over, so it is stored now.
+            # It was never stored at all: an inner DO over the same index
+            # left the outer loop to go round again from a stale value.
+            self._gen_store(index_var, DataType.BYTE)
+            self._emit("ld", "b,a")
+            self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
+            self.loop_stack.pop()
+            return
 
         # Check for optimized down-counting loop: DO I = N TO 0
         # When start is variable, bound is 0, and step is -1 (or default counting down)
@@ -4344,108 +4645,9 @@ class CodeGenerator:
             self.loop_stack.pop()
             return
 
-        # Check for optimized byte loop with constant bound
-        if both_bytes and isinstance(stmt.bound, P.NumberLiteral):
-            bound_val = number_value(stmt.bound)
-
-            # Initialize index variable
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Jump to test
-            self._emit("jp", test_label)
-
-            # Loop body
-            self._emit_label(loop_label)
-            for s in body_stmts:
-                self._gen_stmt(s)
-
-            # Increment/Decrement
-            self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-            elif step_val == 1:
-                self._emit("inc", "a")
-            elif step_val == -1 or step_val == 0xFF:
-                self._emit("dec", "a")
-            else:
-                self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Test condition: compare index with bound
-            self._emit_label(test_label)
-            self._gen_load(index_var)  # A = index
-            if bound_val == 255:
-                # Special case: loop to 0xFF can't use cp 0x100 (truncates to 0)
-                # Instead, check if index wrapped to 0 (meaning we exceeded 0xFF)
-                self._emit("or", "a")  # Sets Z flag if A == 0
-                self._emit("jp", f"nz,{loop_label}")  # Continue if index != 0 (not wrapped)
-            else:
-                self._emit("cp", self._format_number(bound_val + 1))  # Compare with bound+1
-                self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
-
-            self._emit_label(end_label)
-            self.loop_stack.pop()
-            return
-
-        # Check for byte loop with variable bound
         if both_bytes:
-            # Initialize index variable as BYTE
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Jump to test
-            self._emit("jp", test_label)
-
-            # Loop body
-            self._emit_label(loop_label)
-            for s in body_stmts:
-                self._gen_stmt(s)
-
-            # Increment/Decrement
-            self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-            elif step_val == 1:
-                self._emit("inc", "a")
-            elif step_val == -1 or step_val == 0xFF:
-                self._emit("dec", "a")
-            else:
-                self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Test condition: compare index with bound variable
-            # Evaluate bound first, then compare with index
-            self._emit_label(test_label)
-            bound_result = self._gen_expr(stmt.bound)  # A = bound (or HL if ADDRESS)
-            if bound_result == DataType.ADDRESS:
-                self._emit("ld", "a,l")  # Get low byte if ADDRESS
-            self._emit("inc", "a")  # A = bound + 1
-            self._emit("ld", "b,a")  # B = bound + 1
-            self._gen_load(index_var)  # A = index
-            # cp b computes a - b (index - (bound+1)), sets C if index < bound+1
-            self._emit("cp", "B")  # Compare index with bound+1
-            self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
-
-            self._emit_label(end_label)
+            self._gen_byte_loop(stmt, index_var, body_stmts, (step_expr, step_is_const, step_val),
+                                (loop_label, test_label, incr_label, end_label))
             self.loop_stack.pop()
             return
 
@@ -4513,6 +4715,131 @@ class CodeGenerator:
 
         self._emit_label(end_label)
         self.loop_stack.pop()
+
+    def _gen_byte_loop(self, stmt, index_var, body_stmts, step: tuple,
+                       labels: tuple[str, str, str, str]) -> None:
+        """An iterative DO whose index and bound are both BYTEs.
+
+        The loop ends when the index passes the bound, or when stepping it
+        carries out of the byte, which passes any bound: `DO j = 0 TO 255'
+        runs 256 times and leaves j at 0 (PL/M-80 manual, 5.1.4).  The test
+        used to be `index < bound + 1', and bound + 1 is 0 when the bound is
+        255, so such a loop ran no times at all - with a constant bound as
+        well as a variable one.  With a constant 255 there is nothing to
+        compare: the first test always passes and only the carry ends it.
+
+        A step of -1 counts down, and is left as it was.  `step' is (the BY
+        expression or None, whether it is a constant, its value).
+        """
+        step_expr, step_is_const, step_val = step
+        loop_label, test_label, incr_label, end_label = labels
+        bound_val = (number_value(stmt.bound)
+                     if isinstance(stmt.bound, P.NumberLiteral) else None)
+        down = step_is_const and (step_val == -1 or step_val == 0xFF)
+        by_inc = step_is_const and step_val == 1
+        to_255 = bound_val == 255 and not down
+
+        # Initialize index variable
+        start_type = self._gen_expr(stmt.start)
+        if start_type == DataType.ADDRESS:
+            self._emit("ld", "a,l")
+        self._gen_store(index_var, DataType.BYTE)
+
+        if not to_255:
+            self._emit("jp", test_label)
+
+        # Loop body
+        self._emit_label(loop_label)
+        for s in body_stmts:
+            self._gen_stmt(s)
+
+        # Step.  INC sets Z when it wraps, ADD sets carry; storing a BYTE is
+        # all loads, so the flags survive the store.
+        self._emit_label(incr_label)
+        self._gen_load(index_var)  # A = index
+        if not step_is_const:
+            # The step is an expression: keep the index while it runs.
+            self._emit("push", "af")
+            if self._gen_expr(step_expr) == DataType.ADDRESS:
+                self._emit("ld", "a,l")
+            self._emit("ld", "b,a")
+            self._emit("pop", "af")
+            self._emit("add", "a,b")
+        elif by_inc:
+            self._emit("inc", "a")
+        elif down:
+            self._emit("dec", "a")
+        else:
+            self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
+        self._gen_store(index_var, DataType.BYTE)
+
+        if to_255:
+            self._emit("jp", f"{'nz' if by_inc else 'nc'},{loop_label}")
+            self._emit_label(end_label)
+            return
+        if not down and not (by_inc and bound_val is not None):
+            # Wrapped: past any bound.  (By 1 up to a constant below 255 it
+            # cannot wrap.)
+            self._emit("jp", f"{'z' if by_inc else 'c'},{end_label}")
+
+        self._emit_label(test_label)
+        if bound_val == 255:
+            # Down to 255: as before, go on until the index is 0.
+            self._gen_load(index_var)
+            self._emit("or", "a")
+            self._emit("jp", f"nz,{loop_label}")
+        elif bound_val is not None:
+            self._gen_load(index_var)  # A = index
+            self._emit("cp", self._format_number(bound_val + 1))
+            self._emit("jp", f"C,{loop_label}")  # index < bound+1, i.e. index <= bound
+        elif down:
+            # As before: index < bound + 1.
+            if self._gen_expr(stmt.bound) == DataType.ADDRESS:
+                self._emit("ld", "a,l")
+            self._emit("inc", "a")
+            self._emit("ld", "b,a")
+            self._gen_load(index_var)
+            self._emit("cp", "B")
+            self._emit("jp", f"C,{loop_label}")
+        else:
+            # index <= bound, as bound - index with no borrow; bound + 1
+            # would be 0 for a bound of 255.
+            if self._gen_expr(stmt.bound) == DataType.ADDRESS:
+                self._emit("ld", "a,l")
+            self._emit("ld", "b,a")  # B = bound
+            self._gen_load(index_var)  # A = index
+            self._emit("ld", "c,a")
+            self._emit("ld", "a,b")
+            self._emit("cp", "c")
+            self._emit("jp", f"nc,{loop_label}")
+
+        self._emit_label(end_label)
+
+    def _gen_counted_body(self, body_stmts, loop_label: str, incr_label: str,
+                          end_label: str) -> None:
+        """The body and back edge of a loop that counts down B.
+
+        B is pushed while the body runs, since the body is free to use it, so
+        for that long there is a word on the stack that is not the return
+        address: a RETURN in the body pops it (see :attr:`_loop_words`).  A
+        GOTO out of the body would strand it, and such a loop is not counted
+        in B at all.
+        """
+        self._emit_label(loop_label)
+        self._emit("push", "bc")
+        self._loop_words += 1
+        for s in body_stmts:
+            self._gen_stmt(s)
+        self._loop_words -= 1
+        self._emit("pop", "bc")
+
+        # Decrement B and jump if not zero
+        # Use dec b; jp nz instead of DJNZ - peephole will convert to DJNZ if in range
+        self._emit_label(incr_label)
+        self._emit("dec", "b")
+        self._emit("jp", f"nz,{loop_label}")
+
+        self._emit_label(end_label)
 
     def _gen_do_case(self, stmt) -> None:
         """Generate code for a ``DO CASE selector ... END`` block.
@@ -4887,6 +5214,33 @@ class CodeGenerator:
             sym = self.symbols.lookup(name)
         return sym
 
+    @staticmethod
+    def _split_offset(operand: str) -> tuple[str, int]:
+        """`NAME', `NAME+n' or `NAME-n' as (NAME, n)."""
+        m = re.fullmatch(r"(.+?)([+-]\d+)", operand)
+        if m is None:
+            return operand, 0
+        return m.group(1), int(m.group(2))
+
+    def _sym_offset(self, base: str, offset: int) -> str:
+        """The operand for `base' plus a constant byte offset.
+
+        The offset is written signed, since it is taken modulo 65536: an
+        address one below NAME is NAME-1, not NAME+65535.  Where `base' is an
+        external, or stands for one plus an offset (a variable declared AT an
+        external), the offsets are added up into one: the object format
+        carries an external's reference with a single offset, and um80 0.3.48
+        assembles EXT+c1+c2 as EXT+c2 and drops the relocation of EXT+65535.
+        """
+        offset = ((offset + 0x8000) & 0xFFFF) - 0x8000
+        root, base_offset = self._split_offset(base)
+        if root in self._extern_names:
+            base = root
+            offset = ((base_offset + offset + 0x8000) & 0xFFFF) - 0x8000
+        if offset == 0:
+            return base
+        return f"{base}+{offset}" if offset > 0 else f"{base}-{-offset}"
+
     def _based_ptr_operand(self, sym) -> str:
         """Where the pointer behind a BASED variable lives.
 
@@ -4911,7 +5265,7 @@ class CodeGenerator:
             offset += width * (m.dimension or 1)
         else:
             return base_asm
-        return base_asm if offset == 0 else f"{base_asm}+{offset}"
+        return self._sym_offset(base_asm, offset)
 
     def _gen_expr(self, expr) -> DataType:
         """Generate code for a typed expression.
@@ -5395,7 +5749,7 @@ class CodeGenerator:
                             if offset == 0:
                                 self._emit("ld", f"({asm_name}),hl")
                             else:
-                                self._emit("ld", f"de,{asm_name}+{offset}")
+                                self._emit("ld", f"de,{self._sym_offset(asm_name, offset)}")
                                 self._emit("ex", "de,hl")
                                 self._emit("ld", "(hl),e")
                                 self._emit("inc", "hl")
@@ -5406,7 +5760,7 @@ class CodeGenerator:
                             if offset == 0:
                                 self._emit("ld", f"({asm_name}),a")
                             else:
-                                self._emit("ld", f"({asm_name}+{offset}),a")
+                                self._emit("ld", f"({self._sym_offset(asm_name, offset)}),a")
                     else:
                         elem_type = sym.data_type if sym else DataType.BYTE
                         if elem_type == DataType.ADDRESS:
@@ -6181,19 +6535,19 @@ class CodeGenerator:
             if sym and not sym.based_on:
                 asm_name = sym.asm_name if sym.asm_name else self._mangle_name(ident_text(base.name))
                 offset = number_value(index) * elem_size
-                if offset == 0:
-                    self._emit("ld", f"hl,{asm_name}")
-                else:
-                    self._emit("ld", f"hl,{asm_name}+{offset}")
+                self._emit("ld", f"hl,{self._sym_offset(asm_name, offset)}")
                 return
 
         # Optimised BYTE-index path with identifier base.
         if not isinstance(index, P.NumberLiteral):
             idx_type = self._get_expr_type(index)
             if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
-                self._gen_expr(index)
-                self._emit("ld", "l,a")
-                self._emit("ld", "h,0")
+                # What the index comes out as, not what it was expected to:
+                # `-1' is negated in HL, and taking A as the index put
+                # `buf(-1)' at BUF+255 at -O0.
+                if self._gen_expr(index) == DataType.BYTE:
+                    self._emit("ld", "l,a")
+                    self._emit("ld", "h,0")
                 sym = self.symbols.lookup(ident_text(base.name))
                 if sym and sym.based_on:
                     base_sym = self.symbols.lookup(sym.based_on)

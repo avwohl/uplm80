@@ -16,6 +16,8 @@ sits at absolute 0005H, which is not the process's BDOS entry.
 from uplm80.codegen import Mode
 from uplm80.compiler import Compiler
 
+from ._toolchain import compile_cmd, compiler_env
+
 SRC = """
 t: do;
 mon1: procedure (f,a) external; declare (f,a) address; end mon1;
@@ -118,7 +120,6 @@ def test_dri_start_minus_three_entry_reaches_the_stack_setup():
     import os
     import shutil
     import subprocess
-    import sys
     import tempfile
 
     import pytest
@@ -134,7 +135,8 @@ def test_dri_start_minus_three_entry_reaches_the_stack_setup():
         mac, rel, prl = (os.path.join(d, n) for n in ("T.MAC", "T.REL", "T.PRL"))
         run = lambda *a: subprocess.run(a, capture_output=True, text=True)
 
-        r = run(sys.executable, "-m", "uplm80.compiler", "--mode", "mpm", "-o", mac, plm)
+        r = subprocess.run(compile_cmd("--mode", "mpm", "-o", mac, plm),
+                           capture_output=True, text=True, env=compiler_env(), check=False)
         assert r.returncode == 0, r.stderr
         r = run("um80", "-o", rel, mac)
         assert r.returncode == 0, r.stderr
