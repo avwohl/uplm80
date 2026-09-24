@@ -116,6 +116,76 @@ call run;
 """, [0xF8, 0xFE, 0xFF, 0xFF, 0xFF, 0])
 
 
+def test_a_byte_loop_to_255_runs_256_times():
+    """DRI's code for `DO j = common$base TO 0FFH' (MPMLDR/GENSYS.PLM:652,
+    GENSYS.COM 106BH) tests the limit, then `INR A / JNZ': the index wraps
+    to 0 and the loop ends. uplm80 read the index 0 as the wrap and ran the
+    loop no times from 0 (defect 4)."""
+    _check("""
+declare (lo, lim) byte, n address;
+run: procedure;
+  n = 0; do lo = 0 to 255; n = n + 1; end; call ph(n); call ph(lo);
+  n = 0; do lo = 250 to 0ffh; n = n + lo; end; call ph(n); call ph(lo);
+  lim = 255;
+  n = 0; do lo = 0 to lim; n = n + 1; end; call ph(n);
+  n = 0; do lo = 0 to lim; n = n + lo; end; call ph(n);
+end run;
+call run;
+""", [0x100, 0, 0x5EB, 0, 0x100, 0x7F80])
+
+
+def test_loops_stop_where_the_increment_carries_out():
+    """The same rule for an ADDRESS index, and for a BY step: DRI's LOAD.COM
+    adds the step with `DAD D' and leaves on the carry."""
+    _check("""
+declare (b, s) byte, (w, lw, n) address;
+run: procedure;
+  n = 0; do w = 0fff0h to 0ffffh; n = n + 1; end; call ph(n); call ph(w);
+  lw = 0ffffh;
+  n = 0; do w = 0fffeh to lw; n = n + 1; end; call ph(n); call ph(w);
+  n = 0; do w = 0ffd6h to 0fffeh by 3; n = n + 1; end; call ph(n); call ph(w);
+  n = 0; do b = 250 to 254 by 10; n = n + 1; end; call ph(n); call ph(b);
+  s = 10;
+  n = 0; do b = 240 to 250 by s; n = n + 1; end; call ph(n); call ph(b);
+end run;
+call run;
+""", [16, 0, 2, 0, 14, 0, 1, 4, 2, 4])
+
+
+def test_a_loop_converts_its_limit_and_step_to_the_index_type():
+    """`DO b = 0 TO 300' runs to 44 (5.1.4), and BY -1 is BY 0FFH: PL/M-80
+    cannot count down."""
+    _check("""
+declare b byte, (w, n) address;
+run: procedure;
+  w = 300;
+  n = 0; do b = 0 to w; n = n + 1; end; call ph(n);
+  n = 0; do b = 5 to 0 by -1; n = n + 1; end; call ph(n); call ph(b);
+  n = 0; do b = 0 to 0 by -1; n = n + 1; end; call ph(n); call ph(b);
+end run;
+call run;
+""", [45, 0, 5, 1, 0xFF])
+
+
+def test_a_counted_loop_keeps_the_index():
+    """A DJNZ loop must leave the index as the loop would, and cannot be
+    used when the body assigns it: ED.PLM's FILLSOURCE and PIP.PLM's fill
+    loop end early with `I = N', which the DJNZ form ignored."""
+    _check("""
+declare (i, k, m) byte, n address;
+run: procedure;
+  do i = 0 to 9; n = 1; end; call ph(i);
+  n = 0; m = 9;
+  do i = 0 to m; n = n + 1; if n = 3 then i = m; end; call ph(n);
+  k = 255; n = 0;
+  do i = 0 to k; n = n + 1; end; call ph(n); call ph(i);
+  k = 4;
+  do i = 0 to k; n = 1; end; call ph(i);
+end run;
+call run;
+""", [10, 3, 0x100, 0, 5])
+
+
 def test_a_call_ends_what_is_known_about_a_global():
     """`rw = f' calls f, which may change cnt, so cnt is not the 0 assigned
     before it (defect 5); nor after a CALL, inlined or not."""

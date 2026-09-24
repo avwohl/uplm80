@@ -5,6 +5,7 @@ Generates Z80 assembly code from the optimized AST.
 Outputs MACRO-80 compatible .MAC files.
 """
 
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -1681,6 +1682,7 @@ class CodeGenerator:
         self._page_zero_refs = set()
         self._needs_stack = False
         self.literal_macros = {}
+        self._survey_stores([module])
 
         shape = module_shape(module)
 
@@ -1901,6 +1903,7 @@ class CodeGenerator:
         self._page_zero_refs = set()
         self._needs_stack = False
         self.literal_macros = {}
+        self._survey_stores(modules)
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]
@@ -4265,9 +4268,10 @@ class CodeGenerator:
         if sym and sym.data_type == DataType.BYTE:
             index_type = DataType.BYTE
 
-        # Also check bound type
-        bound_type = self._get_expr_type(stmt.bound)
-        both_bytes = (index_type == DataType.BYTE and bound_type == DataType.BYTE)
+        # The limit (like the start and the step) is converted to the
+        # index's type (5.1.4), so a BYTE index makes a byte loop whatever
+        # the limit is: `DO b = 0 TO 300' runs to 44.
+        both_bytes = index_type == DataType.BYTE
 
         # Get step value (default +1 when no BY clause; only constant
         # NumberLiteral steps drive the byte-loop optimisations).
@@ -4299,20 +4303,31 @@ class CodeGenerator:
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
+        # The count is taken once, where PL/M-80 evaluates the limit on
+        # every pass, so a variable limit has to be one the body cannot
+        # change; and the index is not kept up to date, so the body must
+        # not be able to change it either.
+        bound_fixed = self._limit_is_fixed(stmt.bound, body_stmts)
         if (
             both_bytes
             and step_is_const
             and step_val == 1
             and not index_used
             and not body_has_goto
+            and bound_fixed
+            and not self._stmts_may_change(index_name, body_stmts)
             and isinstance(stmt.start, P.NumberLiteral)
             and number_value(stmt.start) == 0
         ):
             # Calculate iteration count = bound + 1
             # If bound is constant, emit LD B,bound+1
             # If bound is variable, emit: load bound; INC A; LD B,A
+            # The index is not stored while the loop runs; after it, it is
+            # given the value the loop leaves in it, limit + 1 -- unless
+            # nothing reads it later.
+            index_live = self._read_outside(index_name, stmt)
             if isinstance(stmt.bound, P.NumberLiteral):
-                bound_const = number_value(stmt.bound)
+                bound_const = number_value(stmt.bound) & 0xFF
                 iter_count = bound_const + 1
                 if iter_count <= 255:
                     self._emit("ld", f"b,{self._format_number(iter_count)}")
@@ -4320,7 +4335,9 @@ class CodeGenerator:
                     # Too many iterations for DJNZ
                     pass  # Fall through to regular loop
             else:
-                # Variable bound: A = bound; A++; B = A
+                # Variable bound: A = bound; A++; B = A. A limit of 255
+                # makes the count 0, which DJNZ takes as 256 -- the index
+                # runs 0..255 and wraps to 0, where the loop stops.
                 bt = self._gen_expr(stmt.bound)
                 if bt == DataType.ADDRESS:
                     self._emit("ld", "a,l")
@@ -4330,7 +4347,7 @@ class CodeGenerator:
             # Only proceed with B-counter loop if we set up B
             if (
                 isinstance(stmt.bound, P.NumberLiteral)
-                and number_value(stmt.bound) + 1 <= 255
+                and (number_value(stmt.bound) & 0xFF) + 1 <= 255
             ):
                 # Loop body - save B since body may clobber it
                 self._emit_label(loop_label)
@@ -4346,16 +4363,13 @@ class CodeGenerator:
                 self._emit("jp", f"nz,{loop_label}")
 
                 self._emit_label(end_label)
+                if index_live:
+                    self._emit("ld", f"a,{self._format_number(iter_count)}")
+                    self._gen_store(index_var, DataType.BYTE)
                 self.loop_stack.pop()
                 return
             elif not isinstance(stmt.bound, P.NumberLiteral):
-                # Variable bound case - we set up B above
-                # But need to handle the case where bound might be 255 (iter count = 256 = 0 in byte)
-                # Skip loop if B is 0 (this handles bound = 255 case)
-                self._emit("ld", "a,b")
-                self._emit("or", "a")
-                self._emit("jp", f"z,{end_label}")  # Skip if iteration count is 0
-
+                # Variable bound case - we set up B above.
                 # Loop body - save B since body may clobber it
                 self._emit_label(loop_label)
                 self._emit("push", "bc")
@@ -4370,55 +4384,26 @@ class CodeGenerator:
                 self._emit("jp", f"nz,{loop_label}")
 
                 self._emit_label(end_label)
+                if index_live:
+                    # The limit is one the body cannot change.
+                    self._gen_expr_to_a(stmt.bound)
+                    self._emit("inc", "a")
+                    self._gen_store(index_var, DataType.BYTE)
                 self.loop_stack.pop()
                 return
 
-        # Check for optimized down-counting loop: DO I = N TO 0
-        # When start is variable, bound is 0, and step is -1 (or default counting down)
-        is_downcount_to_zero = (
-            both_bytes
-            and step_is_const
-            and isinstance(stmt.bound, P.NumberLiteral)
-            and number_value(stmt.bound) == 0
-            and (step_val == -1 or step_val == 0xFF)
-        )
-
-        if is_downcount_to_zero:
-            # Optimized down-counting byte loop
-            # Initialize: load start into A, store to index
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Jump to test
-            self._emit("jp", test_label)
-
-            # Loop body
-            self._emit_label(loop_label)
-            for s in body_stmts:
-                self._gen_stmt(s)
-
-            # Decrement
-            self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            self._emit("dec", "a")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Test: if A >= 0 (not wrapped), continue
-            # After DEC, if result is not negative (i.e., >= 0), continue
-            self._emit_label(test_label)
-            self._gen_load(index_var)  # A = index
-            self._emit("or", "a")  # Set flags
-            self._emit("jp", f"p,{loop_label}")  # Jump if positive (bit 7 clear)
-
-            self._emit_label(end_label)
-            self.loop_stack.pop()
-            return
-
-        # Check for optimized byte loop with constant bound
-        if both_bytes and isinstance(stmt.bound, P.NumberLiteral):
-            bound_val = number_value(stmt.bound)
+        # PL/M-80's iterative DO, as DRI's compiler codes it (UTIL4/ERAQ.PRL,
+        # UTIL3/LOAD.COM): the index is compared with the limit before each
+        # pass, and the loop ends when the increment carries out of the
+        # index's width -- `INR A / JNZ top' for a BYTE step of 1,
+        # `DAD D / JNC top' for a BY step. So `DO b = 0 TO 255' runs 256
+        # times and leaves b = 0, and a step that would wrap past the limit
+        # stops the loop instead. A step of 0FFH (or -1) is 255, not a
+        # count downwards (5.1.4).
+        if both_bytes:
+            bound_val = (number_value(stmt.bound) & 0xFF
+                         if isinstance(stmt.bound, P.NumberLiteral) else None)
+            step_byte = step_val & 0xFF if step_is_const else None
 
             # Initialize index variable
             start_type = self._gen_expr(stmt.start)
@@ -4426,15 +4411,16 @@ class CodeGenerator:
                 self._emit("ld", "a,l")
             self._gen_store(index_var, DataType.BYTE)
 
-            # Jump to test
-            self._emit("jp", test_label)
+            # A limit of 255 passes every index, so there is nothing to test.
+            if bound_val != 0xFF:
+                self._emit("jp", test_label)
 
             # Loop body
             self._emit_label(loop_label)
             for s in body_stmts:
                 self._gen_stmt(s)
 
-            # Increment/Decrement
+            # Increment, and stop when it carries out.
             self._emit_label(incr_label)
             self._gen_load(index_var)  # A = index
             if not step_is_const:
@@ -4445,77 +4431,40 @@ class CodeGenerator:
                 self._emit("ld", "b,a")
                 self._emit("pop", "af")
                 self._emit("add", "a,b")
-            elif step_val == 1:
+                wrap = "c"
+            elif step_byte == 1:
                 self._emit("inc", "a")
-            elif step_val == -1 or step_val == 0xFF:
-                self._emit("dec", "a")
+                wrap = "z"
             else:
-                self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
+                self._emit("add", f"a,{self._format_number(step_byte)}")
+                wrap = "c"
             self._gen_store(index_var, DataType.BYTE)
-
-            # Test condition: compare index with bound
-            self._emit_label(test_label)
-            self._gen_load(index_var)  # A = index
-            if bound_val == 255:
-                # Special case: loop to 0xFF can't use cp 0x100 (truncates to 0)
-                # Instead, check if index wrapped to 0 (meaning we exceeded 0xFF)
-                self._emit("or", "a")  # Sets Z flag if A == 0
-                self._emit("jp", f"nz,{loop_label}")  # Continue if index != 0 (not wrapped)
+            # With a constant limit the index is at most the limit before
+            # the step, so if limit + step fits in a byte it cannot wrap.
+            can_wrap = (bound_val is None or not step_is_const
+                        or bound_val + step_byte > 0xFF)
+            if bound_val == 0xFF:
+                self._emit("jp", f"n{wrap},{loop_label}")
+                self._emit_label(test_label)
             else:
-                self._emit("cp", self._format_number(bound_val + 1))  # Compare with bound+1
-                self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
-
-            self._emit_label(end_label)
-            self.loop_stack.pop()
-            return
-
-        # Check for byte loop with variable bound
-        if both_bytes:
-            # Initialize index variable as BYTE
-            start_type = self._gen_expr(stmt.start)
-            if start_type == DataType.ADDRESS:
-                self._emit("ld", "a,l")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Jump to test
-            self._emit("jp", test_label)
-
-            # Loop body
-            self._emit_label(loop_label)
-            for s in body_stmts:
-                self._gen_stmt(s)
-
-            # Increment/Decrement
-            self._emit_label(incr_label)
-            self._gen_load(index_var)  # A = index
-            if not step_is_const:
-                # The step is an expression: keep the index while it runs.
-                self._emit("push", "af")
-                if self._gen_expr(step_expr) == DataType.ADDRESS:
-                    self._emit("ld", "a,l")
-                self._emit("ld", "b,a")
-                self._emit("pop", "af")
-                self._emit("add", "a,b")
-            elif step_val == 1:
-                self._emit("inc", "a")
-            elif step_val == -1 or step_val == 0xFF:
-                self._emit("dec", "a")
-            else:
-                self._emit("add", f"a,{self._format_number(step_val & 0xFF)}")
-            self._gen_store(index_var, DataType.BYTE)
-
-            # Test condition: compare index with bound variable
-            # Evaluate bound first, then compare with index
-            self._emit_label(test_label)
-            bound_result = self._gen_expr(stmt.bound)  # A = bound (or HL if ADDRESS)
-            if bound_result == DataType.ADDRESS:
-                self._emit("ld", "a,l")  # Get low byte if ADDRESS
-            self._emit("inc", "a")  # A = bound + 1
-            self._emit("ld", "b,a")  # B = bound + 1
-            self._gen_load(index_var)  # A = index
-            # cp b computes a - b (index - (bound+1)), sets C if index < bound+1
-            self._emit("cp", "B")  # Compare index with bound+1
-            self._emit("jp", f"C,{loop_label}")  # Continue if index < bound+1 (i.e., index <= bound)
+                if can_wrap:
+                    self._emit("jp", f"{wrap},{end_label}")
+                self._emit_label(test_label)
+                if bound_val is not None:
+                    self._gen_load(index_var)  # A = index
+                    self._emit("cp", self._format_number(bound_val + 1))
+                    self._emit("jp", f"C,{loop_label}")  # index <= limit
+                else:
+                    # The limit is evaluated on every pass, converted to a
+                    # BYTE. Continue while index <= limit.
+                    bound_result = self._gen_expr(stmt.bound)
+                    if bound_result == DataType.ADDRESS:
+                        self._emit("ld", "a,l")
+                    self._emit("ld", "b,a")  # B = limit
+                    self._gen_load(index_var)  # A = index
+                    self._emit("cp", "b")
+                    self._emit("jp", f"c,{loop_label}")
+                    self._emit("jp", f"z,{loop_label}")
 
             self._emit_label(end_label)
             self.loop_stack.pop()
@@ -4533,19 +4482,24 @@ class CodeGenerator:
                 self._emit("ld", "l,a")
                 self._emit("ld", "h,0")
 
+        bound_val = (number_value(stmt.bound) & 0xFFFF
+                     if isinstance(stmt.bound, P.NumberLiteral) else None)
+        step_word = step_val & 0xFFFF if step_is_const else None
+
         # Initialize index variable
-        self._gen_expr(stmt.start)
+        self._gen_expr_to_hl(stmt.start)
         self._gen_store(index_var, DataType.ADDRESS)
 
-        # Jump to test
-        self._emit("jp", test_label)
+        # Jump to test (a limit of 0FFFFH passes every index)
+        if bound_val != 0xFFFF:
+            self._emit("jp", test_label)
 
         # Loop body
         self._emit_label(loop_label)
         for s in body_stmts:
             self._gen_stmt(s)
 
-        # Increment
+        # Increment, and stop when it carries out.
         self._emit_label(incr_label)
         _index_to_hl()
         if not step_is_const:
@@ -4554,14 +4508,33 @@ class CodeGenerator:
             self._emit("ex", "de,hl")
             self._emit("pop", "hl")
             self._emit("add", "hl,de")
-        elif step_val == 1:
+            wrap = "c"
+        elif step_word == 1:
             self._emit("inc", "hl")
-        elif step_val == -1 or step_val == 0xFFFF:
-            self._emit("dec", "hl")
+            wrap = "z"
         else:
-            self._emit("ld", f"de,{self._format_number(step_val)}")
-            self._emit("add", "hl,de")
+            # BC, not DE: the peephole turns `ld de,1..3 / add hl,de' into
+            # `inc hl', which sets no carry.
+            can_carry = bound_val is None or bound_val + step_word > 0xFFFF
+            pair = "bc" if can_carry else "de"
+            self._emit("ld", f"{pair},{self._format_number(step_word)}")
+            self._emit("add", f"hl,{pair}")
+            wrap = "c"
         self._gen_store(index_var, DataType.ADDRESS)
+        can_wrap = (bound_val is None or not step_is_const
+                    or bound_val + step_word > 0xFFFF)
+        if can_wrap:
+            if wrap == "z":
+                # `inc hl' sets no flags: the index wrapped if it is now 0.
+                self._emit("ld", "a,h")
+                self._emit("or", "l")
+            if bound_val == 0xFFFF:
+                self._emit("jp", f"n{wrap},{loop_label}")
+                self._emit_label(test_label)
+                self._emit_label(end_label)
+                self.loop_stack.pop()
+                return
+            self._emit("jp", f"{wrap},{end_label}")
 
         # Test condition
         self._emit_label(test_label)
@@ -4585,6 +4558,223 @@ class CodeGenerator:
 
         self._emit_label(end_label)
         self.loop_stack.pop()
+
+    def _read_outside(self, name: str, loop) -> bool:
+        """Whether ``name`` may be read anywhere but inside ``loop``: it is
+        not a variable of the procedure being compiled, or the procedure
+        (nested procedures included) names it somewhere else."""
+        if not self._is_private_var(name) or self.current_proc_decl is None:
+            return True
+        stack = [self.current_proc_decl.body]
+        while stack:
+            n = stack.pop()
+            if n is loop:
+                continue
+            if isinstance(n, P.Identifier) and ident_text(n.name) == name:
+                return True
+            if isinstance(n, (P.DoIterBlock, P.DoIterByBlock)) and ident_text(n.index) == name:
+                return True
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+        return False
+
+    _FIXED_BUILTINS = frozenset({"LOW", "HIGH", "DOUBLE", "SHL", "SHR", "ROL", "ROR"})
+
+    def _limit_is_fixed(self, bound, body_stmts) -> bool:
+        """Whether a loop limit has the same value on every pass: constants
+        and variables the body cannot change, and no call in it."""
+        stack = [bound]
+        while stack:
+            e = unwrap_paren(stack.pop())
+            if isinstance(e, (P.NumberLiteral, P.StringLiteral)):
+                continue
+            if isinstance(e, P.Identifier):
+                name = ident_text(e.name)
+                if name in self.literal_macros:
+                    continue
+                sym = self._lookup_symbol(name)
+                if (sym is None or sym.kind not in (SymbolKind.VARIABLE, SymbolKind.PARAMETER)
+                        or sym.dimension is not None
+                        or self._stmts_may_change(name, body_stmts)):
+                    return False
+                continue
+            if isinstance(e, P.BinaryOp):
+                stack.extend([e.left, e.right])
+                continue
+            if isinstance(e, P.UnaryOp):
+                stack.append(e.operand)
+                continue
+            if isinstance(e, P.Call):
+                callee = unwrap_paren(e.callee)
+                if (isinstance(callee, P.Identifier)
+                        and ident_text(callee.name).upper() in self._FIXED_BUILTINS):
+                    stack.extend(e.args)
+                    continue
+            return False
+        return True
+
+    def _survey_stores(self, modules) -> None:
+        """Record, for every procedure, the names its own body assigns, and
+        the names whose address is taken (``.x'') or which are placed AT
+        something anywhere. A call can change a variable only if some
+        procedure assigns it, or stores through its address."""
+        self._proc_assigns: dict[int, set[str]] = {}
+        self._assigned_by_procs: dict[str, int] = {}
+        self._aliased: set[str] = set()
+
+        def assigned_in(body) -> set[str]:
+            names: set[str] = set()
+            stack = [body]
+            while stack:
+                n = stack.pop()
+                if isinstance(n, P.ProcDecl):
+                    continue            # a procedure of its own
+                targets = []
+                if isinstance(n, P.AssignStmt):
+                    targets = list(n.targets)
+                elif isinstance(n, P.EmbeddedAssign):
+                    targets = [n.target]
+                elif isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
+                    names.add(ident_text(n.index))
+                for t in targets:
+                    t = unwrap_paren(t)
+                    if isinstance(t, P.Identifier):
+                        names.add(ident_text(t.name))
+                if isinstance(n, (list, tuple)):
+                    stack.extend(n)
+                    continue
+                fields = getattr(n, "__dataclass_fields__", None)
+                if fields:
+                    stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+            return names
+
+        stack: list = list(modules)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.ProcDecl):
+                own = assigned_in(n.body.items)
+                self._proc_assigns[id(n)] = own
+                for name in own:
+                    self._assigned_by_procs[name] = self._assigned_by_procs.get(name, 0) + 1
+            elif isinstance(n, P.LocationOf):
+                base = unwrap_paren(n.operand)
+                while isinstance(base, (P.Call, P.MemberAccess)):
+                    base = unwrap_paren(base.callee if isinstance(base, P.Call) else base.base)
+                if isinstance(base, P.Identifier):
+                    self._aliased.add(ident_text(base.name))
+            elif isinstance(n, P.DeclItem) and decl_attrs(n).at_location is not None:
+                self._aliased.update(decl_item_names(n))
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+
+    def _assigned_by_another_proc(self, name: str) -> bool:
+        """Whether a procedure other than the one being compiled assigns
+        ``name`` (its bare name: an over-approximation across scopes)."""
+        count = getattr(self, "_assigned_by_procs", {}).get(name, 0)
+        if self.current_proc_decl is not None:
+            if name in self._proc_assigns.get(id(self.current_proc_decl), ()):
+                count -= 1
+        return count > 0
+
+    def _call_may_change(self, name: str) -> bool:
+        """Whether a call of a procedure outside the one being compiled can
+        change the variable ``name``."""
+        sym = self._lookup_symbol(name)
+        if (sym is None or sym.based_on or sym.at_address is not None
+                or sym.is_public or sym.is_external
+                or name in getattr(self, "_aliased", ())):
+            return True
+        return self._assigned_by_another_proc(name)
+
+    def _is_private_var(self, name: str) -> bool:
+        """``name`` is a plain variable of the procedure being compiled,
+        which only it and the procedures nested in it can reach."""
+        if not self.current_proc:
+            return False
+        # Up through the DO-block scopes (B<n>) to the procedure's own.
+        sym = None
+        scope = self.symbols.current_scope
+        while scope is not None and scope.parent is not None:
+            sym = scope.symbols.get(name)
+            if sym is not None or not re.fullmatch(r"B\d+", scope.name):
+                break
+            scope = scope.parent
+        if sym is None:
+            sym = self.symbols.lookup(f"{self.current_proc}${name}")
+        # A variable whose address is taken can be stored into from
+        # anywhere the address went.
+        return (sym is not None
+                and sym.kind in (SymbolKind.VARIABLE, SymbolKind.PARAMETER)
+                and not sym.based_on and sym.at_address is None
+                and not sym.is_public and not sym.is_external
+                and name not in getattr(self, "_aliased", ()))
+
+    def _stmts_may_change(self, name: str, stmts) -> bool:
+        """Whether ``stmts`` may assign ``name``: an assignment or embedded
+        assignment to it, a DO over it, or a call of a procedure that can
+        reach it -- any procedure for a global, a nested one for a variable
+        of the procedure being compiled -- or of MOVE."""
+        private = self._is_private_var(name)
+        nested_prefix = f"{self.current_proc}$"
+        stack = list(stmts)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, P.CallStmt):
+                callee = n.callee
+                if isinstance(callee, (P.Call, P.CallNoArgs)):
+                    callee = callee.callee
+                callee = unwrap_paren(callee)
+                cname = ident_text(callee.name) if isinstance(callee, P.Identifier) else ""
+                sym = self._lookup_symbol(cname) if cname else None
+                if cname.upper() == "MOVE":
+                    if name in getattr(self, "_aliased", ()) or not private:
+                        return True
+                elif (sym is not None and sym.name.startswith(nested_prefix)
+                        or (not private and self._call_may_change(name))):
+                    return True
+            if isinstance(n, P.AssignStmt):
+                for t in n.targets:
+                    t = unwrap_paren(t)
+                    if isinstance(t, P.Identifier) and ident_text(t.name) == name:
+                        return True
+            elif isinstance(n, P.EmbeddedAssign):
+                t = unwrap_paren(n.target)
+                if isinstance(t, P.Identifier) and ident_text(t.name) == name:
+                    return True
+            elif isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
+                if ident_text(n.index) == name:
+                    return True
+            elif isinstance(n, (P.Identifier, P.Call, P.CallNoArgs)):
+                callee = n if isinstance(n, P.Identifier) else unwrap_paren(n.callee)
+                if isinstance(callee, P.Identifier):
+                    sym = self._lookup_symbol(ident_text(callee.name))
+                    if (sym is not None and sym.kind == SymbolKind.PROCEDURE
+                            and (sym.name.startswith(nested_prefix)
+                                 or (not private and self._call_may_change(name)))):
+                        return True
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if not fields:
+                continue
+            for f in fields:
+                if f == "pos":
+                    continue
+                stack.append(getattr(n, f, None))
+        return False
 
     def _gen_do_case(self, stmt) -> None:
         """Generate code for a ``DO CASE selector ... END`` block.
