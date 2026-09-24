@@ -5,6 +5,7 @@ program that assembled and linked cleanly and then wrote through a null or
 short pointer at run time.
 """
 
+import os
 import re
 
 import pytest
@@ -644,3 +645,16 @@ end t;
     j = lines.index("PP:")
     assert lines[j + 1:j + 3] == ["db\t'X'", "ds\t1"], lines[j + 1:j + 4]
     assert "QQ:\tEQU\tPP+1" in lines, asm
+
+
+def test_intel_link_reaches_the_pointer_after_inrecord_p():
+    """Intel's LINK - tests/link1a.plm, from Mark Ogden's reconstruction -
+    declares `(s, e) ADDRESS AT(.inRecord$p)': s is inRecord$p and e the word
+    after it.  With both at inRecord$p, `e = s + inRecord.len + 2' overwrote
+    the record pointer."""
+    path = os.path.join(os.path.dirname(__file__), "link1a.plm")
+    with open(path, encoding="latin-1") as fh:
+        asm = Compiler().compile(fh.read(), path)
+    assert asm is not None
+    d = _defs(asm)
+    assert "@GETRECORD$S: EQU INRECORDP" in d and "@GETRECORD$@E: EQU INRECORDP+2" in d, d
