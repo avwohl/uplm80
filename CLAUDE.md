@@ -46,6 +46,7 @@ cpmemu program.com arg1 arg2      # Run with arguments
    Options:
    - `-m cpm` - CP/M mode (default): For new PL/M programs, maximum stack under BDOS
    - `-m bare` - Bare metal mode: Original Digital Research compatible (jump to start-3)
+   - `-m mpm` - MP/M II relocatable modules: page-zero references become `??BDOS`/`??MAXB`/`??BOOT` externals
    - `-O 0|1|2|3` - Optimization level (default: 2)
    - `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
 

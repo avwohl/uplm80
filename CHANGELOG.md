@@ -3,6 +3,95 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.3.6 — 2026-09-24
+
+Found by building every PL/M program in Digital Research's MP/M II sources and
+running each one next to DRI's own binary on the same disk, command by command,
+until the two printed the same thing. Adds an MP/M runtime mode. Each fix has a
+regression test that fails when it is reverted, and 80un's `80un.com` and
+`80unbas.com` still rebuild byte-identical.
+
+Requires upeepz80 0.2.4, whose dead-store elimination deleted the store in
+`var = (a = b)`.
+
+### Added
+
+- **`-m mpm`, for MP/M II `.PRL`/`.RSP`/`.SPR` modules.** MP/M gives each
+  process a memory segment and puts its page zero at the segment's base, so the
+  BDOS entry, the stack-top pointer at 0006H and the warm-boot jump have to be
+  relocated when the program loads. Only a resolved symbol reference reaches a
+  `.PRL` relocation bitmap, so MP/M mode emits them as the externals `??BDOS`,
+  `??MAXB` and `??BOOT` rather than literals (link with a module that defines
+  them at 0005H, 0006H and 0000H, and with `ul80 --prl`, which relocates
+  page-zero symbols). This is how DRI's PL/M-80 got the same effect:
+  `PLM_WORK/X0100.ASM` and `X0200.ASM` publish the same names at different
+  offsets and GENMOD diffed the two links. The names carry the compiler's `??`
+  prefix because a PL/M identifier cannot contain `?`, and something collides
+  otherwise: SDIR declares a variable called `bdos`. MP/M mode sets SP with the
+  single three-byte `ld sp,??STACK` over a 512-byte stack in the image, because
+  DRI's sources enter themselves by a jump to `.start-3`. CP/M and bare modes
+  are unchanged.
+
+### Fixed
+
+- **A `PUBLIC` procedure took its arguments the way a private one does.** A
+  procedure private to its module is called with the earlier arguments already
+  written into its own storage and only the last in a register; a caller in
+  another module cannot name that storage. A public procedure now takes all its
+  arguments on the stack. SDIR's `pdecimal(v, prec, zerosup)` read two of its
+  three arguments from slots nobody had written.
+- **`AT(.MEMORY)` was not the end of the program.** It named a label at the
+  end of the *module* — the middle of a multi-module program — and was emitted
+  as an EQU, which reads as zero above its own declaration. It is now a label
+  beside the linker's `__END__`, with the `EXTRN` ahead of the EQU that uses
+  it. SDIR's 128-entry hash table first cleared page zero, then another
+  module's strings.
+- **`AT(...)` understood only a bare `NAME(<literal>)`.** A constant
+  expression, `NAME(const)`, `STRUCT.MEMBER` or a chain of them fell through to
+  `EQU $`, the assembler's location counter. STAT read a stray byte as its `$`
+  parameter and set a file read-only instead of listing it; PIP
+  (`DESTR ADDRESS AT(.DEST.FCB(33))`) and PRLCOM were miscompiled the same way.
+  An `AT` that cannot be resolved is now an error. `AT(.name)` uses EQU rather
+  than SET, and `AT(.external)` emits the EQU even when a reference comes
+  first.
+- **A STRUCTURE initialiser was emitted at one width.** It gives one value per
+  member, each at the member's own width; whatever the list does not fill is
+  now reserved. SDIR's ten-byte parser control block came out as five bytes of
+  zero. A value the emitter could not place was dropped silently and is now an
+  error; `.name(n)` is placeable.
+- **`x BASED s.m` read its pointer from the start of `s`.** The member was
+  parsed and dropped. SDIR matched every command-line argument against
+  address 0 and answered "File Not Found."
+- **`DECLARE x (*) BYTE DATA (...)` had no extent.** `LAST(x)` was -2, so PIP
+  never searched its delimiter table and answered "INVALID FORMAT" to every
+  command.
+- **A nested procedure's return type was not known where it is used.** Its
+  symbol is filed under its scoped name and the lookup searched only the top
+  level, so a `BYTE` result was read out of `L` instead of `A`. `LENGTH`,
+  `LAST` and `SIZE` used the same lookup; where they cannot answer they now
+  raise instead of emitting zero.
+- **A variable `BY` step was treated as `BY 1`.** Only a literal step was read.
+  SDIR walks an FCB disk map `BY i`, and counted every block twice on a disk
+  with word block numbers.
+- **A declared variable did not shadow a condition-flag built-in.** `CARRY`,
+  `ZERO`, `SIGN` and `PARITY` are ordinary words a program may declare; STAT's
+  zero-suppression flag `zero` read the Z flag. `STACKPTR` deliberately stays a
+  built-in, since assigning to it sets SP.
+- **A callee's frame was reused while its own arguments were evaluated.** The
+  overlay analysis let a procedure called from a later argument share storage
+  with an earlier argument already stored, so `call f(7, g)` could destroy the
+  7. Bites at the default `-O2`.
+- **A procedure-local STRUCTURE was sized as two bytes.** The next procedure's
+  frame was overlaid inside it. `-O2`.
+- **The target of an embedded assignment was folded like a value.**
+  `q = (k := 7)` after `k = 5` stored through the literal 5 and left the stale
+  fact about `k` in place. `-O3` only.
+- **An induction step hidden in a subscript did not count as modifying the
+  variable,** so `arr(i := i + 1) = 9` could fold away a loop's exit test.
+  `-O3` only.
+- **Only the module that sets SP carries a stack buffer;** a program linked
+  from eight modules was carrying eight.
+
 ## 0.3.5 — 2026-09-22
 
 An audit prompted by the 80un report. The three defects 0.3.3 and 0.3.4 fixed

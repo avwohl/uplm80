@@ -63,9 +63,10 @@ python -m uplm80.compiler input.plm -o output.mac
 ```
 
 Options:
-- `-m cpm` or `-m bare` - Runtime mode (default: cpm)
+- `-m cpm`, `-m bare` or `-m mpm` - Runtime mode (default: cpm)
   - `cpm`: For new PL/M programs, maximum stack under BDOS
   - `bare`: Original Digital Research compatible (jump to start-3)
+  - `mpm`: MP/M II relocatable modules (`.PRL`, `.RSP`, `.SPR`)
 - `-o output.mac` - Output file name
 - `-O 0|1|2|3` - Optimization level (default: 2)
 - `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
@@ -239,6 +240,27 @@ convention of jumping to *start − 3* to skip over a local stack area:
   page 1). In bare mode the leading address constant (e.g. `0100H:` or
   `0200H:`) *is* meaningful — it sets the assembler `org` for the bare image.
 - Compatible with original Intel/DR PL/M-80 sources.
+
+### MP/M Mode (`-m mpm`)
+
+For MP/M II page-relocatable modules. MP/M gives each process a memory
+segment and puts its page zero at the segment's base, so the page-zero
+addresses a program uses have to be relocated when it loads — and only a
+resolved *symbol* reference reaches a `.PRL` relocation bitmap.
+
+- Page-zero references are emitted as externals: `??BDOS` (0005H), `??MAXB`
+  (0006H) and `??BOOT` (0000H). Link with a small module that defines them at
+  those addresses, using `ul80 --prl` (transient, linked at 100H) or
+  `ul80 --spr` (system page, linked at 0); ul80 marks resolved page-zero symbol
+  references for relocation.
+- Entry preamble (auto-generated), one three-byte instruction as DRI's PL/M-80
+  emitted — DRI's sources enter themselves by a jump to `.start-3`:
+
+  ```asm
+  ld   sp,??STACK   ; 512-byte stack carried in the image
+  ```
+- `AT(.MEMORY)` storage lies past the image; give the `.PRL` the memory it
+  needs with `ul80 --extra`, as DRI did with GENMOD's third argument.
 
 ## Project Structure
 
