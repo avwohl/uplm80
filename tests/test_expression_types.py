@@ -579,6 +579,24 @@ call run;
 """, [0x30, 0x30, 0x131])
 
 
+def test_a_constant_moved_right_of_a_relation_is_not_checked():
+    """-O3 puts a relation's constant on the right. Marked as derived when it
+    was a plain number, but not when it was `'AB'' or a sum left unfolded
+    because the procedure uses PLUS; the impossible-comparison check then
+    rejected, at -O3 alone, what compiles at every other level."""
+    _check("""
+declare b byte, w address;
+run: procedure;
+  b = 5;
+  w = 'AB' <> b; call ph(w);
+  w = 0ff01h + 170 <> b; call ph(w);
+  w = 'AB' = b; call ph(w);
+  b = b minus 1;
+end run;
+call run;
+""", [0xFF, 0xFF, 0])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])

@@ -62,11 +62,11 @@ from .plm_types import (
     ADDRESS,
     BYTE,
     BYTE_BUILTINS,
-    DERIVED,
     PATTERN_TYPED_BUILTINS,
     RELATIONS,
     binary_type,
     convert,
+    eval_typed,
     fold_binary,
     fold_builtin,
     fold_unary,
@@ -1476,9 +1476,16 @@ class ASTOptimizer:
         right_key = sort_key(right)
 
         if right_key < left_key:
-            if kind in RELATIONS and isinstance(unwrap_paren(left), P.NumberLiteral):
-                left = make_number_literal(number_value(unwrap_paren(left)), pos=left.pos)
-                left.value.name = DERIVED
+            if kind in RELATIONS:
+                # Any constant, not just a literal: `'AB' <> b', or a sum
+                # a PLUS in the procedure keeps from being folded, was
+                # rejected at -O3 alone. Its value is the relation's
+                # operand (the flags of computing it are dead after the
+                # compare), so it goes over as that value.
+                typed = eval_typed(left)
+                if typed is not None:
+                    left = make_typed_const(typed[0], typed[1], getattr(left, "pos", None),
+                                            derived=True)
             return right, left
         return left, right
 
