@@ -427,3 +427,44 @@ def test_spool_rsp_lays_out_its_queues_where_dris_binary_has_them():
     where = _layout(_asm(SPRSP_SRC))
     assert (where["SPOOLPD"], where["SPOOLLQCB"], where["STPSPLCQCB"], where["LAST"], where["$"]) \
         == (0x02, 0x36, 0xCE, 0xE7, 0xE8), where
+
+
+def test_a_literally_list_stands_for_the_whole_list_inside_initial():
+    """LITERALLY is text substitution, in an INITIAL list as anywhere else.
+
+    A special case kept only the body's first element there, to match the
+    output of an earlier uplm80 that parsed a macro body as one expression.
+    """
+    lines = _data_lines(_asm("""
+t: do;
+declare fill literally '0C7C7H,0C7C7H,0C7C7H';
+declare stk (4) address initial (fill, 1234H);
+declare after byte initial (0AAH);
+end t;
+"""))
+    i = lines.index("STK:")
+    assert lines[i + 1:i + 6] == ["dw\t0C7C7H"] * 3 + ["dw\t1234H", "AFTER:"], lines[i + 1:i + 6]
+
+
+def test_a_resident_process_stack_holds_its_restarts_and_its_entry():
+    """UTIL2/SCBRS.PLM, MSBRS.PLM and SPBRS.PLM build their process stack as
+
+        declare sched$stk (20) address initial (restarts,.sched);
+        declare sched$stack$pointer address data (.sched$stk+38);
+
+    with `restarts' nineteen 0C7C7H words: the initial SP points at the
+    twentieth word, which holds the process's entry point.  DRI's SCHED.BRS
+    has exactly that.  With only the first 0C7C7H the entry point sat in the
+    second word and the one SP pointed at was zero.
+    """
+    restarts = ",".join(["0C7C7H"] * 19)
+    lines = _data_lines(_asm(f"""
+sched: do;
+declare restarts literally '{restarts}';
+declare stkp address data (.stk+38);
+declare stk (20) address initial (restarts,.sched);
+sched: procedure; end sched;
+end sched;
+"""))
+    i = lines.index("STK:")
+    assert lines[i + 1:i + 21] == ["dw\t0C7C7H"] * 19 + ["dw\tSCHED"], lines[i + 1:i + 21]

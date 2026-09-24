@@ -425,16 +425,6 @@ def macro_pass(source: str) -> str:
     n = len(tokens)
     pending: list[_Tok] = []  # putback queue for substituted-body tokens
 
-    # Stack of `(` contexts: each entry is the keyword that opened the
-    # outer parens (``"INITIAL"`` / ``"DATA"`` / ``""`` for any other
-    # paren). Used to pick expression-level vs full-text substitution
-    # for macro bodies — inside ``INITIAL(...)`` / ``DATA(...)`` only
-    # the first top-comma chunk of a macro body is substituted, matching
-    # legacy uplm80's "sub-parse macro body as a single expression"
-    # semantics. Elsewhere the full body is substituted.
-    paren_stack: list[str] = []
-    last_significant: str = ""
-
     def next_tok() -> "_Tok | None":
         nonlocal i
         if pending:
@@ -460,18 +450,7 @@ def macro_pass(source: str) -> str:
         if tok.kind == "STRING":
             out.append(tok.text)
             continue
-        if tok.kind == "PUNCT":
-            if tok.text == "(":
-                opener = last_significant if last_significant in ("INITIAL", "DATA") else ""
-                paren_stack.append(opener)
-            elif tok.text == ")":
-                if paren_stack:
-                    paren_stack.pop()
-            last_significant = tok.text
-            out.append(tok.text)
-            continue
-        if tok.kind == "NUMBER":
-            last_significant = tok.text
+        if tok.kind in ("PUNCT", "NUMBER"):
             out.append(tok.text)
             continue
 
@@ -479,7 +458,6 @@ def macro_pass(source: str) -> str:
         # macro-def shape / macro-use, in that order.
         assert tok.kind == "IDENT"
         text = tok.text  # already upper-folded by the scanner
-        last_significant = text
 
         # Block-scope tracking. PROCEDURE and DO open a scope; END
         # closes the innermost. Detection is purely lexical here —
@@ -530,15 +508,16 @@ def macro_pass(source: str) -> str:
         # machinery, so nested macros expand to the bottom.
         body = lookup(text)
         if body is not None:
-            # Inside INITIAL(...) / DATA(...) the legacy parser
-            # sub-parses the macro body as a single expression and
-            # silently discards anything past the first comma at the
-            # body's top level. Mirror that here so init lists like
-            # `initial(restarts, .status)` — where ``restarts`` is
-            # ``'0C7C7H,0C7C7H,...,0C7C7H'`` — yield 2 init values, not
-            # 19+1.
-            in_init_ctx = bool(paren_stack) and paren_stack[-1] in ("INITIAL", "DATA")
-            effective_body = _first_top_comma_chunk(body) if in_init_ctx else body
+            # The whole body, in an INITIAL or DATA list as anywhere else.
+            # It used to be cut at its first top-level comma there, to match
+            # an earlier uplm80 that parsed a macro body as one expression.
+            # That was a bug being preserved, not PL/M: MP/M II's
+            # UTIL2/SCBRS.PLM declares
+            #     sched$stk (20) address initial (restarts,.sched);
+            # with `restarts' nineteen 0C7C7H words, so that the stack
+            # pointer .sched$stk+38 lands on the entry point - which is what
+            # DRI's SCHED.BRS holds.  Cut short, SP pointed at a zero.
+            #
             # Procedure declarations (`mon1: procedure ... external;`
             # where ``mon1`` is itself a LITERALLY for ``'ldmon1'``)
             # take their name from the macro body verbatim, preserving
@@ -553,11 +532,11 @@ def macro_pass(source: str) -> str:
                 peek_next is not None
                 and peek_next.kind == "PUNCT"
                 and peek_next.text == ":"
-                and _is_simple_ident(effective_body)
+                and _is_simple_ident(body)
             ):
-                out.append(effective_body.strip())
+                out.append(body.strip())
                 continue
-            sub_tokens = _tokenize_for_macros(effective_body)
+            sub_tokens = _tokenize_for_macros(body)
             pending = list(sub_tokens) + pending
             continue
 
@@ -579,34 +558,6 @@ def _is_simple_ident(text: str) -> bool:
     if not (s[0].isalpha() or s[0] == "_"):
         return False
     return all(c.isalnum() or c in "_$" for c in s)
-
-
-def _first_top_comma_chunk(body: str) -> str:
-    """Return everything up to the first top-level (paren-balanced)
-    comma in ``body``. Mimics the legacy parser's behaviour of sub-
-    parsing a macro body as a single expression in INITIAL/DATA arg
-    lists — matters for definitions like
-    ``restarts literally '0C7C7H,0C7C7H,...,0C7C7H'`` whose body has
-    19 comma-separated values but is intended to act as one item when
-    spliced into an INITIAL list."""
-    depth = 0
-    in_str = False
-    for j, c in enumerate(body):
-        if in_str:
-            if c == "'":
-                in_str = False
-            continue
-        if c == "'":
-            in_str = True
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            if depth > 0:
-                depth -= 1
-        elif c == "," and depth == 0:
-            return body[:j]
-    return body
 
 
 @dataclass
