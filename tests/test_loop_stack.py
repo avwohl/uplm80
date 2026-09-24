@@ -83,11 +83,21 @@ def _stack_depth_at_returns(asm: str, proc: str) -> list[tuple[int, int]]:
     return rets
 
 
+def _counted(asm: str) -> bool:
+    """Whether the loop kept its count in B - pushed around the body."""
+    return "push\tbc" in [l.strip() for l in asm.splitlines()]
+
+
+# The reported case had j at module level.  A RETURN leaves such an index
+# where the caller can read it, so that loop is no longer counted at all (see
+# test_an_index_the_caller_can_read_after_a_return_is_not_counted); with j
+# local to g the count is still the fastest form, and still has to be popped.
 RETURN_IN_COUNTED_LOOP = """
 t: do;
-declare (c, n, j) byte;
+declare (c, n) byte;
 f: procedure byte external; end f;
 g: procedure byte;
+    declare j byte;
     do j = 0 to n;
         if f = 0 then return 1;
         c = c + 1;
@@ -110,11 +120,12 @@ def test_a_return_inside_a_counted_loop_leaves_the_count_behind(opt):
 
 SHAPES = """
 t: do;
-declare (c, n, j, k) byte, w address;
+declare (c, n) byte, w address;
 f: procedure byte external; end f;
 
 /* nested counted loops, returning from the inner one */
 g1: procedure byte;
+    declare (j, k) byte;
     do j = 0 to 3;
         do k = 0 to n;
             if f = 0 then return 7;
@@ -125,6 +136,7 @@ end g1;
 
 /* an ADDRESS result has to survive the pops */
 g2: procedure address;
+    declare j byte;
     do j = 0 to 5;
         w = w + 1;
         if f = 1 then return w + 1000;
@@ -134,6 +146,7 @@ end g2;
 
 /* the RETURN sits in a CASE and a DO WHILE inside the counted body */
 g3: procedure;
+    declare j byte;
     do j = 0 to 9;
         do case f;
             c = 1;
@@ -148,6 +161,7 @@ end g3;
 
 /* a loop that falls out normally, and an untyped RETURN after it */
 g4: procedure;
+    declare j byte;
     do j = 0 to 9;
         c = c + 1;
     end;
@@ -175,7 +189,7 @@ def test_every_return_in_a_procedure_leaves_the_stack_as_it_found_it(opt, proc):
 RUN_SRC = """
 0100H:
 t: do;
-declare (c, n, j, k, calls) byte, w address;
+declare (c, n, calls) byte, w address;
 mon1: procedure (f, a) external; declare f byte, a address; end mon1;
 
 putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
@@ -188,6 +202,7 @@ f: procedure byte;
 end f;
 
 g1: procedure byte;
+    declare j byte;
     do j = 0 to n;
         if f = 0 then return 'A';
         c = c + 1;
@@ -196,6 +211,7 @@ g1: procedure byte;
 end g1;
 
 g2: procedure address;
+    declare (j, k) byte;
     do j = 0 to 3;
         do k = 0 to 4;
             w = w + 1;
@@ -218,14 +234,10 @@ end t;
 def test_a_return_from_inside_a_counted_loop_runs(opt):
     """Compile, assemble, link and run.  With the count left on the stack the
     first RET jumps to the count and the program prints nothing sensible."""
+    assert _counted(_asm(RUN_SRC, opt)), "this no longer takes the counted-loop path"
     # g2 runs twice: w reaches 7 on the first call, and on the second it
     # goes past 7 and the loop runs out, returning 0.
     assert run_plm(RUN_SRC, opt).strip() == "AB0."
-
-
-def _counted(asm: str) -> bool:
-    """Whether the loop kept its count in B - pushed around the body."""
-    return "push\tbc" in [l.strip() for l in asm.splitlines()]
 
 
 @pytest.mark.parametrize("body", [
@@ -280,3 +292,100 @@ def test_counted_loops_run_the_right_number_of_times(opt):
     exactly what DJNZ counts down from.  It also cleared only s(0) and ran
     the early-exit loop all ten times."""
     assert run_plm(LOOP_RUN_SRC, opt).strip() == "KKKK310"
+
+
+LOOP_INDEX_SRC = """
+0100H:
+t: do;
+declare (i, j, n, c, calls) byte;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+show: procedure; call putc('0' + i); end show;
+/* returns 0 on its third call */
+f: procedure byte;
+    calls = calls + 1;
+    if calls = 3 then return 0;
+    return 1;
+end f;
+/* j is the module's: whoever called g can read it */
+g: procedure byte;
+    do j = 0 to 9;
+        if f = 0 then return 1;
+    end;
+    return 0;
+end g;
+
+/* an inner loop over the same index leaves it at 10; the outer one then
+   steps it to 11, past its bound, and stops after one pass */
+c = 0;
+do i = 0 to 9; c = c + 1; do i = 0 to 9; end; end;
+call putc('0' + c); call putc('0' + i);
+call putc('.');
+
+/* a procedure the body calls reads the index */
+do i = 0 to 3; call show; end;
+n = 3; do i = 0 to n; call show; end;
+call putc('.');
+
+/* the index after the loop is one past the bound */
+do i = 0 to 3; c = c + 1; end; call putc('0' + i);
+n = 5; do i = 0 to n; c = c + 1; end; call putc('0' + i);
+call putc('.');
+
+/* the bound is looked at every time round */
+n = 4; c = 0; do i = 0 to n; c = c + 1; n = 0; end; call putc('0' + c);
+call putc('.');
+
+/* where a RETURN left the index */
+c = g; call putc('0' + j);
+call putc('.');
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 2, 3])
+def test_a_loop_index_is_where_pl_m_puts_it(opt):
+    """Inside the loop, after it, and after a RETURN from it, the index has
+    the value PL/M-80 gives it (manual, 5.1.4): the start, stepped once per
+    pass, and one step past the bound when the loop ends.
+
+    The counted form kept the count in B and never stored the index, so an
+    inner loop over the same index, a procedure the body calls, the code
+    after the loop, and a caller after a RETURN all saw a stale value; and
+    it counted a bound once that PL/M-80 looks at every time round."""
+    assert run_plm(LOOP_INDEX_SRC, opt).strip() == "1;.01230123.46.1.2.", opt
+
+
+def test_an_index_a_called_procedure_reads_is_not_counted():
+    asm = _asm("""
+t: do;
+declare (i, c) byte;
+show: procedure; c = c + i; end show;
+do i = 0 to 9; call show; end;
+end t;
+""", 2)
+    assert not _counted(asm), asm
+
+
+def test_an_index_the_caller_can_read_after_a_return_is_not_counted():
+    asm = _asm(RETURN_IN_COUNTED_LOOP.replace("    declare j byte;\n", "")
+               .replace("declare (c, n) byte;", "declare (c, n, j) byte;"), 2)
+    assert not _counted(asm), asm
+
+
+@pytest.mark.parametrize("src", [
+    # a local index, whatever the body calls
+    "g: procedure; declare j byte; do j = 0 to 9; call h; end; end g;",
+    # a module-level index no called procedure names
+    "g: procedure; do k = 0 to 9; call h; end; end g;",
+])
+def test_an_index_nothing_else_can_see_is_still_counted(src):
+    asm = _asm(f"""
+t: do;
+declare (c, k) byte;
+h: procedure; c = c + 1; end h;
+{src}
+call g;
+end t;
+""", 2)
+    assert _counted(asm), asm

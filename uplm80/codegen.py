@@ -535,6 +535,9 @@ class CodeGenerator:
         self.emit_data_inline = False  # If True, DATA goes to code segment
         # Call graph for parameter sharing optimization
         self.call_graph: dict[str, set[str]] = {}  # proc -> set of procs it calls
+        self._reset_proc_facts()
+        # callee -> procedures called while evaluating that callee's arguments
+        self.arg_overlaps: dict[str, set[str]] = {}
         self.can_be_active_together: dict[str, set[str]] = {}  # proc -> procs that can be on stack with it
         self.param_slots: dict[str, int] = {}  # param_key -> slot number
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
@@ -884,6 +887,145 @@ class CodeGenerator:
                     return True
         return False
 
+    def _stmts_contain_return(self, stmts) -> bool:
+        """Whether any statement in the tree is a RETURN."""
+        return any(self._stmt_contains(s, (P.ReturnStmt, P.ReturnStmtValue)) for s in stmts)
+
+    def _stmt_contains(self, stmt, kinds) -> bool:
+        if isinstance(stmt, kinds):
+            return True
+        if isinstance(stmt, P.LabeledStmt):
+            return self._stmt_contains(stmt.stmt, kinds)
+        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
+            return (self._stmt_contains(stmt.then_stmt, kinds)
+                    or (isinstance(stmt, P.IfStmtElse)
+                        and self._stmt_contains(stmt.else_stmt, kinds)))
+        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
+            _, body_stmts = block_items_split(stmt.items)
+            return any(self._stmt_contains(s, kinds) for s in body_stmts)
+        if isinstance(stmt, P.DoCaseBlock):
+            return any(self._stmt_contains(s, kinds) for s in stmt.items or [])
+        return False
+
+    def _callees_of(self, stmts) -> set[str]:
+        """Every procedure the statements call, directly or through another."""
+        saved, self.arg_overlaps = self.arg_overlaps, {}
+        calls: set[str] = set()
+        try:
+            self._find_calls_in_stmts(stmts, self.current_proc or "", calls)
+        finally:
+            self.arg_overlaps = saved
+        work = list(calls)
+        while work:
+            for callee in self.call_graph.get(work.pop(), ()):
+                if callee not in calls:
+                    calls.add(callee)
+                    work.append(callee)
+        return calls
+
+    _UNKNOWN_OWNER = "?"
+
+    def _var_owner(self, sym: Symbol, name: str) -> str | None:
+        """The procedure that declares variable `sym', None at module level.
+
+        Read from the assembly name: a local is `@proc$name', or a slot in
+        ??AUTO that storage_labels gives the procedure.  _UNKNOWN_OWNER if it
+        is neither and not a plain module-level name.
+        """
+        if sym.stack_offset is not None:
+            return self.current_proc
+        asm = sym.asm_name or ""
+        if asm.startswith("??AUTO"):
+            parts = (self.current_proc or "").split("$")
+            for i in range(len(parts), 0, -1):
+                proc = "$".join(parts[:i])
+                if self.storage_labels.get(proc, {}).get(name) == asm:
+                    return proc
+            return self._UNKNOWN_OWNER
+        if asm.startswith("@") and "$" in asm:
+            return asm[1:asm.rindex("$")]
+        if "$" in asm or "+" in asm or "-" in asm:
+            return self._UNKNOWN_OWNER
+        return None
+
+    def _proc_sees(self, proc: str, name: str, owner: str | None) -> bool:
+        """Whether procedure `proc' names the `name' that `owner' declares."""
+        if not any(self._var_used_in_stmt(name, s) for s in self.proc_body.get(proc, ())):
+            return False
+        scope: str | None = proc
+        while scope is not None:
+            if name in self.proc_declared.get(scope, ()):
+                return scope == owner
+            scope = self.proc_parent.get(scope)
+        return owner is None
+
+    def _only_the_loop_sees(self, name: str, body_stmts, after_return: bool) -> bool:
+        """Whether nothing but the loop's own code can read or write `name'
+        while the loop runs - no procedure the body calls names it - and, if
+        `after_return', nothing can read it after a RETURN from the body.
+
+        A counted loop keeps its count in B and gives the index its final
+        value before it starts, and evaluates its bound once; both are only
+        right if no one else looks.
+        """
+        sym = self._lookup_symbol(name)
+        if sym is None or sym.kind != SymbolKind.VARIABLE or sym.based_on:
+            return False
+        owner = self._var_owner(sym, name)
+        if owner == self._UNKNOWN_OWNER:
+            return False
+        if after_return and owner != self.current_proc and self._stmts_contain_return(body_stmts):
+            return False    # whoever this returns to can read it
+        shared = sym.is_public or sym.is_external
+        for callee in self._callees_of(body_stmts):
+            if callee in self.proc_body:
+                if self._proc_sees(callee, name, owner):
+                    return False
+            elif shared:
+                return False    # another module's procedure, which may name it
+        return True
+
+    def _bound_is_fixed(self, bound, body_stmts) -> bool:
+        """Whether a loop's bound is the same every time round.
+
+        PL/M-80 evaluates the bound at every test; a counted loop evaluates
+        it once.  That is the same only if the bound calls nothing and none
+        of its variables is named in the body or by what the body calls.
+        """
+        names: set[str] = set()
+
+        def walk(e) -> bool:
+            e = unwrap_paren(e)
+            if isinstance(e, P.NumberLiteral):
+                return True
+            if isinstance(e, P.Identifier):
+                n = ident_text(e.name)
+                if n in self.literal_macros:
+                    return True
+                sym = self._lookup_symbol(n)
+                if sym is None or sym.kind != SymbolKind.VARIABLE:
+                    return False
+                names.add(n)
+                return True
+            if isinstance(e, P.BinaryOp):
+                return walk(e.left) and walk(e.right)
+            if isinstance(e, P.UnaryOp):
+                return walk(e.operand)
+            if isinstance(e, P.Call) and isinstance(e.callee, P.Identifier):
+                n = ident_text(e.callee.name).upper()
+                if n in ("LAST", "LENGTH", "SIZE"):
+                    return True
+                if n in ("LOW", "HIGH", "DOUBLE"):
+                    return all(walk(a) for a in e.args or [])
+                return walk(e.callee) and all(walk(a) for a in e.args or [])
+            return False
+
+        if not walk(bound):
+            return False
+        return all(not any(self._var_used_in_stmt(n, s) for s in body_stmts)
+                   and self._only_the_loop_sees(n, body_stmts, after_return=False)
+                   for n in names)
+
     def _stmts_contain_goto(self, stmts) -> bool:
         """Recursively check whether any statement in the tree is a GotoStmt.
 
@@ -1046,9 +1188,16 @@ class CodeGenerator:
     # Call Graph Analysis and Storage Sharing
     # ========================================================================
 
+    def _reset_proc_facts(self) -> None:
+        """Forget what _analyze_proc_calls recorded about each procedure."""
+        self.proc_body: dict[str, list] = {}           # statements of its body
+        self.proc_parent: dict[str, str | None] = {}   # the procedure it is nested in
+        self.proc_declared: dict[str, set[str]] = {}   # its parameters and locals
+
     def _build_call_graph(self, module) -> None:
         """Build call graph by analyzing all procedure bodies."""
         self.call_graph = {}
+        self._reset_proc_facts()
         # callee -> procedures called while evaluating that callee's arguments
         self.arg_overlaps: dict[str, set[str]] = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}  # proc -> [(var_name, size, type)]
@@ -1142,6 +1291,12 @@ class CodeGenerator:
         calls: set[str] = set()
         self._find_calls_in_stmts(stmt_items, full_name, calls)
         self.call_graph[full_name] = calls
+        # What a counted loop needs to know about a procedure its body calls:
+        # which names it declares, what it says, and where it is nested.
+        self.proc_body[full_name] = stmt_items
+        self.proc_parent[full_name] = parent_proc
+        self.proc_declared[full_name] = set(params) | {
+            n for d in decl_items if isinstance(d, P.DeclItem) for n in decl_item_names(d)}
 
         # Index DeclItems by declared name for parameter type lookup.
         decl_by_name: dict[str, tuple[DataType | None, int | None]] = {}
@@ -2088,6 +2243,7 @@ class CodeGenerator:
     def _build_call_graph_multi(self, modules: list) -> None:
         """Build call graph by analyzing all procedures across multiple modules."""
         self.call_graph = {}
+        self._reset_proc_facts()
         self.arg_overlaps = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}
 
@@ -4372,6 +4528,10 @@ class CodeGenerator:
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
+        # The count stands in for the index, so nothing else may look at the
+        # index while the loop runs: not a procedure the body calls, and not
+        # the caller after a RETURN from the body.  The bound is evaluated
+        # once, so nothing may change it either.
         if (
             both_bytes
             and step_is_const
@@ -4380,43 +4540,28 @@ class CodeGenerator:
             and not body_has_goto
             and isinstance(stmt.start, P.NumberLiteral)
             and number_value(stmt.start) == 0
+            and self._only_the_loop_sees(index_name, body_stmts, after_return=True)
+            and self._bound_is_fixed(stmt.bound, body_stmts)
         ):
-            # Calculate iteration count = bound + 1
-            # If bound is constant, emit LD B,bound+1
-            # If bound is variable, emit: load bound; INC A; LD B,A
+            # A = the number of passes, bound + 1.  A bound of 255 is 256
+            # passes, a count of 0 in B, which is where DJNZ counts 256 from
+            # - a DO from 0 runs at least once whatever its bound (PL/M-80
+            # manual, 5.1.4).
             if isinstance(stmt.bound, P.NumberLiteral):
-                bound_const = number_value(stmt.bound)
-                iter_count = bound_const + 1
-                if iter_count <= 255:
-                    self._emit("ld", f"b,{self._format_number(iter_count)}")
-                else:
-                    # Too many iterations for DJNZ
-                    pass  # Fall through to regular loop
+                self._emit("ld", f"a,{self._format_number((number_value(stmt.bound) + 1) & 0xFF)}")
             else:
-                # Variable bound: A = bound; A++; B = A
-                bt = self._gen_expr(stmt.bound)
-                if bt == DataType.ADDRESS:
+                if self._gen_expr(stmt.bound) == DataType.ADDRESS:
                     self._emit("ld", "a,l")
-                self._emit("inc", "a")  # A = bound + 1 = iteration count
-                self._emit("ld", "b,a")  # B = iteration count
-
-            # Only proceed with B-counter loop if we set up B
-            if (
-                isinstance(stmt.bound, P.NumberLiteral)
-                and number_value(stmt.bound) + 1 <= 255
-            ):
-                self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
-                self.loop_stack.pop()
-                return
-            elif not isinstance(stmt.bound, P.NumberLiteral):
-                # Variable bound case - we set up B above.  A bound of 255 is
-                # 256 iterations, a count of 0 in B, which is where DJNZ
-                # counts 256 from.  The loop used to be skipped then: a DO
-                # from 0 runs at least once whatever the bound (PL/M-80
-                # manual, 5.1.4).
-                self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
-                self.loop_stack.pop()
-                return
+                self._emit("inc", "a")
+            # That is also where the index ends up, one past the bound, and
+            # nothing reads it until the loop is over, so it is stored now.
+            # It was never stored at all: an inner DO over the same index
+            # left the outer loop to go round again from a stale value.
+            self._gen_store(index_var, DataType.BYTE)
+            self._emit("ld", "b,a")
+            self._gen_counted_body(body_stmts, loop_label, incr_label, end_label)
+            self.loop_stack.pop()
+            return
 
         # Check for optimized down-counting loop: DO I = N TO 0
         # When start is variable, bound is 0, and step is -1 (or default counting down)
