@@ -901,38 +901,6 @@ class CodeGenerator:
                     return True
         return False
 
-    def _stmts_contain_goto(self, stmts) -> bool:
-        """Recursively check whether any statement in the tree is a GotoStmt.
-
-        Used to disable loop optimizations (DJNZ) that push state onto the
-        stack across iterations. A GOTO escaping such a loop body would
-        leave that pushed state stranded — see test_goto_loops.
-        """
-        for stmt in stmts:
-            if self._stmt_contains_goto(stmt):
-                return True
-        return False
-
-    def _stmt_contains_goto(self, stmt) -> bool:
-        if isinstance(stmt, P.GotoStmt):
-            return True
-        if isinstance(stmt, P.LabeledStmt):
-            return self._stmt_contains_goto(stmt.stmt)
-        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
-            if self._stmt_contains_goto(stmt.then_stmt):
-                return True
-            if isinstance(stmt, P.IfStmtElse) and self._stmt_contains_goto(
-                stmt.else_stmt
-            ):
-                return True
-            return False
-        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
-            _, body_stmts = block_items_split(stmt.items)
-            return self._stmts_contain_goto(body_stmts)
-        if isinstance(stmt, P.DoCaseBlock):
-            return self._stmts_contain_goto(stmt.items or [])
-        return False
-
     # ========================================================================
     # Register Liveness Analysis
     # ========================================================================
@@ -4326,32 +4294,34 @@ class CodeGenerator:
                 step_is_const = False
 
         # Check if loop index is used in body - if not, we can use DJNZ on Z80.
-        # _index_used_in_body / _stmts_contain_goto still walk the
-        # legacy AST shape; they recurse via isinstance and return
-        # False for unrecognised typed nodes, which is conservative
-        # (forces the safe fallback path).
+        # _index_used_in_body still walks the legacy AST shape; it recurses
+        # via isinstance and returns False for unrecognised typed nodes,
+        # which is conservative (forces the safe fallback path).
         index_used = self._index_used_in_body(index_var, body_stmts)
 
-        # Skip DJNZ optimization when the body has a GOTO — the pattern
-        # pushes BC at the top of each iteration and pops at the bottom,
-        # so a GOTO escaping the body strands the pushed BC on the stack.
-        body_has_goto = self._stmts_contain_goto(body_stmts)
+        # Whether the body can move the index: an assignment, an embedded
+        # one, a DO over it, a call that reaches it, or a store through a
+        # pointer that may.
+        index_moves = self._stmts_may_change(index_name, body_stmts)
 
         # Z80 DJNZ optimization: DO I = 0 TO N where I is not used
         # Convert to: B = N+1; do { body } while (--B != 0)
         # The count is taken once, where PL/M-80 evaluates the limit on
         # every pass, so a variable limit has to be one the body cannot
-        # change; and the index is not kept up to date, so the body must
-        # not be able to change it either.
+        # change; the index is not kept up to date, so the body must not
+        # be able to change or read it -- nor, since nothing here follows a
+        # pointer, may a pointer reach it; and BC is on the stack while the
+        # body runs, so it must not leave by a GOTO or a RETURN.
         bound_fixed = self._limit_is_fixed(stmt.bound, body_stmts)
         if (
             both_bytes
             and step_is_const
             and step_val == 1
             and not index_used
-            and not body_has_goto
+            and not self._stmts_leave_block(body_stmts)
             and bound_fixed
-            and not self._stmts_may_change(index_name, body_stmts)
+            and not index_moves
+            and not self._reachable_by_pointer(index_name)
             and isinstance(stmt.start, P.NumberLiteral)
             and number_value(stmt.start) == 0
         ):
@@ -4476,8 +4446,9 @@ class CodeGenerator:
                 wrap = "c"
             self._gen_store(index_var, DataType.BYTE)
             # With a constant limit the index is at most the limit before
-            # the step, so if limit + step fits in a byte it cannot wrap.
-            can_wrap = (bound_val is None or not step_is_const
+            # the step, so if limit + step fits in a byte it cannot wrap --
+            # unless the body can move the index past the limit.
+            can_wrap = (bound_val is None or not step_is_const or index_moves
                         or bound_val + step_byte > 0xFF)
             if bound_val == 0xFF:
                 self._emit("jp", f"n{wrap},{loop_label}")
@@ -4551,13 +4522,14 @@ class CodeGenerator:
         else:
             # BC, not DE: the peephole turns `ld de,1..3 / add hl,de' into
             # `inc hl', which sets no carry.
-            can_carry = bound_val is None or bound_val + step_word > 0xFFFF
+            can_carry = (bound_val is None or index_moves
+                         or bound_val + step_word > 0xFFFF)
             pair = "bc" if can_carry else "de"
             self._emit("ld", f"{pair},{self._format_number(step_word)}")
             self._emit("add", f"hl,{pair}")
             wrap = "c"
         self._gen_store(index_var, DataType.ADDRESS)
-        can_wrap = (bound_val is None or not step_is_const
+        can_wrap = (bound_val is None or not step_is_const or index_moves
                     or bound_val + step_word > 0xFFFF)
         if can_wrap:
             if wrap == "z":
@@ -4594,6 +4566,24 @@ class CodeGenerator:
 
         self._emit_label(end_label)
         self.loop_stack.pop()
+
+    def _stmts_leave_block(self, stmts) -> bool:
+        """Whether ``stmts`` can leave the block they are in other than at
+        its end: a GOTO or a RETURN anywhere inside them."""
+        stack = list(stmts)
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (P.GotoStmt, P.ReturnStmt, P.ReturnStmtValue)):
+                return True
+            if isinstance(n, P.ProcDecl):
+                continue
+            if isinstance(n, (list, tuple)):
+                stack.extend(n)
+                continue
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields:
+                stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+        return False
 
     def _read_outside(self, name: str, loop) -> bool:
         """Whether ``name`` may be read anywhere but inside ``loop``: it is
@@ -4757,16 +4747,53 @@ class CodeGenerator:
                 and not sym.is_public and not sym.is_external
                 and name not in getattr(self, "_aliased", ()))
 
-    def _stmts_may_change(self, name: str, stmts) -> bool:
+    def _reachable_by_pointer(self, name: str) -> bool:
+        """Whether a store through a pointer may land on ``name``: it is
+        BASED or AT something, its address is taken somewhere, or another
+        module can see it."""
+        sym = self._lookup_symbol(name)
+        return (sym is None or bool(sym.based_on) or sym.at_address is not None
+                or sym.is_public or sym.is_external
+                or name in getattr(self, "_aliased", ()))
+
+    def _stores_may_alias(self, target) -> bool:
+        """Whether a store to ``target`` may land on a variable that pointers
+        reach: anything but a plain variable nobody takes the address of."""
+        t = unwrap_paren(target)
+        if not isinstance(t, P.Identifier):
+            return True                 # an element, a member, MEMORY(...)
+        tname = ident_text(t.name)
+        sym = self._lookup_symbol(tname)
+        return (sym is None or sym.dimension is not None
+                or self._reachable_by_pointer(tname))
+
+    def _stmts_may_change(self, name: str, stmts, _seen: frozenset = frozenset()) -> bool:
         """Whether ``stmts`` may assign ``name``: an assignment or embedded
         assignment to it, a DO over it, or a call of a procedure that can
         reach it -- any procedure for a global, a nested one for a variable
-        of the procedure being compiled -- or of MOVE."""
+        of the procedure being compiled -- or of MOVE. A variable pointers
+        reach may be changed by any store that is not to a plain variable
+        (`x = 9' with x BASED on it, `buf(3) = 1' where it is BASED at
+        .buf(3)), and a BASED one by a change of its pointer."""
         private = self._is_private_var(name)
         nested_prefix = f"{self.current_proc}$"
+        sym = self._lookup_symbol(name)
+        if (sym is not None and sym.based_on and name not in _seen
+                and self._stmts_may_change(sym.based_on, stmts, _seen | {name})):
+            return True
+        aliased = not private and self._reachable_by_pointer(name)
         stack = list(stmts)
         while stack:
             n = stack.pop()
+            if aliased:
+                if isinstance(n, P.AssignStmt) and any(
+                        self._stores_may_alias(t) for t in n.targets):
+                    return True
+                if isinstance(n, P.EmbeddedAssign) and self._stores_may_alias(n.target):
+                    return True
+                if (isinstance(n, (P.DoIterBlock, P.DoIterByBlock))
+                        and self._stores_may_alias(P.Identifier(name=n.index))):
+                    return True
             if isinstance(n, P.CallStmt):
                 callee = n.callee
                 if isinstance(callee, (P.Call, P.CallNoArgs)):

@@ -74,3 +74,61 @@ run: procedure;
 end run;
 call run;
 """, [15, 0])
+
+
+def test_a_loop_stops_where_the_step_wraps_even_if_the_body_moved_the_index():
+    """Step 4 of 5.1.4 ends the loop when stepping the index wraps, whatever
+    put it there. With a constant limit and step that cannot wrap each
+    other, the wrap exit was left out even when the body assigns the index:
+    `DO i = 0 TO 0FEH' that adds 3 to i never stopped."""
+    _check("""
+declare (i, b) byte, (n, w) address;
+run: procedure;
+  n = 0; do i = 1 to 240; n = n + 1; i = i + 16; end; call ph(n); call ph(i);
+  n = 0; do i = 0 to 0feh; n = n + 1; i = i + 3; end; call ph(n); call ph(i);
+  n = 0; do b = 0 to 200 by 10; n = n + 1; if b = 50 then b = 250; end;
+  call ph(n); call ph(b);
+  n = 0; do w = 1 to 240; n = n + 1; if w = 5 then w = 0ffffh; end;
+  call ph(n); call ph(w);
+end run;
+call run;
+""", [15, 0, 64, 0, 6, 4, 5, 0])
+
+
+def test_a_counted_loop_sees_what_pointers_change():
+    """The DJNZ form counts the passes once and leaves the index alone
+    until the end, so it cannot be used when a store through a pointer can
+    change the index or the limit, or a pointer can read the index."""
+    _check("""
+declare (b, c, i) byte, n address;
+declare p address, x based p byte;
+declare buf(10) byte, q address, m based q byte;
+run: procedure;
+  p = .b;
+  n = 0; do b = 0 to 9; n = n + 1; x = 9; end; call ph(n);
+  q = .buf(3); buf(3) = 5;
+  n = 0; do c = 0 to m; n = n + 1; buf(3) = 1; end; call ph(n);
+  p = .i;
+  n = 0; do i = 0 to 9; n = n + x; end; call ph(n);
+end run;
+call run;
+""", [1, 2, 45])
+
+
+def test_a_return_from_inside_a_counted_loop():
+    """The DJNZ form keeps its count on the stack while the body runs; a
+    RETURN from the body returned through it."""
+    _check("""
+declare (k) byte, n address;
+f: procedure byte;
+  declare j byte;
+  do j = 0 to 9; n = n + 1; if n = 3 then return 7; end;
+  return 9;
+end f;
+run: procedure;
+  n = 0; k = f; call ph(k); call ph(n);
+end run;
+call run;
+""", [7, 3])
+
+
