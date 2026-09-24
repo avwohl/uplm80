@@ -462,6 +462,23 @@ class CodeGenerator:
         self._emit("ds", str(size))
         self._emit_label("??STACK")   # label above the buffer: SP starts here
 
+    def _emit_at_defs(self) -> None:
+        """The EQUs that define AT variables, after every symbol they can name.
+
+        An EQU is evaluated where it stands, and um80 0.3.48 takes a symbol it
+        has not reached yet as zero.  In the data segment an AT stood before
+        whatever was declared after it, and before ??AUTO: UTIL5/SUB.PLM
+        declares `rbuff(1) byte at (.minimum$buffer)' two hundred lines above
+        minimum$buffer, and SUBMIT built its command file at address 0.  A
+        reference to an EQU'd name from further up is fine; only the EQU's own
+        operand has to be defined first.
+        """
+        if not self.at_defs:
+            return
+        self._emit()
+        self._emit(comment="AT declarations")
+        self.output.extend(self.at_defs)
+
     def _pz(self, addr: int) -> str:
         """Render a page-zero address: a literal, or an extern under MP/M."""
         if self.mode != Mode.MPM:
@@ -481,6 +498,7 @@ class CodeGenerator:
         self.string_counter = 0
         self.data_segment: list[AsmLine] = []
         self.code_data_segment: list[AsmLine] = []  # DATA values emitted inline in code
+        self.at_defs: list[AsmLine] = []  # AT variables' EQUs, after all storage
         self.string_literals: list[tuple[str, str]] = []  # (label, value)
         self.current_proc: str | None = None
         # ``current_proc_decl`` now holds a typed :class:`P.ProcDecl`; its
@@ -1644,6 +1662,7 @@ class CodeGenerator:
         """Generate assembly code for a module."""
         self.output = []
         self.data_segment = []
+        self.at_defs = []
         self.code_data_segment = []
         self.string_literals = []
         self.needs_runtime = set()
@@ -1840,6 +1859,8 @@ class CodeGenerator:
             for name in sorted(self._page_zero_refs):
                 self._emit("extrn", name)
 
+        self._emit_at_defs()
+
         # End directive
         self._emit()
         self._emit("end")
@@ -1865,6 +1886,7 @@ class CodeGenerator:
 
         self.output = []
         self.data_segment = []
+        self.at_defs = []
         self.code_data_segment = []
         self.string_literals = []
         self.needs_runtime = set()
@@ -2057,6 +2079,8 @@ class CodeGenerator:
             self._emit()
             for name in sorted(self._page_zero_refs):
                 self._emit("extrn", name)
+
+        self._emit_at_defs()
 
         # End directive
         self._emit()
@@ -2505,7 +2529,8 @@ class CodeGenerator:
         if __END__ is not known to be external by then it silently takes the
         value zero.
         """
-        if not self.needs_end_symbol:
+        if not any(l.opcode == "extrn" and l.operands == "__END__"
+                   for l in self.data_segment):
             self.data_segment.append(AsmLine(opcode="extrn", operands="__END__"))
         self.needs_end_symbol = True
 
@@ -2528,7 +2553,7 @@ class CodeGenerator:
             if root in self._extern_names:
                 sym.asm_name = operand
         if asm_name and asm_name != operand:
-            self.data_segment.append(
+            self.at_defs.append(
                 AsmLine(label=asm_name, opcode="EQU", operands=operand))
 
     def _emit_data_values(self, values, dtype: DataType, inline: bool = False) -> None:

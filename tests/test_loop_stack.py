@@ -10,16 +10,13 @@ tracks how many words it has pushed; the run test executes the same shapes
 under a CP/M emulator.
 """
 
-import os
 import re
-import shutil
-import subprocess
-import sys
-import tempfile
 
 import pytest
 
 from uplm80.compiler import Compiler
+
+from ._toolchain import run_plm
 
 
 def _asm(src: str, opt: int) -> str:
@@ -217,36 +214,10 @@ end t;
 """
 
 
-def _cpmemu() -> str | None:
-    for cand in (os.environ.get("CPMEMU"), shutil.which("cpmemu"),
-                 os.path.expanduser("~/src/cpmemu/src/cpmemu")):
-        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
-
-
 @pytest.mark.parametrize("opt", [0, 2])
 def test_a_return_from_inside_a_counted_loop_runs(opt):
     """Compile, assemble, link and run.  With the count left on the stack the
     first RET jumps to the count and the program prints nothing sensible."""
-    emu = _cpmemu()
-    for tool in ("um80", "ul80"):
-        if shutil.which(tool) is None:
-            pytest.skip(f"{tool} not installed")
-    if emu is None:
-        pytest.skip("cpmemu not installed")
-    with tempfile.TemporaryDirectory() as d:
-        plm, mac, rel, com = (os.path.join(d, n) for n in ("T.PLM", "T.MAC", "T.REL", "T.COM"))
-        with open(plm, "w") as fh:
-            fh.write(RUN_SRC)
-        run = lambda *a: subprocess.run(a, capture_output=True, text=True, timeout=60)
-        r = run(sys.executable, "-P", "-m", "uplm80.compiler", "-O", str(opt), "-o", mac, plm)
-        assert r.returncode == 0, r.stderr
-        r = run("um80", "-o", rel, mac)
-        assert r.returncode == 0, r.stderr
-        r = run("ul80", "-o", com, rel)
-        assert r.returncode == 0, r.stderr
-        r = run(emu, com)
-        # g2 runs twice: w reaches 7 on the first call, and on the second it
-        # goes past 7 and the loop runs out, returning 0.
-        assert r.stdout.replace("\r", "").strip() == "AB0.", (r.stdout, r.stderr)
+    # g2 runs twice: w reaches 7 on the first call, and on the second it
+    # goes past 7 and the loop runs out, returning 0.
+    assert run_plm(RUN_SRC, opt).strip() == "AB0."

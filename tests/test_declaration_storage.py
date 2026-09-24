@@ -12,6 +12,8 @@ import pytest
 from uplm80.codegen import Mode
 from uplm80.compiler import Compiler
 
+from ._toolchain import run_plm
+
 
 def _asm(src: str, mode: Mode = Mode.CPM, opt: int = 2) -> str:
     out = Compiler(mode=mode, opt_level=opt).compile(src, "<test>")
@@ -557,3 +559,56 @@ end t;
     # m(0), m(1) and n name the externals with one signed offset each.
     assert "ld\thl,TBUFF-1" in lines and "ld\thl,TBUFF" in lines, asm
     assert "ld\thl,(W-4)" in lines, asm
+
+
+def test_at_a_variable_declared_further_down_is_defined_after_it():
+    """An EQU is evaluated where it stands, and um80 0.3.48 takes a symbol it
+    has not reached yet as zero.  UTIL5/SUB.PLM declares
+
+        declare rbuff(1) byte at (.minimum$buffer), ...
+        ...
+        declare minimum$buffer (1024) byte;
+
+    so SUBMIT built its command file at address 0.  The AT definitions now
+    follow all the storage they can name.
+    """
+    asm = _asm("""
+t: do;
+declare rbuff (1) byte at (.minimum$buffer), rbp address;
+p: procedure; declare loc (8) byte; declare l3 byte at (.loc(3)); l3 = 1; end p;
+declare minimum$buffer (1024) byte;
+rbuff(0) = 0ffh;
+call p;
+end t;
+""")
+    lines = [l.strip() for l in asm.splitlines()]
+    where = {l.split(":")[0]: i for i, l in enumerate(lines) if ":" in l and not l.startswith(";")}
+    rb = next(i for i, l in enumerate(lines) if l.startswith("RBUFF:") and "EQU" in l)
+    assert where["MINIMUMBUFFER"] < rb, asm
+    l3 = next(i for i, l in enumerate(lines) if "L3:" in l and "EQU" in l)
+    assert where["??AUTO"] < l3, asm
+
+
+def test_a_forward_at_writes_where_it_should_when_run():
+    """The same shape, assembled and run: `rbuff(0)' has to land in
+    minimum$buffer, and `l3' in the procedure's `loc'."""
+    out = run_plm("""
+0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare rbuff (1) byte at (.minimum$buffer);
+p: procedure;
+    declare loc (4) byte;
+    declare l3 byte at (.loc(3));
+    loc(3) = 'C';
+    l3 = 'D';
+    call mon1(2, loc(3));
+end p;
+declare minimum$buffer (4) byte;
+minimum$buffer(0) = 'A';
+rbuff(0) = 'B';
+call mon1(2, minimum$buffer(0));
+call p;
+end t;
+""")
+    assert out.strip() == "BD", out
