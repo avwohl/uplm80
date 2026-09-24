@@ -4476,6 +4476,12 @@ class CodeGenerator:
             again = "nc"
         elif step_val == 1:
             self._emit("inc", "hl")
+            if can_wrap:
+                # `inc hl' sets no flags: the index wrapped if it is now 0.
+                # Tested before the store, which for a BASED index leaves
+                # the pointer in HL; a store sets no flags.
+                self._emit("ld", "a,h")
+                self._emit("or", "l")
             again = "nz"
         else:
             # BC, not DE, where the carry is read: the peephole turns
@@ -4488,10 +4494,6 @@ class CodeGenerator:
         if not can_wrap:
             self._emit("jp", test_label)
         else:
-            if again == "nz":
-                # `inc hl' sets no flags: the index wrapped if it is now 0.
-                self._emit("ld", "a,h")
-                self._emit("or", "l")
             self._emit("jp", f"{again},{test_label}")
 
         self._emit_label(end_label)

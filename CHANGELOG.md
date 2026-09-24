@@ -124,6 +124,9 @@ way DRI's end, when the increment carries out of the index.
 - **A REENTRANT procedure's BYTE `DO` loop did not assemble** at `-O1` and
   above: upeepz80 turned the increment of `(ix+n)` into `ld hl,ix+n`. The
   index is now incremented in place, `inc (ix+n)`.
+- **A BASED ADDRESS loop index stepped by 1 never wrapped:** the `inc hl`
+  sets no flags, and the zero test that stands for it came after the store,
+  which leaves the pointer in HL.
 - **A BYTE argument to an ADDRESS parameter was stored as one byte,** unless
   it was the last argument, leaving the parameter's high byte from the call
   before. SHOW's and STAT's `pdecimal(getuser, 100, true)` printed the user

@@ -171,3 +171,20 @@ run: procedure;
 end run;
 call run;
 """, [8, 8, 28, 8, 8, 1024, 4, 4, 10, 0])
+
+
+def test_a_based_address_index_wraps():
+    """A step of 1 to an ADDRESS index is `inc hl', which sets no flags, so
+    the wrap is tested as `ld a,h / or l' -- after the store, which for a
+    BASED index leaves the pointer in HL: such a loop to 0FFFFH never
+    ended."""
+    _check("""
+declare (n, pw, lim) address, bw based pw address, wbuf(2) address;
+run: procedure;
+  pw = .wbuf(1);
+  n = 0; do bw = 0fffeh to 0ffffh; n = n + 1; end; call ph(n); call ph(wbuf(1));
+  lim = 0ffffh;
+  n = 0; do bw = 0fffdh to lim; n = n + 1; end; call ph(n); call ph(wbuf(1));
+end run;
+call run;
+""", [2, 0, 3, 0])
