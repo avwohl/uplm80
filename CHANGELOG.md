@@ -307,7 +307,10 @@ Each fix has a regression test that fails without it.
   programs print what the model says at `-O0` to `-O3`; seed 1063 differs at
   `-O1` and above, by the second upeepz80 defect above.
 - The run tests compile with the checkout under test: they used to start the
-  compiler with `python -P`, which found whatever uplm80 was installed.
+  compiler with `python -P`, which found whatever uplm80 was installed. Every
+  test that runs a program - the run tests, the differential test and the
+  division oracle - now assembles, links and runs it with
+  `tests/_toolchain.py`.
 
 ## 0.3.6 — 2026-09-24
 

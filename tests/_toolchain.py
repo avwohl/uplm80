@@ -2,6 +2,9 @@
 
 For the tests that have to see what a program does, not only what it
 assembles to.  They skip when um80, ul80 or cpmemu is not installed.
+:func:`run_plm` compiles with this checkout's compiler as a command; the
+differential test and the division oracle compile in-process and share
+:func:`run_asm` for the rest.
 """
 
 import os
@@ -41,39 +44,70 @@ def cpmemu() -> str | None:
     return None
 
 
+def tools_missing() -> str | None:
+    """Why a program cannot be assembled, linked and run here, or None."""
+    for tool in ("um80", "ul80"):
+        if shutil.which(tool) is None:
+            return f"{tool} not installed"
+    if cpmemu() is None:
+        return "cpmemu not installed"
+    return None
+
+
+class ToolchainError(Exception):
+    """A step of building or running a program failed; the message says which."""
+
+
+def run_asm(asm: str, extra_asm: str | None = None,
+            timeout: float = 60) -> subprocess.CompletedProcess:
+    """Assemble `asm' with um80, link it with ul80 and run it under cpmemu.
+
+    `extra_asm' is a second module, in assembly, linked after the program:
+    somewhere to define what the program declares EXTERNAL.  Returns the
+    emulator's CompletedProcess (text); raises ToolchainError, naming the
+    step, if one fails or the program runs longer than `timeout' seconds.
+    """
+    def step(*argv: str) -> None:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=False)
+        if r.returncode:
+            raise ToolchainError(f"{argv[0]}: {r.stdout}{r.stderr}")
+
+    with tempfile.TemporaryDirectory() as d:
+        rels = []
+        for name, text in (("T", asm), ("X", extra_asm)):
+            if text is None:
+                continue
+            mac, rel = os.path.join(d, name + ".MAC"), os.path.join(d, name + ".REL")
+            with open(mac, "w") as fh:
+                fh.write(text)
+            step("um80", "-o", rel, mac)
+            rels.append(rel)
+        com = os.path.join(d, "T.COM")
+        step("ul80", "-o", com, *rels)
+        try:
+            return subprocess.run([cpmemu(), com], capture_output=True, text=True,
+                                  timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise ToolchainError("run: timed out") from exc
+
+
 def run_plm(src: str, opt: int = 2, extra_asm: str | None = None) -> str:
     """What the program prints, carriage returns removed.
 
-    `extra_asm' is a second module, in assembly, linked after the program:
-    somewhere to define what the program declares EXTERNAL.
+    It is compiled by this checkout's compiler, run as a command, and built and
+    run by :func:`run_asm`.  The test skips when um80, ul80 or cpmemu is not
+    installed.
     """
-    emu = cpmemu()
-    for tool in ("um80", "ul80"):
-        if shutil.which(tool) is None:
-            pytest.skip(f"{tool} not installed")
-    if emu is None:
-        pytest.skip("cpmemu not installed")
+    reason = tools_missing()
+    if reason:
+        pytest.skip(reason)
     with tempfile.TemporaryDirectory() as d:
-        plm, mac, rel, com = (os.path.join(d, n) for n in ("T.PLM", "T.MAC", "T.REL", "T.COM"))
+        plm, mac = os.path.join(d, "T.PLM"), os.path.join(d, "T.MAC")
         with open(plm, "w") as fh:
             fh.write(src)
-
-        def run(*argv, env=None):
-            return subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
-
-        r = run(*compile_cmd("-O", str(opt), "-o", mac, plm), env=compiler_env())
+        r = subprocess.run(compile_cmd("-O", str(opt), "-o", mac, plm), capture_output=True,
+                           text=True, timeout=60, env=compiler_env(), check=False)
         assert r.returncode == 0, r.stderr
-        r = run("um80", "-o", rel, mac)
-        assert r.returncode == 0, r.stderr
-        rels = [rel]
-        if extra_asm is not None:
-            xmac, xrel = os.path.join(d, "X.MAC"), os.path.join(d, "X.REL")
-            with open(xmac, "w") as fh:
-                fh.write(extra_asm)
-            r = run("um80", "-o", xrel, xmac)
-            assert r.returncode == 0, r.stderr
-            rels.append(xrel)
-        r = run("ul80", "-o", com, *rels)
-        assert r.returncode == 0, r.stderr
-        r = run(emu, com)
-        return r.stdout.replace("\r", "")
+        with open(mac) as fh:
+            asm = fh.read()
+    return run_asm(asm, extra_asm).stdout.replace("\r", "")

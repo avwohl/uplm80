@@ -41,12 +41,10 @@ left, which the manual (12.1) says cannot be relied on.
 
 from __future__ import annotations
 
-import os
 import random
-import shutil
-import subprocess
-import tempfile
 from dataclasses import dataclass, field
+
+from ._toolchain import ToolchainError, run_asm
 
 B, A = "BYTE", "ADDRESS"
 MASK = {B: 0xFF, A: 0xFFFF}
@@ -724,24 +722,6 @@ def generate(seed: int, n_stmts: int = 60) -> tuple[str, list[tuple[str, int]]]:
 
 # ---- building and running ---------------------------------------------------
 
-def cpmemu_path() -> str | None:
-    for cand in (os.environ.get("CPMEMU"), shutil.which("cpmemu"),
-                 os.path.expanduser("~/src/cpmemu/src/cpmemu")):
-        if cand and os.access(cand, os.X_OK):
-            return cand
-    return None
-
-
-def tools_missing() -> str | None:
-    """Why programs cannot be built and run here, or None."""
-    for tool in ("um80", "ul80"):
-        if shutil.which(tool) is None:
-            return f"{tool} not installed"
-    if cpmemu_path() is None:
-        return "cpmemu not installed"
-    return None
-
-
 def build_and_run(src: str, opt: int) -> tuple[list[int], str | None]:
     """Compile ``src`` at ``-O opt``, link and run it: (printed words, error)."""
     from uplm80.compiler import Compiler
@@ -753,19 +733,10 @@ def build_and_run(src: str, opt: int) -> tuple[list[int], str | None]:
     if asm is None:
         errors = getattr(compiler.errors, "errors", None) or ["failed"]
         return [], "compile: " + "; ".join(str(e) for e in errors)
-    with tempfile.TemporaryDirectory() as d:
-        mac, rel, com = (os.path.join(d, n) for n in ("T.MAC", "T.REL", "T.COM"))
-        with open(mac, "w") as f:
-            f.write(asm)
-        for cmd in (["um80", "-o", rel, mac], ["ul80", "-o", com, rel]):
-            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if r.returncode:
-                return [], f"{cmd[0]}: {r.stdout}{r.stderr}"
-        try:
-            r = subprocess.run([cpmemu_path(), com], capture_output=True, text=True,
-                               timeout=15, check=False)
-        except subprocess.TimeoutExpired:
-            return [], "run: timed out"
+    try:
+        r = run_asm(asm, timeout=15)
+    except ToolchainError as exc:
+        return [], str(exc)
     if "Program exit" not in r.stderr:
         return [], f"run: {r.stderr[-300:]}"
     try:

@@ -20,9 +20,6 @@ the ways uplm80 computes a quotient or a remainder are checked against it.
 """
 
 import os
-import shutil
-import subprocess
-import tempfile
 
 import pytest
 
@@ -30,6 +27,8 @@ from uplm80.ast_optimizer import ASTOptimizer
 from uplm80.ast_view import BinaryOpKind
 from uplm80.compiler import Compiler
 from uplm80.runtime import plm_div, plm_mod
+
+from ._toolchain import run_asm, tools_missing
 
 # PLM80.LIB module @P0029, as linked at 0000H. Entry @P0029 is offset 0
 # (divisor in HL); entry @P0030 is offset 2 (divisor already in BC).
@@ -231,31 +230,12 @@ end t;
 
 # --- End to end: compile a table of divisions, run it, compare with the oracle.
 
-def _cpmemu() -> str | None:
-    for cand in (os.environ.get("CPMEMU"), shutil.which("cpmemu"),
-                 os.path.expanduser("~/src/cpmemu/src/cpmemu")):
-        if cand and os.access(cand, os.X_OK):
-            return cand
-    return None
-
-
 def _run(src: str, opt: int) -> list[int]:
     """Compile, assemble, link and run ``src``; the hex words it printed."""
-    cpmemu = _cpmemu()
-    for tool in ("um80", "ul80"):
-        if shutil.which(tool) is None:
-            pytest.skip(f"{tool} not installed")
-    if cpmemu is None:
-        pytest.skip("cpmemu not installed")
-    asm = _asm(src, opt)
-    with tempfile.TemporaryDirectory() as d:
-        mac, rel, com = (os.path.join(d, n) for n in ("T.MAC", "T.REL", "T.COM"))
-        with open(mac, "w") as f:
-            f.write(asm)
-        for cmd in (["um80", "-o", rel, mac], ["ul80", "-o", com, rel]):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            assert r.returncode == 0, r.stdout + r.stderr
-        r = subprocess.run([cpmemu, com], capture_output=True, text=True, timeout=120)
+    reason = tools_missing()
+    if reason:
+        pytest.skip(reason)
+    r = run_asm(_asm(src, opt), timeout=120)
     assert "Program exit" in r.stderr, r.stderr[-500:]
     return [int(w, 16) for w in r.stdout.replace("\r", "").split()]
 

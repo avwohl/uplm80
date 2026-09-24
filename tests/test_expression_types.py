@@ -17,7 +17,8 @@ rules (tests/plm_difftest.py); scripts/difftest.py runs many more of them.
 
 import pytest
 
-from tests.plm_difftest import build_and_run, generate, tools_missing
+from tests._toolchain import tools_missing
+from tests.plm_difftest import build_and_run, generate
 from uplm80.compiler import Compiler
 
 LEVELS = (0, 1, 2, 3)
