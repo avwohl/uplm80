@@ -2684,6 +2684,17 @@ class CodeGenerator:
             return 2 * len(val.values or [])
         return 1 if dtype == DataType.BYTE else 2
 
+    @staticmethod
+    def _flatten_values(values) -> list:
+        """The value list with any `.(a, b, ...)' spliced in, as it is emitted."""
+        flat = []
+        for val in values:
+            if isinstance(unwrap_paren(val), P.LocationOfList):
+                flat.extend(CodeGenerator._flatten_values(unwrap_paren(val).values or []))
+            else:
+                flat.append(val)
+        return flat
+
     def _emit_initial_values(self, values, dtype: DataType,
                              struct_members=None, dimension=None,
                              size: int | None = None) -> None:
@@ -2698,20 +2709,48 @@ class CodeGenerator:
         scanned its command line through a null pointer and blanked the BDOS
         entry in page zero.
 
+        The values fill the scalars being declared in order, and a string
+        fills as many of them as it takes (PL/M-80 Programming Manual, 6.2.9:
+        one character to each BYTE scalar, two to each ADDRESS scalar).  Taking
+        a value's width from its position in the LIST put every value after a
+        string at the width of the wrong member: UTIL2/SCRSP.PLM's
+        `initial (0,'Sched   ',69,1)' emitted the queue's two ADDRESS fields
+        as bytes.
+
         Whatever the list does not fill is reserved, so the next declaration
         still lands where it should.
         """
         widths = self._initial_member_widths(struct_members, dimension)
+        if widths is None:
+            widths = []
+        # Past the declared scalars - a list longer than its declaration -
+        # the values keep the declaration's own width, as they always have.
+        spare = 1 if dtype == DataType.BYTE else 2
+        target = self.data_segment
+        slot = 0
         emitted = 0
-        for i, val in enumerate(values):
-            if widths is not None and i < len(widths):
-                slot = DataType.BYTE if widths[i] == 1 else DataType.ADDRESS
-            else:
-                slot = dtype
-            self._emit_data_values([val], slot)
-            emitted += self._initial_value_width(val, slot)
+        for val in self._flatten_values(values):
+            inner = unwrap_paren(val)
+            if isinstance(inner, P.StringLiteral):
+                text = string_value(inner)
+                used = 0
+                while used < len(text):
+                    used += widths[slot] if slot < len(widths) else spare
+                    slot += 1
+                target.append(AsmLine(opcode="db", operands=self._escape_string(text)))
+                if used > len(text):
+                    # An odd character left in an ADDRESS scalar: it is the
+                    # scalar's low byte, the way 'A' is 0041H.
+                    target.append(AsmLine(opcode="db", operands="0"))
+                emitted += used
+                continue
+            width = widths[slot] if slot < len(widths) else spare
+            slot += 1
+            self._emit_data_values(
+                [val], DataType.BYTE if width == 1 else DataType.ADDRESS)
+            emitted += width
         if size is not None and emitted < size:
-            self.data_segment.append(
+            target.append(
                 AsmLine(opcode="ds", operands=str(size - emitted))
             )
 

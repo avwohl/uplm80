@@ -278,3 +278,43 @@ def test_last_of_a_fixed_array_is_unchanged():
     asm = _asm("t: do; declare a (15) byte, i byte, n byte; n=0; "
                "do i = 0 to last(a); n=n+1; end; end t;", opt=0)
     assert "ld\thl,14" in [l.strip() for l in asm.splitlines()], asm
+
+
+def test_a_string_in_a_structure_initial_fills_one_member_per_character():
+    """`'WXYZ'' supplies four BYTE scalars, not one member.
+
+    The width of each value was looked up by the value's position in the list
+    instead of by the scalar it lands in, so everything after a string was
+    emitted at the width of the wrong member.  UTIL2/SCRSP.PLM and MSRSP.PLM
+    initialise their queue control blocks with the queue's name,
+
+        declare sched$lqcb structure (lqueue, buf (71) byte)
+          initial (0,'Sched   ',69,1);
+
+    and msglen and nmbmsgs, both ADDRESS, came out as two bytes.
+    """
+    lines = _data_lines(_asm("""
+t: do;
+declare q structure (a address, n (4) byte, c address, d address)
+    initial (1, 'WXYZ', 3, 4);
+declare after byte initial (0AAH);
+end t;
+"""))
+    i = lines.index("Q:")
+    assert lines[i + 1:i + 6] == ["dw\t1", "db\t'WXYZ'", "dw\t3", "dw\t4", "AFTER:"], \
+        lines[i + 1:i + 6]
+
+
+def test_a_string_that_runs_into_an_address_member_fills_it_two_characters_at_a_time():
+    """PL/M-80 Programming Manual, 6.2.9: one character to each BYTE scalar
+    and two to each ADDRESS scalar.  An odd character left over still takes a
+    whole ADDRESS scalar, so the next value lands on the next member."""
+    lines = _data_lines(_asm("""
+t: do;
+declare q structure (n (2) byte, w address, x address, y byte)
+    initial ('ABCDE', 7);
+end t;
+"""))
+    i = lines.index("Q:")
+    # A,B -> n; C,D -> w; E -> x (and a zero byte); 7 -> y.
+    assert lines[i + 1:i + 4] == ["db\t'ABCDE'", "db\t0", "db\t7"], lines[i + 1:i + 4]
