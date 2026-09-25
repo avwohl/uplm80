@@ -428,6 +428,65 @@ def test_a_pointer_from_an_initialised_local_reaches_the_next_one(opt):
     assert _run(ADDRESS_OF_INITIAL, opt) == "I"
 
 
+RUN_ON_NESTED = """
+sp1: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte;
+    inner: procedure (v) byte;
+        declare v byte;
+        return v;
+    end inner;
+    declare nxt byte;
+    arr(0) = 1; arr(1) = 2;
+    nxt = 'N';
+    arr(n) = inner('I');
+    return nxt;
+end sp1;
+sp2: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte, nxt byte;
+    nxt = 'M';
+    arr(0) = 0; arr(1) = 0;
+    do;
+        declare blk byte;
+        blk = 'B';
+        arr(n) = 'X';
+        return blk;
+    end;
+end sp2;
+sp3: procedure byte;
+    declare x byte;
+    peek: procedure (v) byte;
+        declare v byte;
+        return v;
+    end peek;
+    declare nxt byte;
+    declare pp address, c based pp byte;
+    nxt = 'N';
+    pp = .x + 1;
+    c = 'Q';
+    return nxt + peek('P') - 'P';
+end sp3;
+call mon1(2, sp1(2));
+call mon1(2, sp2(3));
+call mon1(2, sp3);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_overrun_reaches_what_the_text_declares_next(opt):
+    """DRI lays out what a procedure's text declares in that order, a
+    nested procedure's parameters and locals and a DO block's variables
+    included: MP/M II's SUBMIT has FILLRBUFF's `ssbp' at 0E7AH, the
+    parameter of PUTRBUFF, declared next, at 0E7BH, and FILLRBUFF's
+    `reading', declared after PUTRBUFF, at 0E7CH.  So `arr(2)' is
+    `inner''s `v', not `nxt', and `arr(3)' in `sp2' is the block's `blk';
+    a pointer run on from `.x' in `sp3' reaches `peek''s `v' before `nxt'.
+    The frame in ??AUTO has only the procedure's own locals, and the
+    static ones left out the nested procedure's: `IBQ'."""
+    assert _run(RUN_ON_NESTED, opt) == "NXN"
+
+
 STATIC_ORDER = """
 so: procedure (n) byte;
     declare n byte;

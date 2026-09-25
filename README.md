@@ -315,9 +315,14 @@ Every other local is static, `@proc$name` among the variables:
 A local with `INITIAL` or `PUBLIC` is static in any case; a `REENTRANT`
 procedure's are on the stack.
 
-DRI lays a procedure's locals out in the order they are declared, and so
-does uplm80 - the static ones among the variables, the others in the
-procedure's frame in `??AUTO`, the parameters first, in the order the
+DRI lays out what a procedure's text declares in the order it declares it:
+its parameters and locals, and among them the parameters and locals of the
+procedures nested in it and the variables of its `DO` blocks, where the
+text has them (MP/M II's SUBMIT has FILLRBUFF's `ssbp` at 0E7AH, the
+parameter of PUTRBUFF, declared next, at 0E7BH, and `reading`, which
+FILLRBUFF declares after PUTRBUFF, at 0E7CH).  uplm80 keeps that order - the
+static locals among the variables in the order of the text, the others in
+the procedure's frame in `??AUTO`, the parameters first, as the
 `PROCEDURE` statement lists them - wherever a program can tell:
 
 - every local declared after one whose address is taken, or which is
@@ -328,8 +333,16 @@ procedure's frame in `??AUTO`, the parameters first, in the order the
   structure on, a procedure's locals are all static or all in `??AUTO`:
   if any of them is static (an `INITIAL` one included), all of them are.
   A read through such a subscript counts as a read of every local it can
-  run on into.  A subscript that runs backwards, before the array, is not
-  covered.
+  run on into;
+- a frame in `??AUTO` holds only its procedure's own locals, so where a
+  procedure with parameters or locals, or a `DO` block with variables, is
+  declared after the local that either of those starts from, what comes
+  after that local is static, the nested procedure's storage too, in the
+  order of the text.
+
+A subscript or pointer that runs backwards, before the variable, is not
+covered, nor is one that runs past a procedure's last local, or past a
+module-level variable into the procedures declared after it.
 
 The analysis is in `uplm80/local_storage.py`.
 
