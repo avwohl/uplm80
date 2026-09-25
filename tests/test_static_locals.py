@@ -654,6 +654,54 @@ call f;
     assert _static(asm) == {"P$V"}, asm
 
 
+# ---- a store before RETURN -------------------------------------------------
+
+RETURNED = """
+pw: procedure byte;
+    declare v byte;
+    declare old byte;
+    old = v;
+    old = (v := old + 1);
+    return v;
+end pw;
+declare i byte;
+do i = 1 to 4;
+    call mon1(2, '0' + pw);
+end;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_embedded_assignment_is_stored_before_a_return_of_it(opt):
+    """`v', read before it is assigned, is static and keeps what the call
+    before left.  Its store was left out because the next statement
+    returns it, for RETURN to take the value from A: `1111'."""
+    assert _run(RETURNED, opt) == "1234"
+
+
+READCS = """
+declare cs byte;
+rb: procedure byte; return 5; end rb;
+readcs: procedure byte;
+    declare v byte;
+    cs = cs + (v := rb);
+    return v;
+end readcs;
+cs = 1;
+call mon1(2, '0' + readcs);
+call mon1(2, '0' + cs);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_return_does_not_take_the_statement_before_it_for_the_value(opt):
+    """MP/M II's LOAD reads a HEX file through `READCS: PROCEDURE BYTE;
+    DECLARE B BYTE; CS = CS + (B := READBYTE); RETURN B;', which returned
+    CS + B, what A held when the statement was done: LOAD built from
+    source stopped with INVERTED LOAD ADDRESS on the first record."""
+    assert _run(READCS, opt) == "56"
+
+
 # ---- which frames ??AUTO may overlay ---------------------------------------
 
 def _generator(body: str, opt: int = 2) -> CodeGenerator:

@@ -702,12 +702,6 @@ class CodeGenerator:
         self.param_slots: dict[str, int] = {}  # param_key -> slot number
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
         self.proc_params: dict[str, list[tuple[str, str, DataType, int]]] = {}  # proc -> [(name, asm_name, type, size)]
-        # For liveness analysis: remaining statements in current scope
-        self.pending_stmts: list = []
-        # For tracking embedded assignment target for return optimization
-        self.embedded_assign_target: str | None = None  # Variable name of last embedded assignment
-        # Current IF statement being processed (for embedded assign optimization)
-        self.current_if_stmt = None  # P.IfStmt | P.IfStmtElse | None
         # Flag: A register contains L (low byte of HL) - for avoiding redundant ld a,L
         self.a_has_l: bool = False
         # Register allocator for automatic spill/restore
@@ -1264,113 +1258,6 @@ class CodeGenerator:
         such a loop is not counted.
         """
         return any(self._stmt_contains(s, P.GotoStmt) for s in stmts)
-
-    # ========================================================================
-    # Register Liveness Analysis
-    # ========================================================================
-
-    def _expr_clobbers_a(self, expr) -> bool:
-        """Check if evaluating expression will clobber A register.
-
-        Most expressions clobber A because they compute into A (for BYTE) or use A
-        as a scratch register. Only certain simple operations preserve A.
-        """
-        expr = unwrap_paren(expr)
-        if isinstance(expr, P.NumberLiteral):
-            return False  # ld hl,const doesn't touch A
-
-        if isinstance(expr, P.Identifier):
-            sym = self._lookup_symbol(ident_text(expr.name))
-            if sym and sym.data_type == DataType.BYTE:
-                return True  # ld a,(addr) clobbers A
-            return False  # ld hl,(addr) doesn't clobber A
-
-        if isinstance(expr, P.BinaryOp):
-            expr_type = self._get_expr_type(expr)
-            if expr_type == DataType.ADDRESS:
-                if binop_kind(expr) == BinaryOpKind.ADD:
-                    return (
-                        self._expr_clobbers_a(expr.left)
-                        or self._expr_clobbers_a(expr.right)
-                    )
-            return True
-
-        # Most other expressions clobber A
-        return True
-
-    def _stmt_clobbers_a(self, stmt) -> bool:
-        """Check if a statement will clobber the A register."""
-        if isinstance(stmt, P.NullStmt):
-            return False
-
-        if isinstance(stmt, P.LabeledStmt):
-            return self._stmt_clobbers_a(stmt.stmt)
-
-        if isinstance(stmt, P.AssignStmt):
-            for target in stmt.targets:
-                t = unwrap_paren(target)
-                if isinstance(t, P.Identifier):
-                    sym = self._lookup_symbol(ident_text(t.name))
-                    if not sym or sym.data_type == DataType.BYTE:
-                        return True
-                else:
-                    return True
-            return self._expr_clobbers_a(stmt.value)
-
-        if isinstance(stmt, P.CallStmt):
-            return True
-
-        if isinstance(stmt, P.ReturnStmtValue):
-            return True
-        if isinstance(stmt, P.ReturnStmt):
-            return False
-
-        if isinstance(stmt, P.GotoStmt):
-            return False
-
-        if isinstance(stmt, P.HaltStmt):
-            return False
-
-        if isinstance(stmt, (P.EnableStmt, P.DisableStmt)):
-            return False
-
-        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
-            condition = unwrap_paren(stmt.condition)
-            if isinstance(condition, P.Identifier):
-                return True
-            if isinstance(condition, P.BinaryOp):
-                op = binop_kind(condition)
-                if op in (
-                    BinaryOpKind.EQ, BinaryOpKind.NE,
-                    BinaryOpKind.LT, BinaryOpKind.GT,
-                    BinaryOpKind.LE, BinaryOpKind.GE,
-                ):
-                    left_type = self._get_expr_type(condition.left)
-                    if left_type == DataType.BYTE:
-                        if isinstance(unwrap_paren(condition.right), P.NumberLiteral):
-                            then_clobbers = self._stmt_clobbers_a(stmt.then_stmt)
-                            else_clobbers = (
-                                isinstance(stmt, P.IfStmtElse)
-                                and self._stmt_clobbers_a(stmt.else_stmt)
-                            )
-                            return then_clobbers or else_clobbers
-            return True
-
-        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock,
-                             P.DoIterByBlock, P.DoCaseBlock)):
-            return True
-
-        if isinstance(stmt, P.DeclareStmt):
-            return False
-
-        return True
-
-    def _a_survives_stmts(self, stmts) -> bool:
-        """Check if A register survives through a list of statements."""
-        for stmt in stmts:
-            if self._stmt_clobbers_a(stmt):
-                return False
-        return True
 
     def _lookup_symbol(self, name: str) -> Symbol | None:
         """Look up a symbol in the current scope hierarchy."""
@@ -3639,14 +3526,10 @@ class CodeGenerator:
             self._emit("ld", "sp,hl")
             frame_lines = self.output[start:]
 
-        # Generate code for statements with liveness tracking
         ends_with_return = False
-        for i, stmt in enumerate(body_stmts):
-            # Track remaining statements for liveness analysis
-            self.pending_stmts = body_stmts[i + 1:]
+        for stmt in body_stmts:
             self._gen_stmt(stmt)
             ends_with_return = isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue))
-        self.pending_stmts = []  # Clear after procedure
 
         if frame_lines:
             if self._reentrant_local_offset < 0:
@@ -4116,22 +3999,8 @@ class CodeGenerator:
         proc_attrs_view = self.current_proc_attrs
 
         if value is not None:
-            # Check if A already has the value from embedded assignment optimization
-            skip_load = False
-            if (
-                self.embedded_assign_target
-                and isinstance(value, P.Identifier)
-                and ident_text(value.name) == self.embedded_assign_target
-            ):
-                # A already has this value - skip the load
-                skip_load = True
-                self.embedded_assign_target = None  # Clear after use
-
-            if skip_load:
-                # A already contains the return value - just return
-                pass
             # Optimize: if returning BYTE and value is a small constant, use ld a,n directly
-            elif (
+            if (
                 return_type == DataType.BYTE
                 and isinstance(value, P.NumberLiteral)
                 and number_value(value) <= 255
@@ -4195,10 +4064,6 @@ class CodeGenerator:
         end_label = self._new_label("ENDIF")
         false_target = else_label if else_stmt is not None else end_label
 
-        # Track current IF statement for embedded assignment optimization
-        old_if_stmt = self.current_if_stmt
-        self.current_if_stmt = stmt
-
         # Try to generate optimized conditional jump for comparisons
         if self._gen_condition_jump_false(stmt.condition, false_target):
             # Condition jump was generated directly
@@ -4208,7 +4073,6 @@ class CodeGenerator:
             result_type = self._gen_expr(self._low_byte_form(stmt.condition))
             self._emit_truth_test(result_type, false_target, jump_when_true=False)
 
-        self.current_if_stmt = old_if_stmt  # Restore before generating body
 
         # Then branch
         self._gen_stmt(stmt.then_stmt)
@@ -5842,30 +5706,13 @@ class CodeGenerator:
             target = unwrap_paren(expr.target)
             target_name = ident_text(target.name) if isinstance(target, P.Identifier) else None
 
-            skip_store = False
-            if val_type == DataType.BYTE and target_name:
-                stmts_to_check: list = []
-                if self.current_if_stmt:
-                    stmts_to_check.append(self.current_if_stmt.then_stmt)
-                    if isinstance(self.current_if_stmt, P.IfStmtElse):
-                        stmts_to_check.append(self.current_if_stmt.else_stmt)
-
-                stmts_to_check.extend(self.pending_stmts)
-
-                if stmts_to_check:
-                    last_stmt = stmts_to_check[-1]
-                    preceding = stmts_to_check[:-1]
-
-                    if self._a_survives_stmts(preceding):
-                        if isinstance(last_stmt, P.ReturnStmtValue):
-                            val = unwrap_paren(last_stmt.value)
-                            if isinstance(val, P.Identifier) and ident_text(val.name) == target_name:
-                                skip_store = True
-                                self.embedded_assign_target = target_name
-
-            if skip_store:
-                pass
-            elif val_type == DataType.BYTE:
+            # The target is always stored.  (Its store was left out when the
+            # procedure's last statement returned it, for RETURN to take the
+            # value from A: but the rest of the statement may change A -
+            # MP/M II's LOAD has `CS = CS + (B := READBYTE); RETURN B;',
+            # which returned CS + B - and the variable is static, or not the
+            # procedure's at all, and keeps the value it is given.)
+            if val_type == DataType.BYTE:
                 store_clobbers_a = True
                 if isinstance(target, P.Identifier):
                     sym = self._lookup_symbol(target_name)
