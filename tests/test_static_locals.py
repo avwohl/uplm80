@@ -313,6 +313,146 @@ def test_every_level_decides_the_same_for_a_constant_subscript():
         assert _static(asm) == {"K9$ARR", "K9$NXT"}, (opt, asm)
 
 
+RUN_ON = """
+k1: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte, nxt (2) byte;
+    declare i byte;
+    arr(0) = 1; arr(1) = 2;
+    do i = 0 to n; arr(i) = 'R'; end;
+    return nxt(1);
+end k1;
+call mon1(2, k1(3));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_variable_subscript_runs_on_into_the_local_declared_after(opt):
+    """DRI lays a procedure's locals out in declaration order, and so did
+    0.3.6, in its frame in ??AUTO: `arr(3)' is `nxt(1)' (the gate's a4, k1).
+    `nxt' is read before it is assigned, so it is static; `arr' was left in
+    ??AUTO, and the stores went there."""
+    assert _run(RUN_ON, opt) == "R"
+
+
+RUN_ON_READ = """
+rd: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte, nxt byte;
+    declare r byte;
+    arr(0) = 1; arr(1) = 2;
+    r = arr(n);
+    nxt = 'X';
+    return r;
+end rd;
+call mon1(2, rd(0) + 'A' - 1);
+call other;
+call mon1(2, rd(2));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_read_through_a_variable_subscript_reads_what_it_runs_on_into(opt):
+    """`arr(2)' is `nxt', which the call before left 'X'.  Every local is
+    assigned before it is read by name, so all three were overlaid, and
+    `other' filled them with 0FFH."""
+    assert _run(RUN_ON_READ, opt) == "A.X"
+
+
+RUN_ON_AUTO = """
+w: procedure byte;
+    declare arr (2) byte, nxt byte, i byte;
+    nxt = '?';
+    arr(0) = 0; arr(1) = 0;
+    do i = 0 to 2; arr(i) = 'W'; end;
+    return nxt;
+end w;
+call mon1(2, w);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_locals_run_on_into_may_share_auto_together(opt):
+    """Nothing here is read before it is assigned, so `arr', `nxt' and `i'
+    share ??AUTO - together, in declaration order."""
+    assert _run(RUN_ON_AUTO, opt) == "W"
+    asm = _asm(RUN_ON_AUTO, opt)
+    assert _static(asm) == set(), asm
+    # w's frame: arr at +0, nxt at +2, i at +3 (other's is overlaid on it).
+    offsets = [int(m) for m in re.findall(r"\?\?AUTO\+(\d+)", asm)]
+    assert {0, 2, 3} <= set(offsets), asm
+
+
+RUN_ON_INITIAL = """
+fx: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte initial (1, 2);
+    declare nxt byte;
+    nxt = '?';
+    arr(n) = 'F';
+    return nxt;
+end fx;
+call mon1(2, fx(2));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_initialised_array_runs_on_into_the_local_declared_after(opt):
+    """`arr' is static for its INITIAL, so `nxt', which `arr(2)' is, has to
+    follow it there."""
+    assert _run(RUN_ON_INITIAL, opt) == "F"
+
+
+ADDRESS_OF_INITIAL = """
+ax: procedure byte;
+    declare v byte initial (0);
+    declare nxt byte;
+    declare pp address, c based pp byte;
+    nxt = '?';
+    pp = .v + 1;
+    c = 'I';
+    return nxt;
+end ax;
+call mon1(2, ax);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_pointer_from_an_initialised_local_reaches_the_next_one(opt):
+    """A pointer run on from a local whose address is taken reaches what
+    is declared after it; `v' is static for its INITIAL, and was not
+    counted."""
+    assert _run(ADDRESS_OF_INITIAL, opt) == "I"
+
+
+STATIC_ORDER = """
+so: procedure (n) byte;
+    declare n byte;
+    declare first byte;
+    declare arr (2) byte;
+    declare mid byte initial (7);
+    declare (x2, y2) byte;
+    declare last2 address;
+    arr(n) = 1;
+    return first + arr(0) + mid + x2 + y2 + low(last2);
+end so;
+call mon1(2, so(1));
+"""
+
+
+def test_the_static_locals_keep_declaration_order():
+    """From `arr' on, everything is static and contiguous, in the order it
+    is declared, the INITIAL `mid' among the rest."""
+    for opt in LEVELS:
+        asm = _asm(STATIC_ORDER, opt)
+        data = asm[asm.index("dseg"):]
+        labels = re.findall(r"^(@SO\$\w+):", data, re.MULTILINE)
+        assert labels == ["@SO$FIRST", "@SO$ARR", "@SO$MID", "@SO$X2", "@SO$Y2",
+                          "@SO$LAST2"], (opt, asm)
+        block = data[data.index("@SO$FIRST:"):data.index("@SO$LAST2:")]
+        assert re.findall(r"^([@?\w$]+):", block, re.MULTILINE) == labels[:-1], (opt, asm)
+
+
 # ---- the memory saving, where it is safe -----------------------------------
 
 def test_locals_assigned_before_they_are_read_still_share_auto():
@@ -352,29 +492,39 @@ call mon1(2, p(1, 2));
 ARRAYS = """
 p: procedure (i) byte;
     declare i byte;
-    declare whole (3) byte, part (3) byte, loop (3) byte;
+    declare part (3) byte;
+    declare whole (3) byte;
     declare s structure (x byte, y (2) address);
     declare (j, sum) byte;
-    whole(0) = 1; whole(1) = 2; whole(2) = 3;
     part(0) = 1; part(2) = 3;
-    do j = 0 to 2; loop(j) = j; end;
+    whole(0) = 1; whole(1) = 2; whole(2) = 3;
     s.x = 1; s.y(0) = 2; s.y(1) = 3;
+    j = 0; sum = 0;
     sum = whole(i) + part(0) + part(2) + s.x + low(s.y(i));
-    sum = sum + part(i) + loop(i);
+    sum = sum + part(1) + j;
     return sum;
 end p;
-call mon1(2, p(1));
+q: procedure (i) byte;
+    declare i byte;
+    declare loop (3) byte, k byte;
+    do k = 0 to 2; loop(k) = k; end;
+    return loop(i);
+end q;
+call mon1(2, p(1) + q(1));
 """
 
 
 def test_an_array_is_assigned_once_every_element_has_been():
     """An array or structure assigned element by element through constant
     subscripts is assigned when the last element is; a read of an element
-    through a constant subscript needs only that element.  A variable
-    subscript assigns nothing, so `loop' is static, and `part(i)' may read
-    the element that was not assigned."""
+    through a constant subscript needs only that element, and `part(1)'
+    reads the one that was not assigned.  A read through a variable
+    subscript may run on into the locals declared after the array, and
+    they are all assigned by then.  A store through a variable subscript
+    assigns nothing, so `loop' is static, and `k', which an overrun of
+    `loop' reaches, with it."""
     asm = _asm(ARRAYS)
-    assert _static(asm) == {"P$PART", "P$LOOP"}, asm
+    assert _static(asm) == {"P$PART", "Q$LOOP", "Q$K"}, asm
 
 
 def test_a_factored_declaration_stays_together():

@@ -294,14 +294,39 @@ overlaying the storage of procedures that are never active at the same time,
   call; a use of a BASED variable reads its base.  An array or structure is
   assigned once every element has been, through constant subscripts.
 
-Every other local is static, `@proc$name` among the variables: one that may
-be read before it is assigned, one whose address is taken (`.x`, in a
-statement, an `AT` or an `INITIAL`), one subscripted outside its bounds, one
-named by a nested procedure whose address is taken, and one declared with
-such a local in a factored declaration (6.2.4 makes those contiguous) or
-after one whose address is taken, which a pointer run on from it can reach.
-A local with `INITIAL` is static in any case; a `REENTRANT` procedure's are
-on the stack.  The analysis is in `uplm80/local_storage.py`.
+Every other local is static, `@proc$name` among the variables:
+
+- one that may be read before it is assigned;
+- one whose address is taken (`.x`, in a statement, an `AT` or an
+  `INITIAL`), and one named by a nested procedure whose address is taken;
+- one reached outside its bounds through a subscript: a scalar with any
+  subscript but `(0)`, an array (or an array member of a structure) with a
+  constant subscript past its end, and a one-element array with any
+  subscript but a constant 0.  A subscript is a constant when it folds to
+  one - `a(1+1)`, `a(-1)` (which is `a(255)`), `a(LAST(a))` - and it is
+  decided the same way at every optimization level;
+- one declared with a static local in a factored declaration (6.2.4 makes
+  those contiguous).
+
+A local with `INITIAL` or `PUBLIC` is static in any case; a `REENTRANT`
+procedure's are on the stack.
+
+DRI lays a procedure's locals out in the order they are declared, and so
+does uplm80 - the static ones among the variables, the others in the
+procedure's frame in `??AUTO` - wherever a program can tell:
+
+- every local declared after one whose address is taken, or which is
+  reached outside its bounds, is static too: a pointer run on from it
+  reaches them;
+- an array or structure subscripted by anything but a constant may run on
+  into the locals declared after it, so from the first such array or
+  structure on, a procedure's locals are all static or all in `??AUTO`:
+  if any of them is static (an `INITIAL` one included), all of them are.
+  A read through such a subscript counts as a read of every local it can
+  run on into.  A subscript that runs backwards, before the array, is not
+  covered.
+
+The analysis is in `uplm80/local_storage.py`.
 
 ## Project Structure
 

@@ -53,7 +53,7 @@ from .ast_view import (
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
-from .local_storage import LocalStorage
+from .local_storage import AUTO, LocalStorage
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -1458,7 +1458,8 @@ class CodeGenerator:
                 self.proc_storage[proc] = []
                 continue
             keep = set(proc_param_names(info.decl))
-            keep |= set(info.locals) - static.get(proc, set())
+            keep |= {n for n, loc in info.locals.items()
+                     if loc.kind == AUTO} - static.get(proc, set())
             self.proc_storage[proc] = [entry for entry in storage if entry[0] in keep]
 
     def _note_main_arg_overlaps(self, stmts) -> None:
