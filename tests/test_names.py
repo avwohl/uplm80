@@ -658,3 +658,31 @@ if true then call pc('y');
 end t;
 """) == "y"
 
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_goto_to_a_public_label_of_another_module(opt):
+    """The third GOTO PL/M-80 allows (9.3): to the main program's PUBLIC
+    label, from a module that declares it EXTERNAL.  Compiled together the
+    EXTERNAL declaration was an EXTRN of a label the same assembly defines,
+    and the peephole's `jr AGAIN' was "JR to 'AGAIN': its target is the
+    external symbol AGAIN" at -O1 and up.  No EXTRN is emitted now for a
+    name one of the modules makes PUBLIC."""
+    main = """0100H:
+a: do;
+mon1: procedure (f, x) external; declare f byte, x address; end mon1;
+declare again label public;
+declare n byte public;
+bump: procedure external; end bump;
+n = 0;
+again:
+call mon1(2, '0' + n);
+if n < 3 then call bump;
+end a;
+"""
+    other = """b: do;
+declare again label external;
+declare n byte external;
+bump: procedure public; n = n + 1; goto again; end bump;
+end b;
+"""
+    assert _run_modules([main, other], opt) == "0123"

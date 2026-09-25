@@ -712,6 +712,12 @@ class CodeGenerator:
         self._reentrant_deferred: list[Symbol] | None = None
         # Assembly names declared EXTRN, which _sym_offset folds offsets onto.
         self._extern_names: set[str] = {"__END__"}
+        # In a multi-file compile, the names one of the modules makes PUBLIC.
+        # Another's EXTERNAL declaration of one is no EXTRN: the name is
+        # defined in the same assembly, and um80 takes a symbol declared
+        # EXTRN for another module's, so `jr' to a PUBLIC label from the
+        # peephole is "JR to 'AGAIN': its target is the external symbol".
+        self._compile_publics: set[str] = set()
         # Every module-level DeclItem, for an AT that names a variable declared
         # further down (see _declared_later).
         self._module_decl_items: list = []
@@ -2345,6 +2351,11 @@ class CodeGenerator:
 
     def _generate_multi(self, modules: list) -> str:
         resolve_names(modules, multi=True)
+        self._compile_publics = {
+            data_name(n) for m in modules for d in module_shape(m).decls
+            for n in ([proc_name(d)] if isinstance(d, P.ProcDecl) and proc_attrs(d).is_public
+                      else decl_item_names(d) if isinstance(d, P.DeclItem)
+                      and decl_attrs(d).is_public else [])}
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2819,8 +2830,9 @@ class CodeGenerator:
                 )
             )
             if is_external:
-                self._emit("extrn", base_name)
-                self._extern_names.add(base_name)
+                if base_name not in self._compile_publics:
+                    self._emit("extrn", base_name)
+                    self._extern_names.add(base_name)
             elif is_public:
                 self._emit("public", base_name)
             return
@@ -2846,8 +2858,9 @@ class CodeGenerator:
 
         # External variables don't get storage here
         if is_external:
-            self._emit("extrn", asm_name)
-            self._extern_names.add(asm_name)
+            if asm_name not in self._compile_publics:
+                self._emit("extrn", asm_name)
+                self._extern_names.add(asm_name)
             return
 
         # Public declaration
@@ -2944,7 +2957,7 @@ class CodeGenerator:
                          dimension=dimension, struct_members=struct_members,
                          based_on=based_on, is_external=attrs.is_external,
                          asm_name=self._mangle_name(name))
-            if attrs.is_external:
+            if attrs.is_external and sym.asm_name not in self._compile_publics:
                 self._extern_names.add(sym.asm_name)
             if attrs.at_location is None or based_on:
                 return sym, None
