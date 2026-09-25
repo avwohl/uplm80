@@ -222,6 +222,7 @@ class Compiler:
                         print(f"[DEBUG] Phase 3: AST Optimization for {filename}", file=sys.stderr)
                     optimizer = ASTOptimizer(self.opt_level)
                     ast = optimizer.optimize(ast)
+                    ast.uplm80_file = filename  # a new Module; see names._file_name
 
                 modules.append(ast)
 

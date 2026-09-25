@@ -52,6 +52,7 @@ def parse_source(
     except Exception as e:  # ScanError or ParseError
         raise _syntax_error(e, line_map, filename) from e
     note_origins(tree, line_map)
+    tree.uplm80_file = filename
     return tree
 
 

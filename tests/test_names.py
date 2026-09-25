@@ -654,6 +654,25 @@ def test_a_module_without_a_name_goes_by_its_files():
     assert "M0?Q:" in r.stdout and "M1?Q:" in r.stdout, r.stdout
 
 
+def test_a_module_without_a_name_goes_by_its_own_file_not_an_included_one():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "COMMON.LIT"), "w") as fh:
+            fh.write("declare true literally '0ffh';\n")
+        paths = []
+        for name, text in (("ONE.PLM", "declare x byte public;\nq: procedure; x = 1; end q;\ncall q;\n"),
+                           ("TWO.PLM", "declare x byte external;\nq: procedure; x = true; end q;\n")):
+            paths.append(os.path.join(d, name))
+            with open(paths[-1], "w") as fh:
+                fh.write("$include (common.lit)\n" + text)
+        mac = os.path.join(d, "AB.MAC")
+        r = subprocess.run(compile_cmd("-o", mac, *paths), capture_output=True, text=True,
+                           timeout=60, env=compiler_env(), check=False)
+        assert r.returncode == 0, r.stderr
+        with open(mac) as fh:
+            asm = fh.read()
+    assert "ONE?Q:" in asm and "TWO?Q:" in asm, asm
+
+
 def test_two_main_program_modules_are_an_error():
     """Only the first module's statements were compiled; the second's were
     dropped without a word."""

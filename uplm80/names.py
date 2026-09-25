@@ -196,13 +196,11 @@ class _Module:
 
 def _file_name(module) -> str | None:
     """A module without a name of its own goes by its file's, made a name."""
-    for it in module.items:
-        origin = getattr(getattr(it, "pos", None), "origin", None)
-        if origin:
-            stem = os.path.splitext(os.path.basename(origin[0]))[0].upper()
-            stem = re.sub(r"[^A-Z0-9_]", "_", stem)
-            return stem if stem[:1].isalpha() else f"M{stem}"
-    return None
+    path = getattr(module, "uplm80_file", None)
+    if not path:
+        return None
+    stem = re.sub(r"[^A-Z0-9_]", "_", os.path.splitext(os.path.basename(path))[0].upper())
+    return stem if stem[:1].isalpha() else f"M{stem}"
 
 
 @dataclass(eq=False)
