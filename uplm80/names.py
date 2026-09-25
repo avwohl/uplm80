@@ -579,10 +579,14 @@ class _Resolver:
             if r.goto or r.decl is None:
                 continue
             found = self._codegen_lookup(r.decl.name, r.block, procs)
-            if found is not None and found is not r.decl and found.kind == "proc" \
-                    and not found.shared and id(found) not in wrong:
-                wrong.add(id(found))
-                self.rename(found, self.fresh(found.name))
+            if found is r.decl:
+                continue
+            # The procedure goes: its name is the one code generation takes
+            # for another's, or it is not found by its own.
+            proc = found if found is not None and found.kind == "proc" else r.decl
+            if proc.kind == "proc" and not proc.shared and id(proc) not in wrong:
+                wrong.add(id(proc))
+                self.rename(proc, self.fresh(proc.name))
         return bool(wrong)
 
     def _codegen_lookup(self, name: str, block: _Block, procs: dict) -> _Decl | None:
@@ -593,11 +597,13 @@ class _Resolver:
                 d = procs.get("$".join(parts[:i]) + "$" + name)
                 if d is not None:
                     return d
-        # Then its scopes, which hold everything but the nested procedures.
+        # Then its scopes, which hold everything but procedures: those are
+        # all in the outermost, under their keys.  A procedure a DO block
+        # declares is behind every variable of its name in scope.
         b: _Block | None = block
         while b is not None:
             d = b.decls.get(name)
-            if d is not None and (d.kind != "proc" or self.proc_key(d).upper() == name):
+            if d is not None and d.kind != "proc":
                 return d
             b = b.parent
         return procs.get(name)

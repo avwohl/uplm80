@@ -450,6 +450,27 @@ end t;
 
 
 @pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_a_block_declares_behind_a_variable_of_its_name(opt):
+    """Code generation keeps every procedure in its outermost scope, so
+    through the scopes around the inner block, where Q is the procedure,
+    the outer block's variable Q came first: the procedure was generated
+    under the variable's label, @B1$Q, "multiply defined"."""
+    assert run_plm(PRELUDE + """
+do;
+  declare q byte;
+  q = 'q';
+  do;
+    declare e byte;
+    q: procedure; call pc('P'); end q;
+    call q;
+  end;
+  call pc(q);
+end;
+end t;
+""", opt) == "Pq"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
 def test_a_blocks_variables_are_not_a_procedure_b1s(opt):
     """A DO block's variables are named after the block's number, @B1$X;
     a procedure B1's X is @B1$X too, and the block's X took its place in

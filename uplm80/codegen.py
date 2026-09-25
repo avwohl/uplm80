@@ -3435,9 +3435,10 @@ class CodeGenerator:
         saved_block_procs = self.deferred_block_procs
         self.deferred_block_procs = []
 
-        # Look up the procedure (already registered in pass 1)
-        # Use full_proc_name to find the correct symbol for nested procs
-        sym = self.symbols.lookup(full_proc_name)
+        # Look up the procedure (already registered in pass 1, in the
+        # outermost scope: through the scopes around a procedure a DO block
+        # declares, a variable of its name in an enclosing block came first)
+        sym = self.symbols.global_scope.lookup_local(full_proc_name)
         if sym is None:
             sym = Symbol(
                 name=full_proc_name,
