@@ -752,6 +752,16 @@ Each fix has a regression test that fails without it.
   EXTERNAL would call it the wrong way; since a PUBLIC procedure takes its
   arguments on the stack, the EXTERNAL declaration is right, and it is what
   lets each module also be compiled alone.
+- **uplm80 requires upeepz80 0.2.5.** upeepz80 0.2.4 deleted register
+  loads that were still needed, at `-O1` and above; the differential test
+  found each, and each was in 0.3.6's output as well. `b, w = -(NOT b)` left
+  `w` holding A's old value; after `b = 0FEH`, `w = LOW(LAST(big))`, with
+  `big` 300 bytes long, got the low byte of the statement before instead of
+  2BH (seed 1063 of `scripts/difftest.py`); `ld hl,0 / ld a,l / ld (sb),a /
+  push hl / ld (w1),hl / pop hl / ld (w0),hl` lost its `ld hl,0`, since
+  `ld (nn),hl` did not count as a read of HL; and `ld a,(ix+n) / inc a /
+  ld (ix+n),a` became `ld hl,ix+n`, which is not a Z80 instruction. 0.2.5
+  makes a rewrite only where nothing reads what it changes.
 
 ### Added
 
@@ -770,26 +780,6 @@ Each fix has a regression test that fails without it.
 
 ### Known issues
 
-- **upeepz80 0.2.4 deletes register loads that are still needed,** all found
-  by the differential test and all in 0.3.6's output as well; the fixes
-  belong in upeepz80.
-  * It rewrites `ld a,(x) / cpl / cpl / inc a / push af / ld (x),a / pop af`
-    into `ld hl,x / inc (hl)` although A is read next: `b, w = -(NOT b)` - a
-    BYTE and an ADDRESS assigned together - leaves `w` holding A's old value
-    at `-O1` and above (one of 700 random programs).
-  * Right after a load of A, it rewrites `ld hl,nn / ld a,l / ld l,a /
-    ld h,0` into `ld a,nn / ld h,0`, so L keeps whatever it held: after
-    `b = 0FEH`, `w = LOW(LAST(big))`, with `big` 300 bytes long, got the low
-    byte of the statement before instead of 2BH at `-O1` and above (seed 1063
-    of `scripts/difftest.py`).
-  * It drops an `ld hl,n` that a store of HL still reads: `ld hl,0 / ld a,l /
-    ld (sb),a / push hl / ld (w1),hl / pop hl / ld (w0),hl` becomes `xor a /
-    ld (sb),a / ld (w1),hl / ld (w0),hl`. Its check that HL is dead, before
-    `ld hl,n / ld a,l` becomes `ld a,n`, does not count `ld (nn),hl` as a
-    read. LOW and HIGH of a constant no longer generate either shape, but
-    other code can.
-  * Its `ld a,(x) / inc a / ld (x),a` to `ld hl,x / inc (hl)` takes `(ix+n)`
-    for an address (`ld hl,ix+n`); DO loops no longer generate that.
 - **PLUS, MINUS, SCL and SCR after `+ 1` to `+ 4` or `- 1` to `- 4` of an
   ADDRESS** take a stale carry: those are `inc hl` and `dec hl`, which set
   none, so `(w - 1) MINUS z` with w = z = 0 gives 0FFFFH, not 0FFFEH. DRI's
