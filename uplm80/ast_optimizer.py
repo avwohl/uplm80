@@ -1951,10 +1951,14 @@ class ASTOptimizer:
         # Level 3: Loop unrolling for small constant-bound loops: each pass
         # assigns the index its value, and the index is left with the value
         # the loop leaves in it. Not when the body changes the index, or
-        # holds a label or a declaration the copies would repeat.
+        # holds a label or a declaration the copies would repeat. The index
+        # must be a plain variable: one BASED on a pointer moves when the
+        # body sets the pointer, and one AT another variable changes when
+        # the body sets that one by name, and neither is a store through a
+        # pointer that _body_may_move could see.
         max_iter = 4 if self.optimize_for == OptimizeFor.SPEED else 2
         run = (self._loop_values(start_c[0], bound_c[0], step_c[0], index_type, max_iter)
-               if constant and self.opt_level >= 3
+               if constant and index_decl.plain and self.opt_level >= 3
                and self.optimize_for != OptimizeFor.SIZE else None)
         if (
             run is not None

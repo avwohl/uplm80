@@ -234,8 +234,14 @@ Each fix has a regression test that fails without it.
   value.
 - **-O3 unrolled a loop whose body could change its index,** through a call
   or a store through a pointer: `DO i = 0 TO 1; CALL bump; ...` with `bump`
-  setting `i` ran twice. A loop is unrolled now only if its body calls
-  nothing, and stores through no pointer when a pointer may reach the index.
+  setting `i` ran twice. A loop is unrolled now only if its index is a
+  plain variable, its body calls nothing, and it stores through no pointer
+  when a pointer may reach the index. An index BASED on a pointer moves when
+  the body sets the pointer, and one AT another variable changes when the
+  body sets that variable by name: `DO x = 2 TO 0FEH BY 128` with `x BASED
+  p` and `p = .buf(2)` in the body stored 2 and 82H through the moved
+  pointer, and `DO y = 254 TO 0FEH BY 0FFH; g = 10; END` with `y AT (.g)`
+  left `y` 0FDH, not 9 (0.3.6 was wrong at `-O3` too).
 - **`-O3` turned `SIZE(b)` into `SIZE(5)`** after `b = 5`, which does not
   compile; SIZE, LENGTH and LAST name a variable, not its value.
 - **`-O3` rejected a constant it had moved right of a relation:**

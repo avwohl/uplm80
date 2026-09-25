@@ -134,6 +134,36 @@ call run;
 """, [1, 0x0B, 1, 0x15])
 
 
+def test_an_unrolled_loop_over_a_based_or_at_index():
+    """An index BASED on a pointer moves when the body sets the pointer, and
+    an index AT another variable changes when the body sets that variable by
+    name -- directly, or in a procedure that -O3 inlines into the body.
+    Neither is a store through a pointer, and -O3 unrolled both loops: the
+    BASED one stored 2 and 82H through the moved pointer and added 210H,
+    the AT one left the index 0FDH. Found by the integration verification's
+    fuzzer (seeds 1540 and 20514)."""
+    _check("""
+declare acc address, buf(4) byte, p address, x based p byte, i byte;
+declare g byte, y byte at (.g);
+setp: procedure; p = .buf(2); end setp;
+setg: procedure; g = 10; end setg;
+run: procedure;
+  acc = 0; buf(2) = 80h; buf(3) = 0ffh; p = .buf(3);
+  do x = 2 to 0feh by 128;
+    do i = 0 to 3; acc = acc + x; end;
+    p = .buf(2);
+  end;
+  call ph(acc); call ph(buf(2)); call ph(buf(3));
+  acc = 0; buf(2) = 80h; buf(3) = 0ffh; p = .buf(3);
+  do x = 2 to 0feh by 128; acc = acc + x; call setp; end;
+  call ph(acc); call ph(buf(2)); call ph(buf(3));
+  do y = 254 to 0feh by 0ffh; g = 10; end; call ph(y);
+  do y = 254 to 0feh by 0ffh; call setg; end; call ph(y);
+end run;
+call run;
+""", [8, 0, 2, 2, 0, 2, 9, 9])
+
+
 def test_a_return_from_inside_a_counted_loop():
     """The DJNZ form keeps its count on the stack while the body runs; a
     RETURN from the body returned through it."""
