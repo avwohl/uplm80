@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 
 from . import _plm_parser
+from . import _plm_parser as P
 from ._plm_parser import Module
 from .errors import ParserError, SourceLocation
 from .preprocess import macro_pass, preprocess as uplm_preprocess
@@ -101,6 +102,12 @@ def note_origins(tree, line_map: list[tuple[str, int]]) -> None:
             continue
         seen.add(id(n))
         pos = getattr(n, "pos", None)
+        if isinstance(n, P.AssignStmt) and n.targets:
+            # The grammar starts an assignment's span at its `=': the
+            # targets before it are a list, which has no position.
+            first = getattr(n.targets[0], "pos", None)
+            if first is not None and first.start_line:
+                pos.start_line, pos.start_column = first.start_line, first.start_column
         if pos is not None and getattr(pos, "start_line", 0):
             pos.origin = _origin(line_map, pos.start_line, "")
         stack.extend(getattr(n, f, None) for f in fields if f != "pos")

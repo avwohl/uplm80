@@ -71,3 +71,11 @@ def test_a_code_generation_error_names_the_file_and_line():
     }, "d.plm")
     assert r.returncode != 0
     assert "inc.plm:3:9: error: AT(.NOTHERE): NOTHERE is not declared" in r.stderr, r.stderr
+
+
+def test_an_assignment_is_placed_at_its_target():
+    """The grammar starts an assignment's span at its `=': the error was
+    placed at column 6 here (and, before, nowhere)."""
+    r = _compile({"sz.plm": "t: do;\ndeclare x address;\n\n   x = size(3);\nend t;\n"}, "sz.plm")
+    assert r.returncode != 0
+    assert "sz.plm:4:4: error: SIZE() needs a declared variable" in r.stderr, r.stderr
