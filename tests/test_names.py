@@ -798,6 +798,36 @@ def test_the_qualified_names():
     assert "public\tT2" in r.stdout
 
 
+@pytest.mark.parametrize("opt", (0, 2))
+def test_a_public_procedures_parameter_keeps_its_name(opt):
+    """An EXTERNAL declaration of a procedure, in a module before the one
+    that defines it, gave its parameter a label as if it were static
+    there, `@KEEPIT$V', which the definition's static parameter then met:
+    that one was renamed `@KEEPIT$V?2'.  It worked, but the name was not
+    the one the module compiled alone has.  An EXTERNAL procedure's
+    parameters are in the module that defines it."""
+    user = """0100H:
+a: do;
+mon1: procedure (f, x) external; declare f byte, x address; end mon1;
+keepit: procedure (v) external; declare v byte; end keepit;
+call keepit('K');
+call keepit('L');
+call mon1(0, 0);
+end a;
+"""
+    lib = """b: do;
+mon1: procedure (f, x) external; declare f byte, x address; end mon1;
+declare keep address;
+declare kept based keep byte;
+keepit: procedure (v) public; declare v byte; keep = .v; call mon1(2, kept); end keepit;
+end b;
+"""
+    r = _compile_modules([user, lib], opt)
+    assert r.returncode == 0, r.stderr
+    assert "@KEEPIT$V:" in r.stdout and "?2" not in r.stdout, r.stdout
+    assert _run_modules([user, lib], opt) == "KL"
+
+
 def test_a_private_name_of_another_module_is_an_error():
     """Compiled alone, a module cannot reach another's private procedure;
     together, it silently could.  Now it is an error that says what to do."""

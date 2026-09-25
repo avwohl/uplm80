@@ -650,6 +650,13 @@ Each fix has a regression test that fails without it.
   its target is the external symbol AGAIN" at `-O1` and up: the EXTERNAL
   declaration was an EXTRN of a label the same assembly defines. No EXTRN
   is emitted for a name one of the modules makes PUBLIC.
+- **A PUBLIC procedure's static parameter was `@KEEPIT$V?2`, not
+  `@KEEPIT$V`,** when a module before the one that defines KEEPIT declared
+  it EXTERNAL: the EXTERNAL declaration's parameter took the name, as if it
+  were static in that module. The program ran as it should; only the names
+  in the assembly differed from those of the module compiled alone, and now
+  they do not. Found by the release gate (0.3.6 kept every parameter in
+  `??AUTO`, with no name of its own).
 - **Only the first of two modules with statements at their outer level was
   compiled;** the second's statements were dropped without a word. It is
   an error now: only the main program module may have them.

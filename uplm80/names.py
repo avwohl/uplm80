@@ -353,9 +353,10 @@ class _Resolver:
         body = _Block("proc", block, block.module, d)
         params = p.signature.params
         for n in (params.names or []) if params is not None else []:
-            # Static, a parameter has a label as a local does (local_storage).
+            # Static, a parameter has a label as a local does (local_storage);
+            # an EXTERNAL procedure's are in the module that defines it.
             self._declare(body, _key(n.name), "param", (n, "name"),
-                          storage=not attrs.is_reentrant)
+                          storage=not (attrs.is_reentrant or attrs.is_external))
         self._visit(p.body.items, body)
 
     def _decl_item(self, item: P.DeclItem, block: _Block) -> None:
