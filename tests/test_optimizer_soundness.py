@@ -33,8 +33,9 @@ end t1;
 
 
 @pytest.mark.parametrize("opt", [0, 1, 2, 3])
-def test_a_callee_frame_is_live_while_its_own_arguments_are_evaluated(opt):
-    """`call f(7, g)' passes 7, then runs g for the second argument.
+def test_an_argument_survives_a_call_in_the_next_argument(opt):
+    """`call f(7, g)' passes 7, then runs g for the second argument, and f
+    gets both: r is 7 * 100 + 6, 706.
 
     Up to 0.3.x a non-reentrant local procedure took its earlier arguments
     in its own shared slots, which the caller filled one at a time, so f's
