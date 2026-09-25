@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 
 import pytest
 
@@ -58,14 +59,15 @@ class ToolchainError(Exception):
     """A step of building or running a program failed; the message says which."""
 
 
-def run_asm(asm: str, extra_asm: str | None = None,
+def run_asm(asm: str, extra_asm: str | Sequence[str] | None = None,
             timeout: float = 60) -> subprocess.CompletedProcess:
     """Assemble `asm' with um80, link it with ul80 and run it under cpmemu.
 
     `extra_asm' is a second module, in assembly, linked after the program:
-    somewhere to define what the program declares EXTERNAL.  Returns the
-    emulator's CompletedProcess (text); raises ToolchainError, naming the
-    step, if one fails or the program runs longer than `timeout' seconds.
+    somewhere to define what the program declares EXTERNAL; or a sequence
+    of them, linked in that order.  Returns the emulator's CompletedProcess
+    (text); raises ToolchainError, naming the step, if one fails or the
+    program runs longer than `timeout' seconds.
     The test skips when um80, ul80 or cpmemu is not installed.
     """
     reason = tools_missing()
@@ -79,9 +81,8 @@ def run_asm(asm: str, extra_asm: str | None = None,
 
     with tempfile.TemporaryDirectory() as d:
         rels = []
-        for name, text in (("T", asm), ("X", extra_asm)):
-            if text is None:
-                continue
+        extras = [extra_asm] if isinstance(extra_asm, str) else list(extra_asm or ())
+        for name, text in [("T", asm)] + [(f"X{i}", x) for i, x in enumerate(extras)]:
             mac, rel = os.path.join(d, name + ".MAC"), os.path.join(d, name + ".REL")
             with open(mac, "w") as fh:
                 fh.write(text)
