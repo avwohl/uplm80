@@ -287,7 +287,8 @@ count on it - a first-time flag, a running count.  uplm80 saves memory by
 overlaying the storage of procedures that are never active at the same time,
 `??AUTO`, but only for what no call can see the old value of:
 
-- **Parameters**, which every call assigns.
+- **Parameters**, which every call assigns, unless a rule below makes
+  one static.
 - **A local that every call assigns before anything reads it.**  The
   compiler follows each procedure's statements, GOTOs included, and counts
   a call of a nested procedure that names the local as a read of it at the
@@ -298,7 +299,10 @@ Every other local is static, `@proc$name` among the variables:
 
 - one that may be read before it is assigned;
 - one whose address is taken (`.x`, in a statement, an `AT` or an
-  `INITIAL`), and one named by a nested procedure whose address is taken;
+  `INITIAL`) - a parameter too;
+- one named by a procedure nested in its own whose address is taken, or
+  by anything that procedure calls: a call through the address can come
+  when the procedure the local belongs to is not active;
 - one reached outside its bounds through a subscript: a scalar with any
   subscript but `(0)`, an array (or an array member of a structure) with a
   constant subscript past its end, and a one-element array with any
@@ -313,7 +317,8 @@ procedure's are on the stack.
 
 DRI lays a procedure's locals out in the order they are declared, and so
 does uplm80 - the static ones among the variables, the others in the
-procedure's frame in `??AUTO` - wherever a program can tell:
+procedure's frame in `??AUTO`, the parameters first, in the order the
+`PROCEDURE` statement lists them - wherever a program can tell:
 
 - every local declared after one whose address is taken, or which is
   reached outside its bounds, is static too: a pointer run on from it
@@ -327,6 +332,16 @@ procedure's frame in `??AUTO` - wherever a program can tell:
   covered.
 
 The analysis is in `uplm80/local_storage.py`.
+
+Two procedures' frames in `??AUTO` overlap only if the procedures are never
+active at the same time, which the call graph decides.  It has the calls
+the program's text does not name as well: a `CALL` through an address
+(8.2.1) may call any procedure whose address is taken; an `EXTERNAL`
+procedure may call back any `PUBLIC` procedure and any whose address is
+taken (a call of `MON1` or `MON2` with a constant function is a call of the
+BDOS, which calls nothing back); and an `INTERRUPT` procedure, and
+everything it calls, may run while any procedure is active, so their
+frames overlap no other.
 
 ## Project Structure
 

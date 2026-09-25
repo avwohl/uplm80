@@ -16,8 +16,9 @@ may share ``??AUTO`` when
   DATA or AT of any declaration - and it is not reached by subscripting it
   outside its bounds (a subscripted scalar, a constant subscript past its
   end, a variable subscript of a one-element array);
-* no procedure that names it has its address taken, since a call through an
-  address can come at any time; and
+* no procedure nested in its own that names it, or that calls one that
+  does, has its address taken, since a call through that address can come
+  when the procedure the local belongs to is not active; and
 * the same holds for every name declared with it in one factored
   declaration, which the manual (6.2.4) makes contiguous.
 
