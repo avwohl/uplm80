@@ -55,7 +55,7 @@ from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError, CompilerError
 from .frontend import source_location
 from .local_storage import LocalStorage
-from .names import resolve_names
+from .names import REGISTER_NAMES, data_name, resolve_names
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -452,9 +452,8 @@ class CodeGenerator:
     addresses and 16-bit values.
     """
 
-    # Reserved assembler names that conflict with Z80 registers
-    RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
-                      'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
+    # Assembler names that are Z80 registers (names.REGISTER_NAMES).
+    RESERVED_NAMES = REGISTER_NAMES
 
     # Page-zero addresses a hosted program reaches directly.  Under CP/M they
     # are fixed locations and the literal is emitted.  Under MP/M page zero
@@ -771,10 +770,9 @@ class CodeGenerator:
             return int(s, 0)  # Let Python auto-detect base (0x, 0b, 0o prefixes)
 
     def _mangle_name(self, name: str) -> str:
-        """Mangle variable names that conflict with assembler reserved words."""
-        if name.upper() in self.RESERVED_NAMES:
-            return f"@{name}"
-        return name
+        """The assembler's name for a variable: `@name' for a register or an
+        operator of um80's expressions (names.data_name)."""
+        return data_name(name)
 
     def _get_const_byte_value(self, expr) -> int | None:
         """Extract a constant byte value from an expression if possible.
@@ -2067,7 +2065,8 @@ class CodeGenerator:
             proc_asm_name = f"@{parent_proc}${name}"
             full_proc_name = f"{parent_proc}${name}"
         else:
-            proc_asm_name = name
+            # A register or an operator of um80's is `@A', as a variable is.
+            proc_asm_name = data_name(name)
             full_proc_name = name
 
         # Extract parameter types from the procedure body's DeclItems
@@ -2234,13 +2233,13 @@ class CodeGenerator:
             if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS, call main, return to OS
                 self._emit_entry_stack()
-                self._emit("call", entry_proc_name)
+                self._emit("call", data_name(entry_proc_name))
                 self._emit("jp", self._pz(0x0000))  # Warm boot to return to CP/M
             else:
                 # BARE: Use locally-defined stack, jump to entry
                 self._emit("ld", "sp,??STACK")
                 self._needs_stack = True
-                self._emit("jp", entry_proc_name)
+                self._emit("jp", data_name(entry_proc_name))
 
         # Generate code for module-level statements
         if shape.stmts:
@@ -2463,12 +2462,12 @@ class CodeGenerator:
             self._emit(comment="Entry point")
             if self.mode in (Mode.CPM, Mode.MPM):
                 self._emit_entry_stack()
-                self._emit("call", entry_proc_name)
+                self._emit("call", data_name(entry_proc_name))
                 self._emit("jp", self._pz(0x0000))
             else:
                 self._emit("ld", "sp,??STACK")
                 self._needs_stack = True
-                self._emit("call", entry_proc_name)
+                self._emit("call", data_name(entry_proc_name))
 
         # Procedures hoisted out of DO blocks in the module body.
         self._drain_block_procs([])
@@ -3407,7 +3406,7 @@ class CodeGenerator:
             full_proc_name = f"{old_proc}${name}"
             self.current_proc = full_proc_name  # Compound name for further nesting
         else:
-            proc_asm_name = name
+            proc_asm_name = data_name(name)
             full_proc_name = name
             self.current_proc = name
 
@@ -3453,7 +3452,7 @@ class CodeGenerator:
 
         self._emit()
         if attrs.is_public:
-            self._emit("public", name)
+            self._emit("public", proc_asm_name)
 
         self._emit(comment=f"Procedure {name}")
         self._emit_label(proc_asm_name)

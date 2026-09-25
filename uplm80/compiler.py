@@ -12,6 +12,7 @@ from . import __version__
 from .frontend import parse_source
 from .codegen import CodeGenerator, Mode
 from .errors import CompilerError, ErrorCollector
+from .names import fix_symbols
 
 # Import AST optimizer (PL/M-80 specific)
 from .ast_optimizer import ASTOptimizer
@@ -128,7 +129,7 @@ class Compiler:
                     for pattern, count in peephole.stats.items():
                         print(f"[DEBUG]   {pattern}: {count} applied", file=sys.stderr)
 
-            return asm_code
+            return fix_symbols(asm_code)
 
         except CompilerError as e:
             self.errors.add_error(e)
@@ -245,6 +246,7 @@ class Compiler:
 
                 peephole = PeepholeOptimizer()
                 asm_code = peephole.optimize(asm_code)
+            asm_code = fix_symbols(asm_code)
 
             # Determine output path
             if output_path is None:

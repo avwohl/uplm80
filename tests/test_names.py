@@ -445,6 +445,62 @@ end t;
 """, opt) == "PD"
 
 
+
+# ---- names the assembler reads as something else ---------------------------
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_names_that_are_registers_conditions_or_operators_to_the_assembler(opt):
+    """um80 reads `A' and `HL' as registers ("Register 'A' used as value",
+    for procedures A and HL), and EQ, NE, LT, LE, GT, GE, SHR and NUL as
+    operators - `call EQ' calls 0FFFFH, without a word.  Such a procedure,
+    label or variable is `@A', `@EQ' ... now, as a variable named like a
+    register already was.  It reads `Z' and `P' after `jp' as conditions
+    (the peephole makes `call z / ret' `jp Z'): the jump is `jp 0+Z'.  And
+    a symbol whose letters end in one of its word operators, followed by +
+    or -, is read as that operator: `ld hl,TYPE+2' is TYPE(+2), `X1EQ+2'
+    does not parse, and neither does a procedure's own `@Q$NUL+1'.  Such an
+    offset is written `2+TYPE'."""
+    assert run_plm(PRELUDE + """
+declare (eq, ne, lt, le, gt, ge, shr) byte;
+declare nul (3) byte, type (4) byte, x1eq (3) byte, w address;
+a: procedure; call pc('a'); end a;
+nz: procedure; call pc('n'); end nz;
+z: procedure (c); declare c byte; call pc(c); end z;
+p: procedure; call z('p'); end p;
+hl: procedure byte; return 'h'; end hl;
+q: procedure;
+   declare (type, nul) (3) byte;
+   type(2) = 'y'; nul(1) = 'u';
+   call pc(type(2)); call pc(nul(1));
+end q;
+eq = '='; ne = '#'; lt = '<'; le = '['; gt = '>'; ge = ']'; shr = '/';
+nul(2) = 'N'; type(3) = 'T'; type(1) = 't'; x1eq(2) = 'x'; w = .type(3);
+call a; call nz; call p; call pc(hl); call q;
+call pc(eq); call pc(ne); call pc(lt); call pc(le); call pc(gt); call pc(ge); call pc(shr);
+call pc(nul(2)); call pc(type(3)); call pc(type(1)); call pc(x1eq(2));
+if w = .type + 3 then call pc('w');
+goto c;
+call pc('X');
+c: call pc('.');
+end t;
+""", opt) == "anphyu=#<[>]/NTtxw."
+
+
+def test_an_offset_from_such_a_symbol_is_written_the_other_way_round():
+    from uplm80.names import fix_symbols
+    asm = ("\tld\ta,(TYPE+2)\t; TYPE+2\n\tdb\t'TYPE+1',TYPE-3\nX\tEQU\tlow+1\n"
+           "\tld\thl,@P$NUL+2\n\tld\thl,M?EQ+2-1\n\tld\ta,(ix+2)\n\tld\thl,COLOR+2")
+    assert fix_symbols(asm) == (
+        "\tld\ta,(2+TYPE)\t; TYPE+2\n\tdb\t'TYPE+1',-3+TYPE\nX\tEQU\t1+low\n"
+        "\tld\thl,2+@P$NUL\n\tld\thl,2-1+M?EQ\n\tld\ta,(ix+2)\n\tld\thl,COLOR+2")
+
+
+def test_a_jump_to_a_symbol_named_like_a_condition():
+    from uplm80.names import fix_symbols
+    assert fix_symbols("\tjp\tP\n\tjr\tZ\t; z\nL1:\tjp\tNZ\n\tjp\tnz,P\n\tjp\tPX\n\tcall\tP") == (
+        "\tjp\t0+P\n\tjr\t0+Z\t; z\nL1:\tjp\t0+NZ\n\tjp\tnz,P\n\tjp\tPX\n\tcall\tP")
+
+
 # ---- a multi-file compile --------------------------------------------------
 
 def _compile_modules(sources: list[str], opt: int = 2) -> subprocess.CompletedProcess:

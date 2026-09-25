@@ -60,24 +60,86 @@ REGISTER_NAMES = frozenset(
     {"A", "B", "C", "D", "E", "H", "L", "M", "SP", "PSW",
      "AF", "BC", "DE", "HL", "IX", "IY", "I", "R"})
 OPERATOR_NAMES = frozenset({"EQ", "NE", "LT", "LE", "GT", "GE", "SHL", "SHR", "NUL"})
-# And as the target of a jump, a condition: `jp P' wants an address after
-# the P.  A procedure is jumped to as well as called - the peephole turns
-# `call x / ret' into `jp x'.
-CONDITION_NAMES = frozenset({"Z", "NZ", "NC", "PO", "PE", "P"})
 
 
 def data_name(name: str) -> str:
-    """The assembler's name for a variable or a LITERALLY called ``name``."""
+    """The assembler's name for a variable, a procedure, a label or a
+    LITERALLY called ``name``."""
     if name.upper() in REGISTER_NAMES or name.upper() in OPERATOR_NAMES:
         return f"@{name}"
     return name
 
 
-def code_name(name: str) -> str:
-    """The assembler's name for a procedure or a label called ``name``."""
-    if name.upper() in CONDITION_NAMES:
-        return f"@{name}"
-    return data_name(name)
+# As the target of a jump, a condition: `jp P' wants an address after the
+# P.  A procedure is jumped to as well as called (the peephole turns
+# `call p / ret' into `jp P'), and a label is.  `call P' and `ld hl,P' are
+# the symbol, so such a name is not renamed; the jump is written `jp 0+P'
+# (fix_symbols).
+_JUMP_TO_CONDITION = re.compile(
+    r"^(\s*(?:[\w?@$.]+:)?\s*(?:jp|jr)\s+)(Z|NZ|NC|PO|PE|P)(\s*(?:;.*)?)$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+# And a symbol followed by a + or a - where the letters it ends in are one of
+# um80's word operators: it takes the + for the sign of that operator's
+# operand, so `ld hl,TYPE+2' is TYPE(+2), the type of the expression +2, and
+# `@P$NUL+2', `LIB?EQ+1' and `X1LOW-1' do not parse.  Bare, such a symbol is
+# read as a symbol (but for the operators themselves, which data_name
+# renames), and MP/M II's PIP has a variable TYPE, so they are not renamed;
+# an offset from one is written the other way round, `2+TYPE' (fix_symbols).
+_UM80_WORDS = frozenset({"MOD", "SHL", "SHR", "AND", "OR", "XOR", "NOT", "EQ", "NE", "LT",
+                         "LE", "GT", "GE", "HIGH", "LOW", "NUL", "TYPE"})
+_WORD_THEN_SIGN = re.compile(r"(?:" + "|".join(sorted(_UM80_WORDS)) + r")[+-]", re.IGNORECASE)
+_SYMBOL_OFFSETS = re.compile(r"(?<![\w?@$.])([A-Za-z_?@$.][\w?@$.]*)((?:[+-][\w?@$.]+)+)")
+
+
+def fix_symbols(asm: str) -> str:
+    """``asm`` with every `TYPE+n', `@P$NUL-n', ... written `n+TYPE',
+    `-n+@P$NUL', and every `jp P', `jr Z' ... `jp 0+P', `jr 0+Z', which
+    um80 reads as the symbol (and an offset)."""
+    asm = _JUMP_TO_CONDITION.sub(r"\g<1>0+\2\3", asm)
+    if not _WORD_THEN_SIGN.search(asm):
+        return asm
+    lines = asm.split("\n")
+    for i, line in enumerate(lines):
+        if _WORD_THEN_SIGN.search(line):
+            lines[i] = _fix_line(line)
+    return "\n".join(lines)
+
+
+def _fix_line(line: str) -> str:
+    """One line, left alone in its strings and its comment."""
+    out: list[str] = []
+    code = ""
+    quote = None
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"":
+            out.append(_SYMBOL_OFFSETS.sub(_swap, code))
+            code = ""
+            out.append(ch)
+            quote = ch
+        elif ch == ";":
+            out.append(_SYMBOL_OFFSETS.sub(_swap, code))
+            code = ""
+            out.append(ch)
+            quote = "\n"       # the comment runs to the end of the line
+        else:
+            code += ch
+    out.append(_SYMBOL_OFFSETS.sub(_swap, code))
+    return "".join(out)
+
+
+def _swap(m: re.Match) -> str:
+    sym, offsets = m.groups()
+    tail = re.search(r"[A-Za-z]+$", sym)
+    if tail is None or tail.group(0).upper() not in _UM80_WORDS:
+        return m.group(0)
+    return f"{offsets.removeprefix('+')}+{sym}"
 
 
 GOTO_RULE = ("PL/M-80 allows a GOTO out of a procedure only to a label at the "
@@ -365,11 +427,11 @@ class _Resolver:
         parent = self.owner(d)
         if d.kind == "proc":
             if d.shared or parent is None:
-                return code_name(d.name)
+                return data_name(d.name)
             return f"@{self.proc_key(d)}"
         if d.kind == "label":
             if d.shared or parent is None:
-                return code_name(d.name)
+                return data_name(d.name)
             return f"@{self.proc_key(parent)}${d.name}"
         if d.kind == "lit":
             try:
