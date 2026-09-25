@@ -3531,6 +3531,15 @@ class CodeGenerator:
                     self.data_segment.append(
                         AsmLine(label=asm_name, opcode="ds", operands=str(param_size))
                     )
+                    # upeepz80 drops the store of the last argument at a
+                    # procedure's entry when nothing else names its storage:
+                    # it takes a parameter to be reachable by its name only.
+                    # A static one can be reached from the address of the
+                    # parameter before it (`.a + 1'), so an EQU, which costs
+                    # nothing, names it once more.
+                    self.data_segment.append(
+                        AsmLine(label="?" + asm_name, opcode="equ", operands=asm_name)
+                    )
                     self._note_storage(decl, start)
 
                 self.symbols.define(

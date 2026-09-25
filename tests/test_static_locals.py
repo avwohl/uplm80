@@ -613,6 +613,30 @@ def test_a_static_parameter_declared_with_a_local(opt):
     assert _run(FACTORED_PARAM, opt) == "B.A"
 
 
+PARAM_THROUGH_NEIGHBOUR = """0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+pq: procedure (a, b) byte;
+    declare (a, b) byte;
+    declare pp address, c based pp byte;
+    pp = .a + 1;
+    return c;
+end pq;
+call mon1(2, pq('A', 'B'));
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_parameter_reached_only_through_the_one_before_it(opt):
+    """`b' arrives in A and is stored at `pq''s entry, and nothing names
+    it after that: upeepz80 dropped the store at -O1 and up, taking the
+    parameter to be reachable by its name only (0.3.6 the same, when
+    nothing else happened to name its slot in ??AUTO)."""
+    got = run_plm(PARAM_THROUGH_NEIGHBOUR, opt).replace("\0", "").strip()
+    assert got == "B"
+
+
 def test_a_procedure_whose_address_is_taken_keeps_the_parameters_it_names():
     """`show' can be called through its address after `p' has returned,
     and reads `v', which is `p''s parameter."""
