@@ -582,6 +582,27 @@ end t;
     assert run_plm(src, opt) == "."
 
 
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_declaration_hides_the_built_in_of_its_name(opt):
+    """PL/M-80's built-ins are declared outside the program, and a
+    declaration of the name hides one (9.2).  Code generation took
+    `size(2)' of an array SIZE for SIZE(2) ("SIZE() needs a declared
+    variable"), and `high(1)' of an array HIGH for HIGH(1); it already let
+    a variable ZERO hide the flag, as MP/M II's STAT needs."""
+    assert run_plm(PRELUDE + """
+declare size (4) byte, length address, input byte, last (3) byte, high (2) address;
+declare w address, b byte;
+time: procedure (n) byte; declare n byte; return n + 1; end time;
+size(2) = 'S'; length = 'L'; input = 'I'; last(1) = 'T'; high(1) = 'H';
+call pc(size(2)); call pc(length); call pc(input); call pc(last(1)); call pc(high(1));
+call pc(time('a'));
+w = .size(2); b = size(2) + 1; call pc(b);
+if high(1) = 'H' then call pc('=');
+end t;
+""", opt) == "SLITHbT="
+
+
 # ---- a multi-file compile --------------------------------------------------
 
 def _compile_modules(sources: list[str], opt: int = 2) -> subprocess.CompletedProcess:

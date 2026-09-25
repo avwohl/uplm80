@@ -674,6 +674,8 @@ class CodeGenerator:
         self._stmt_node = None
         self._warned_comparisons: set = set()  # see _check_impossible_comparison
         self.symbols = SymbolTable()
+        # The built-in variables, MEMORY and STACKPTR (see _declared).
+        self._predeclared = dict(self.symbols.global_scope.symbols)
         self.output: list[AsmLine] = []
         self.label_counter = 0
         self.string_counter = 0
@@ -5460,7 +5462,8 @@ class CodeGenerator:
             if isinstance(callee, P.Identifier):
                 name = ident_text(callee.name).upper()
                 # Built-ins first, as _gen_call_expr dispatches them.
-                builtin_type = self._builtin_type(name, expr)
+                builtin_type = (None if self._declared(ident_text(callee.name))
+                                else self._builtin_type(name, expr))
                 if builtin_type is not None:
                     return builtin_type
                 sym = self._lookup_symbol(ident_text(callee.name))
@@ -7249,7 +7252,8 @@ class CodeGenerator:
         base = unwrap_paren(expr.callee)
         index = expr.args[0]
 
-        if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
+        if (isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS
+                and not self._declared(ident_text(base.name))):
             return self._gen_call_expr(expr)
 
         elem_type = DataType.BYTE
@@ -7280,7 +7284,8 @@ class CodeGenerator:
         base = unwrap_paren(expr.callee)
         index = unwrap_paren(expr.args[0])
 
-        if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
+        if (isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS
+                and not self._declared(ident_text(base.name))):
             self._gen_call_expr(expr)
             return
 
@@ -7494,7 +7499,7 @@ class CodeGenerator:
         # Handle built-in functions
         if isinstance(callee, P.Identifier):
             name = ident_text(callee.name)
-            result = self._gen_builtin(name, args)
+            result = None if self._declared(name) else self._gen_builtin(name, args)
             if result is not None:
                 return result
 
@@ -7595,6 +7600,15 @@ class CodeGenerator:
                 self._emit("pop", "de")
 
         return sym.return_type if sym and sym.return_type else DataType.ADDRESS
+
+    def _declared(self, name: str) -> bool:
+        """Whether ``name`` here is something the program declares, which
+        hides a built-in of the name: `DECLARE size (4) BYTE' makes
+        `size(2)' an element, not SIZE(2).  MEMORY and STACKPTR are in the
+        symbol table from the start, as built-in variables."""
+        sym = self._lookup_symbol(name)
+        return (sym is not None and sym.kind != SymbolKind.BUILTIN
+                and sym is not self._predeclared.get(sym.name))
 
     def _gen_builtin(self, name: str, args) -> DataType | None:
         """Generate code for built-in function. Returns type if handled, None otherwise.
