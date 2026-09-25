@@ -506,6 +506,25 @@ class CodeGenerator:
             self._emit("ld", f"hl,({self._pz(0x0006)})")
             self._emit("ld", "sp,hl")
 
+    def _emit_stack_reload(self) -> None:
+        """Set SP again to where the main program's first statement had it.
+
+        At a label of the main program's outer level that a GOTO in a
+        procedure can reach (names.resolve_names marks it), as DRI's PL/M-80
+        does: such a GOTO abandons the calls it leaves, and without this
+        their return addresses stayed on the stack, so a program that took
+        it over and over - MP/M II's PIP, whose ERROR ends `GO TO RETRY' -
+        ran out of stack.  Nothing is on the stack at the outer level: a
+        counted DO keeps its count there, but a label in a DO is not at the
+        outer level, and no such GOTO can reach it.
+        """
+        if self.mode == Mode.CPM:
+            self._emit("ld", f"hl,({self._pz(0x0006)})")
+            self._emit("ld", "sp,hl")
+        else:
+            self._emit("ld", "sp,??STACK")
+            self._needs_stack = True
+
     def _emit_stack_storage(self) -> None:
         """Emit the stack buffer, for the modes that carry their own.
 
@@ -3726,6 +3745,8 @@ class CodeGenerator:
             if not self.current_proc:
                 self.symbols.define(Symbol(name=ident_text(stmt.label), kind=SymbolKind.LABEL))
             self._emit_label(stmt.uplm80_asm)
+            if getattr(stmt, "uplm80_reload_sp", False):
+                self._emit_stack_reload()
             self._gen_stmt(stmt.stmt)
         elif isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             self._gen_if(stmt)

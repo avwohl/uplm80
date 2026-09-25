@@ -179,6 +179,7 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     literal: str | None = None
     defined: bool = False       # a label that labels a statement
     reentrant: bool = False     # a REENTRANT procedure
+    from_proc: bool = False     # a label a GOTO in a procedure jumps to
     orig: str = ""              # the name as declared
 
     def __post_init__(self) -> None:
@@ -642,6 +643,8 @@ class _Resolver:
                 raise CodeGenError(
                     f"GOTO {text} leaves procedure {here.orig} for a label in {place}; "
                     f"{GOTO_RULE}", where)
+            if here is not there:
+                d.from_proc = True
             r.node.uplm80_asm = self.asm_name(d)
 
     def _undeclared(self, text: str, r: _Ref) -> str:
@@ -658,14 +661,26 @@ class _Resolver:
 
     def annotate(self) -> None:
         """Tell code generation what each label, and each other name for
-        one, is called in the assembly."""
+        one, is called in the assembly, and which labels reload SP.
+
+        A GOTO out of a procedure leaves on the stack the return addresses
+        of the calls it abandons, and whatever they pushed; DRI's PL/M-80
+        sets SP again, to the main program's stack, at a label such a GOTO
+        can reach (MP/M II's PIP.PRL: procedure ERROR ends `JMP RETRY',
+        and RETRY: begins `LXI SP' as PIPENTRY-3 does), and at no other.
+        Such a label is at the outer level of the main program (the GOTO
+        rule), where nothing else is on the stack.  A PUBLIC label may be
+        reached by a GOTO in another module's procedure, compiled apart.
+        """
         for d in self.decls:
             if d.kind != "label":
                 continue
             name = self.asm_name(d)
+            reload = d.block.kind == "module" and (d.from_proc or (d.public and d.defined))
             for node, _ in d.sites:
                 if isinstance(node, P.LabeledStmt):
                     node.uplm80_asm = name
+                    node.uplm80_reload_sp = reload
             for r in self.refs_of.get(id(d), []):
                 if not r.goto:
                     r.node.uplm80_asm = name

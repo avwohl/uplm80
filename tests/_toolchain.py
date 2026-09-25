@@ -91,12 +91,13 @@ def run_asm(asm: str, extra_asm: str | None = None,
             raise ToolchainError("run: timed out") from exc
 
 
-def run_plm(src: str, opt: int = 2, extra_asm: str | None = None) -> str:
+def run_plm(src: str, opt: int = 2, extra_asm: str | None = None,
+            mode: str = "cpm") -> str:
     """What the program prints, carriage returns removed.
 
-    It is compiled by this checkout's compiler, run as a command, and built and
-    run by :func:`run_asm`.  The test skips when um80, ul80 or cpmemu is not
-    installed.
+    It is compiled by this checkout's compiler, run as a command, in ``mode``
+    (``--mode``), and built and run by :func:`run_asm`.  The test skips when
+    um80, ul80 or cpmemu is not installed.
     """
     reason = tools_missing()
     if reason:
@@ -105,8 +106,9 @@ def run_plm(src: str, opt: int = 2, extra_asm: str | None = None) -> str:
         plm, mac = os.path.join(d, "T.PLM"), os.path.join(d, "T.MAC")
         with open(plm, "w") as fh:
             fh.write(src)
-        r = subprocess.run(compile_cmd("-O", str(opt), "-o", mac, plm), capture_output=True,
-                           text=True, timeout=60, env=compiler_env(), check=False)
+        r = subprocess.run(compile_cmd("-O", str(opt), "--mode", mode, "-o", mac, plm),
+                           capture_output=True, text=True, timeout=60, env=compiler_env(),
+                           check=False)
         assert r.returncode == 0, r.stderr
         with open(mac) as fh:
             asm = fh.read()
