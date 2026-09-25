@@ -179,6 +179,15 @@ RUNTIME_SUBDE = """\
 	ret
 """
 
+# Call through an address: the caller's CALL pushes the return address,
+# and this goes on to DE.  (The Z80 has no CALL (HL).)
+RUNTIME_JPDE = """\
+??jpde:
+	; Jump to the address in DE, from a CALL
+	push	de
+	ret
+"""
+
 # Compare strings for equality
 RUNTIME_STRCMP = """\
 ??strcmp:
@@ -212,6 +221,7 @@ def get_runtime_library(needed: set[str] | None = None) -> str:
         "mul8": RUNTIME_MUL8,
         "move": RUNTIME_MOVE,
         "subde": RUNTIME_SUBDE,
+        "jpde": RUNTIME_JPDE,
     }
 
     # Dependencies: some routines call others

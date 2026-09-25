@@ -3926,13 +3926,13 @@ class CodeGenerator:
         else:
             self._gen_slot_args(sym, args, callee_name_str)
 
+        if callee_name_str is None or (sym is not None and sym.kind in (
+                SymbolKind.VARIABLE, SymbolKind.PARAMETER)):
+            self._gen_indirect_call(callee_expr, args)
+            return
+
         # Call the procedure
-        if callee_name_str is not None:
-            self._emit("call", call_name)
-        else:
-            # Indirect call through address
-            self._gen_expr(callee_expr)
-            self._emit("jp", "(hl)")
+        self._emit("call", call_name)
 
         # Clean up stack (caller cleanup) - only for stack-based calls
         if use_stack and args:
@@ -3951,6 +3951,35 @@ class CodeGenerator:
                 self._emit("ld", f"hl,{stack_bytes}")
                 self._emit("add", "hl,sp")
                 self._emit("ld", "sp,hl")
+
+    def _gen_indirect_call(self, target, args) -> None:
+        """``CALL target (args)`` where ``target`` is an ADDRESS variable (or
+        member) holding a procedure's address (Programming Manual, 8.2.1).
+
+        It was `call Q', which ran the bytes of Q itself, or, for `CALL
+        s.p', a `jp (hl)' with no return address, so the procedure returned
+        to the caller's caller.  The address goes to DE and ??jpde jumps
+        there with the return address pushed.  The caller has pushed the
+        arguments, the way a PUBLIC or REENTRANT procedure takes them; the
+        last is still in HL, and is left there and its low byte in A, where
+        a procedure private to its module takes its only one.
+        """
+        if len(args) > 1:
+            self._warn("a CALL through an address passes more than one argument only to a "
+                       "PUBLIC or REENTRANT procedure", self._current_location())
+        if args:
+            self._emit("push", "hl")
+        if self._gen_expr(target) == DataType.BYTE:
+            self._emit("ld", "l,a")
+            self._emit("ld", "h,0")
+        self._emit("ex", "de,hl")
+        if args:
+            self._emit("pop", "hl")
+            self._emit("ld", "a,l")
+        self.needs_runtime.add("jpde")
+        self._emit("call", "??jpde")
+        for _ in args:
+            self._emit("pop", "de")
 
     def _param_slot(self, sym, param_name: str, callee_name: str | None) -> str:
         """The label of parameter ``param_name`` of procedure ``sym``."""
@@ -7502,11 +7531,11 @@ class CodeGenerator:
         else:
             self._gen_slot_args(sym, args, name)
 
-        if isinstance(callee, P.Identifier):
-            self._emit("call", call_name)
-        else:
-            self._gen_expr(callee)
-            self._emit("jp", "(hl)")
+        if not isinstance(callee, P.Identifier) or (sym is not None and sym.kind in (
+                SymbolKind.VARIABLE, SymbolKind.PARAMETER)):
+            self._gen_indirect_call(callee, args)
+            return DataType.ADDRESS
+        self._emit("call", call_name)
 
         if use_stack and args:
             for _ in args:
@@ -8045,7 +8074,10 @@ class CodeGenerator:
                 except ValueError:
                     return self._gen_location(_make_location(_make_ident(macro_val)))
 
-            sym = self.symbols.lookup(name)
+            # Through the enclosing procedures, as a call finds it: a nested
+            # procedure is filed as `outer$name', so `.show' of one named
+            # the bare SHOW, which nothing defines.
+            sym = self._lookup_symbol(name)
 
             if sym and sym.stack_offset is not None:
                 self._emit("push", "ix")

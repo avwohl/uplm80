@@ -26,6 +26,16 @@ pc: procedure (c); declare c byte; call mon1(2, c); end pc;
 """
 
 
+def _compile(src: str, opt: int = 2) -> subprocess.CompletedProcess:
+    with tempfile.TemporaryDirectory() as d:
+        plm = os.path.join(d, "T.PLM")
+        with open(plm, "w") as fh:
+            fh.write(src)
+        return subprocess.run(compile_cmd("-O", str(opt), "-o", os.path.join(d, "T.MAC"), plm),
+                              capture_output=True, text=True, timeout=60, env=compiler_env(),
+                              check=False)
+
+
 def _compile_error(src: str, opt: int = 2) -> str:
     """The compiler's stderr for a program it has to reject."""
     with tempfile.TemporaryDirectory() as d:
@@ -222,3 +232,74 @@ def test_a_goto_to_a_variable_is_an_error():
 def test_a_label_defined_twice_in_one_block_is_an_error():
     err = _compile_error(PRELUDE + "declare i byte;\nl: i = 0;\nl: i = 1;\nend t;\n")
     assert "error: label L is defined twice in the same block" in err
+
+
+# ---- the address of a procedure --------------------------------------------
+
+EXTP = "\t.z80\n\tpublic\tEXTP\n\tcseg\nEXTP:\tld\tc,2\n\tld\te,45H\n\tjp\t5\n\tend\n"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_the_address_of_every_kind_of_procedure_and_a_call_through_it(opt):
+    """`.show' of a procedure nested in another named the bare SHOW, which
+    nothing defines: it is filed as OUTER$SHOW, and `.' looked it up only
+    by its own name.  And a CALL through an address (8.2.1) did not call:
+    `CALL q' was `call Q', which ran the bytes of Q itself, and `CALL s.p'
+    a `jp (hl)' with no return address.  Here every kind of procedure -
+    nested, outer, PUBLIC, REENTRANT, EXTERNAL - has its address taken in
+    an expression, a DATA and an INITIAL list and an AT, and is called
+    through it, with an argument where it takes one."""
+    src = PRELUDE + """
+extp: procedure external; end extp;
+declare q address;
+declare s structure (p address);
+declare mt (3) address data (.top, .extp, .pub);
+declare mi address initial (.top);
+declare atop byte at (.top);
+top: procedure; call pc('T'); end top;
+pub: procedure (w) public; declare w address; call pc(low(w)); end pub;
+re: procedure (c) reentrant; declare c byte; call pc(c); end re;
+outer: procedure;
+  declare t (2) address data (.show, .inner2);
+  declare r address initial (.show);
+  declare atx byte at (.show);
+  show: procedure; call pc('S'); end show;
+  inner2: procedure (c); declare c byte; call pc(c); end inner2;
+  q = .show; call q;
+  q = t(0); call q;
+  q = t(1); call q('I');
+  q = r; call q;
+  if .atx = .show then call pc('=');
+  s.p = .show; call s.p;
+end outer;
+call outer;
+call pc('/');
+q = .top; call q;
+q = mt(0); call q;
+q = mt(1); call q;
+q = mt(2); call q('P');
+q = mi; call q;
+q = .pub; call q('p');
+q = .re; call q('R');
+q = .extp; call q;
+if .atop = .top then call pc('=');
+s.p = .extp; call s.p;
+call pc('.');
+end t;
+"""
+    assert run_plm(src, opt, extra_asm=EXTP) == "SSIS=S/TTEPTpRE=E."
+
+
+def test_a_call_through_an_address_with_two_arguments_warns():
+    """A procedure private to its module takes all but its last argument in
+    its own storage, which a call through an address cannot reach."""
+    r = _compile(PRELUDE + """declare q address;
+pub: procedure (a, b) public; declare (a, b) byte; call pc(a); call pc(b); end pub;
+q = .pub;
+call q(1, 2);
+end t;
+""")
+    assert r.returncode == 0, r.stderr
+    assert ("T.PLM:8:1: warning: a CALL through an address passes more than one argument "
+            "only to a PUBLIC or REENTRANT procedure") in r.stderr, r.stderr
+
