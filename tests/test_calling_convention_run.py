@@ -10,6 +10,7 @@ way, with garbage in the high byte of a BYTE.  Every program checks, as it
 goes, that SP is where it started.
 """
 import os
+import re
 import subprocess
 import tempfile
 
@@ -386,26 +387,56 @@ def _t2_parts() -> tuple[str, str]:
 
 def _t2_program(procs: str, main: str) -> str:
     """A program with T2's variables, public for the assembly, that sets
-    them, calls MAIN and prints them."""
+    them, calls MAIN and prints them; SHOW prints them too."""
     return PRELUDE[:PRELUDE.index("declare res")].replace("t: do;", "t2run: do;") + """
 declare sp0 address;
 declare (b1, b2, b3, b4, b5) byte public;
 declare (a1, a2, a3, a4, a5) address public;
+show: procedure;
+  call ph(b1); call ph(b2); call ph(b3); call ph(b4); call ph(b5);
+  call ph(a1); call ph(a2); call ph(a3); call ph(a4); call ph(a5);
+  call mon1(2, '|');
+end show;
 """ + procs + main + """
 b1 = 12h; b2 = 34h; b3 = 56h; b4 = 78h; b5 = 9ah;
 a1 = 1357h; a2 = 2468h; a3 = 369ch; a4 = 48d0h; a5 = 5a5ah;
 sp0 = stackptr;
 call main;
-call ph(b1); call ph(b2); call ph(b3); call ph(b4); call ph(b5);
-call ph(a1); call ph(a2); call ph(a3); call ph(a4); call ph(a5);
+call show;
 call ph(stackptr - sp0);
 end t2run;
 """
 
 
-# Each call but the last passes the variables back to themselves; the last
-# is P5(7, 1234H, B1+B2, A1+A2, 9).
-T2_EXPECT = "0007 0034 0046 0078 0009 1357 1234 369C 37BF 5A5A 0000"
+# Each of MAIN's calls stores its arguments in T2's variables, which the next
+# calls pass on, and the last, P5(7, 1234H, B1+B2, A1+A2, 9), overwrites B1,
+# A2, B3, A4 and B5.  Checked only at the end, a wrong store by an earlier
+# call showed late, or not at all.  So SHOW prints the ten after every call,
+# called from the uplm80 side: at the end of each procedure where uplm80
+# compiles them (MAIN is then T2's own, or Intel's), and after each call in
+# MAIN where Intel compiled them.  Every call but the last passes the
+# variables back to themselves, so leaves them as they started.
+
+
+def _show_at_each_procedures_end(procs: str) -> str:
+    """T2's procedures, each calling SHOW when it has stored its arguments."""
+    procs, n = re.subn(r"(END P\w+;)", r"CALL SHOW; \1", procs)
+    assert n == 11, n
+    return procs
+
+
+def _show_after_each_call(main: str) -> str:
+    """T2's MAIN, calling SHOW after each of its calls."""
+    main, n = re.subn(r"(CALL P\w+\(.*?\);)", r"\1 CALL SHOW;", main)
+    assert n == 12, n
+    return main
+
+
+_T2_START = "0012 0034 0056 0078 009A 1357 2468 369C 48D0 5A5A |"
+_T2_END = "0007 0034 0046 0078 0009 1357 1234 369C 37BF 5A5A |"
+# Eleven calls that change nothing, the last call, then the program's own
+# SHOW after MAIN, and SP where it started.
+T2_EXPECT = _T2_START * 11 + _T2_END + _T2_END + "0000"
 
 _T2_EXTERNALS = """
 P2BB: PROCEDURE(X, Y) EXTERNAL; DECLARE (X, Y) BYTE; END P2BB;
@@ -429,18 +460,20 @@ def _t2_run(opt: int, program: str, extra: str | None) -> str:
 @pytest.mark.parametrize("opt", LEVELS)
 def test_t2_as_uplm80_compiles_it(opt):
     procs, main = _t2_parts()
-    assert _t2_run(opt, _t2_program(procs, main), None) == T2_EXPECT
+    program = _t2_program(_show_at_each_procedures_end(procs), main)
+    assert _t2_run(opt, program, None) == T2_EXPECT
 
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_intels_main_calls_uplm80s_procedures(opt):
     procs, _ = _t2_parts()
-    program = _t2_program(procs, "MAIN: PROCEDURE EXTERNAL; END MAIN;\n")
+    program = _t2_program(_show_at_each_procedures_end(procs),
+                          "MAIN: PROCEDURE EXTERNAL; END MAIN;\n")
     assert _t2_run(opt, program, _fixture("t2_main.asm")) == T2_EXPECT
 
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_uplm80s_main_calls_intels_procedures(opt):
     _, main = _t2_parts()
-    program = _t2_program(_T2_EXTERNALS, main)
+    program = _t2_program(_T2_EXTERNALS, _show_after_each_call(main))
     assert _t2_run(opt, program, _fixture("t2_procs.asm")) == T2_EXPECT
