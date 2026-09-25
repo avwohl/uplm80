@@ -4086,8 +4086,12 @@ class CodeGenerator:
             return
         code = self._capture(self._gen_expr_to_hl, arg)
         if (len(code) == 1 and code[0].opcode == "ld" and not code[0].label
-                and code[0].operands.lower().startswith("hl,")):
-            # `ld hl,X' (a number, a label or `(label)') loads the pair itself.
+                and code[0].operands.lower().startswith("hl,")
+                and (pair == "bc" or not code[0].operands[3:].startswith("("))):
+            # `ld hl,X' loads the pair itself: `ld bc,X', `ld de,X'.  Not
+            # `ld de,(X)', which is no shorter than `ld hl,(X) / ex de,hl',
+            # and where HL holds X already - `P: ld (X),hl' at a procedure's
+            # entry - upeepz80 drops that load and not this one.
             self._emit("ld", f"{pair},{code[0].operands[3:]}")
             return
         self.output.extend(code)

@@ -85,19 +85,19 @@ def _errors(src: str) -> list[str]:
     # two: BC then DE, in each order of types
     ("call p2bb(b1, b2);", ["ld\ta,(B1)", "ld\tc,a", "ld\ta,(B2)", "ld\te,a"]),
     ("call p2aa(1, 2);", ["ld\tbc,1", "ld\tde,2"]),
-    ("call p2aa(a1, a2);", ["ld\tbc,(A1)", "ld\tde,(A2)"]),
+    ("call p2aa(a1, a2);", ["ld\tbc,(A1)", "ld\thl,(A2)", "ex\tde,hl"]),
     ("call p2aa(a1, a2 + 1);", ["ld\tbc,(A1)", "ld\thl,(A2)", "inc\thl", "ex\tde,hl"]),
     ("call p2ab(a1, b2);", ["ld\tbc,(A1)", "ld\ta,(B2)", "ld\te,a"]),
     ("call p2ab(a1, 5);", ["ld\tbc,(A1)", "ld\te,5"]),
-    ("call p2ba(b1, a2);", ["ld\ta,(B1)", "ld\tc,a", "ld\tde,(A2)"]),
+    ("call p2ba(b1, a2);", ["ld\ta,(B1)", "ld\tc,a", "ld\thl,(A2)", "ex\tde,hl"]),
     # three and more: the first ones pushed, left to right
     ("call p3aba(a1, b2, a3);",
-     ["ld\thl,(A1)", "push\thl", "ld\ta,(B2)", "ld\tc,a", "ld\tde,(A3)"]),
+     ["ld\thl,(A1)", "push\thl", "ld\ta,(B2)", "ld\tc,a", "ld\thl,(A3)", "ex\tde,hl"]),
     ("call p3bab(b1, a2, b3);",
      ["ld\ta,(B1)", "ld\tl,a", "push\thl", "ld\tbc,(A2)", "ld\ta,(B3)", "ld\te,a"]),
     ("call p4(b1, a2, b3, a4);",
      ["ld\ta,(B1)", "ld\tl,a", "push\thl", "ld\thl,(A2)", "push\thl",
-      "ld\ta,(B3)", "ld\tc,a", "ld\tde,(A4)"]),
+      "ld\ta,(B3)", "ld\tc,a", "ld\thl,(A4)", "ex\tde,hl"]),
     ("call p5(b1, a2, b3, a4, b5);",
      ["ld\ta,(B1)", "ld\tl,a", "push\thl", "ld\thl,(A2)", "push\thl",
       "ld\ta,(B3)", "ld\tl,a", "push\thl", "ld\tbc,(A4)", "ld\ta,(B5)", "ld\te,a"]),
@@ -120,7 +120,7 @@ def test_arguments_are_placed_as_plm80_places_them(stmt, code):
     ("call p1a(b1);", ["ld\ta,(B1)", "ld\tc,a", "ld\tb,0"]),
     ("call p2aa(a1, b2);", ["ld\tbc,(A1)", "ld\ta,(B2)", "ld\te,a", "ld\td,0"]),
     ("call p3aba(b1, b2, a3);",
-     ["ld\ta,(B1)", "ld\tl,a", "ld\th,0", "push\thl", "ld\ta,(B2)", "ld\tc,a", "ld\tde,(A3)"]),
+     ["ld\ta,(B1)", "ld\tl,a", "ld\th,0", "push\thl", "ld\ta,(B2)", "ld\tc,a", "ld\thl,(A3)", "ex\tde,hl"]),
     # ADDRESS to BYTE: the low byte
     ("call p1b(300);", ["ld\tc,2CH"]),
     ("call p1b(a1);", ["ld\thl,(A1)", "ld\ta,l", "ld\tc,a"]),
@@ -346,8 +346,8 @@ def test_a_call_through_an_address_keeps_bc_and_de_while_the_address_is_found():
     assert "push\tbc" not in _main("call q(a1, a2);")
     decls = DECLS + "declare t (4) address;\n"
     code = _main("call t(b1)(a1, a2);", decls=decls)
-    i = code.index("ld\tde,(A2)")
-    assert code[i + 1:i + 3] == ["push\tbc", "push\tde"], code
+    i = code.index("ld\thl,(A2)")
+    assert code[i + 1:i + 4] == ["ex\tde,hl", "push\tbc", "push\tde"], code
     assert code[-3:] == ["pop\tde", "pop\tbc", "call\t??jphl"], code
 
 
@@ -370,7 +370,7 @@ def test_a_call_through_an_address_with_several_arguments_does_not_warn(n, capsy
 def test_mon1_with_a_constant_function_calls_the_bdos():
     code = _main("call mon1(9, .a1); call mon1(9, a1); b1 = mon2(11, 0);")
     assert code == ["ld\tde,A1", "ld\tc,9", "call\t5",
-                    "ld\tde,(A1)", "ld\tc,9", "call\t5",
+                    "ld\thl,(A1)", "ex\tde,hl", "ld\tc,9", "call\t5",
                     "ld\tde,0", "ld\tc,0BH", "call\t5", "ld\t(B1),a"]
 
 
@@ -389,7 +389,7 @@ def test_a_byte_parameter_of_mon1_takes_e_alone():
 
 
 def test_mon1_with_a_function_not_constant_is_called():
-    assert _main("call mon1(f, a1);") == ["ld\ta,(F)", "ld\tc,a", "ld\tde,(A1)", "call\tMON1"]
+    assert _main("call mon1(f, a1);") == ["ld\ta,(F)", "ld\tc,a", "ld\thl,(A1)", "ex\tde,hl", "call\tMON1"]
 
 
 def test_mon1_under_mpm_calls_bdos_by_name():
