@@ -395,3 +395,39 @@ def test_mon1_with_a_function_not_constant_is_called():
 def test_mon1_under_mpm_calls_bdos_by_name():
     assert _main("call mon1(2, b1);", mode=Mode.MPM) == [
         "ld\ta,(B1)", "ld\te,a", "ld\td,0", "ld\tc,2", "call\t??BDOS"]
+
+
+# ---- Errors ------------------------------------------------------------------
+
+@pytest.mark.parametrize("stmt, message", [
+    ("call p2aa(1);",
+     "invalid number of arguments in call of P2AA, too few: 1 for 2 parameters"),
+    ("call p2aa(1, 2, 3);",
+     "invalid number of arguments in call of P2AA, too many: 3 for 2 parameters"),
+    ("call p0(5);",
+     "invalid number of arguments in call of P0, too many: 1 for 0 parameters"),
+    ("a1 = fa(1);",
+     "invalid number of arguments in call of FA, too many: 1 for 0 parameters"),
+    ("call p1a;",
+     "invalid number of arguments in call of P1A, too few: 0 for 1 parameter"),
+    ("a1 = p1a + 1;",
+     "invalid number of arguments in call of P1A, too few: 0 for 1 parameter"),
+])
+def test_a_call_passes_as_many_arguments_as_there_are_parameters(stmt, message):
+    """PL/M-80 V3.1: errors 153 and 154.  With the callee taking the pushed
+    arguments off the stack, a call with the wrong number of them would
+    return with the stack moved."""
+    errors = _errors("t: do;\n" + DECLS + stmt + "\nend t;\n")
+    assert any(message in e for e in errors), errors
+
+
+def test_a_private_procedure_called_with_too_many_arguments_is_an_error():
+    """0.3.x dropped the extra ones."""
+    errors = _errors("t: do;\ndeclare v byte;\np: procedure (x); declare x byte; v = x; end p;\n"
+                     "call p(1, 2);\nend t;\n")
+    assert any("in call of P, too many: 2 for 1 parameter" in e for e in errors), errors
+
+
+def test_a_call_through_an_address_is_not_counted():
+    """8.2.1: "the compiler does not check the number of parameters"."""
+    _asm("t: do;\n" + DECLS + "q = .p2aa; call q(1, 2, 3);\nend t;\n")

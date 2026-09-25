@@ -4034,13 +4034,33 @@ class CodeGenerator:
         named ``call_name`` in the output, with ``args``; the result's type."""
         formals = None
         if sym is not None and sym.kind == SymbolKind.PROCEDURE:
+            self._check_arg_count(sym, len(args))
             formals = sym.param_types
-        if sym is not None and sym.uses_reg_param and len(args) == 1:
+        if sym is not None and sym.uses_reg_param:
             self._gen_reg_arg(args[0], formals[0])
         else:
             self._gen_args(args, formals)
         self._emit("call", call_name)
         return sym.return_type if sym and sym.return_type else DataType.ADDRESS
+
+    def _check_arg_count(self, sym, count: int) -> None:
+        """A call of ``sym`` passes as many arguments as it has parameters.
+
+        PL/M-80 V3.1 stops with errors 153 and 154.  With the callee taking
+        the pushed arguments off the stack, a call with too many or too few
+        returns with the stack moved.  (A CALL through an address is not
+        checked: 8.2.1, "the compiler does not check the number of
+        parameters".)
+        """
+        want = len(sym.params)
+        if count == want:
+            return
+        name = sym.name.rsplit("$", 1)[-1]
+        raise CodeGenError(
+            f"invalid number of arguments in call of {name}, "
+            f"too {'many' if count > want else 'few'}: {count} for {want} "
+            f"parameter{'' if want == 1 else 's'}",
+            self._current_location())
 
     def _gen_indirect_call(self, target, args) -> None:
         """``CALL target (args)`` where ``target`` is an ADDRESS variable (or
@@ -6132,6 +6152,7 @@ class CodeGenerator:
             if sym:
                 # If it's a procedure with no args, generate a call
                 if sym.kind == SymbolKind.PROCEDURE:
+                    self._check_arg_count(sym, 0)
                     call_name = sym.asm_name if sym.asm_name else name
                     self._emit("call", call_name)
                     # Result is in A (for BYTE) or HL (for ADDRESS/untyped)
