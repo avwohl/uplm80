@@ -910,6 +910,39 @@ call mon1(2, outer);
     assert "LONE" not in together["CALLER"] | together["OUTER"], together
 
 
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_call_through_an_address_keeps_the_callers_frame(opt):
+    """The same at run time, now that `CALL f' calls the procedure at the
+    address in `f' (it was `call F', a call of the variable's storage):
+    `tgt' and `other' fill their frames with 0FFH while `caller' and
+    `outer' are active, and `k' and `n1' keep their values.  Without the
+    call graph's edges `k' came back 0FFH."""
+    assert _run("""
+declare f address;
+tgt: procedure (c);
+    declare c byte;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+    call mon1(2, c);
+end tgt;
+caller: procedure byte;
+    declare (k, m) byte;
+    k = 'G'; m = 'Z';
+    call f('T');
+    return k;
+end caller;
+outer: procedure byte;
+    declare (n1, n2) byte;
+    n1 = 1; n2 = caller;
+    return n1 + n2;
+end outer;
+f = .tgt;
+call mon1(2, outer);
+f = .other;
+call mon1(2, caller);
+""", opt) == "TH.G"
+
+
 def test_a_bdos_call_is_no_call_back():
     """MON1 and MON2 with a constant function are the BDOS itself, which
     calls nothing back: a PUBLIC procedure may still share ??AUTO with a
