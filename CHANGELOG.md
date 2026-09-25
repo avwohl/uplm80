@@ -156,6 +156,19 @@ Each fix has a regression test that fails without it.
   arguments are already in `p2`'s own storage, and the storage allocator,
   which keeps `g` out of it for such a call in a procedure, never looked at
   the main program's calls.
+- **An array or structure local to a REENTRANT procedure did not
+  assemble.** The frame had room for it, but the code addressed it by a
+  label that was never defined (`ld (V),a`, "Undefined symbol 'V'"). It is
+  now reached as IX plus its offset, and placed after the procedure's
+  scalars, which `(ix+d)` has to reach; a scalar more than 128 bytes into
+  the frame is an error rather than a displacement the assembler rejects.
+- **A local declared in a DO block of a REENTRANT procedure was below
+  SP.** The frame was sized from the procedure's own declarations before
+  the body was read, so the block's locals were outside it, and the next
+  push or call wrote over them: a recursive `q` keeping `c` in a DO block
+  returned 8 for 10. The frame is sized after the body now. (Both found by
+  the integration verification or next to what it found; 0.3.6 did the
+  same.)
 
 #### DO loops
 

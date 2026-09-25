@@ -344,3 +344,64 @@ run: procedure;
 end run;
 call run;
 """, [3, 0, 4, 0, 6, 0])
+
+
+def test_a_reentrant_procedures_arrays_and_block_locals_are_in_its_frame():
+    """An array or a structure local to a REENTRANT procedure was given room
+    in the frame but addressed by a label that was never defined, so the
+    program did not assemble ("Undefined symbol 'V'"); a local declared in a
+    DO block inside one was put below SP, since the frame was sized before
+    the body was read, and the recursive call's push wrote over it. Each
+    activation now keeps its own copy, arrays after the scalars that
+    `(ix+d)' reaches (0.3.6 did the same; found by the integration
+    verification)."""
+    _check("""
+declare gb(4) byte;
+sumb: procedure (p, n) address;
+  declare p address, n byte, b based p (1) byte, (s, i) address;
+  s = 0; do i = 0 to n - 1; s = s + b(i); end; return s;
+end sumb;
+rv: procedure (n) byte reentrant;
+  declare n byte, v(2) byte;
+  v(0) = n; v(1) = n + 1;
+  if n = 0 then return v(1);
+  return rv(n - 1) + v(0);
+end rv;
+r: procedure (n) address reentrant;
+  declare n byte;
+  declare big(200) byte, w(3) address, (i, j) byte, a address;
+  declare st structure (x byte, y address, z(3) byte);
+  declare sa(2) structure (m byte, q(2) address);
+  do i = 0 to last(big); big(i) = i + n; end;
+  w(0) = n; w(1) = 1000h + n; j = 2; w(j) = w(1) + w(0);
+  st.x = n; st.y = 1234h; st.z(0) = 1; st.z(j) = n + 7;
+  sa(1).m = n + 1; sa(1).q(1) = 0abcdh; sa(0).q(0) = n;
+  a = size(big) + length(w);
+  if n > 0 then a = a + r(n - 1);
+  if n = 1 then do;
+    call ph(big(199)); call ph(big(j)); call ph(w(2)); call ph(st.z(j));
+    call ph(sa(1).m); call ph(sa(1).q(1)); call ph(sa(0).q(0)); call ph(st.y);
+    call ph(sumb(.big(10), 3));
+    call move(3, .big(20), .gb); call ph(gb(0) + gb(2));
+  end;
+  do;
+    declare l(2) address;
+    l(0) = 7; l(1) = n;
+    a = a + l(0) + l(1);
+  end;
+  return a;
+end r;
+q: procedure (n) byte reentrant;
+  declare n byte;
+  do;
+    declare c byte;
+    c = n + 1;
+    if n = 0 then return c;
+    return q(n - 1) + c;
+  end;
+end q;
+run: procedure;
+  call ph(rv(3)); call ph(r(2)); call ph(q(3));
+end run;
+call run;
+""", [7, 0xC8, 3, 0x1002, 8, 2, 0xABCD, 1, 0x1234, 0x24, 0x2C, 0x279, 10])

@@ -662,6 +662,11 @@ class CodeGenerator:
         # pushed while their bodies run.  A RETURN from inside one has to pop
         # them first, or its RET takes a loop count for the return address.
         self._loop_words = 0
+        # A REENTRANT procedure's frame: the offset from IX of its last
+        # local, and, while its declarations are read, the arrays and
+        # structures that go after its scalars (None otherwise).
+        self._reentrant_local_offset = 0
+        self._reentrant_deferred: list[Symbol] | None = None
         # Assembly names declared EXTRN, which _sym_offset folds offsets onto.
         self._extern_names: set[str] = {"__END__"}
         # Every module-level DeclItem, for an AT that names a variable declared
@@ -1883,6 +1888,19 @@ class CodeGenerator:
             self._emit("ld", f"de,{self._format_number(n)}")
             self._emit("add", "hl,de")
 
+    def _emit_frame_addr(self, sym, extra: int = 0) -> None:
+        """HL = the address of ``sym``, a REENTRANT procedure's local, plus
+        ``extra``.  It lives in the procedure's frame, IX + its offset; an
+        array or a structure there has no label to add a subscript to."""
+        offset = sym.stack_offset + extra
+        self._emit("push", "ix")
+        self._emit("pop", "hl")
+        if offset:
+            self.regs.need_reg('de', 'frame_addr', self._emit)
+            self._emit("ld", f"de,{self._format_number(offset)}")
+            self._emit("add", "hl,de")
+            self.regs.release_reg('de', self._emit)
+
     def _new_label(self, prefix: str = "L") -> str:
         """Generate a new unique label."""
         self.label_counter += 1
@@ -2649,11 +2667,22 @@ class CodeGenerator:
 
         # For reentrant procedures, allocate stack space for locals
         stack_offset = None
+        defer_to_frame_end = False
         if in_reentrant:
             # Locals are at negative offsets from IX
             # Decrement offset first, then use it (so first local is at IX-size)
-            self._reentrant_local_offset -= size
-            stack_offset = self._reentrant_local_offset
+            if (dimension or struct_members) and self._reentrant_deferred is not None:
+                # An array or structure is reached through its address, IX
+                # plus a 16-bit offset, and goes after the procedure's
+                # scalars, which `(ix+d)' has to reach.
+                defer_to_frame_end = True
+            else:
+                self._reentrant_local_offset -= size
+                stack_offset = self._reentrant_local_offset
+                if not (dimension or struct_members) and stack_offset < -128:
+                    raise CodeGenError(
+                        f"{name}: more than 128 bytes into the frame of REENTRANT "
+                        f"procedure {self.current_proc}, beyond the reach of (ix+d)")
 
         # LABEL declarations: register the label and emit any extrn/public
         # directive — labels never get storage.
@@ -2689,6 +2718,8 @@ class CodeGenerator:
             stack_offset=stack_offset,  # Stack offset for reentrant locals
         )
         self.symbols.define(sym)
+        if defer_to_frame_end:
+            self._reentrant_deferred.append(sym)
 
         # External variables don't get storage here
         if is_external:
@@ -3443,6 +3474,9 @@ class CodeGenerator:
 
         # Track locals offset for reentrant procedures (negative from IX)
         self._reentrant_local_offset = 0  # Will be decremented as locals are allocated
+        # A REENTRANT procedure's arrays and structures go after its scalars,
+        # which IX reaches with an 8-bit displacement (see _gen_var_decl).
+        self._reentrant_deferred = [] if attrs.is_reentrant else None
 
         # Generate code for local declarations (skip parameters and nested procedures)
         nested_procs: list = []
@@ -3463,13 +3497,23 @@ class CodeGenerator:
             else:
                 self._gen_declaration(local_decl)
 
-        # For reentrant procedures, allocate stack space for locals
-        if attrs.is_reentrant and self._reentrant_local_offset < 0:
-            # Allocate stack space: SP = SP + offset (offset is negative)
-            # ld hl,offset; add hl,sp; ld sp,hl
-            self._emit("ld", f"hl,{self._reentrant_local_offset}")
+        # A REENTRANT procedure's frame: SP = SP + offset (offset is
+        # negative), `ld hl,offset / add hl,sp / ld sp,hl'.  Its size is
+        # known only after the body, whose DO blocks can declare locals too:
+        # a frame sized from the procedure's own declarations left those
+        # below SP, where the next push or call wrote over them.
+        frame_lines: list[AsmLine] = []
+        start = 0
+        if attrs.is_reentrant:
+            for sym in self._reentrant_deferred:
+                self._reentrant_local_offset -= sym.size
+                sym.stack_offset = self._reentrant_local_offset
+            self._reentrant_deferred = None
+            start = len(self.output)
+            self._emit("ld", "hl,0")
             self._emit("add", "hl,sp")
             self._emit("ld", "sp,hl")
+            frame_lines = self.output[start:]
 
         # Generate code for statements with liveness tracking
         ends_with_return = False
@@ -3479,6 +3523,12 @@ class CodeGenerator:
             self._gen_stmt(stmt)
             ends_with_return = isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue))
         self.pending_stmts = []  # Clear after procedure
+
+        if frame_lines:
+            if self._reentrant_local_offset < 0:
+                frame_lines[0].operands = f"hl,{self._reentrant_local_offset}"
+            elif self.output[start] is frame_lines[0]:
+                del self.output[start:start + len(frame_lines)]
 
         # Procedure epilogue (implicit return if no explicit RETURN at end)
         if not ends_with_return:
@@ -6085,7 +6135,8 @@ class CodeGenerator:
                 sym = self.symbols.lookup(ident_text(callee.name))
                 if sym and sym.kind != SymbolKind.PROCEDURE:
                     idx_arg = unwrap_paren(expr.args[0])
-                    if isinstance(idx_arg, P.NumberLiteral) and not sym.based_on:
+                    if (isinstance(idx_arg, P.NumberLiteral) and not sym.based_on
+                            and sym.stack_offset is None):
                         asm_name = sym.asm_name if sym.asm_name else self._mangle_name(ident_text(callee.name))
                         elem_type = sym.data_type if sym else DataType.BYTE
                         elem_size = 2 if elem_type == DataType.ADDRESS else 1
@@ -7080,6 +7131,9 @@ class CodeGenerator:
         # Constant folding: label + constant.
         if isinstance(base, P.Identifier) and isinstance(index, P.NumberLiteral):
             sym = self.symbols.lookup(ident_text(base.name))
+            if sym and sym.stack_offset is not None:
+                self._emit_frame_addr(sym, number_value(index) * elem_size)
+                return
             if sym and not sym.based_on:
                 asm_name = sym.asm_name if sym.asm_name else self._mangle_name(ident_text(base.name))
                 offset = number_value(index) * elem_size
@@ -7089,7 +7143,10 @@ class CodeGenerator:
         # Optimised BYTE-index path with identifier base.
         if not isinstance(index, P.NumberLiteral):
             idx_type = self._get_expr_type(index)
-            if idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier):
+            base_sym = (self.symbols.lookup(ident_text(base.name))
+                        if isinstance(base, P.Identifier) else None)
+            if (idx_type == DataType.BYTE and elem_size == 1 and isinstance(base, P.Identifier)
+                    and not (base_sym and base_sym.stack_offset is not None)):
                 # By what _gen_expr returns, not by idx_type: an index can
                 # come back in HL (an embedded assignment of a constant), and
                 # taking A for it put the element somewhere that depended on
@@ -7112,7 +7169,9 @@ class CodeGenerator:
         # Get base address.
         if isinstance(base, P.Identifier):
             sym = self.symbols.lookup(ident_text(base.name))
-            if sym and sym.based_on:
+            if sym and sym.stack_offset is not None:
+                self._emit_frame_addr(sym)
+            elif sym and sym.based_on:
                 base_sym = self.symbols.lookup(sym.based_on)
                 base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
                 self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
@@ -7209,7 +7268,9 @@ class CodeGenerator:
             sym = self._lookup_symbol(name)
 
             if sym and sym.struct_members:
-                if sym.based_on:
+                if sym.stack_offset is not None:
+                    self._emit_frame_addr(sym)
+                elif sym.based_on:
                     base_sym = self.symbols.lookup(sym.based_on)
                     base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
                     self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
