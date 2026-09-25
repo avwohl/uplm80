@@ -894,3 +894,47 @@ bump: procedure public; n = n + 1; goto again; end bump;
 end b;
 """
     assert _run_modules([main, other], opt) == "0123"
+
+
+PUBLIC_IN_A_BLOCK = """0100H:
+a: do;
+mon1: procedure (f, x) external; declare f byte, x address; end mon1;
+declare again label public;
+declare n byte public;
+bump: procedure external; end bump;
+n = 0;
+do;
+again:
+    call mon1(2, '0' + n);
+    if n < 3 then call bump;
+end;
+end a;
+"""
+
+
+def test_a_public_label_that_labels_no_statement_at_the_outer_level_is_an_error():
+    """A PUBLIC label is attached to a statement at the outer level of the
+    main program module (9.3); `again:' in a DO block is another label, the
+    block's.  uplm80 emitted `public AGAIN' with nothing defining it, so
+    only the linker, or in a multi-file compile the assembler, found it
+    ("Undefined symbol 'AGAIN'"); Intel's PL/M-80 V3.1 rejects the program,
+    ERROR #172, INVALID LABEL: UNDEFINED."""
+    err = _compile_error(PUBLIC_IN_A_BLOCK)
+    assert ("T.PLM:4:9: error: AGAIN is declared a PUBLIC LABEL but labels no statement "
+            "at the outer level of the main program module") in err, err
+    assert "9800268B, 9.3" in err and "the AGAIN: in a DO block is another label" in err
+    err = _compile_error("0100H:\nt: do;\ndeclare x label public;\n"
+                         "p: procedure public; end p;\nend t;\n")
+    assert "T.PLM:3:9: error: X is declared a PUBLIC LABEL but labels no statement" in err
+
+
+def test_a_public_label_that_labels_no_statement_in_a_multi_file_compile():
+    other = """b: do;
+declare again label external;
+declare n byte external;
+bump: procedure public; n = n + 1; goto again; end bump;
+end b;
+"""
+    r = _compile_modules([PUBLIC_IN_A_BLOCK, other])
+    assert r.returncode != 0
+    assert "M0.PLM:4:9: error: AGAIN is declared a PUBLIC LABEL" in r.stderr, r.stderr

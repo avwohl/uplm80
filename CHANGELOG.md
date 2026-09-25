@@ -526,6 +526,17 @@ Each fix has a regression test that fails without it.
   PL/M-80 identifier has a `?`). A `DECLARE l LABEL` in a procedure, and
   the address of a procedure's label, `.there` in a statement or in a DATA
   or INITIAL list, named the bare label.
+- **A PUBLIC label that labels no statement at the outer level of the main
+  program was left for the linker to find.** PL/M-80 requires a PUBLIC
+  label to be attached to an executable statement there (9.3). With
+  `declare again label public;` at module level and `again:` in a DO
+  block, which is a label of the block's own, uplm80 emitted `public
+  AGAIN` with nothing defining it: the module compiled alone did not link,
+  and compiled with the module that jumps to it did not assemble
+  ("Undefined symbol 'AGAIN'"). 0.3.6 took the DO block's label for the
+  PUBLIC one. It is a compile error now that cites the rule and says where
+  the other label is, as Intel's PL/M-80 V3.1 rejects the program (ERROR
+  #172, INVALID LABEL: UNDEFINED). Found by the release gate.
 - **`.show`, of a procedure nested in another, did not assemble:** it named
   `SHOW`, where the procedure is `@OUTER$SHOW`. A DATA or INITIAL list and
   an AT found it already; an expression does now.
@@ -758,7 +769,8 @@ Each fix has a regression test that fails without it.
   something wrong or did not assemble: a GOTO out of a procedure except to
   the main program's outer level or an EXTERNAL label (to a DO block of the
   main program it is a warning, and compiles as Intel's PL/M-80 compiles
-  it), a GOTO into a block or to a name that is not a label, a name
+  it), a GOTO into a block or to a name that is not a label, a PUBLIC
+  label that labels no statement at the main program's outer level, a name
   declared twice in one block,
   and, compiling several modules together, a second main program module or
   a name another module declares without PUBLIC.

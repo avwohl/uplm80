@@ -659,16 +659,39 @@ class _Resolver:
                 d.from_proc = True
             r.node.uplm80_asm = self.asm_name(d)
 
+    def check_public_labels(self) -> None:
+        """A PUBLIC label labels a statement at the outer level of the main
+        program module (9.3).  One that labels none - a label of that name
+        in a DO block is another label, the block's - is a PUBLIC name
+        with no definition, which only the linker would find."""
+        for d in self.decls:
+            if d.kind != "label" or not d.public or d.defined:
+                continue
+            node, attr = d.sites[0]
+            text = ident_text(getattr(node, attr))
+            inner = next((x for x in self.decls if x.kind == "label" and x.orig == d.orig
+                          and x.defined and x.block.module is d.block.module), None)
+            also = (f"; the {text}: in {self._place(inner)} is another label, that block's"
+                    if inner is not None else "")
+            raise CodeGenError(
+                f"{text} is declared a PUBLIC LABEL but labels no statement at the outer "
+                "level of the main program module, where PL/M-80 requires a PUBLIC label "
+                f"to be (Programming Manual 9800268B, 9.3){also}", source_location(node))
+
+    @staticmethod
+    def _place(d: _Decl) -> str:
+        """The block a declaration is in, in words."""
+        return ("a DO block" if d.block.kind == "do"
+                else f"procedure {d.block.proc.orig}" if d.block.proc is not None
+                else "the main program")
+
     def _undeclared(self, text: str, r: _Ref) -> str:
         """Why a GOTO names no label it can reach."""
         name = _key(r.node.label)
         for d in self.decls:
             if d.kind == "label" and d.orig == name and d.block.module is r.block.module:
-                place = ("a DO block" if d.block.kind == "do"
-                         else f"procedure {d.block.proc.orig}" if d.block.proc is not None
-                         else "the main program")
-                return (f"GOTO {text}: the label {text} is in {place} this GOTO is not in; "
-                        f"{SCOPE_RULE}")
+                return (f"GOTO {text}: the label {text} is in {self._place(d)} this GOTO "
+                        f"is not in; {SCOPE_RULE}")
         return f"GOTO {text}: no label {text} is declared here"
 
     def annotate(self) -> None:
@@ -713,7 +736,8 @@ def resolve_names(modules: list, multi: bool = False) -> list[tuple]:
     (a multi-file compile), whose private names are qualified per module.
     Raises CodeGenError for what PL/M-80 does not allow: a GOTO out of a
     procedure to a label of another procedure, into a block or to what is
-    not a label; a name declared twice in one block; and,
+    not a label; a name declared twice in one block; a PUBLIC label that
+    labels no statement at the main program's outer level; and,
     in a multi-file compile, a second main program module or another
     module's private name.  Returns the warnings, (location, text) pairs:
     a GOTO out of a procedure to a label in a DO block of the main
@@ -731,6 +755,7 @@ def resolve_names(modules: list, multi: bool = False) -> list[tuple]:
                 "outer level; only the main program module may", source_location(mains[1].first))
         r.check_private()
         r.qualify()
+    r.check_public_labels()
     r.settle()
     r.check_gotos()
     r.annotate()
