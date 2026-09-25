@@ -216,6 +216,7 @@ def test_a_subscripted_scalar_is_a_place_not_its_value(opt):
 
 def test_a_subscripted_scalar_is_not_called():
     """The same at the level of the code: nothing in the program is an
-    indirect call, so ??jpde is never needed."""
+    indirect call, so ??jphl, which makes one, is never needed (??jpde
+    did, up to 0.3.x)."""
     asm = _asm(SUBSCRIPTED_SCALAR_SRC, opt=3)
-    assert "??jpde" not in asm.lower(), asm
+    assert "??jphl" not in asm.lower(), asm
