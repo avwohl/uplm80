@@ -405,6 +405,44 @@ class AsmLine:
         return "".join(parts)
 
 
+class _ScopedLiterals(dict):
+    """The LITERALLY macros, as a name in scope where code is being generated
+    has them.
+
+    The macro pass puts a LITERALLY's text in place of every name it
+    covers, with PL/M-80's scope; what reaches code generation under the
+    name is something else the program declares.  It was a flat table, so
+    once a procedure declared `K LITERALLY '1'' a variable K in another
+    procedure read as 1.  A name is a macro here only if the declaration
+    of it in scope is the LITERALLY (or, for a module-level one entered
+    before its declaration is generated, nothing is).
+    """
+
+    def __init__(self, symbols: SymbolTable) -> None:
+        super().__init__()
+        self._symbols = symbols
+
+    def _in_scope(self, name) -> Symbol | None | bool:
+        sym = self._symbols.lookup(name)
+        if sym is None:
+            return dict.__contains__(self, name)
+        return sym if sym.kind == SymbolKind.LITERAL else False
+
+    def __contains__(self, name) -> bool:
+        return bool(self._in_scope(name)) and dict.__contains__(self, name)
+
+    def __getitem__(self, name):
+        sym = self._in_scope(name)
+        if isinstance(sym, Symbol) and sym.literal_value is not None:
+            return sym.literal_value
+        if not sym:
+            raise KeyError(name)
+        return dict.__getitem__(self, name)
+
+    def get(self, name, default=None):
+        return self[name] if name in self else default
+
+
 class CodeGenerator:
     """
     Generates assembly code from PL/M-80 AST.
@@ -689,7 +727,7 @@ class CodeGenerator:
         self._page_zero_refs: set[str] = set()
         # Whether this module sets SP and so needs the ??STACK buffer.
         self._needs_stack = False
-        self.literal_macros: dict[str, str] = {}  # LITERALLY macro expansions
+        self.literal_macros: dict[str, str] = _ScopedLiterals(self.symbols)
         self.block_scope_counter = 0  # Counter for unique DO block scopes
         # Procedures declared at the head of a DO block.  They are
         # hoisted out of the block and emitted after the body of the
@@ -2107,7 +2145,7 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self._page_zero_refs = set()
         self._needs_stack = False
-        self.literal_macros = {}
+        self.literal_macros = _ScopedLiterals(self.symbols)
         self._survey_aliases([module])
         self._number_declarations([module])
 
@@ -2318,7 +2356,7 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self._page_zero_refs = set()
         self._needs_stack = False
-        self.literal_macros = {}
+        self.literal_macros = _ScopedLiterals(self.symbols)
         self._survey_aliases(modules)
         self._number_declarations(modules)
 

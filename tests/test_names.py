@@ -304,6 +304,49 @@ end t;
             "only to a PUBLIC or REENTRANT procedure") in r.stderr, r.stderr
 
 
+
+# ---- LITERALLY -------------------------------------------------------------
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_literally_in_each_of_two_procedures(opt):
+    """Each is the EQU of its name, `K EQU 1' and `K EQU 2': "Symbol 'K'
+    multiply defined"."""
+    assert run_plm(PRELUDE + """
+pa: procedure; declare k literally '1'; call pc('0' + k); end pa;
+pb: procedure; declare k literally '2'; call pc('0' + k); end pb;
+call pa; call pb;
+end t;
+""", opt) == "12"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_literally_does_not_reach_a_variable_of_its_name_elsewhere(opt):
+    """Code generation kept every LITERALLY in one table, so once PA had
+    declared K LITERALLY '1' the variable K of PB read as 1 (silently: the
+    program printed 11)."""
+    assert run_plm(PRELUDE + """
+pa: procedure; declare k literally '1'; call pc('0' + k); end pa;
+pb: procedure; declare k byte; k = 5; call pc('0' + k); end pb;
+call pa; call pb;
+end t;
+""", opt) == "15"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_literally_named_like_a_module_variable_or_label(opt):
+    """`K EQU 1' and the variable's `K: ds 1', the label's `DONE:'."""
+    assert run_plm(PRELUDE + """
+declare k byte;
+pa: procedure; declare k literally '1', done literally '1'; call pc('0' + k + done); end pa;
+k = 5;
+call pa; call pc('0' + k);
+goto done;
+call pc('X');
+done: call pc('.');
+end t;
+""", opt) == "25."
+
+
 # ---- a multi-file compile --------------------------------------------------
 
 def _compile_modules(sources: list[str], opt: int = 2) -> subprocess.CompletedProcess:

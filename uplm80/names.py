@@ -438,9 +438,10 @@ class _Resolver:
                 "(declare it PUBLIC there and EXTERNAL here)", source_location(r.node))
 
     # The kind of declaration renamed first when two meet in one assembler
-    # name: a label, which nothing outside its procedure names, before a
-    # procedure, and a variable last.
-    _RENAME_FIRST = {"label": 0, "proc": 1, "var": 2, "param": 2, "lit": 2}
+    # name: a LITERALLY, whose EQU nothing uses (the macro pass has put its
+    # text in place of every use), then a label, which nothing outside its
+    # procedure names, then a procedure, and a variable last.
+    _RENAME_FIRST = {"lit": 0, "label": 1, "proc": 2, "var": 3, "param": 3}
 
     def settle(self) -> None:
         """Rename declarations until no two code generation would give one
@@ -461,7 +462,7 @@ class _Resolver:
                 if d in keep or (d.kind == "lit" and all(
                         k.kind == "lit" and k.literal == d.literal for k in keep)):
                     continue
-                if d.kind == "label":
+                if d.kind in ("label", "lit"):
                     self.rename(d, self.fresh(d.name))
 
     # ---- GOTO ----------------------------------------------------------
