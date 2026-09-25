@@ -55,6 +55,7 @@ from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError, CompilerError
 from .frontend import source_location
 from .local_storage import LocalStorage
+from .names import resolve_names
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -2095,6 +2096,7 @@ class CodeGenerator:
             return self._generate(module)
 
     def _generate(self, module) -> str:
+        resolve_names([module])
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2305,6 +2307,7 @@ class CodeGenerator:
             return self._generate_multi(modules)
 
     def _generate_multi(self, modules: list) -> str:
+        resolve_names(modules)
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -3682,20 +3685,11 @@ class CodeGenerator:
         elif isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue)):
             self._gen_return(stmt)
         elif isinstance(stmt, P.GotoStmt):
-            # Check if target is a LITERALLY macro
-            target = ident_text(stmt.label)
-            if target in self.literal_macros:
-                target = self.literal_macros[target]
-            # Check if this is a module-level label or procedure-local label
-            # Module-level labels are defined without procedure prefix
-            module_label = self.symbols.lookup(target)
-            if module_label and module_label.kind == SymbolKind.LABEL:
-                # Module-level label - use as-is
-                pass
-            elif self.current_proc:
-                # Procedure-local label - prefix with current procedure
-                target = f"@{self.current_proc}${target}"
-            self._emit("jp", target)
+            # names.resolve_names found the label and checked the GOTO may
+            # reach it.  (The symbol table has a main-program label and not
+            # a procedure's, so a GOTO in a procedure went to the main
+            # program's label of the same name, if it had one.)
+            self._emit("jp", stmt.uplm80_asm)
         elif isinstance(stmt, P.HaltStmt):
             self._emit("halt")
         elif isinstance(stmt, P.EnableStmt):
@@ -3705,20 +3699,12 @@ class CodeGenerator:
         elif isinstance(stmt, P.NullStmt):
             pass  # No code
         elif isinstance(stmt, P.LabeledStmt):
-            raw_label = ident_text(stmt.label)
-            if self.current_proc:
-                # Procedure-local label - prefix with current procedure
-                label = f"@{self.current_proc}${raw_label}"
-            else:
-                # Module-level label - register in symbol table for GOTO lookups
-                self.symbols.define(
-                    Symbol(
-                        name=raw_label,
-                        kind=SymbolKind.LABEL,
-                    )
-                )
-                label = raw_label
-            self._emit_label(label)
+            # A procedure's label is `@proc$label', a main program's the
+            # label itself (names.resolve_names, which renames one that
+            # would meet another).
+            if not self.current_proc:
+                self.symbols.define(Symbol(name=ident_text(stmt.label), kind=SymbolKind.LABEL))
+            self._emit_label(stmt.uplm80_asm)
             self._gen_stmt(stmt.stmt)
         elif isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             self._gen_if(stmt)
@@ -8042,6 +8028,12 @@ class CodeGenerator:
             if name.upper() == "MEMORY":
                 self.needs_end_symbol = True
                 self._emit("ld", "hl,__END__")
+                return DataType.ADDRESS
+
+            label = getattr(operand, "uplm80_asm", None)
+            if label is not None:
+                # The address of a label: `@proc$label' in a procedure.
+                self._emit("ld", f"hl,{label}")
                 return DataType.ADDRESS
 
             if name in self.literal_macros:
