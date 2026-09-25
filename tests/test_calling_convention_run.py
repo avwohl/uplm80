@@ -162,6 +162,7 @@ def _module(*parts: str) -> str:
     return ("    .z80\n    cseg\n" + "".join(parts)
             + "    dseg\nRES:    ds 10\nARES:   ds 2\n    end\n")
 
+
 BODY = """
 cap0: procedure external; end cap0;
 cap1b: procedure (x) external; declare x byte; end cap1b;

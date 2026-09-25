@@ -210,7 +210,7 @@ def test_a_procedure_takes_its_arguments_at_entry(name, entry):
     code = _proc(_asm(ENTRIES), name)
     assert code[:len(entry)] == entry, code
     assert code.count("ret") == 1 and code[-1] == "ret", code
-    if len(entry) <= 5:
+    if name[1] in "12":
         # One or two parameters: BC and DE are left as they came, so a body
         # can pass them on (DRI's `MON1: ... GO TO BDOS').
         for line in entry:
