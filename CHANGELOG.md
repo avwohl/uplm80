@@ -497,6 +497,23 @@ Each fix has a regression test that fails without it.
   targets through its symbol table, which has the main program's labels and
   not a procedure's. `p: procedure; ... goto done; ... done: call pc('a');
   end p;` with a `done:` in the main program jumped out of P.
+- **A GOTO from a procedure to a label at the outer level of the main
+  program left the procedure's return addresses on the stack.** DRI's
+  PL/M-80 reloads SP at such a label: MP/M II's PIP ends its ERROR
+  procedure with `GO TO RETRY`, and in DRI's `PIP.PRL`, `RETRY:` begins
+  with the same `LXI SP` as the program's entry. uplm80 only jumped, so each
+  such GOTO leaked what the calls on the way had pushed. With `bail:
+  procedure; n = n + 1; goto again; end bail;` and, in the main program,
+  `again: if n < 1000 then call bail;`, `-m bare`'s 64-byte stack ran into
+  the program after about a dozen rounds. MP/M II's PIP printed garbage and
+  dropped back to the CLI after 86 errors in one interactive session. Such
+  a label now reloads SP, as DRI's code does, and so does a PUBLIC label,
+  which a procedure in another module can reach: `ld sp,??STACK` in bare
+  and MP/M mode, and `ld hl,(6) / ld sp,hl` in CP/M mode. A label that
+  only the main program jumps to is left as it was, as DRI leaves it. Every
+  MP/M II program built from PL/M now loads SP as often as DRI's binary of
+  it does: ED at five labels, GENSYS at two, and PIP, TOD, SCHED, PRLCOM
+  and MPMLDR at one. Found by the release gate; 0.3.6 did the same.
 - **A label in each of two DO blocks** of the main program or of one
   procedure was "multiply defined", both `LP:` or both `@P$LP:`, though
   each DO block has labels of its own (9.3). The second is `LP?2` now (no
@@ -819,6 +836,11 @@ Each fix has a regression test that fails without it.
 - **A name that is declared nowhere is not an error.** `y = nosuch + 1`
   compiles to `ld hl,(NOSUCH)`, and only um80 reports it, as an undefined
   symbol (0.3.6 the same).
+- **`x()`, with empty parentheses, where x is a variable, is accepted
+  without a diagnostic.** In an expression, `y = x() + 1` with x a BYTE
+  compiles to a CALL through x's value (`ld a,(X) / ... / call ??jpde`);
+  0.3.6 compiled it to `call X`. PL/M-80 has no empty argument list; `f()`
+  of a procedure is taken as `f`.
 - **An INTERRUPT procedure nested in another procedure is accepted without
   a diagnostic.** PL/M-80 requires an INTERRUPT procedure to be at the outer
   level of the module; uplm80 compiles a nested one, and a local of the
@@ -960,6 +982,24 @@ Each fix has a regression test that fails without it.
   and -O3. `scripts/difftest.py --seeds 200 --first 2000`: all 200 programs
   as the model says at -O0 to -O3; the gate's generator of locals, 100 seeds
   of each of its two versions: all 200 as its model says.
+- The release gate's round after that found the GOTO out of a procedure
+  that left its calls on the stack (see Fixed, Names and labels). With the
+  fix, its program of sixty such GOTOs from two calls down prints sixty
+  `e` and then `ad.` with `-m bare` at -O0 to -O3, where it stopped after
+  11 to 18, and its program of twenty thousand prints `12.`, where it
+  printed `.`. The MP/M II and 80un compiles change only by the new loads
+  of SP, 52 bytes of code at each of -O0, -O2 and -O3, and GENSYS makes the
+  same `MPM.SYS` for V2.0 and V2.1. MP/M II built from source for V2.0 and
+  V2.1, 44 of 44 targets each, passes `run_tests.sh all` for both and
+  `run_tests.sh src`, and `verify_dri.py` reports what it did. On the V2.0
+  system built from source, one PIP session fed `t9.txt=nosuch.txt` 120
+  times and then `con:=t1.txt` prints the 120 errors and types T1.TXT,
+  exactly as DRI's `PIP.PRL` does. The 122-command session prints what it
+  printed without the fix, apart from MPMSTAT's list of processes. The
+  gate's other programs print what they printed before, at -O0 to -O3.
+  `scripts/difftest.py --seeds 200 --first 6000`, the gate's generator of
+  locals (100 seeds of each version) and `scripts/namestest.py` (100
+  one-module and 40 three-module seeds): all as their models say.
 
 ## 0.3.6 — 2026-09-24
 
