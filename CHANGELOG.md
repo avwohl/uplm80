@@ -154,8 +154,8 @@ leaves the stack alone after the call.
 
 - **Smaller code.** Over MP/M II's PL/M (UTIL2 to UTIL7 and MPMLDR, 39
   modules, SDIR's eight included) and 80un's two programs, at `-O2` with
-  upeepz80 0.2.6, the code is 111,144 bytes against 0.3.7's 113,348
-  (−2,204), and no module is larger. A pushed argument costs one `push`
+  upeepz80 0.2.6, the code is 111,223 bytes against 0.3.7's 113,528
+  (−2,305), and no module is larger. A pushed argument costs one `push`
   where 0.3.x stored it into the callee's slot, the entry stores it once,
   and the A/HL exception saves the `ld c,a` or `ld b,h / ld c,l` every
   call of a one-parameter procedure would otherwise need (about 1,300
@@ -169,6 +169,17 @@ leaves the stack alone after the call.
 - A REENTRANT procedure pushes the arguments that came in BC and DE under
   its return address, which is the frame 0.3.x had, and every exit takes
   all of them off the stack, keeping A and HL.
+- A GOTO out of a procedure can now abandon, besides the return addresses
+  of the calls it leaves, the words pushed for a call whose arguments were
+  being evaluated: the first arguments, and BC, kept round the last one.
+  `call p3(1, 2, f)`, where `f` ends in `goto again`, leaves two. The
+  label at the outer level of the main program that such a GOTO reaches
+  sets SP again, as it does since 0.3.7, and that takes them off too: 1000
+  such GOTOs run in `-m bare`'s 64-byte stack, out of an argument of a
+  direct call, of a CALL through an address and of a REENTRANT
+  procedure's callee (`tests/test_goto_stack.py`). A GOTO to a label in a
+  DO block of the main program, which draws a warning, leaves them, as
+  Intel's PL/M-80 does.
 - `??jphl` replaces `??jpde`.
 
 ### Fixed
@@ -196,27 +207,64 @@ leaves the stack alone after the call.
   uplm80's procedures and uplm80's `MAIN` calling Intel's.
 - `tests/test_upeepz80_version.py`: the upeepz80 floor, against
   pyproject.toml's, and what is refused and accepted below it.
+- `tests/abi_fuzz.py`, a fuzz test of the convention across modules: random
+  programs of two PL/M modules, each defining procedures of 0 to 6
+  parameters that the other declares EXTERNAL, some private, some
+  REENTRANT, some called through an address, and an assembly module that
+  stands between some calls and the procedures they call, taking the
+  arguments where the convention puts them and passing them on with
+  garbage in the high byte of each BYTE. Bodies end in calls. Each program
+  is built at `-O0`, which must leave SP where it found it, and at `-O1` to
+  `-O3`, with its two modules at different levels and in one multi-file
+  compile, and every build must print what `-O0`'s prints.
+  `tests/test_abi_fuzz.py` runs three seeds, and checks that the test
+  fails when `call x / ret` becomes `jp x`, as upeepz80 0.2.5 made it;
+  `scripts/abifuzz.py --seeds N [--jobs J]` runs more.
+- `tests/_toolchain.py`: `run_asm` links any number of assembly modules
+  after the program.
 
 ### Verified
 
-- The test suite: 719 tests pass. pylint rates the package 9.72, as before.
-- `scripts/difftest.py`, 200 seeds at `-O0` to `-O3`: none differs.
-  `scripts/namestest.py`, 200 seeds: none differs; with `--modules`, 100
-  seeds: none differs.
+On 0.3.7 as released, with 0.3.7's last fixes underneath (the reload of SP
+at a label a GOTO out of a procedure reaches, PUBLIC labels, the names of
+an EXTERNAL procedure's parameters, -O3 and a subscripted scalar):
+
+- The test suite: 769 tests pass. pylint rates the package 9.72, as before.
+- `scripts/abifuzz.py --seeds 500`: every program prints, in each of its
+  seven builds, what its `-O0` build prints, and leaves SP where it found
+  it.
+- `scripts/difftest.py --seeds 150 --first 14000`: all 150 programs as the
+  model says at `-O0` to `-O3`. `scripts/namestest.py --seeds 100 --first
+  5000`, and with `--modules` 40 seeds: all print what their scopes say.
+- The 87 compiles of MP/M II's and 80un's PL/M (DRI's tree and mpm2's
+  overrides, each in the mode `tools/build.py` uses, 80un's files one at
+  a time and its two programs) at `-O2`: the same 77 assemble as with
+  0.3.7, 165,320 bytes of code against 168,158, and each output sets SP
+  again at the labels 0.3.7's does. The 41 programs of the size figures
+  above compile and assemble at every level from `-O0` to `-O3`.
+- 0.3.7's release-gate programs of GOTOs out of procedures - out of
+  REENTRANT recursion, counted loops, calls through an address, nested
+  procedures and another module's procedures, to PUBLIC labels and to a
+  label in a DO block - print what 0.3.7 prints at `-O0` to `-O3`, in
+  `-m bare` and CP/M mode, and the diagnostics among them say what 0.3.7
+  says.
+- 80un: `80un.com` and `80unbas.com` built at `-O2` write, on each of the
+  29 inputs in its tests, exactly the files and the output those built by
+  0.3.7 do.
+- `tests/run_tests.sh` prints what it prints with 0.3.7 for all 22
+  programs (21 pass; `test_byte_conditions` fails with both).
+
+Before those fixes were underneath:
+
 - Every PL/M source of MP/M II (`mpm2src/*/*.PLM`), 80un and `sample_code`
   that 0.3.7 compiles compiles, without the argument-count or INTERRUPT
-  error, and the 41 programs of the size figures above compile and
-  assemble at every level from `-O0` to `-O3`. `tests/run_tests.sh` prints what it prints with 0.3.7 for all 22
-  programs (21 pass; `test_byte_conditions` fails with both).
+  error.
 - MP/M II, built from DRI's sources with DRI's `X0100.ASM`, `BRSPBI.ASM`
   and `LDMONX.ASM` linked unmodified and the shims that stood in for them
   gone, V2.0 and V2.1: every test of the emulator's battery passes on the
   source-built system (DIR, STAT, the resident processes, HTTP, SFTP), and
   the assembly-built files are still DRI's byte for byte
   (`tools/verify_dri.py`).
-- 80un: `80un.com` and `80unbas.com` built by 0.4.0 write, on each of the
-  29 inputs in its tests, exactly the files and the output those built by
-  0.3.7 do.
 
 ## 0.3.7 — 2026-09-25
 

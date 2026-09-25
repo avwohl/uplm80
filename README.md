@@ -268,7 +268,8 @@ Code built with 0.4.0 needs upeepz80 0.2.6 or later: 0.2.5 turned `push ... /
 call p / ret` into `push ... / jp p`, after which p takes its return address
 for its first argument.  At `-O1` and up the compiler refuses an upeepz80
 whose version is below 0.2.6, unless it keeps that `call` (a development
-tree with the fix, not yet numbered 0.2.6); `-O0` does not use upeepz80.
+tree with the fix, numbered before 0.2.6 was released); `-O0` does not use
+upeepz80.
 
 ## Names in the Output
 
