@@ -821,13 +821,9 @@ CALLBACK_ASM = """
     extrn CB
 ; ext: code outside the module that calls its PUBLIC procedure back.
 EXT:    jp CB
-; icall(a): calls the procedure at a.
-ICALL:  ld hl,2
-        add hl,sp
-        ld a,(hl)
-        inc hl
-        ld h,(hl)
-        ld l,a
+; icall(a): calls the procedure at a, which comes in BC.
+ICALL:  ld h,b
+        ld l,c
         jp (hl)
     end
 """
@@ -1075,13 +1071,9 @@ ICALL_ASM = """
     .z80
     cseg
     public ICALL
-; icall(a): calls the procedure at a.
-ICALL:  ld hl,2
-        add hl,sp
-        ld a,(hl)
-        inc hl
-        ld h,(hl)
-        ld l,a
+; icall(a): calls the procedure at a, which comes in BC.
+ICALL:  ld h,b
+        ld l,c
         jp (hl)
     end
 """

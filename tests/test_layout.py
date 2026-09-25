@@ -106,18 +106,10 @@ _PAGE_ZERO = """
 ??BOOT\tequ\t0
 ??MAXB\tequ\t6
 MAXB\tequ\t6
-\tpublic\t??BDOS, ??BOOT, ??MAXB, MAXB
-\tcseg
-MON1:
-\tpublic\tMON1
-\tld\thl,2
-\tadd\thl,sp
-\tld\te,(hl)
-\tinc\thl
-\tld\td,(hl)
-\tinc\thl
-\tld\tc,(hl)
-\tjp\t5
+; A call of MON1 passes the function in C and the argument in DE, as the
+; BDOS takes them (DRI's X0100.ASM).
+MON1\tequ\t5
+\tpublic\t??BDOS, ??BOOT, ??MAXB, MAXB, MON1
 \tend
 """
 

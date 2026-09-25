@@ -16,21 +16,22 @@ from uplm80.compiler import Compiler
 from ._toolchain import compile_cmd, compiler_env, run_asm, tools_missing
 
 
-def _asm(src: str, mode: Mode = Mode.CPM) -> str:
-    out = Compiler(mode=mode).compile(src, "<test>")
+def _asm(src: str, mode: Mode = Mode.CPM, opt: int = 2) -> str:
+    out = Compiler(mode=mode, opt_level=opt).compile(src, "<test>")
     assert out is not None, "compilation failed"
     return out
 
 
-def test_a_public_procedure_takes_its_arguments_on_the_stack():
+def test_a_public_procedure_takes_its_arguments_as_plm80_passes_them():
     """A caller in another module cannot name the callee's storage.
 
-    A procedure private to its module is called with its earlier arguments
-    already written into its own slots, and only the last in a register. A
-    PUBLIC one cannot be: the caller pushes everything. The two conventions
-    have to agree, and they did not - SDIR's public `pdecimal(v, prec, zerosup)'
-    read two of its three arguments from slots no one had written, so every
-    number it printed was wrong or missing.
+    Up to 0.3.x a procedure private to its module was called with its
+    earlier arguments already written into its own slots, and a PUBLIC one
+    with all of them pushed; SDIR's public `pdecimal(v, prec, zerosup)'
+    once read two of its three from slots no one had written.  Now every
+    call passes them as PL/M-80 does: the last in DE (E), the one before in
+    BC (C), the first pushed, and the callee takes the pushed one off the
+    stack itself.
     """
     asm = _asm("""
 t: do;
@@ -41,34 +42,67 @@ p: procedure (a,b,c) public;
    end p;
 call p(1,2,3);
 end t;
-""")
+""", opt=0)
     lines = [l.strip() for l in asm.splitlines()]
     i = lines.index("P:")
-    prologue = lines[i + 1:i + 6]
-    # Reads its arguments off the stack rather than taking one in a register.
-    assert prologue[0] == "ld\thl,6" and prologue[1] == "add\thl,sp", prologue
-    # And the caller pushes all three and pops them again.
-    assert lines.count("push\thl") >= 3, asm
-    assert lines.count("pop\tde") >= 3, asm
+    entry = lines[i + 1:i + 8]
+    assert entry[:2] == ["ld\ta,e", "ld\t(??AUTO+4),a"], entry
+    assert entry[2] == "ld\t(??AUTO+2),bc", entry
+    assert entry[3:6] == ["pop\thl", "ex\t(sp),hl", "ld\t(??AUTO+0),hl"], entry
+    assert "add\thl,sp" not in lines, asm
+    # The caller pushes the first, and pops nothing after the call.
+    j = lines.index("call\tP")
+    assert lines[j - 4:j + 2] == ["ld\thl,1", "push\thl", "ld\tbc,2", "ld\te,3", "call\tP",
+                                  "jp\t0"], lines[j - 5:j + 2]
 
 
-def test_a_private_procedure_keeps_the_register_convention():
-    """Nothing outside the module can call it, so the cheap form still applies."""
+def test_a_private_procedure_with_one_parameter_keeps_the_register_convention():
+    """Nothing outside the module can call it, so it takes its argument in A
+    or HL.  One with two parameters takes them in BC and DE, and no caller
+    writes into a callee's storage."""
     asm = _asm("""
 t: do;
+declare (s, w) address, v byte;
 p: procedure (a,b);
    declare a address, b byte;
    declare r address;
    r = a + b;
+   s = r;
    end p;
+q: procedure (a);
+   declare a address;
+   w = a + 1;
+   end q;
+k: procedure (b);
+   declare b byte;
+   v = b + 1;
+   end k;
 call p(1,2);
+call q(w);
+call k(v);
 end t;
-""")
+""", opt=0)
     lines = [l.strip() for l in asm.splitlines()]
-    # No stack-reading prologue: `ld hl,<n> / add hl,sp' is its signature.
+    # No stack-reading entry: `ld hl,<n> / add hl,sp' is its signature.
     assert "add\thl,sp" not in lines, asm
-    # The caller writes the earlier argument straight into the callee's slot.
-    assert any(l.startswith("ld\t(??AUTO+") and l.endswith("),hl") for l in lines), asm
+    # p: BC and DE, stored at its entry.
+    i = lines.index("call\tP")
+    assert lines[i - 2:i] == ["ld\tbc,1", "ld\te,2"], lines[i - 4:i + 1]
+    i = lines.index("P:")
+    assert lines[i + 1:i + 6] == ["ld\ta,e", "ld\t(??AUTO+2),a", "ld\th,b", "ld\tl,c",
+                                  "ld\t(??AUTO+0),hl"], lines[i + 1:i + 6]
+    # q and k: HL and A.
+    i = lines.index("call\tQ")
+    assert lines[i - 1] == "ld\thl,(W)", lines[i - 2:i + 1]
+    assert lines[lines.index("Q:") + 1].startswith("ld\t(??AUTO+") and \
+        lines[lines.index("Q:") + 1].endswith("),hl"), asm
+    i = lines.index("call\tK")
+    assert lines[i - 1] == "ld\ta,(V)", lines[i - 2:i + 1]
+    assert lines[lines.index("K:") + 1].startswith("ld\t(??AUTO+") and \
+        lines[lines.index("K:") + 1].endswith("),a"), asm
+    # Only a procedure's own entry stores into its parameters.
+    main = lines[:lines.index("P:")]
+    assert not any(l.startswith("ld\t(??AUTO+") for l in main), main
 
 
 def test_a_variable_by_step_is_actually_used():

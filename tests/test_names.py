@@ -364,18 +364,23 @@ end t;
     assert run_plm(src, opt, extra_asm=EXTP) == "SSIS=S/TTEPTpRE=E."
 
 
-def test_a_call_through_an_address_with_two_arguments_warns():
-    """A procedure private to its module takes all but its last argument in
-    its own storage, which a call through an address cannot reach."""
+def test_a_call_through_an_address_with_two_arguments_does_not_warn():
+    """A call through an address passes its arguments as a direct call does
+    (uplm80 0.4.0), so any procedure can take any number of them that way.
+    0.3.x warned, since a procedure private to its module took all but its
+    last argument in its own storage.  (tests/test_calling_convention_run.py
+    runs such calls.)"""
     r = _compile(PRELUDE + """declare q address;
 pub: procedure (a, b) public; declare (a, b) byte; call pc(a); call pc(b); end pub;
+priv: procedure (a, b, c); declare (a, b, c) byte; call pc(a); call pc(c); end priv;
 q = .pub;
 call q(1, 2);
+q = .priv;
+call q(1, 2, 3);
 end t;
 """)
     assert r.returncode == 0, r.stderr
-    assert ("T.PLM:8:1: warning: a CALL through an address passes more than one argument "
-            "only to a PUBLIC or REENTRANT procedure") in r.stderr, r.stderr
+    assert "warning" not in r.stderr, r.stderr
 
 
 

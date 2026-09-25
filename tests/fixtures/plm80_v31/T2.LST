@@ -1,0 +1,460 @@
+PL/M-80 COMPILER                                                                                                PAGE   1
+
+
+ISIS-II PL/M-80 V3.1 COMPILATION OF MODULE T2
+OBJECT MODULE PLACED IN T2.OBJ
+COMPILER INVOKED BY:  PLM80 T2.PLM CODE
+
+
+
+   1          T2: DO;
+   2   1      DECLARE (B1, B2, B3, B4, B5) BYTE;
+   3   1      DECLARE (A1, A2, A3, A4, A5) ADDRESS;
+              /* 2 params */
+   4   1      P2BB: PROCEDURE(X, Y) PUBLIC; DECLARE (X, Y) BYTE; B1 = X; B2 = Y; END P2BB;
+                                                 ; STATEMENT # 4
+                         ; PROC  P2BB
+           0000  211000          LXI     H,Y
+           0003  73              MOV     M,E
+           0004  2B              DCX     H
+           0005  71              MOV     M,C
+                                                 ; STATEMENT # 6
+           0006  3A0F00          LDA     X
+           0009  320000          STA     B1
+                                                 ; STATEMENT # 7
+           000C  3A1000          LDA     Y
+           000F  320100          STA     B2
+                                                 ; STATEMENT # 8
+           0012  C9              RET
+   9   1      P2AA: PROCEDURE(X, Y) PUBLIC; DECLARE (X, Y) ADDRESS; A1 = X; A2 = Y; END P2AA;
+                                                 ; STATEMENT # 9
+                         ; PROC  P2AA
+           0013  211400          LXI     H,Y+1H
+           0016  72              MOV     M,D
+           0017  2B              DCX     H
+           0018  73              MOV     M,E
+           0019  2B              DCX     H
+           001A  70              MOV     M,B
+           001B  2B              DCX     H
+           001C  71              MOV     M,C
+                                                 ; STATEMENT # 11
+           001D  2A1100          LHLD    X
+           0020  220500          SHLD    A1
+                                                 ; STATEMENT # 12
+           0023  2A1300          LHLD    Y
+           0026  220700          SHLD    A2
+                                                 ; STATEMENT # 13
+           0029  C9              RET
+  14   1      P2AB: PROCEDURE(X, Y) PUBLIC; DECLARE X ADDRESS, Y BYTE; A1 = X; B2 = Y; END P2AB;
+                                                 ; STATEMENT # 14
+                         ; PROC  P2AB
+           002A  211700          LXI     H,Y
+           002D  73              MOV     M,E
+           002E  2B              DCX     H
+           002F  70              MOV     M,B
+           0030  2B              DCX     H
+           0031  71              MOV     M,C
+                                                 ; STATEMENT # 16
+           0032  2A1500          LHLD    X
+           0035  220500          SHLD    A1
+                                                 ; STATEMENT # 17
+PL/M-80 COMPILER                                                                                                PAGE   2
+
+
+           0038  3A1700          LDA     Y
+           003B  320100          STA     B2
+                                                 ; STATEMENT # 18
+           003E  C9              RET
+  19   1      P2BA: PROCEDURE(X, Y) PUBLIC; DECLARE X BYTE, Y ADDRESS; B1 = X; A2 = Y; END P2BA;
+                                                 ; STATEMENT # 19
+                         ; PROC  P2BA
+           003F  211A00          LXI     H,Y+1H
+           0042  72              MOV     M,D
+           0043  2B              DCX     H
+           0044  73              MOV     M,E
+           0045  2B              DCX     H
+           0046  71              MOV     M,C
+                                                 ; STATEMENT # 21
+           0047  3A1800          LDA     X
+           004A  320000          STA     B1
+                                                 ; STATEMENT # 22
+           004D  2A1900          LHLD    Y
+           0050  220700          SHLD    A2
+                                                 ; STATEMENT # 23
+           0053  C9              RET
+              /* 3 params */
+  24   1      P3BBB: PROCEDURE(X, Y, Z) PUBLIC; DECLARE (X, Y, Z) BYTE; B1 = X; B2 = Y; B3 = Z; END P3BBB;
+                                                 ; STATEMENT # 24
+                         ; PROC  P3BBB
+           0054  211D00          LXI     H,Z
+           0057  73              MOV     M,E
+           0058  2B              DCX     H
+           0059  71              MOV     M,C
+           005A  2B              DCX     H
+           005B  D1              POP     D       
+           005C  C1              POP     B       
+           005D  71              MOV     M,C
+           005E  D5              PUSH    D       
+                                                 ; STATEMENT # 26
+           005F  3A1B00          LDA     X
+           0062  320000          STA     B1
+                                                 ; STATEMENT # 27
+           0065  3A1C00          LDA     Y
+           0068  320100          STA     B2
+                                                 ; STATEMENT # 28
+           006B  3A1D00          LDA     Z
+           006E  320200          STA     B3
+                                                 ; STATEMENT # 29
+           0071  C9              RET
+  30   1      P3AAA: PROCEDURE(X, Y, Z) PUBLIC; DECLARE (X, Y, Z) ADDRESS; A1 = X; A2 = Y; A3 = Z; END P3AAA;
+                                                 ; STATEMENT # 30
+                         ; PROC  P3AAA
+           0072  212300          LXI     H,Z+1H
+           0075  72              MOV     M,D
+           0076  2B              DCX     H
+           0077  73              MOV     M,E
+           0078  2B              DCX     H
+           0079  70              MOV     M,B
+           007A  2B              DCX     H
+           007B  71              MOV     M,C
+           007C  2B              DCX     H
+PL/M-80 COMPILER                                                                                                PAGE   3
+
+
+           007D  D1              POP     D       
+           007E  C1              POP     B       
+           007F  70              MOV     M,B
+           0080  2B              DCX     H
+           0081  71              MOV     M,C
+           0082  D5              PUSH    D       
+                                                 ; STATEMENT # 32
+           0083  2A1E00          LHLD    X
+           0086  220500          SHLD    A1
+                                                 ; STATEMENT # 33
+           0089  2A2000          LHLD    Y
+           008C  220700          SHLD    A2
+                                                 ; STATEMENT # 34
+           008F  2A2200          LHLD    Z
+           0092  220900          SHLD    A3
+                                                 ; STATEMENT # 35
+           0095  C9              RET
+  36   1      P3BAB: PROCEDURE(X, Y, Z) PUBLIC; DECLARE (X, Z) BYTE, Y ADDRESS; B1 = X; A2 = Y; B3 = Z; END P3BAB;
+                                                 ; STATEMENT # 36
+                         ; PROC  P3BAB
+           0096  212700          LXI     H,Z
+           0099  73              MOV     M,E
+           009A  2B              DCX     H
+           009B  70              MOV     M,B
+           009C  2B              DCX     H
+           009D  71              MOV     M,C
+           009E  2B              DCX     H
+           009F  D1              POP     D       
+           00A0  C1              POP     B       
+           00A1  71              MOV     M,C
+           00A2  D5              PUSH    D       
+                                                 ; STATEMENT # 38
+           00A3  3A2400          LDA     X
+           00A6  320000          STA     B1
+                                                 ; STATEMENT # 39
+           00A9  2A2500          LHLD    Y
+           00AC  220700          SHLD    A2
+                                                 ; STATEMENT # 40
+           00AF  3A2700          LDA     Z
+           00B2  320200          STA     B3
+                                                 ; STATEMENT # 41
+           00B5  C9              RET
+  42   1      P3ABA: PROCEDURE(X, Y, Z) PUBLIC; DECLARE (X, Z) ADDRESS, Y BYTE; A1 = X; B2 = Y; A3 = Z; END P3ABA;
+                                                 ; STATEMENT # 42
+                         ; PROC  P3ABA
+           00B6  212C00          LXI     H,Z+1H
+           00B9  72              MOV     M,D
+           00BA  2B              DCX     H
+           00BB  73              MOV     M,E
+           00BC  2B              DCX     H
+           00BD  71              MOV     M,C
+           00BE  2B              DCX     H
+           00BF  D1              POP     D       
+           00C0  C1              POP     B       
+           00C1  70              MOV     M,B
+           00C2  2B              DCX     H
+           00C3  71              MOV     M,C
+PL/M-80 COMPILER                                                                                                PAGE   4
+
+
+           00C4  D5              PUSH    D       
+                                                 ; STATEMENT # 44
+           00C5  2A2800          LHLD    X
+           00C8  220500          SHLD    A1
+                                                 ; STATEMENT # 45
+           00CB  3A2A00          LDA     Y
+           00CE  320100          STA     B2
+                                                 ; STATEMENT # 46
+           00D1  2A2B00          LHLD    Z
+           00D4  220900          SHLD    A3
+                                                 ; STATEMENT # 47
+           00D7  C9              RET
+              /* 4 params */
+  48   1      P4: PROCEDURE(W, X, Y, Z) PUBLIC; DECLARE (W, Y) BYTE, (X, Z) ADDRESS;
+                                                 ; STATEMENT # 48
+                         ; PROC  P4
+           00D8  213200          LXI     H,Z+1H
+           00DB  72              MOV     M,D
+           00DC  2B              DCX     H
+           00DD  73              MOV     M,E
+           00DE  2B              DCX     H
+           00DF  71              MOV     M,C
+           00E0  2B              DCX     H
+           00E1  D1              POP     D       
+           00E2  C1              POP     B       
+           00E3  70              MOV     M,B
+           00E4  2B              DCX     H
+           00E5  71              MOV     M,C
+           00E6  2B              DCX     H
+           00E7  C1              POP     B       
+           00E8  71              MOV     M,C
+           00E9  D5              PUSH    D       
+  50   2        B1 = W; A2 = X; B3 = Y; A4 = Z; END P4;
+                                                 ; STATEMENT # 50
+           00EA  3A2D00          LDA     W
+           00ED  320000          STA     B1
+                                                 ; STATEMENT # 51
+           00F0  2A2E00          LHLD    X
+           00F3  220700          SHLD    A2
+                                                 ; STATEMENT # 52
+           00F6  3A3000          LDA     Y
+           00F9  320200          STA     B3
+                                                 ; STATEMENT # 53
+           00FC  2A3100          LHLD    Z
+           00FF  220B00          SHLD    A4
+                                                 ; STATEMENT # 54
+           0102  C9              RET
+  55   1      P4X: PROCEDURE(W, X, Y, Z) PUBLIC; DECLARE (W, Y) ADDRESS, (X, Z) BYTE;
+                                                 ; STATEMENT # 55
+                         ; PROC  P4X
+           0103  213800          LXI     H,Z
+           0106  73              MOV     M,E
+           0107  2B              DCX     H
+           0108  70              MOV     M,B
+           0109  2B              DCX     H
+           010A  71              MOV     M,C
+           010B  2B              DCX     H
+PL/M-80 COMPILER                                                                                                PAGE   5
+
+
+           010C  D1              POP     D       
+           010D  C1              POP     B       
+           010E  71              MOV     M,C
+           010F  2B              DCX     H
+           0110  C1              POP     B       
+           0111  70              MOV     M,B
+           0112  2B              DCX     H
+           0113  71              MOV     M,C
+           0114  D5              PUSH    D       
+  57   2        A1 = W; B2 = X; A3 = Y; B4 = Z; END P4X;
+                                                 ; STATEMENT # 57
+           0115  2A3300          LHLD    W
+           0118  220500          SHLD    A1
+                                                 ; STATEMENT # 58
+           011B  3A3500          LDA     X
+           011E  320100          STA     B2
+                                                 ; STATEMENT # 59
+           0121  2A3600          LHLD    Y
+           0124  220900          SHLD    A3
+                                                 ; STATEMENT # 60
+           0127  3A3800          LDA     Z
+           012A  320300          STA     B4
+                                                 ; STATEMENT # 61
+           012D  C9              RET
+              /* 5 params */
+  62   1      P5: PROCEDURE(V, W, X, Y, Z) PUBLIC; DECLARE (V, X, Z) BYTE, (W, Y) ADDRESS;
+                                                 ; STATEMENT # 62
+                         ; PROC  P5
+           012E  213F00          LXI     H,Z
+           0131  73              MOV     M,E
+           0132  2B              DCX     H
+           0133  70              MOV     M,B
+           0134  2B              DCX     H
+           0135  71              MOV     M,C
+           0136  2B              DCX     H
+           0137  D1              POP     D       
+           0138  C1              POP     B       
+           0139  71              MOV     M,C
+           013A  2B              DCX     H
+           013B  C1              POP     B       
+           013C  70              MOV     M,B
+           013D  2B              DCX     H
+           013E  71              MOV     M,C
+           013F  2B              DCX     H
+           0140  C1              POP     B       
+           0141  71              MOV     M,C
+           0142  D5              PUSH    D       
+  64   2        B1 = V; A2 = W; B3 = X; A4 = Y; B5 = Z; END P5;
+                                                 ; STATEMENT # 64
+           0143  3A3900          LDA     V
+           0146  320000          STA     B1
+                                                 ; STATEMENT # 65
+           0149  2A3A00          LHLD    W
+           014C  220700          SHLD    A2
+                                                 ; STATEMENT # 66
+           014F  3A3C00          LDA     X
+           0152  320200          STA     B3
+PL/M-80 COMPILER                                                                                                PAGE   6
+
+
+                                                 ; STATEMENT # 67
+           0155  2A3D00          LHLD    Y
+           0158  220B00          SHLD    A4
+                                                 ; STATEMENT # 68
+           015B  3A3F00          LDA     Z
+           015E  320400          STA     B5
+                                                 ; STATEMENT # 69
+           0161  C9              RET
+  70   1      MAIN: PROCEDURE PUBLIC;
+                                                 ; STATEMENT # 70
+                         ; PROC  MAIN
+  71   2        CALL P2BB(B1, B2);
+                                                 ; STATEMENT # 71
+           0162  2A0000          LHLD    B1
+           0165  4D              MOV     C,L
+           0166  2A0100          LHLD    B2
+           0169  EB              XCHG
+           016A  CD0000          CALL    P2BB
+  72   2        CALL P2AA(A1, A2);
+                                                 ; STATEMENT # 72
+           016D  2A0500          LHLD    A1
+           0170  44              MOV     B,H
+           0171  4D              MOV     C,L
+           0172  2A0700          LHLD    A2
+           0175  EB              XCHG
+           0176  CD1300          CALL    P2AA
+  73   2        CALL P2AB(A1, B2);
+                                                 ; STATEMENT # 73
+           0179  2A0500          LHLD    A1
+           017C  44              MOV     B,H
+           017D  4D              MOV     C,L
+           017E  2A0100          LHLD    B2
+           0181  EB              XCHG
+           0182  CD2A00          CALL    P2AB
+  74   2        CALL P2BA(B1, A2);
+                                                 ; STATEMENT # 74
+           0185  2A0000          LHLD    B1
+           0188  4D              MOV     C,L
+           0189  2A0700          LHLD    A2
+           018C  EB              XCHG
+           018D  CD3F00          CALL    P2BA
+  75   2        CALL P3BBB(B1, B2, B3);
+                                                 ; STATEMENT # 75
+           0190  2A0000          LHLD    B1
+           0193  E5              PUSH    H       ; 1
+           0194  2A0100          LHLD    B2
+           0197  4D              MOV     C,L
+           0198  2A0200          LHLD    B3
+           019B  EB              XCHG
+           019C  CD5400          CALL    P3BBB
+  76   2        CALL P3AAA(A1, A2, A3);
+                                                 ; STATEMENT # 76
+           019F  2A0500          LHLD    A1
+           01A2  E5              PUSH    H       ; 1
+           01A3  2A0700          LHLD    A2
+           01A6  44              MOV     B,H
+           01A7  4D              MOV     C,L
+PL/M-80 COMPILER                                                                                                PAGE   7
+
+
+           01A8  2A0900          LHLD    A3
+           01AB  EB              XCHG
+           01AC  CD7200          CALL    P3AAA
+  77   2        CALL P3BAB(B1, A2, B3);
+                                                 ; STATEMENT # 77
+           01AF  2A0000          LHLD    B1
+           01B2  E5              PUSH    H       ; 1
+           01B3  2A0700          LHLD    A2
+           01B6  44              MOV     B,H
+           01B7  4D              MOV     C,L
+           01B8  2A0200          LHLD    B3
+           01BB  EB              XCHG
+           01BC  CD9600          CALL    P3BAB
+  78   2        CALL P3ABA(A1, B2, A3);
+                                                 ; STATEMENT # 78
+           01BF  2A0500          LHLD    A1
+           01C2  E5              PUSH    H       ; 1
+           01C3  2A0100          LHLD    B2
+           01C6  4D              MOV     C,L
+           01C7  2A0900          LHLD    A3
+           01CA  EB              XCHG
+           01CB  CDB600          CALL    P3ABA
+  79   2        CALL P4(B1, A2, B3, A4);
+                                                 ; STATEMENT # 79
+           01CE  2A0000          LHLD    B1
+           01D1  E5              PUSH    H       ; 1
+           01D2  2A0700          LHLD    A2
+           01D5  E5              PUSH    H       ; 2
+           01D6  2A0200          LHLD    B3
+           01D9  4D              MOV     C,L
+           01DA  2A0B00          LHLD    A4
+           01DD  EB              XCHG
+           01DE  CDD800          CALL    P4
+  80   2        CALL P4X(A1, B2, A3, B4);
+                                                 ; STATEMENT # 80
+           01E1  2A0500          LHLD    A1
+           01E4  E5              PUSH    H       ; 1
+           01E5  2A0100          LHLD    B2
+           01E8  E5              PUSH    H       ; 2
+           01E9  2A0900          LHLD    A3
+           01EC  44              MOV     B,H
+           01ED  4D              MOV     C,L
+           01EE  2A0300          LHLD    B4
+           01F1  EB              XCHG
+           01F2  CD0301          CALL    P4X
+  81   2        CALL P5(B1, A2, B3, A4, B5);
+                                                 ; STATEMENT # 81
+           01F5  2A0000          LHLD    B1
+           01F8  E5              PUSH    H       ; 1
+           01F9  2A0700          LHLD    A2
+           01FC  E5              PUSH    H       ; 2
+           01FD  2A0200          LHLD    B3
+           0200  E5              PUSH    H       ; 3
+           0201  2A0B00          LHLD    A4
+           0204  44              MOV     B,H
+           0205  4D              MOV     C,L
+           0206  2A0400          LHLD    B5
+PL/M-80 COMPILER                                                                                                PAGE   8
+
+
+           0209  EB              XCHG
+           020A  CD2E01          CALL    P5
+  82   2        CALL P5(7, 1234H, B1+B2, A1+A2, 9);
+                                                 ; STATEMENT # 82
+           020D  0E07            MVI     C,7H
+           020F  C5              PUSH    B       ; 1
+           0210  013412          LXI     B,1234H
+           0213  C5              PUSH    B       ; 2
+           0214  3A0100          LDA     B2
+           0217  210000          LXI     H,B1
+           021A  86              ADD     M
+           021B  4F              MOV     C,A
+           021C  C5              PUSH    B       ; 3
+           021D  2A0700          LHLD    A2
+           0220  EB              XCHG
+           0221  2A0500          LHLD    A1
+           0224  19              DAD     D
+           0225  44              MOV     B,H
+           0226  4D              MOV     C,L
+           0227  1E09            MVI     E,9H
+           0229  CD2E01          CALL    P5
+  83   2      END MAIN;
+                                                 ; STATEMENT # 83
+           022C  C9              RET
+  84   1      END T2;
+
+
+
+MODULE INFORMATION:
+
+     CODE AREA SIZE     = 022DH    557D
+     VARIABLE AREA SIZE = 0040H     64D
+     MAXIMUM STACK SIZE = 0008H      8D
+     36 LINES READ
+     0 PROGRAM ERROR(S)
+
+END OF PL/M-80 COMPILATION

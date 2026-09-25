@@ -1448,6 +1448,25 @@ class CodeGenerator:
                     if loc.kind in (AUTO, PARAM)} - static.get(proc, set())
             self.proc_storage[proc] = [entry for entry in storage if entry[0] in keep]
 
+    def _mark_register_params(self) -> None:
+        """Say which procedures take their argument in A or HL.
+
+        Every call uses PL/M-80's convention (see _gen_args), except of a
+        procedure nothing outside this compile can reach: not PUBLIC or
+        EXTERNAL, not REENTRANT, with its address never taken, and with a
+        single parameter.  Such a procedure takes its argument in A (a BYTE
+        parameter) or HL (an ADDRESS one), where its body usually wants it,
+        not in C or BC, which each call would have to move it to.  Whether
+        its address is taken is known only once the whole compile has been
+        surveyed (_keep_carried_locals_static).
+        """
+        taken = self.local_storage.proc_addr_taken
+        for sym in self.symbols.global_scope.symbols.values():
+            if sym.kind == SymbolKind.PROCEDURE:
+                sym.uses_reg_param = (
+                    len(sym.params) == 1 and not sym.is_public and not sym.is_external
+                    and not sym.is_reentrant and sym.name not in taken)
+
     def _complete_call_graph(self, analysis: LocalStorage) -> None:
         """Add the calls the program's text does not name.
 
@@ -2067,12 +2086,6 @@ class CodeGenerator:
             param_type = decl_by_name.get(param) or DataType.ADDRESS
             param_types.append(param_type)
 
-        # For non-reentrant procedures with params, pass the LAST param in register
-        # Byte params in A, ADDRESS params in HL - saves a store/load pair
-        uses_reg_param = (len(params) >= 1 and
-                         not attrs.is_reentrant and
-                         not attrs.is_external)
-
         # Register in symbol table at the GLOBAL level so it's always accessible
         # This allows forward references from anywhere in the module
         # Use full_proc_name as the symbol name to avoid collisions between
@@ -2086,7 +2099,6 @@ class CodeGenerator:
             is_public=attrs.is_public,
             is_external=attrs.is_external,
             is_reentrant=attrs.is_reentrant,
-            uses_reg_param=uses_reg_param,
             interrupt_num=attrs.interrupt_num,
             asm_name=proc_asm_name,
         )
@@ -2190,6 +2202,7 @@ class CodeGenerator:
 
         # Pass 2: Build call graph and allocate shared storage for procedure locals
         self._build_call_graph(module)
+        self._mark_register_params()
         self._compute_active_together()
         self._allocate_shared_storage()
 
@@ -2386,6 +2399,7 @@ class CodeGenerator:
 
         # Build unified call graph across all modules
         self._build_call_graph_multi(modules)
+        self._mark_register_params()
         self._compute_active_together()
         self._allocate_shared_storage()
 
@@ -3482,10 +3496,19 @@ class CodeGenerator:
         param_infos: list[tuple[str, str, DataType, int]] = []  # (name, asm_name, type, size)
         use_shared_storage = not attrs.is_reentrant and full_proc_name in self.storage_labels
 
-        # For reentrant procedures, set up IX frame pointer first
-        # Stack at entry: [params...][ret_addr] <- SP
+        # For reentrant procedures, set up IX frame pointer first.  The
+        # arguments that came in BC and DE are pushed under the return
+        # address, after the ones the caller pushed, so that every argument
+        # is on the stack in order (see _gen_args):
+        # Stack then: [params...][ret_addr] <- SP
         # After PUSH IX: [params...][ret_addr][saved_IX] <- SP, IX
         if attrs.is_reentrant:
+            if params:
+                self._emit("pop", "hl")
+                self._emit("push", "bc")
+                if len(params) >= 2:
+                    self._emit("push", "de")
+                self._emit("push", "hl")
             self._emit("push", "ix")
             self._emit("ld", "ix,0")
             self._emit("add", "ix,sp")
@@ -3540,9 +3563,10 @@ class CodeGenerator:
                     self.data_segment.append(
                         AsmLine(label=asm_name, opcode="ds", operands=str(param_size))
                     )
-                    # upeepz80 drops the store of the last argument at a
-                    # procedure's entry when nothing else names its storage:
-                    # it takes a parameter to be reachable by its name only.
+                    # upeepz80 drops the store of an argument that came in A
+                    # at a procedure's entry (`P: / ld (p),a') when nothing
+                    # else names its storage: it takes a parameter to be
+                    # reachable by its name only.
                     # A static one can be reached from the address of the
                     # parameter before it (`.a + 1'), so an EQU, which costs
                     # nothing, names it once more.
@@ -3562,45 +3586,13 @@ class CodeGenerator:
                 )
                 param_infos.append((param, asm_name, param_type, param_size))
 
-        # Generate prologue code for parameters.
-        #
-        # A procedure private to this module is called with its earlier
-        # arguments already written into its own storage by the caller, and
-        # only the last one arrives in a register.  A PUBLIC procedure cannot
-        # be: a caller in another module has no way to name those slots, so it
-        # pushes every argument and pops them again.  The two conventions have
-        # to agree, so a public procedure takes all of its arguments off the
-        # stack here.  (MP/M II's SDIR is eight modules and calls a public
-        # `pdecimal(v, prec, zerosup)' across them: the callee was reading two
-        # of the three from slots nobody had written, so every number it
-        # printed was wrong or missing.)
+        # Take the arguments into the parameters' storage (see _gen_args).
         if param_infos and not attrs.is_reentrant:
-            if attrs.is_public:
-                # Pushed left to right, so the last argument is nearest the
-                # return address: parameter i sits at SP+2+2*(n-1-i).
-                n_params = len(param_infos)
-                for idx, (_, p_asm, p_type, _) in enumerate(param_infos):
-                    off = 2 + 2 * (n_params - 1 - idx)
-                    self._emit("ld", f"hl,{off}")
-                    self._emit("add", "hl,sp")
-                    if p_type == DataType.BYTE:
-                        # A BYTE argument is widened to a word when pushed.
-                        self._emit("ld", "a,(hl)")
-                        self._emit("ld", f"({p_asm}),a")
-                    else:
-                        self._emit("ld", "e,(hl)")
-                        self._emit("inc", "hl")
-                        self._emit("ld", "d,(hl)")
-                        self._emit("ex", "de,hl")
-                        self._emit("ld", f"({p_asm}),hl")
+            if sym.uses_reg_param:
+                _, p_asm, p_type, _ = param_infos[0]
+                self._emit("ld", f"({p_asm}),{'a' if p_type == DataType.BYTE else 'hl'}")
             else:
-                _, last_asm_name, last_param_type, _ = param_infos[-1]
-                if last_param_type == DataType.BYTE:
-                    # Last param came in A - store it
-                    self._emit("ld", f"({last_asm_name}),a")
-                else:
-                    # Last param came in HL - store it
-                    self._emit("ld", f"({last_asm_name}),hl")
+                self._gen_param_entry(param_infos)
 
         # Track locals offset for reentrant procedures (negative from IX)
         self._reentrant_local_offset = 0  # Will be decremented as locals are allocated
@@ -3677,6 +3669,69 @@ class CodeGenerator:
         self.current_proc_return_type = old_proc_return_type
         self._loop_words = old_loop_words
 
+    def _gen_param_entry(self, param_infos) -> None:
+        """Store the arguments PL/M-80's convention delivers (_gen_args) in
+        the parameters' storage, and take the pushed ones off the stack.
+
+        With one or two parameters, BC and DE are left as they came: DRI's
+        CP/M 1.x sources declare `MON1: PROCEDURE (F, A); ... GO TO BDOS;
+        END', which passes C and DE on to the BDOS.  A single ADDRESS, or the
+        first of two, goes by way of HL, where the body most often wants it.
+        """
+        def store(pair: str, info) -> None:
+            _, p_asm, p_type, _ = info
+            if p_type == DataType.BYTE:
+                self._emit("ld", f"a,{pair[1]}")
+                self._emit("ld", f"({p_asm}),a")
+            else:
+                self._emit("ld", f"({p_asm}),{pair}")
+
+        n = len(param_infos)
+        if n >= 2:
+            store("de", param_infos[-1])
+        if n <= 2:
+            _, p_asm, p_type, _ = param_infos[0]
+            if p_type == DataType.BYTE:
+                store("bc", param_infos[0])
+            else:
+                self._emit("ld", "h,b")
+                self._emit("ld", "l,c")
+                self._emit("ld", f"({p_asm}),hl")
+            return
+        store("bc", param_infos[-2])
+        # The rest are on the stack, under the return address, the last
+        # pushed on top.
+        self._emit("pop", "hl")                 # the return address
+        for info in reversed(param_infos[1:-2]):
+            self._emit("pop", "de")
+            store("de", info)
+        self._emit("ex", "(sp),hl")             # the first; the return address back
+        store("hl", param_infos[0])
+
+    def _emit_reentrant_exit(self, n_params: int) -> None:
+        """Leave a REENTRANT procedure: drop its frame, and the words its
+        ``n_params`` arguments took on the stack (_gen_proc_decl pushes
+        those that came in BC and DE), keeping A and HL."""
+        self._emit("ld", "sp,ix")
+        self._emit("pop", "ix")
+        if n_params == 0:
+            self._emit("ret")
+        elif n_params < 8:
+            self._emit("pop", "de")             # the return address
+            for _ in range(n_params):
+                self._emit("pop", "bc")
+            self._emit("push", "de")
+            self._emit("ret")
+        else:
+            self._emit("pop", "bc")             # the return address
+            self._emit("ex", "de,hl")
+            self._emit("ld", f"hl,{2 * n_params}")
+            self._emit("add", "hl,sp")
+            self._emit("ld", "sp,hl")
+            self._emit("ex", "de,hl")
+            self._emit("push", "bc")
+            self._emit("ret")
+
     def _gen_proc_epilogue(self, decl) -> None:
         """Generate procedure epilogue for a typed :class:`P.ProcDecl`."""
         attrs = proc_attrs(decl)
@@ -3688,12 +3743,7 @@ class CodeGenerator:
             self._emit("ei")
             self._emit("ret")
         elif attrs.is_reentrant:
-            # Restore stack pointer and frame pointer for reentrant procedures
-            # ld sp,ix restores SP to point to saved IX
-            # pop IX restores the old frame pointer
-            self._emit("ld", "sp,ix")
-            self._emit("pop", "ix")
-            self._emit("ret")
+            self._emit_reentrant_exit(len(proc_param_names(decl)))
         else:
             self._emit("ret")
 
@@ -3929,101 +3979,244 @@ class CodeGenerator:
                 sym = self.symbols.lookup(name)
             call_name = sym.asm_name if sym and sym.asm_name else name
 
-        # Optimize CP/M BDOS calls: MON1(func, arg) and MON2(func, arg)
-        # This must be checked AFTER symbol resolution but regardless of call_name status
-        if callee_name_str is not None:
-            upper_name = callee_name_str.upper()
-            if upper_name in ('MON1', 'MON2') and len(args) == 2:
-                func_arg, addr_arg = args
-                # Check if function number is a constant
-                func_num = self._get_const_byte_value(func_arg)
-
-                if func_num is not None:
-                    # Direct BDOS call: ld de,addr; ld c,func; CALL 5.
-                    # The function number is loaded LAST: C is not
-                    # callee-saved and the argument expression is free to
-                    # contain a call (including another MON1/MON2), which
-                    # would otherwise leave a different function number in C.
-                    addr_type = self._gen_expr(addr_arg)
-                    if addr_type == DataType.BYTE:
-                        # BYTE arg goes in E; BDOS ignores D for byte-only functions
-                        self._emit("ld", "e,a")
-                    else:
-                        self._emit("ex", "de,hl")  # DE = addr
-                    self._emit("ld", f"c,{self._format_number(func_num)}")
-                    self._emit("call", self._pz(0x0005))  # BDOS entry point
-                    return  # Done - no stack cleanup needed
-
-        # For non-reentrant LOCAL procedures, store args directly to parameter memory
-        # For reentrant procedures, external procedures, or indirect calls, use stack
-        use_stack = not (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
-                         and not sym.is_external and not sym.is_public)
-
-        if use_stack:
-            # Stack-based parameter passing (reentrant or indirect calls)
-            for arg in args:
-                arg_type = self._gen_expr(arg)
-                if arg_type == DataType.BYTE:
-                    self._emit("ld", "l,a")
-                    self._emit("ld", "h,0")
-                self._emit("push", "hl")
-        else:
-            self._gen_slot_args(sym, args, callee_name_str)
+        if callee_name_str is not None and self._gen_bdos_call(callee_name_str, sym, args):
+            return
 
         if callee_name_str is None or (sym is not None and sym.kind in (
                 SymbolKind.VARIABLE, SymbolKind.PARAMETER)):
             self._gen_indirect_call(callee_expr, args)
             return
 
-        # Call the procedure
-        self._emit("call", call_name)
+        self._gen_proc_call(sym, call_name, args)
 
-        # Clean up stack (caller cleanup) - only for stack-based calls
-        if use_stack and args:
-            stack_bytes = len(args) * 2
-            if stack_bytes == 2:
-                self._emit("pop", "de")  # Dummy pop
-            elif stack_bytes == 4:
-                self._emit("pop", "de")
-                self._emit("pop", "de")
-            elif stack_bytes <= 8:
-                for _ in range(len(args)):
-                    self._emit("pop", "de")
-            else:
-                # Adjust the stack pointer directly. (This loaded DE and
-                # added SP to whatever the procedure left in HL.)
-                self._emit("ld", f"hl,{stack_bytes}")
-                self._emit("add", "hl,sp")
-                self._emit("ld", "sp,hl")
+    # ---- Calls: PL/M-80's calling convention (README, Calling Convention) ----
+    #
+    # A call passes its arguments the way Intel's PL/M-80 does, so that code
+    # compiled here links with assembly written for PL/M-80 and with what
+    # PL/M-80 compiled: the last argument in DE (E for a BYTE parameter), the
+    # one before it in BC (C), a single one in BC (C), and any earlier ones
+    # pushed left to right, one word each, which the callee takes off the
+    # stack.  A BYTE result comes back in A, an ADDRESS one in HL, and nothing
+    # else survives a call but SP, IX and IY.  The one exception is a
+    # procedure no other module, no assembly and no CALL through an address
+    # can reach, with a single parameter (Symbol.uses_reg_param): its argument
+    # comes in A or HL, where its body usually wants it.
+
+    def _gen_bdos_call(self, name: str, sym, args) -> bool:
+        """``MON1(f, a)`` or ``MON2(f, a)`` with a constant function number,
+        compiled as a call of the BDOS itself: `ld de,a / ld c,f / call 5'.
+        Whether it was.
+
+        Those are the registers PL/M-80's own call of MON1 or MON2 sets,
+        and DRI's X0100.ASM defines them as `mon1 equ 5'.  The argument is
+        converted to the type of MON1's second parameter where the program
+        declares it, else to ADDRESS, as for any call: a BYTE goes to E with
+        D zero, which a function that reads DE whole (MP/M's 141, delay)
+        needs.  The function number is loaded last: the argument expression
+        may contain a call, even of MON1 or MON2 again, which would leave
+        another in C.
+        """
+        if name.upper() not in ('MON1', 'MON2') or len(args) != 2:
+            return False
+        func_num = self._get_const_byte_value(args[0])
+        if func_num is None:
+            return False
+        formal = DataType.ADDRESS
+        if sym is not None and sym.kind == SymbolKind.PROCEDURE and len(sym.param_types) == 2:
+            formal = sym.param_types[1]
+        self._arg_to_pair(args[1], formal, "de")
+        self._emit("ld", f"c,{self._format_number(func_num)}")
+        self._emit("call", self._pz(0x0005))  # BDOS entry point
+        return True
+
+    def _gen_proc_call(self, sym, call_name: str, args) -> DataType:
+        """Call procedure ``sym`` (None: one the program does not declare),
+        named ``call_name`` in the output, with ``args``; the result's type."""
+        formals = None
+        if sym is not None and sym.kind == SymbolKind.PROCEDURE:
+            formals = sym.param_types
+        if sym is not None and sym.uses_reg_param and len(args) == 1:
+            self._gen_reg_arg(args[0], formals[0])
+        else:
+            self._gen_args(args, formals)
+        self._emit("call", call_name)
+        return sym.return_type if sym and sym.return_type else DataType.ADDRESS
 
     def _gen_indirect_call(self, target, args) -> None:
         """``CALL target (args)`` where ``target`` is an ADDRESS variable (or
         member) holding a procedure's address (Programming Manual, 8.2.1).
 
-        It was `call Q', which ran the bytes of Q itself, or, for `CALL
-        s.p', a `jp (hl)' with no return address, so the procedure returned
-        to the caller's caller.  The address goes to DE and ??jpde jumps
-        there with the return address pushed.  The caller has pushed the
-        arguments, the way a PUBLIC or REENTRANT procedure takes them; the
-        last is still in HL, and is left there and its low byte in A, where
-        a procedure private to its module takes its only one.
+        The arguments are placed as for a direct call, each converted to
+        ADDRESS, which is right for either type of parameter (a BYTE one
+        reads the low half), and the address is evaluated after them, as
+        PL/M-80 does.  ??jphl jumps to it with the return address pushed.
         """
-        if len(args) > 1:
-            self._warn("a CALL through an address passes more than one argument only to a "
-                       "PUBLIC or REENTRANT procedure", self._current_location())
-        if args:
-            self._emit("push", "hl")
-        if self._gen_expr(target) == DataType.BYTE:
+        self._gen_args(args, None)
+        code = self._capture(self._gen_expr_to_hl, target)
+        self._emit_keeping(code, ("bc", "de")[:len(args)])
+        self.needs_runtime.add("jphl")
+        self._emit("call", "??jphl")
+
+    def _gen_reg_arg(self, arg, formal: DataType) -> None:
+        """The argument of a procedure that takes its single one in A (a BYTE
+        parameter) or HL (an ADDRESS one), converted to that type."""
+        if formal == DataType.BYTE:
+            self._gen_expr_to_a(arg)
+        else:
+            self._gen_expr_to_hl(arg)
+
+    def _gen_args(self, args, formals) -> None:
+        """Place ``args`` as PL/M-80 passes them: all but the last two pushed
+        left to right, the next-to-last in BC (C for a BYTE parameter) and
+        the last in DE (E); a single one in BC (C).
+
+        ``formals`` are the parameters' types, which each argument is
+        converted to; None - a procedure the program does not declare, or a
+        CALL through an address - converts every argument to ADDRESS.  The
+        arguments are evaluated strictly left to right, and the last one's
+        code keeps BC, where the one before it is, or is made to.
+        """
+        n = len(args)
+        types = list(formals or [])[:n]
+        types += [DataType.ADDRESS] * (n - len(types))
+        for arg, formal in zip(args[:n - 2], types):
+            self._push_arg(arg, formal)
+        if n == 1:
+            self._arg_to_pair(args[0], types[0], "bc")
+        elif n >= 2:
+            self._arg_to_pair(args[-2], types[-2], "bc")
+            self._emit_keeping(self._capture(self._arg_to_pair, args[-1], types[-1], "de"),
+                               ("bc",))
+
+    def _const_arg(self, arg) -> int | None:
+        """The value of ``arg`` if it is a constant a register can be
+        loaded with directly, else None."""
+        value = self._get_const_byte_value(arg)
+        if value is None and isinstance(unwrap_paren(arg), P.NumberLiteral):
+            value = number_value(unwrap_paren(arg))
+        return value
+
+    def _byte_valued(self, arg) -> bool:
+        """Whether ``arg`` is a BYTE the program computes (not a constant)."""
+        return self._get_expr_type(arg) == DataType.BYTE and self._const_arg(arg) is None
+
+    def _arg_to_pair(self, arg, formal: DataType, pair: str) -> None:
+        """``arg``, converted to ``formal``, into ``pair`` (bc or de): a BYTE
+        in its low register, the high one not defined."""
+        hi, lo = pair
+        if formal == DataType.BYTE:
+            value = self._const_arg(arg)
+            if value is not None:
+                self._emit("ld", f"{lo},{self._format_number(value & 0xFF)}")
+                return
+            self._gen_expr_to_a(arg)
+            self._emit("ld", f"{lo},a")
+            return
+        if self._byte_valued(arg):
+            self._gen_expr_to_a(arg)
+            self._emit("ld", f"{lo},a")
+            self._emit("ld", f"{hi},0")
+            return
+        code = self._capture(self._gen_expr_to_hl, arg)
+        if (len(code) == 1 and code[0].opcode == "ld" and not code[0].label
+                and code[0].operands.lower().startswith("hl,")):
+            # `ld hl,X' (a number, a label or `(label)') loads the pair itself.
+            self._emit("ld", f"{pair},{code[0].operands[3:]}")
+            return
+        self.output.extend(code)
+        if pair == "de":
+            self._emit("ex", "de,hl")
+        else:
+            self._emit("ld", "b,h")
+            self._emit("ld", "c,l")
+
+    def _push_arg(self, arg, formal: DataType) -> None:
+        """Push ``arg``, converted to ``formal``, as a word: a BYTE in the low
+        byte, the high one not defined."""
+        if formal == DataType.BYTE:
+            value = self._const_arg(arg)
+            if value is not None:
+                self._emit("ld", f"hl,{self._format_number(value & 0xFF)}")
+            else:
+                self._gen_expr_to_a(arg)
+                self._emit("ld", "l,a")
+        elif self._byte_valued(arg):
+            self._gen_expr_to_a(arg)
             self._emit("ld", "l,a")
             self._emit("ld", "h,0")
-        self._emit("ex", "de,hl")
-        if args:
-            self._emit("pop", "hl")
-            self._emit("ld", "a,l")
-        self.needs_runtime.add("jpde")
-        self._emit("call", "??jpde")
-        for _ in args:
-            self._emit("pop", "de")
+        else:
+            self._gen_expr_to_hl(arg)
+        self._emit("push", "hl")
+
+    def _capture(self, fn, *args) -> list[AsmLine]:
+        """The code ``fn(*args)`` generates, kept aside instead of emitted.
+
+        It is only ever emitted after what is already there: an index into
+        the output (a REENTRANT procedure's frame) stays right."""
+        saved, self.output = self.output, []
+        try:
+            fn(*args)
+            return self.output
+        finally:
+            self.output = saved
+
+    def _emit_keeping(self, code: list[AsmLine], pairs) -> None:
+        """Emit ``code``, keeping register ``pairs`` (bc, de) as they are if
+        it may write any of their registers."""
+        regs = {r for pair in pairs for r in pair}
+        if not self._writes(code, regs):
+            self.output.extend(code)
+            return
+        for pair in pairs:
+            self._emit("push", pair)
+        self.output.extend(code)
+        for pair in reversed(pairs):
+            self._emit("pop", pair)
+
+    # What an instruction of an argument's code can write of B, C, D and E.
+    # These may write any of them:
+    _WRITES_ANY = frozenset((
+        "call", "rst", "djnz", "exx", "ldi", "ldir", "ldd", "lddr", "cpi", "cpir",
+        "cpd", "cpdr", "ini", "inir", "ind", "indr", "outi", "otir", "outd", "otdr"))
+    # These write the register their first operand names (`ld c,a', `pop bc'),
+    # with the number of operands each has:
+    _WRITES_FIRST = {"ld": 2, "in": 2, "pop": 1, "inc": 1, "dec": 1, "rl": 1, "rr": 1,
+                     "rlc": 1, "rrc": 1, "sla": 1, "sra": 1, "sll": 1, "srl": 1}
+    # These write none of them.  An instruction on none of the lists is taken
+    # to write all four.
+    _WRITES_NONE = frozenset((
+        "add", "adc", "sub", "sbc", "and", "or", "xor", "cp", "neg", "cpl", "ccf",
+        "scf", "daa", "rla", "rra", "rlca", "rrca", "rld", "rrd", "bit", "nop",
+        "halt", "di", "ei", "im", "jp", "jr", "ret", "reti", "retn", "out", "push"))
+
+    @classmethod
+    def _writes(cls, code: list[AsmLine], regs: set[str]) -> bool:
+        """Whether a line of ``code`` may write one of ``regs`` (of b, c, d
+        and e).  A condition is not a register: `jp c,x' writes no C."""
+        if not regs:
+            return False
+        for line in code:
+            op = line.opcode.lower()
+            if not op or op in cls._WRITES_NONE:
+                continue
+            if op in cls._WRITES_ANY:
+                return True
+            operands = [o.strip().lower() for o in line.operands.split(",")] \
+                if line.operands else []
+            if op == "ex" and operands in (["af", "af'"], ["(sp)", "hl"],
+                                           ["(sp)", "ix"], ["(sp)", "iy"]):
+                continue
+            if op == "ex" and operands == ["de", "hl"]:
+                dest = "de"
+            elif op in ("set", "res") and len(operands) == 2:
+                dest = operands[1]
+            elif op in cls._WRITES_FIRST and len(operands) == cls._WRITES_FIRST[op]:
+                dest = operands[0]
+            else:
+                return True             # not known
+            if set(dest if dest in ("bc", "de") else (dest,)) & regs:
+                return True
+        return False
 
     def _param_slot(self, sym, param_name: str, callee_name: str | None) -> str:
         """The label of parameter ``param_name`` of procedure ``sym``."""
@@ -4035,97 +4228,6 @@ class CodeGenerator:
         if proc_base.startswith('@'):
             proc_base = proc_base[1:]
         return f"@{proc_base}${self._mangle_name(param_name)}"
-
-    def _may_reenter(self, expr, callee: str) -> bool:
-        """Whether evaluating ``expr`` may call procedure ``callee`` (its full
-        name): a call of it, of a procedure that reaches it, or through an
-        address."""
-        stack = [expr]
-        while stack:
-            e = unwrap_paren(stack.pop())
-            target = None
-            if isinstance(e, (P.Call, P.CallNoArgs)):
-                c = unwrap_paren(e.callee)
-                if isinstance(c, P.Identifier):
-                    target = ident_text(c.name)
-                elif not isinstance(c, P.MemberAccess):   # `s.m(i)' is an element
-                    return True             # an indirect call
-            elif isinstance(e, P.Identifier):
-                target = ident_text(e.name)
-            elif isinstance(e, P.LocationOf) and isinstance(unwrap_paren(e.operand), P.Identifier):
-                continue                    # `.f' names f, it does not call it
-            if target is not None:
-                g = self._resolve_proc_name(target, self.current_proc or "")
-                if g is not None and (g == callee or callee in self._get_reachable(g, set())):
-                    return True
-            if isinstance(e, (list, tuple)):
-                stack.extend(e)
-                continue
-            fields = getattr(e, "__dataclass_fields__", None)
-            if fields:
-                stack.extend(getattr(e, f, None) for f in fields if f != "pos")
-        return False
-
-    def _gen_slot_args(self, sym, args, callee_name: str | None) -> None:
-        """Pass ``args`` to a non-reentrant local procedure ``sym``: each is
-        stored in the procedure's own slot for its parameter, converted to
-        the parameter's type (8.2), except a last one passed in A or HL.
-
-        An argument whose evaluation calls the procedure again -- ``f(1,
-        f(2, 3))'' -- would store over the slots the arguments before it
-        already filled, so those are kept on the stack until it has run.
-        DRI's PL/M-80 passes them on the stack and lets the callee store
-        them, which comes to the same thing.
-        """
-        last_param_idx = len(args) - 1
-        uses_reg = sym.uses_reg_param and len(args) > 0
-        reenter = max((j for j in range(1, len(args))
-                       if self._may_reenter(args[j], sym.name)), default=0)
-        stashed: list[tuple[str, DataType]] = []
-
-        for i, arg in enumerate(args):
-            if i >= len(sym.params):
-                continue
-            param_name = sym.params[i]
-            param_type = sym.param_types[i] if i < len(sym.param_types) else DataType.ADDRESS
-
-            # Evaluate into A for a BYTE parameter, HL for an ADDRESS one.
-            if param_type == DataType.BYTE:
-                self._gen_expr_to_a(arg)
-            else:
-                self._gen_expr_to_hl(arg)
-
-            if i == last_param_idx and uses_reg:
-                continue                    # passed in the register
-            slot = self._param_slot(sym, param_name, callee_name)
-            if i < reenter:
-                self._emit("push", "af" if param_type == DataType.BYTE else "hl")
-                stashed.append((slot, param_type))
-            elif param_type == DataType.BYTE:
-                self._emit("ld", f"({slot}),a")
-            else:
-                # A BYTE argument is widened: storing A alone left the high
-                # byte of an ADDRESS parameter as the last call had left it.
-                self._emit("ld", f"({slot}),hl")
-
-        if stashed:
-            reg_type = sym.param_types[last_param_idx] if (
-                uses_reg and last_param_idx < len(sym.param_types)) else None
-            if reg_type == DataType.BYTE:
-                self._emit("ld", "e,a")
-            elif reg_type is not None:
-                self._emit("ex", "de,hl")
-            for slot, t in reversed(stashed):
-                if t == DataType.BYTE:
-                    self._emit("pop", "af")
-                    self._emit("ld", f"({slot}),a")
-                else:
-                    self._emit("pop", "hl")
-                    self._emit("ld", f"({slot}),hl")
-            if reg_type == DataType.BYTE:
-                self._emit("ld", "a,e")
-            elif reg_type is not None:
-                self._emit("ex", "de,hl")
 
     def _gen_return(self, stmt) -> None:
         """Generate code for a RETURN statement.
@@ -4186,10 +4288,7 @@ class CodeGenerator:
             self._emit("ei")
             self._emit("ret")
         elif proc_attrs_view is not None and proc_attrs_view.is_reentrant:
-            # Reentrant procedure return - restore frame pointer
-            self._emit("ld", "sp,ix")
-            self._emit("pop", "ix")
-            self._emit("ret")
+            self._emit_reentrant_exit(len(proc_param_names(self.current_proc_decl)))
         else:
             self._emit("ret")
 
@@ -7511,48 +7610,14 @@ class CodeGenerator:
             sym = self._lookup_symbol(name)
             call_name = sym.asm_name if sym and sym.asm_name else name
 
-            # CP/M BDOS optimisation: MON1/MON2(func, arg).
-            if name.upper() in ('MON1', 'MON2') and len(args) == 2:
-                func_arg, addr_arg = args
-                func_num = self._get_const_byte_value(func_arg)
-                if func_num is not None and func_num <= 255:
-                    # Function number loaded last; see the statement-call
-                    # site for why C cannot be parked across the argument.
-                    addr_type = self._gen_expr(addr_arg)
-                    if addr_type == DataType.BYTE:
-                        self._emit("ld", "e,a")
-                    else:
-                        self._emit("ex", "de,hl")
-                    self._emit("ld", f"c,{self._format_number(func_num)}")
-                    self._emit("call", self._pz(0x0005))
-                    return DataType.BYTE if name.upper() == 'MON2' else DataType.ADDRESS
-
-        use_stack = True
-        if (sym and sym.kind == SymbolKind.PROCEDURE and not sym.is_reentrant
-                and not sym.is_external and not sym.is_public):
-            use_stack = False
-
-        if use_stack:
-            for arg in args:
-                arg_type = self._gen_expr(arg)
-                if arg_type == DataType.BYTE:
-                    self._emit("ld", "l,a")
-                    self._emit("ld", "h,0")
-                self._emit("push", "hl")
-        else:
-            self._gen_slot_args(sym, args, name)
+            if self._gen_bdos_call(name, sym, args):
+                return DataType.BYTE if name.upper() == 'MON2' else DataType.ADDRESS
 
         if not isinstance(callee, P.Identifier) or (sym is not None and sym.kind in (
                 SymbolKind.VARIABLE, SymbolKind.PARAMETER)):
             self._gen_indirect_call(callee, args)
             return DataType.ADDRESS
-        self._emit("call", call_name)
-
-        if use_stack and args:
-            for _ in args:
-                self._emit("pop", "de")
-
-        return sym.return_type if sym and sym.return_type else DataType.ADDRESS
+        return self._gen_proc_call(sym, call_name, args)
 
     def _declared(self, name: str) -> bool:
         """Whether ``name`` here is something the program declares, which

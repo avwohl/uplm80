@@ -208,6 +208,9 @@ end t;
     "if ({e}) = 3 then call pb(1);",
     "if ({e}) < y then call pb(1);",
     "call pb({e});",
+    "call pb2({e}, y);",
+    "call pb2(y, {e});",
+    "call pb3({e}, y, y);",
     "buf({e}) = 0;",
     "if {e} then call pb(1);",
     "y = ({e}) + y;",
@@ -215,12 +218,15 @@ end t;
 def test_a_byte_remainder_costs_nothing_where_its_width_does_not_show(use):
     """`x MOD 8' is an ADDRESS, so it becomes DOUBLE(x AND 7); where only its
     low byte is read, or it is compared with a BYTE, that must compile to
-    exactly what `x AND 7' does."""
+    exactly what `x AND 7' does: among others as a BYTE argument, in C, in E
+    or pushed."""
     def compile_with(expr):
         asm = _asm(f"""
 t: do;
 declare (x, y) byte, buf(16) byte;
 pb: procedure (c) external; declare c byte; end pb;
+pb2: procedure (c, d) external; declare (c, d) byte; end pb2;
+pb3: procedure (c, d, e) external; declare (c, d, e) byte; end pb3;
 {use.format(e=expr)}
 end t;
 """, 2)

@@ -1,0 +1,128 @@
+; T2.PLM's MAIN as Intel's PL/M-80 V3.1 compiled it: T2.LST, statements 70
+; to 83, transcribed instruction for instruction in 8080 mnemonics.  Only
+; the addresses are symbolic.  A BYTE is loaded with LHLD, as PL/M-80
+; loads it, so the high byte of a BYTE argument is whatever follows it.
+; The procedures and the module's variables B1 ... A5 are EXTRN here: the
+; test's PL/M module defines them.
+
+	PUBLIC	MAIN
+	EXTRN	P2BB,P2AA,P2AB,P2BA,P3BBB,P3AAA,P3BAB,P3ABA,P4,P4X,P5
+	EXTRN	B1,B2,B3,B4,B5,A1,A2,A3,A4,A5
+	CSEG
+
+MAIN:
+; CALL P2BB(B1, B2);
+	LHLD	B1
+	MOV	C,L
+	LHLD	B2
+	XCHG
+	CALL	P2BB
+; CALL P2AA(A1, A2);
+	LHLD	A1
+	MOV	B,H
+	MOV	C,L
+	LHLD	A2
+	XCHG
+	CALL	P2AA
+; CALL P2AB(A1, B2);
+	LHLD	A1
+	MOV	B,H
+	MOV	C,L
+	LHLD	B2
+	XCHG
+	CALL	P2AB
+; CALL P2BA(B1, A2);
+	LHLD	B1
+	MOV	C,L
+	LHLD	A2
+	XCHG
+	CALL	P2BA
+; CALL P3BBB(B1, B2, B3);
+	LHLD	B1
+	PUSH	H
+	LHLD	B2
+	MOV	C,L
+	LHLD	B3
+	XCHG
+	CALL	P3BBB
+; CALL P3AAA(A1, A2, A3);
+	LHLD	A1
+	PUSH	H
+	LHLD	A2
+	MOV	B,H
+	MOV	C,L
+	LHLD	A3
+	XCHG
+	CALL	P3AAA
+; CALL P3BAB(B1, A2, B3);
+	LHLD	B1
+	PUSH	H
+	LHLD	A2
+	MOV	B,H
+	MOV	C,L
+	LHLD	B3
+	XCHG
+	CALL	P3BAB
+; CALL P3ABA(A1, B2, A3);
+	LHLD	A1
+	PUSH	H
+	LHLD	B2
+	MOV	C,L
+	LHLD	A3
+	XCHG
+	CALL	P3ABA
+; CALL P4(B1, A2, B3, A4);
+	LHLD	B1
+	PUSH	H
+	LHLD	A2
+	PUSH	H
+	LHLD	B3
+	MOV	C,L
+	LHLD	A4
+	XCHG
+	CALL	P4
+; CALL P4X(A1, B2, A3, B4);
+	LHLD	A1
+	PUSH	H
+	LHLD	B2
+	PUSH	H
+	LHLD	A3
+	MOV	B,H
+	MOV	C,L
+	LHLD	B4
+	XCHG
+	CALL	P4X
+; CALL P5(B1, A2, B3, A4, B5);
+	LHLD	B1
+	PUSH	H
+	LHLD	A2
+	PUSH	H
+	LHLD	B3
+	PUSH	H
+	LHLD	A4
+	MOV	B,H
+	MOV	C,L
+	LHLD	B5
+	XCHG
+	CALL	P5
+; CALL P5(7, 1234H, B1+B2, A1+A2, 9);
+	MVI	C,7H
+	PUSH	B
+	LXI	B,1234H
+	PUSH	B
+	LDA	B2
+	LXI	H,B1
+	ADD	M
+	MOV	C,A
+	PUSH	B
+	LHLD	A2
+	XCHG
+	LHLD	A1
+	DAD	D
+	MOV	B,H
+	MOV	C,L
+	MVI	E,9H
+	CALL	P5
+; END MAIN;
+	RET
+	END

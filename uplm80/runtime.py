@@ -180,12 +180,12 @@ RUNTIME_SUBDE = """\
 """
 
 # Call through an address: the caller's CALL pushes the return address,
-# and this goes on to DE.  (The Z80 has no CALL (HL).)
-RUNTIME_JPDE = """\
-??jpde:
-	; Jump to the address in DE, from a CALL
-	push	de
-	ret
+# and this goes on to HL.  (The Z80 has no CALL (HL).)  The arguments are
+# in BC, DE and on the stack, as for any call.
+RUNTIME_JPHL = """\
+??jphl:
+	; Jump to the address in HL, from a CALL
+	jp	(hl)
 """
 
 # INPUT and OUTPUT of a port that is not a constant: the Z80's IN and OUT
@@ -238,7 +238,7 @@ def get_runtime_library(needed: set[str] | None = None) -> str:
         "mul8": RUNTIME_MUL8,
         "move": RUNTIME_MOVE,
         "subde": RUNTIME_SUBDE,
-        "jpde": RUNTIME_JPDE,
+        "jphl": RUNTIME_JPHL,
         "inp": RUNTIME_INP,
         "outp": RUNTIME_OUTP,
     }
