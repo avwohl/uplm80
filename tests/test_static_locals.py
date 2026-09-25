@@ -453,6 +453,99 @@ def test_the_static_locals_keep_declaration_order():
         assert re.findall(r"^([@?\w$]+):", block, re.MULTILINE) == labels[:-1], (opt, asm)
 
 
+# ---- parameters -------------------------------------------------------------
+
+PARAM_KEPT = """
+declare keep address, kept based keep byte;
+sv: procedure (v);
+    declare v byte;
+    keep = .v;
+end sv;
+call sv('P');
+call other;
+call mon1(2, kept);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_pointer_to_a_parameter_kept_after_the_call(opt):
+    """PL/M-80 allocates a parameter statically, like any other local, so
+    `.v' still points at 'P' after `sv' has returned; in ??AUTO, `other'
+    wrote 0FFH over it."""
+    assert _run(PARAM_KEPT, opt) == ".P"
+
+
+PARAM_RUN_ON = """
+sq: procedure (v) byte;
+    declare v byte;
+    declare nxt byte;
+    declare pp address, c based pp byte;
+    pp = .v + 1;
+    c = 'Q';
+    return nxt;
+end sq;
+call mon1(2, sq(0));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_pointer_run_on_from_a_parameter_reaches_the_first_local(opt):
+    """The parameters come first, then the locals: `.v + 1' is `nxt'.  `v'
+    stayed in ??AUTO while `nxt', read before it is assigned, was static,
+    and the store went into `pp'."""
+    assert _run(PARAM_RUN_ON, opt) == "Q"
+
+
+NESTED_PARAM = """
+outer: procedure (w) byte;
+    declare w byte;
+    inner: procedure (v) byte;
+        declare v byte;
+        declare pp address, c based pp byte;
+        pp = .v;
+        return c;
+    end inner;
+    return inner(w + 1);
+end outer;
+pub: procedure (v) byte public;
+    declare v byte;
+    declare pp address, c based pp byte;
+    pp = .v;
+    return c + 1;
+end pub;
+call mon1(2, outer('M'));
+call mon1(2, pub('N'));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_static_parameter_of_a_nested_and_of_a_public_procedure(opt):
+    """A static parameter is where the caller stores it: the nested
+    procedure's label has the procedures it is in, and a PUBLIC one takes
+    its arguments off the stack into it."""
+    assert _run(NESTED_PARAM, opt) == "NO"
+    asm = _asm(NESTED_PARAM, opt)
+    assert re.search(r"^@OUTER\$INNER\$V:\s+ds\s+1$", asm, re.MULTILINE), asm
+    assert "PUB$V" in _static(asm), asm
+
+
+def test_a_procedure_whose_address_is_taken_keeps_the_parameters_it_names():
+    """`show' can be called through its address after `p' has returned,
+    and reads `v', which is `p''s parameter."""
+    asm = _asm("""
+p: procedure (v) address;
+    declare v byte;
+    show: procedure; call mon1(2, v); end show;
+    return .show;
+end p;
+declare f address;
+f = p('A');
+call other;
+call f;
+""")
+    assert _static(asm) == {"P$V"}, asm
+
+
 # ---- the memory saving, where it is safe -----------------------------------
 
 def test_locals_assigned_before_they_are_read_still_share_auto():

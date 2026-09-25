@@ -46,8 +46,12 @@ been assigned through constant subscripts, and a read of one element through
 constant subscripts needs only that element.  Any other read needs the
 whole.  A store through a variable subscript assigns nothing.
 
-Parameters are written by every call, so they always share ``??AUTO``.
-Anything the analysis cannot follow leaves the local in static storage.
+Parameters are written by every call, so they share ``??AUTO`` unless
+their address is taken - a parameter is as static as any other local, and a
+pointer to it may be kept after the call - or a procedure whose address is
+taken names one.  They come first in the order that is kept, as the
+PROCEDURE statement lists them.  Anything the analysis cannot follow leaves
+the local in static storage.
 """
 
 from __future__ import annotations
@@ -110,8 +114,12 @@ def _meet(a: State, b: State) -> State:
 # What a Local is.  Only an AUTO local may share ??AUTO; a FIXED one - with
 # INITIAL, or PUBLIC - is static whatever the analysis finds, but it has its
 # place in the procedure's storage, next to the locals declared around it.
+# A PARAM is in ??AUTO unless its address is taken or a procedure whose
+# address is taken names it; the parameters come first, in the order the
+# PROCEDURE statement lists them.
 AUTO = "auto"
 FIXED = "fixed"
+PARAM = "param"
 
 
 @dataclass
@@ -121,7 +129,7 @@ class Local:  # pylint: disable=too-many-instance-attributes
 
     name: str
     order: int                    # position among the procedure's locals
-    group: int                    # which declaration it is in
+    group: int                    # which declaration it is in; -1 for a parameter
     dim: Optional[int]            # array dimension, None for a scalar
     members: Optional[dict]       # structure member -> its dimension or None
     kind: str = AUTO
@@ -361,7 +369,7 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
                 self.label_addr_taken.update((full, n) for n in decl_item_names(d))
         info.frame = _frame(decls, full, info.locals)
         for p in params:
-            info.frame.setdefault(p, ("var", full, None))
+            info.frame.setdefault(p, ("local" if p in info.locals else "var", full, None))
         info.labels = _labels(stmts)
         self.procs[full] = info
         self._scan_items(items, full, chain + [(full, info.frame)])
@@ -385,16 +393,16 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
                 if info.locals}
 
     def _close(self, full: str, info: ProcInfo) -> set[str]:
-        """The AUTO locals of ``info`` that are static, once declaration
-        order is kept: after a local whose address is taken, or which is
-        subscripted outside its bounds, everything is static; a factored
+        """The parameters and AUTO locals of ``info`` that are static, once
+        declaration order is kept: after a local whose address is taken, or
+        which is subscripted outside its bounds, everything is static; a factored
         declaration is all static or not at all (6.2.4); and from the first
         array or structure subscripted by a variable on, the locals are all
         static or all in ??AUTO - so that an overrun reaches the local
         declared after it, as in DRI's layout."""
         locs = sorted(info.locals.values(), key=lambda loc: loc.order)
         static = {loc.name for loc in locs
-                  if loc.kind != AUTO or (full, loc.name) in self.reasons}
+                  if loc.kind == FIXED or (full, loc.name) in self.reasons}
         escaped = [loc for loc in locs if (full, loc.name) in self.escapes]
         runs = [loc for loc in locs if (full, loc.name) in self.runs]
 
@@ -424,7 +432,7 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
                     changed |= take([loc.name for loc in tail],
                                     f"{runs[0].name}, subscripted by a variable, "
                                     "runs on into a static local")
-        return {n for n in static if info.locals[n].kind == AUTO}
+        return {n for n in static if info.locals[n].kind != FIXED}
 
     def make_static(self, owner: str, name: str, why: str) -> None:
         """Keep local ``name`` of ``owner`` out of ``??AUTO``."""
@@ -471,8 +479,12 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
 
 
 def _layout(decls, params: list[str]) -> dict[str, Local]:
-    """A procedure's locals with storage of their own, in declaration order."""
+    """A procedure's parameters and its locals with storage of their own,
+    in that order: the parameters as the PROCEDURE statement lists them,
+    the locals as they are declared."""
     out: dict[str, Local] = {}
+    for p in params:
+        out[p] = Local(p, len(out), -1, None, None, PARAM)
     for group, d in enumerate(decls):
         if not isinstance(d, P.DeclItem):
             continue

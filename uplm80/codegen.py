@@ -53,7 +53,7 @@ from .ast_view import (
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
-from .local_storage import AUTO, LocalStorage
+from .local_storage import AUTO, PARAM, LocalStorage
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -1457,9 +1457,8 @@ class CodeGenerator:
             if info is None or proc_attrs(info.decl).is_reentrant:
                 self.proc_storage[proc] = []
                 continue
-            keep = set(proc_param_names(info.decl))
-            keep |= {n for n, loc in info.locals.items()
-                     if loc.kind == AUTO} - static.get(proc, set())
+            keep = {n for n, loc in info.locals.items()
+                    if loc.kind in (AUTO, PARAM)} - static.get(proc, set())
             self.proc_storage[proc] = [entry for entry in storage if entry[0] in keep]
 
     def _note_main_arg_overlaps(self, stmts) -> None:
@@ -3471,8 +3470,10 @@ class CodeGenerator:
                 if use_shared_storage and param in self.storage_labels.get(full_proc_name, {}):
                     asm_name = self.storage_labels[full_proc_name][param]
                 else:
-                    # Fallback: individual storage
-                    asm_name = f"@{name}${self._mangle_name(param)}"
+                    # Static: the label a caller stores the argument at.
+                    # (`@name$param' left out the procedures a nested one
+                    # is in, which the caller's name for it has.)
+                    asm_name = self._param_slot(sym, param, name)
                     # Allocate individual storage in data segment
                     start = len(self.data_segment)
                     self.data_segment.append(
