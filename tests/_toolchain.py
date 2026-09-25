@@ -66,7 +66,12 @@ def run_asm(asm: str, extra_asm: str | None = None,
     somewhere to define what the program declares EXTERNAL.  Returns the
     emulator's CompletedProcess (text); raises ToolchainError, naming the
     step, if one fails or the program runs longer than `timeout' seconds.
+    The test skips when um80, ul80 or cpmemu is not installed.
     """
+    reason = tools_missing()
+    if reason:
+        pytest.skip(reason)
+
     def step(*argv: str) -> None:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=False)
         if r.returncode:
