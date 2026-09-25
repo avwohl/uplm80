@@ -7,15 +7,18 @@ declares the name again (Programming Manual 9800268B, chapter 9); every DO
 block is a block, and so is every procedure.  Code generation names what it
 emits the simple way: a module-level name as it is, a procedure's own
 names and labels as ``@proc$name``, a DO block's variables as
-``@proc$Bn$name``, a LITERALLY as an EQU of its name.  That is one name per
-declaration only as long as no two declarations it names alike are in
-scope at once, and PL/M-80 lets them be:
+``@proc$Bn$name``, a LITERALLY as an EQU of its name; and it finds a name
+by looking it up as a procedure nested in each enclosing procedure, then
+through its scopes, which hold everything but procedures.  That gives one
+name, and the right one, per declaration only as long as no two
+declarations it treats alike are in scope at once, and PL/M-80 lets them
+be:
 
 * a label in each of two DO blocks of a procedure (both ``@proc$L``), or
   of the main program (both ``L``);
-* a procedure declared in each of two DO blocks of one procedure;
-* a LITERALLY in each of two procedures (two EQUs of one name), or one
-  named like a variable somewhere else;
+* a procedure declared in each of two DO blocks of one procedure (both
+  ``P$Q``), or in a DO block, named like a variable declared elsewhere;
+* a LITERALLY in each of two procedures (two EQUs of one name);
 * in a multi-file compile, a private name in each of two modules, which
   the modules' separate name spaces keep apart when they are compiled
   one at a time.
@@ -26,10 +29,12 @@ with another - ``L`` to ``L?2``; no PL/M-80 identifier contains a ``?``,
 so a new name cannot meet one the program has - and qualifies, in a
 multi-file compile, each module's private module-level names with the
 module's own (``LIB?HELPER``).  A program in which no two declarations
-meet is left exactly as it was.
+meet is left exactly as it was.  It also checks every GOTO against the
+rules of 9.3, tells code generation the label each one jumps to, and
+rejects a name declared twice in one block.
 
-It also checks every GOTO against the rules of 9.3, and tells code
-generation the label each one jumps to.
+:func:`data_name` and :func:`fix_symbols` keep names away from what um80
+reads as a register, a condition or an operator.
 """
 
 from __future__ import annotations
@@ -675,7 +680,11 @@ def resolve_names(modules: list, multi: bool = False) -> None:
     confuse, and check the GOTOs (see the module docstring).  ``multi``:
     the modules are separate modules compiled together into one assembly
     (a multi-file compile), whose private names are qualified per module.
-    Raises CodeGenError for a GOTO PL/M-80 does not allow."""
+    Raises CodeGenError for what PL/M-80 does not allow: a GOTO out of a
+    procedure other than to the main program's outer level, into a block
+    or to what is not a label; a name declared twice in one block; and,
+    in a multi-file compile, a second main program module or another
+    module's private name."""
     r = _Resolver()
     for i, m in enumerate(modules):
         r.add_module(m, i)
