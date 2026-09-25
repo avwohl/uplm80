@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## Unreleased
+## 0.3.7 — 2026-09-25
 
 Two sets of fixes, each checked against what Digital Research's own PL/M-80
 does, and a program layout that is Intel's.
