@@ -764,8 +764,6 @@ class CodeGenerator:
         # Call graph for parameter sharing optimization
         self.call_graph: dict[str, set[str]] = {}  # proc -> set of procs it calls
         self._reset_proc_facts()
-        # callee -> procedures called while evaluating that callee's arguments
-        self.arg_overlaps: dict[str, set[str]] = {}
         self.can_be_active_together: dict[str, set[str]] = {}  # proc -> procs that can be on stack with it
         self.param_slots: dict[str, int] = {}  # param_key -> slot number
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
@@ -1185,12 +1183,8 @@ class CodeGenerator:
 
     def _callees_of(self, stmts) -> set[str]:
         """Every procedure the statements call, directly or through another."""
-        saved, self.arg_overlaps = self.arg_overlaps, {}
         calls: set[str] = set()
-        try:
-            self._find_calls_in_stmts(stmts, self.current_proc or "", calls)
-        finally:
-            self.arg_overlaps = saved
+        self._find_calls_in_stmts(stmts, self.current_proc or "", calls)
         work = list(calls)
         while work:
             for callee in self.call_graph.get(work.pop(), ()):
@@ -1389,8 +1383,6 @@ class CodeGenerator:
         """Build call graph by analyzing all procedure bodies."""
         self.call_graph = {}
         self._reset_proc_facts()
-        # callee -> procedures called while evaluating that callee's arguments
-        self.arg_overlaps: dict[str, set[str]] = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}  # proc -> [(var_name, size, type)]
 
         shape = module_shape(module)
@@ -1411,7 +1403,6 @@ class CodeGenerator:
             attrs = proc_attrs(decl)
             if not attrs.is_external:
                 self._analyze_proc_calls(decl, None)
-        self._note_main_arg_overlaps(shape.stmts)
         self._keep_carried_locals_static([list(shape.decls) + list(shape.stmts)])
 
     def _keep_carried_locals_static(self, modules: list[list]) -> None:
@@ -1497,16 +1488,6 @@ class CodeGenerator:
         the BDOS itself, not of the procedure (see _gen_call_stmt)."""
         return (name.upper() in ("MON1", "MON2") and len(args) == 2
                 and self._get_const_byte_value(args[0]) is not None)
-
-    def _note_main_arg_overlaps(self, stmts) -> None:
-        """Record the argument overlaps of the calls in the main program.
-
-        The main program is not a procedure, so _analyze_proc_calls never
-        sees its statements; but a call there fills its callee's slots just
-        as a call in a procedure does, and `CALL p2(5, g(1, 2))' at module
-        level put g's frame over p2's first argument (see _note_arg_overlap).
-        """
-        self._find_calls_in_stmts(list(stmts), "", set())
 
     def _collect_proc_names(self, decls: list, parent_proc: str | None, all_procs: set[str]) -> None:
         """Recursively collect all procedure names."""
@@ -1642,20 +1623,6 @@ class CodeGenerator:
         for stmt in stmts:
             self._find_calls_in_stmt(stmt, current_proc, calls)
 
-    def _note_arg_overlap(self, callee: str | None, arg_calls: set[str]) -> None:
-        """Record that ``callee``'s frame is live while ``arg_calls`` run.
-
-        A non-reentrant local procedure takes its arguments in its own shared
-        slots, and the caller writes them there one at a time, so the callee's
-        frame holds live data from the first store - before the call, and
-        therefore while every later argument is still being evaluated.  If one
-        of those arguments calls a procedure whose frame is overlaid on this
-        one's, it lands on an argument already stored.
-        """
-        if not callee or not arg_calls:
-            return
-        self.arg_overlaps.setdefault(callee, set()).update(arg_calls)
-
     def _find_calls_in_stmt(self, stmt, current_proc: str, calls: set[str]) -> None:
         """Find procedure calls in a typed statement."""
         if isinstance(stmt, P.CallStmt):
@@ -1676,13 +1643,9 @@ class CodeGenerator:
                 if callee:
                     calls.add(callee)
             else:
-                callee = None
                 self._find_calls_in_expr(callee_expr, current_proc, calls)
-            arg_calls: set[str] = set()
             for arg in args:
-                self._find_calls_in_expr(arg, current_proc, arg_calls)
-            self._note_arg_overlap(callee, arg_calls)
-            calls.update(arg_calls)
+                self._find_calls_in_expr(arg, current_proc, calls)
         elif isinstance(stmt, P.AssignStmt):
             for target in stmt.targets:
                 self._find_calls_in_expr(target, current_proc, calls)
@@ -1728,13 +1691,9 @@ class CodeGenerator:
                 if callee:
                     calls.add(callee)
             else:
-                callee = None
                 self._find_calls_in_expr(expr.callee, current_proc, calls)
-            arg_calls: set[str] = set()
             for arg in expr.args:
-                self._find_calls_in_expr(arg, current_proc, arg_calls)
-            self._note_arg_overlap(callee, arg_calls)
-            calls.update(arg_calls)
+                self._find_calls_in_expr(arg, current_proc, calls)
         elif isinstance(expr, P.CallNoArgs):
             if isinstance(expr.callee, P.Identifier):
                 callee = self._resolve_proc_name(ident_text(expr.callee.name), current_proc)
@@ -1801,21 +1760,6 @@ class CodeGenerator:
             # Add this proc to all procs it can reach
             for callee in reachable[proc]:
                 self.can_be_active_together[callee].add(proc)
-
-        # A callee's frame is live from the moment the caller stores its first
-        # argument, which is before the call and so before the later arguments
-        # have even been evaluated.  Anything reached while evaluating them is
-        # therefore active at the same time as the callee.
-        for callee, during in self.arg_overlaps.items():
-            if callee not in self.can_be_active_together:
-                continue
-            live = set(during)
-            for g in list(during):
-                live.update(reachable.get(g, set()))
-            for g in live:
-                if g in self.can_be_active_together:
-                    self.can_be_active_together[callee].add(g)
-                    self.can_be_active_together[g].add(callee)
 
         # An INTERRUPT procedure runs when the interrupt comes, whatever is
         # active then, and so does everything it calls (8.1.7): none of
@@ -2548,7 +2492,6 @@ class CodeGenerator:
         """Build call graph by analyzing all procedures across multiple modules."""
         self.call_graph = {}
         self._reset_proc_facts()
-        self.arg_overlaps = {}
         self.proc_storage: dict[str, list[tuple[str, int, DataType]]] = {}
 
         shapes = [module_shape(m) for m in modules]
@@ -2570,8 +2513,6 @@ class CodeGenerator:
             attrs = proc_attrs(decl)
             if not attrs.is_external:
                 self._analyze_proc_calls(decl, None)
-        for shape in shapes:
-            self._note_main_arg_overlaps(shape.stmts)
         self._keep_carried_locals_static(
             [list(shape.decls) + list(shape.stmts) for shape in shapes])
 

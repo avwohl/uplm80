@@ -21,35 +21,29 @@ def _asm(src: str, opt: int = 2, mode: Mode = Mode.CPM) -> str:
 
 ARG_OVERLAP_SRC = """
 t1: do;
+  mon1: procedure (f, a) external; declare f byte, a address; end mon1;
   declare r address;
   f: procedure(x,y); declare (x,y) address; r = x*100 + y; end f;
   g: procedure address; declare (p,q,s) address; p=1; q=2; s=3; return p+q+s; end g;
   h: procedure; call f(7, g); end h;
   call h;
+  call mon1(2, '0' + r / 100); call mon1(2, '0' + r / 10 mod 10); call mon1(2, '0' + r mod 10);
 end t1;
 """
 
 
-def test_a_callee_frame_is_live_while_its_own_arguments_are_evaluated():
-    """`call f(7, g)' stores 7 into f's slot, then runs g.
+@pytest.mark.parametrize("opt", [0, 1, 2, 3])
+def test_a_callee_frame_is_live_while_its_own_arguments_are_evaluated(opt):
+    """`call f(7, g)' passes 7, then runs g for the second argument.
 
-    A non-reentrant local procedure takes its arguments in its own shared
-    slots, and the caller fills them one at a time, so f's frame holds live
-    data before the call is made. The overlay analysis only considered a
-    procedure live once it was ON the stack, so it was free to put g's locals
-    on top of f's parameters - and g ran between the two stores.
+    Up to 0.3.x a non-reentrant local procedure took its earlier arguments
+    in its own shared slots, which the caller filled one at a time, so f's
+    frame held live data before the call was made, and the overlay analysis
+    put g's locals on top of f's parameters - g ran between the two
+    stores.  PL/M-80's convention (0.4.0) keeps the 7 in a register, saved
+    on the stack round the call of g, until f is called.
     """
-    asm = _asm(ARG_OVERLAP_SRC)
-    slots = {}
-    for line in asm.splitlines():
-        s = line.strip()
-        if s.startswith("ld\t(??AUTO+") or s.startswith("ld\thl,(??AUTO+"):
-            off = int(s.split("??AUTO+")[1].split(")")[0])
-            slots.setdefault(off, 0)
-    # f has two ADDRESS parameters and g three ADDRESS locals: five distinct
-    # slots, so at least 10 bytes, and none of them shared.
-    assert "ds\t10" in [l.strip() for l in asm.splitlines()], \
-        [l.strip() for l in asm.splitlines() if l.strip().startswith("ds")]
+    assert run_plm(ARG_OVERLAP_SRC, opt).strip() == "706"
 
 
 def test_embedded_assignment_target_is_not_folded_to_a_constant():
