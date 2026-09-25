@@ -174,14 +174,16 @@ def _clobbered_before_use(instrs, park, consumers, writes):
     return bad
 
 
-# The ??subde and ??mul16 helpers take DE as an operand, so a call to one reads
-# DE rather than destroying an operand parked there.
+# The ??subde and ??mul16 helpers take DE as an operand, and a procedure takes
+# its last argument in DE (PL/M-80's convention), so a call reads DE rather
+# than destroying an operand parked there.
 _DE_CONSUMERS = ("add\thl,de", "adc\thl,de", "sbc\thl,de", "ex\tde,hl",
-                 "push\tde", "call\t??")
+                 "push\tde", "call\t")
 _DE_WRITES = ("ld\tde,", "ld\td,", "ld\te,", "pop\tde")
 
-# Nothing passes an argument in B, and the helpers are free to use B, so any
-# call is a hazard for a value parked there.
+# An argument goes in C or in all of BC, never in B alone, so `ld b,a' parks
+# an operand, not an argument; a callee and the helpers are free to use B, so
+# any call is a hazard for a value parked there.
 _B_CONSUMERS = ("and\tb", "or\tb", "xor\tb", "sub\tb", "add\ta,b", "cp\tb")
 _B_WRITES = ("ld\tb,", "pop\tbc", "call\t")
 

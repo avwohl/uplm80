@@ -6923,8 +6923,9 @@ class CodeGenerator:
         # "ld b,a" as its own scratch move, and any procedure call clobbers B.
         # So spill A through the stack and load B only after the other operand
         # has been generated.  "pop bc" would be shorter than "ld b,a" + "pop
-        # af", but "pop bc" also overwrites C, and the CP/M call convention
-        # keeps a live argument there.
+        # af", but it also writes C, and a call's last argument whose code
+        # writes B or C has BC saved round it, where the argument before it
+        # is (_gen_args): as a call's argument this is B alone.
         self._emit("push", "af")
 
         self._gen_expr_to_a(right)
@@ -7008,8 +7009,9 @@ class CodeGenerator:
         # "ld b,a" as its own scratch move, and any procedure call clobbers B.
         # So spill A through the stack and load B only after the other operand
         # has been generated.  "pop bc" would be shorter than "ld b,a" + "pop
-        # af", but "pop bc" also overwrites C, and the CP/M call convention
-        # keeps a live argument there.
+        # af", but it also writes C, and a call's last argument whose code
+        # writes B or C has BC saved round it, where the argument before it
+        # is (_gen_args): as a call's argument this is B alone.
         self._emit("push", "af")
 
         self._gen_expr_to_a(right)
