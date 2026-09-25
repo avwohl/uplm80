@@ -2114,7 +2114,8 @@ class CodeGenerator:
             return self._generate(module)
 
     def _generate(self, module) -> str:
-        resolve_names([module])
+        for loc, text in resolve_names([module]):
+            self._warn(text, loc)
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2325,7 +2326,8 @@ class CodeGenerator:
             return self._generate_multi(modules)
 
     def _generate_multi(self, modules: list) -> str:
-        resolve_names(modules, multi=True)
+        for loc, text in resolve_names(modules, multi=True):
+            self._warn(text, loc)
         self._compile_publics = {
             data_name(n) for m in modules for d in module_shape(m).decls
             for n in ([proc_name(d)] if isinstance(d, P.ProcDecl) and proc_attrs(d).is_public

@@ -152,6 +152,15 @@ GOTO_RULE = ("PL/M-80 allows a GOTO out of a procedure only to a label at the "
              "9800268B, 8.1.3 and 9.3)")
 SCOPE_RULE = ("a GOTO reaches only a label in its own block or in a block "
               "enclosing it (Programming Manual 9800268B, 9.3)")
+# A GOTO out of a procedure to a label in a DO block of the main program:
+# the manual does not allow it (the outer level of a module is its
+# exclusive extent, 10.1), but Intel's PL/M-80 V3.1 compiles it without a
+# word, to a plain JMP, and uplm80 0.3.6 did the same.
+DO_BLOCK_GOTO = ("PL/M-80 allows a GOTO out of a procedure only to a label at the "
+                 "outer level of the main program module, which a DO block is not "
+                 "(Programming Manual 9800268B, 9.3 and 10.1); compiled as Intel's "
+                 "PL/M-80 compiles it, a plain jump that leaves on the stack what "
+                 "the calls it abandons pushed")
 
 # What every module can name without declaring it (symbols.SymbolTable).
 _BUILTINS = frozenset(
@@ -244,6 +253,7 @@ class _Resolver:
     def __init__(self) -> None:
         self.decls: list[_Decl] = []
         self.refs: list[_Ref] = []
+        self.warnings: list[tuple] = []     # (location, text)
         self.modules: list[_Module] = []
         self.globals = _Block("global", None, None, None)
         self.refs_of: dict[int, list[_Ref]] = {}
@@ -638,11 +648,13 @@ class _Resolver:
             here, there = r.block.proc, d.block.proc
             if here is not there and not (
                     d.external or (d.block.kind == "module" and d.block.module.main)):
-                place = (f"procedure {there.orig}" if there is not None
-                         else "a DO block of the main program")
-                raise CodeGenError(
-                    f"GOTO {text} leaves procedure {here.orig} for a label in {place}; "
-                    f"{GOTO_RULE}", where)
+                if there is not None:
+                    raise CodeGenError(
+                        f"GOTO {text} leaves procedure {here.orig} for a label in "
+                        f"procedure {there.orig}; {GOTO_RULE}", where)
+                self.warnings.append((where, (
+                    f"GOTO {text} leaves procedure {here.orig} for a label in a DO "
+                    f"block of the main program; {DO_BLOCK_GOTO}")))
             if here is not there:
                 d.from_proc = True
             r.node.uplm80_asm = self.asm_name(d)
@@ -694,16 +706,19 @@ class _Resolver:
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
 
 
-def resolve_names(modules: list, multi: bool = False) -> None:
+def resolve_names(modules: list, multi: bool = False) -> list[tuple]:
     """Bind the names of ``modules``, rename what code generation would
     confuse, and check the GOTOs (see the module docstring).  ``multi``:
     the modules are separate modules compiled together into one assembly
     (a multi-file compile), whose private names are qualified per module.
     Raises CodeGenError for what PL/M-80 does not allow: a GOTO out of a
-    procedure other than to the main program's outer level, into a block
-    or to what is not a label; a name declared twice in one block; and,
+    procedure to a label of another procedure, into a block or to what is
+    not a label; a name declared twice in one block; and,
     in a multi-file compile, a second main program module or another
-    module's private name."""
+    module's private name.  Returns the warnings, (location, text) pairs:
+    a GOTO out of a procedure to a label in a DO block of the main
+    program, which PL/M-80 does not allow either, but Intel's PL/M-80
+    compiles."""
     r = _Resolver()
     for i, m in enumerate(modules):
         r.add_module(m, i)
@@ -720,3 +735,4 @@ def resolve_names(modules: list, multi: bool = False) -> None:
     r.check_gotos()
     r.annotate()
     r.write_back()
+    return r.warnings

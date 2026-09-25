@@ -491,7 +491,13 @@ Each fix has a regression test that fails without it.
   block it is not in, a GOTO to a name that is not a label, and a label
   defined twice in one block. A GOTO out of a procedure to the main
   program's outer level, one within a procedure, and one out of a DO block
-  to a label of a block around it work as before.
+  to a label of a block around it work as before. A GOTO out of a
+  procedure to a label in a DO block of the main program breaks the same
+  rule, since the outer level is the module's exclusive extent (10.1), but
+  Intel's PL/M-80 V3.1 compiles it without an error, to a plain `JMP` that
+  leaves the procedure's return address on the stack, and 0.3.6 compiled
+  it. It draws a warning that cites the rule and compiles to the same
+  plain jump.
 - **A GOTO in a procedure went to the main program's label of the same
   name,** not the procedure's own, silently: code generation found GOTO
   targets through its symbol table, which has the main program's labels and
@@ -750,8 +756,10 @@ Each fix has a regression test that fails without it.
   same instructions and data as before, in another order.
 - **What PL/M-80 does not allow is an error,** where it compiled to
   something wrong or did not assemble: a GOTO out of a procedure except to
-  the main program's outer level or an EXTERNAL label, a GOTO into a block
-  or to a name that is not a label, a name declared twice in one block,
+  the main program's outer level or an EXTERNAL label (to a DO block of the
+  main program it is a warning, and compiles as Intel's PL/M-80 compiles
+  it), a GOTO into a block or to a name that is not a label, a name
+  declared twice in one block,
   and, compiling several modules together, a second main program module or
   a name another module declares without PUBLIC.
 - **Some names in the output are new.** In a multi-file compile a module's

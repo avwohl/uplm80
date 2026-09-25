@@ -245,6 +245,59 @@ end t;
     assert "error: GOTO LP: the label LP is in a DO block this GOTO is not in" in err
 
 
+def _compile_asm(src: str, opt: int, mode: str = "cpm") -> tuple[subprocess.CompletedProcess, str]:
+    """The compiler's result for a program it has to compile, and its assembly."""
+    with tempfile.TemporaryDirectory() as d:
+        plm, mac = os.path.join(d, "T.PLM"), os.path.join(d, "T.MAC")
+        with open(plm, "w") as fh:
+            fh.write(src)
+        r = subprocess.run(compile_cmd("-O", str(opt), "--mode", mode, "-o", mac, plm),
+                           capture_output=True, text=True, timeout=60, env=compiler_env(),
+                           check=False)
+        assert r.returncode == 0, r.stderr
+        with open(mac) as fh:
+            return r, fh.read()
+
+
+DO_BLOCK_GOTO = PRELUDE + """declare n byte;
+n = 0;
+do;
+    bail: procedure; n = n + 1; goto l1; end bail;
+l1:
+    call pc('0' + n);
+    if n < 3 then call bail;
+end;
+call pc('.');
+call mon1(0, 0);
+end t;
+"""
+
+
+@pytest.mark.parametrize("mode", ("cpm", "bare"))
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_goto_from_a_procedure_to_a_do_block_of_the_main_program_warns(opt, mode):
+    """PL/M-80 does not allow it either: a GOTO out of a procedure goes to
+    the outer level of the main program module (9.3), the module's
+    exclusive extent (10.1), and a DO block is not in that.  But Intel's
+    PL/M-80 V3.1 compiles it with no error, BAIL's GOTO to a plain `JMP L1'
+    and no `LXI SP' at L1, and so did uplm80 0.3.6; this release's check of
+    GOTOs made it an error.  It is a warning, once, and the jump Intel's."""
+    reason = tools_missing()
+    if reason:
+        pytest.skip(reason)
+    r, asm = _compile_asm(DO_BLOCK_GOTO, opt, mode)
+    warnings = [x for x in r.stderr.splitlines() if "warning:" in x]
+    assert len(warnings) == 1, r.stderr
+    assert ("T.PLM:8:33: warning: GOTO L1 leaves procedure BAIL for a label in a DO block "
+            "of the main program; ") in warnings[0], warnings
+    assert "9800268B, 9.3 and 10.1" in warnings[0]
+    lines = [" ".join(x.split(";")[0].split()) for x in asm.splitlines()]
+    assert "jp L1" in lines or "jr L1" in lines
+    after = lines[lines.index("L1:") + 1]
+    assert not after.startswith("ld sp") and after != "ld hl,(6)", after
+    assert run_asm(asm).stdout.replace("\r", "") == "0123."
+
+
 def test_a_goto_to_a_variable_is_an_error():
     err = _compile_error(PRELUDE + "declare i byte;\ni = 0;\ngoto i;\nend t;\n")
     assert "error: GOTO I: I is not a label" in err
