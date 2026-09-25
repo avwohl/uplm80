@@ -101,11 +101,20 @@ def preprocess(
     filename: str = "<input>",
     defines: list[str] | None = None,
     include_paths: list[str] | None = None,
+    line_map: list[tuple[str, int]] | None = None,
 ) -> str:
     """Run uplm80's preprocessor over ``source`` and return the
     transformed text. Handles include expansion and the $cond family;
     leaves LITERALLY / case folding / harmless ``$Q=1``-style directives
-    for the downstream uplox preprocess pass."""
+    for the downstream uplox preprocess pass.
+
+    ``line_map``, if given, is filled with where each line of the result
+    came from: entry ``n - 1`` is the (file, line) of line ``n``.  Text
+    from an ``$INCLUDE`` is not where the including file's lines are, so a
+    diagnostic about it has to be told which file and line it is.  Lines
+    a conditional skips are kept as empty lines, so the rest of a file
+    keeps its own line numbers.
+    """
     source = _strip_high_bits(source)
 
     state = _State()
@@ -118,7 +127,11 @@ def preprocess(
         if d not in paths:
             paths.insert(0, d)
 
-    return _process(source, filename, state, paths)
+    origins: list[tuple[str, int]] = []
+    text = _process(source, filename, state, paths, origins)
+    if line_map is not None:
+        line_map[:] = origins
+    return text
 
 
 def _strip_high_bits(source: str) -> str:
@@ -134,7 +147,8 @@ def _strip_high_bits(source: str) -> str:
     return "".join(chr(ord(c) & 0x7F) for c in source)
 
 
-def _process(source: str, filename: str, state: _State, paths: list[str]) -> str:
+def _process(source: str, filename: str, state: _State, paths: list[str],
+             origins: list[tuple[str, int]]) -> str:
     """Walk ``source`` once, emitting active text into a buffer.
 
     The walk treats comments and strings as opaque so directives buried
@@ -142,6 +156,9 @@ def _process(source: str, filename: str, state: _State, paths: list[str]) -> str
     markers are the exception — they are conditional-compilation
     directives even though they live in comment syntax — so we peek at
     each comment opener to decide.
+
+    ``origins`` gets the (file, line) of each line of the result: one entry
+    for every newline emitted, and one for the text after the last.
     """
     out: list[str] = []
     i = 0
@@ -153,9 +170,14 @@ def _process(source: str, filename: str, state: _State, paths: list[str]) -> str
     def loc() -> SourceLocation:
         return SourceLocation(line, col, filename)
 
-    def emit(text: str) -> None:
-        if not state.skipping():
-            out.append(text)
+    def emit(text: str, first_line: int | None = None) -> None:
+        # Skipped text still ends its lines, so what follows keeps its line
+        # numbers and ``origins`` stays one entry per line.
+        if state.skipping():
+            text = "\n" * text.count("\n")
+        out.append(text)
+        start = line if first_line is None else first_line
+        origins.extend((filename, start + k) for k in range(text.count("\n")))
 
     while i < n:
         ch = source[i]
@@ -188,7 +210,9 @@ def _process(source: str, filename: str, state: _State, paths: list[str]) -> str
             if m:
                 _apply_directive(m.group(1), m.group(2).strip(), state)
                 # Drop the directive comment from the output entirely —
-                # it's not meaningful to plm_full.
+                # it's not meaningful to plm_full — but not the lines it
+                # spans.
+                emit("\n" * comment.count("\n"))
             else:
                 emit(comment)
             # Update line/col for the consumed span.
@@ -206,7 +230,7 @@ def _process(source: str, filename: str, state: _State, paths: list[str]) -> str
                 j += 1
             directive_line = source[i:j].strip()
             consumed = _apply_line_directive(
-                directive_line, filename, state, paths, out, loc()
+                directive_line, filename, state, paths, out, loc(), origins
             )
             i = j
             col += (j - i if j > i else 0)
@@ -249,6 +273,7 @@ def _process(source: str, filename: str, state: _State, paths: list[str]) -> str
         col += 1
         at_line_start = False
 
+    origins.append((filename, line))
     return "".join(out)
 
 
@@ -278,13 +303,14 @@ def _apply_directive(name: str, arg: str, state: _State) -> None:
     # Other directives (title, eject, list, ...) drop silently.
 
 
-def _apply_line_directive(
+def _apply_line_directive(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     line: str,
     filename: str,
     state: _State,
     paths: list[str],
     out: list[str],
     loc: SourceLocation,
+    origins: list[tuple[str, int]],
 ) -> bool:
     """Process a single line that starts with ``$``. Returns True if the
     directive was recognised and consumed; False if it should be passed
@@ -315,20 +341,38 @@ def _apply_line_directive(
         if state.skipping():
             return True
         target = m.group(1).strip().strip("'").strip('"')
-        content = _read_include(target, paths, loc)
+        path, content = _read_include(target, paths, loc)
         # Recursively expand. State is shared so a $set inside an
         # included file is visible to the outer file.
         included_paths = list(paths)
         d = os.path.dirname(os.path.abspath(target)) if os.path.isabs(target) else None
         if d and d not in included_paths:
             included_paths.insert(0, d)
-        out.append(_process(content, target, state, included_paths))
+        sub: list[tuple[str, int]] = []
+        text = _process(content, _display_path(path), state, included_paths, sub)
+        # End the included text's last line, so that it keeps its own
+        # origin rather than running on into the rest of this one (which
+        # the directive has consumed).
+        if text.endswith("\n"):
+            sub.pop()
+        else:
+            text += "\n"
+        out.append(text)
+        origins.extend(sub)
         return True
     return False
 
 
-def _read_include(name: str, paths: list[str], loc: SourceLocation) -> str:
-    """Resolve and read an ``$INCLUDE`` target. Tries the name as given,
+def _display_path(path: str) -> str:
+    """How a diagnostic names an included file: relative to the current
+    directory when it is below it, as found otherwise."""
+    rel = os.path.relpath(path)
+    return path if rel.startswith("..") else rel
+
+
+def _read_include(name: str, paths: list[str], loc: SourceLocation) -> tuple[str, str]:
+    """Resolve and read an ``$INCLUDE`` target: (the file found, its text).
+    Tries the name as given,
     upper-case, lower-case, plus ``.lit`` / ``.LIT`` extensions across
     every search path. CP/M devices like ``:F1:`` are stripped first
     since modern filesystems don't carry them."""
@@ -350,7 +394,7 @@ def _read_include(name: str, paths: list[str], loc: SourceLocation) -> str:
             except UnicodeDecodeError:
                 with open(cand, "r", encoding="latin-1") as f:
                     raw = f.read()
-            return _strip_high_bits(raw)
+            return cand, _strip_high_bits(raw)
     raise LexerError(f"$INCLUDE file not found: {name}", loc)
 
 

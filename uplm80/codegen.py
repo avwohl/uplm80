@@ -52,7 +52,8 @@ from .ast_view import (
 )
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
-from .errors import CodeGenError
+from .errors import CodeGenError, CompilerError
+from .frontend import source_location
 from .local_storage import LocalStorage
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
@@ -631,6 +632,8 @@ class CodeGenerator:
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
         self.reg_debug = reg_debug  # Enable register tracking debug output
         self.warnings: list[str] = []  # Collected warnings
+        # The statement or declaration being generated (see _loc).
+        self._stmt_node = None
         self._warned_comparisons: set = set()  # see _check_impossible_comparison
         self.symbols = SymbolTable()
         self.output: list[AsmLine] = []
@@ -873,16 +876,40 @@ class CodeGenerator:
         if found is None:
             return
         const, text = found
-        from .errors import SourceLocation
-        pos = getattr(const, 'pos', None)
-        where = (str(SourceLocation(pos.start_line, pos.start_column))
-                 if pos is not None and getattr(pos, 'start_line', 0) else None)
+        loc = self._loc(const)
+        where = str(loc) if loc is not None else None
         # The same comparison can be looked at more than once.
         key = (where, text) if where else (id(const), text)
         if key in self._warned_comparisons:
             return
         self._warned_comparisons.add(key)
-        self.warnings.append(f"{where}: warning: {text}" if where else f"warning: {text}")
+        self._warn(text, loc)
+
+    def _loc(self, node):
+        """Where ``node`` is in the source - its file (the included one, for
+        text from an $INCLUDE) and line - or, if it carries no position (the
+        optimizer made it), where the statement being generated is."""
+        loc = source_location(node) if node is not None else None
+        return loc if loc is not None else self._current_location()
+
+    def _current_location(self):
+        """Where the statement or declaration being generated is, if known."""
+        node = getattr(self, "_stmt_node", None)
+        return source_location(node) if node is not None else None
+
+    def _warn(self, text: str, loc) -> None:
+        self.warnings.append(f"{loc}: warning: {text}" if loc else f"warning: {text}")
+
+    @contextmanager
+    def _located_errors(self) -> Iterator[None]:
+        """Place an error raised without a location at the statement or
+        declaration being generated when it was raised."""
+        try:
+            yield
+        except CompilerError as e:
+            if e.location is None:
+                e.location = self._current_location()
+            raise
 
     def _impossible_comparison(self, byte_side, const_side, op):
         """(the constant, the message) if ``byte_side op const_side`` compares
@@ -918,10 +945,7 @@ class CodeGenerator:
         """
         const_val = self._try_eval_const(condition)
         if const_val is not None:
-            from .errors import CodeGenError, SourceLocation
-            loc = None
-            if hasattr(condition, 'span') and condition.span:
-                loc = SourceLocation(condition.span.start_line, condition.span.start_col)
+            loc = self._loc(condition)
 
             if const_val == 0:
                 msg = f"{context} is always false (constant 0)"
@@ -941,10 +965,7 @@ class CodeGenerator:
 
         const_val = self._try_eval_const(condition)
         if const_val is not None:
-            from .errors import SourceLocation
-            loc = None
-            if hasattr(condition, 'span') and condition.span:
-                loc = SourceLocation(condition.span.start_line, condition.span.start_col)
+            loc = self._loc(condition)
 
             # Truth is bit 0, not non-zero (see _emit_truth_test), so the
             # diagnostic has to agree with the code the generator emits:
@@ -955,12 +976,7 @@ class CodeGenerator:
                 msg = (f"IF condition is always false (constant {const_val}: "
                        "PL/M-80 tests bit 0)" if const_val
                        else "IF condition is always false (constant 0)")
-
-            if loc:
-                warning = f"{loc}: warning: {msg}"
-            else:
-                warning = f"warning: {msg}"
-            self.warnings.append(warning)
+            self._warn(msg, loc)
 
     # ========================================================================
     # Loop Index Usage Analysis
@@ -2075,6 +2091,10 @@ class CodeGenerator:
 
     def generate(self, module) -> str:
         """Generate assembly code for a module."""
+        with self._located_errors():
+            return self._generate(module)
+
+    def _generate(self, module) -> str:
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2281,7 +2301,10 @@ class CodeGenerator:
         """
         if len(modules) == 1:
             return self.generate(modules[0])
+        with self._located_errors():
+            return self._generate_multi(modules)
 
+    def _generate_multi(self, modules: list) -> str:
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2546,6 +2569,7 @@ class CodeGenerator:
         :class:`P.LiterallyDecl` (LITERALLY macro), or
         :class:`P.ProcDecl` (procedure).
         """
+        self._stmt_node = decl
         if isinstance(decl, P.ProcDecl):
             self._gen_proc_decl(decl)
         elif isinstance(decl, P.LiterallyDecl):
@@ -2585,6 +2609,7 @@ class CodeGenerator:
         with multiple names emits one storage row per name with each
         getting its own symbol entry.
         """
+        self._stmt_node = decl
         start = len(self.data_segment)
         self._gen_var_decl_names(decl)
         self._note_storage(decl, start)
@@ -3326,6 +3351,7 @@ class CodeGenerator:
         old_proc_return_type = self.current_proc_return_type
         old_loop_words = self._loop_words
         self._loop_words = 0
+        self._stmt_node = decl
 
         attrs = proc_attrs(decl)
         name = proc_name(decl)
@@ -3631,6 +3657,16 @@ class CodeGenerator:
     # ========================================================================
 
     def _gen_stmt(self, stmt) -> None:
+        """Generate code for a single typed statement node, noting where it
+        is for a diagnostic about it (see :meth:`_located_errors`).  Left
+        set if an error is raised, so the error is placed at the innermost
+        statement."""
+        outer = self._stmt_node
+        self._stmt_node = stmt
+        self._gen_stmt_kind(stmt)
+        self._stmt_node = outer
+
+    def _gen_stmt_kind(self, stmt) -> None:
         """Generate code for a single typed statement node.
 
         Dispatches over the uplox-generated :mod:`uplm80._plm_parser`
