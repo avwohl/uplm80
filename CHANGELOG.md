@@ -40,9 +40,17 @@ Changed). DRI's programs use everything past their last variable as a
 buffer, and MP/M II's SUBMIT and SPOOL now build from DRI's own sources and
 behave as DRI's binaries do.
 
-A procedure's local variables are static, as the manual has them, except
-where no call can tell: a local shares the procedures' overlaid storage only
-if every call assigns it before anything reads it (see Changed).
+A procedure's variables are static, as the manual has them, its parameters
+included, except where no program can tell: a local or a parameter shares
+the procedures' overlaid storage only if every call assigns it before
+anything reads it, and only where no pointer or overrun from another local
+can tell it from DRI's layout (see Changed).
+
+Every name means the declaration PL/M-80 gives it (`uplm80/names.py`):
+labels, procedures and LITERALLYs of one name in different blocks, and in a
+multi-file compile each module's private names, are kept apart; a GOTO that
+PL/M-80 does not allow is an error; and a CALL through an address calls the
+procedure. Every warning and error names the file and line it is about.
 
 Each fix has a regression test that fails without it.
 
@@ -64,6 +72,87 @@ Each fix has a regression test that fails without it.
   multi-file copy after an error, calls MULTCOPY again, which goes on from
   the directory entry and the count it keeps in NEXTDIR and NCOPIED
   (`if eretry = 0 then NEXTDIR, NCOPIED = 0`); both are static.
+- **A pointer to a parameter, kept after the call, pointed into storage that
+  other procedures overlay.** PL/M-80 allocates a procedure's parameters
+  statically, like its other variables, but uplm80 kept every parameter in
+  `??AUTO` because every call assigns it. After `sv: procedure (v); declare v
+  byte; keep = .v; end sv;`, the sequence `call sv('P'); call other;` read
+  0FFH (`other`'s locals) through `keep`, where DRI's code reads 'P' (0.3.6
+  the same). A procedure whose address is taken also read a parameter of the
+  procedure it is nested in out of `??AUTO` after that procedure had returned.
+  A parameter is now static by the same rules as any other local (see
+  Changed).
+- **A pointer or an overrun from a local reached something other than what
+  DRI's layout has there.** DRI lays out what a procedure's text declares in
+  the order the text declares it (see Changed). uplm80 kept a frame's locals
+  in `??AUTO` apart from three things: the parameters and locals of procedures
+  nested among them, the variables of the procedure's DO blocks, and its
+  INITIAL locals, which were static (0.3.6 the same). Examples:
+  * with `declare arr (2) byte` before a nested `inner: procedure (v) byte`
+    and `declare nxt byte` after it, `arr(2) = inner('I')` set `nxt` instead
+    of `v`;
+  * with `arr` INITIAL, `arr(n) = 'F'` did not reach the local declared after
+    it, and neither did `.v + 1` with `v` INITIAL;
+  * a read of `arr(2)` did not see what the previous call had left in `nxt`.
+
+  These now reach what DRI's layout has there.
+- **An INTERRUPT procedure's frame was put over the frames of the procedures
+  it interrupts.** `??AUTO` overlays the frames of procedures that are never
+  active at the same time, and the call graph decides which those are. Nothing
+  calls an INTERRUPT procedure: the interrupt activates it (8.1.6), whatever
+  is running. So `ih: procedure interrupt 7; declare (x, y) byte; ... call
+  helper; end ih;` shared its frame with `work`, which `ih` may interrupt, and
+  so did `helper` (0.3.6 the same). An INTERRUPT procedure and everything it
+  calls are now active together with every procedure, and their frames overlap
+  none.
+- **A procedure called through an address, or called back from outside the
+  module, shared its frame with its caller.** A `CALL` through an address
+  (8.2.1) may call any procedure whose address is taken. An EXTERNAL procedure
+  may call back any PUBLIC procedure, or any procedure whose address it was
+  given. The call graph had none of those calls. `back` called an EXTERNAL
+  `ext`, which called the PUBLIC `cb`; `cb`'s frame was `back`'s, and `back`'s
+  local came back 0FFH at every level. The same happened to `through`, which
+  passed the address of `cb2` to an EXTERNAL `icall` (0.3.6 the same). A
+  procedure with a `CALL` through an address may now call every procedure
+  whose address is taken, and an EXTERNAL procedure may call back every PUBLIC
+  procedure and every procedure whose address is taken, whether the address is
+  taken in the main program or in a procedure. A call of MON1 or MON2 with a
+  constant function is a call of the BDOS, which calls nothing back. A `CALL`
+  through an address now calls the procedure, too (see Names and labels):
+  `CALL f` from `caller` to a procedure that fills its frame with 0FFH leaves
+  `caller`'s locals as they were.
+- **A parameter reached only through the address of the parameter before it
+  lost its value at -O1 and up.** upeepz80 drops the store of the last
+  argument at a procedure's entry when nothing else in the module names the
+  parameter's storage. So `pq: procedure (a, b) byte; declare (a, b) byte; ...
+  pp = .a + 1; return c;` (with `c` BASED on `pp`) returned 0 for `pq('A',
+  'B')`. 0.3.6 did the same whenever no other procedure happened to name that
+  slot in `??AUTO`. Each static parameter is now also named by an EQU, which
+  costs nothing and which upeepz80 counts as a use. The rule itself belongs to
+  upeepz80.
+- **An embedded assignment was not stored when the procedure returned its
+  target next.** RETURN took the value from A instead, even though the rest of
+  the statement could change A and the target has to keep its value. MP/M II's
+  LOAD reads a HEX file through `READCS: PROCEDURE BYTE; DECLARE B BYTE; CS =
+  CS + (B := READBYTE); RETURN B;`, which returned CS + B, so LOAD built from
+  source stopped with INVERTED LOAD ADDRESS on the first record of any file.
+  With `v` static, `old = v; old = (v := old + 1); return v;` returned 1 on
+  every call (0.3.6 the same for both). The store is now always made. LOAD
+  built from source now produces, from a test HEX file, the same .COM as DRI's
+  LOAD.COM: under MP/M II, and in BARE mode under cpmemu at -O0 to -O3. ED's
+  GETSOURCE is 6 bytes longer.
+- **A counted loop left its index with a value PL/M-80 would not give it.** A
+  BYTE `DO i = 0 TO n` whose body does not name `i` counts its passes in B. It
+  gives `i` its final value up front only if something may read `i`, and it
+  allows a RETURN from the body when `i` is the procedure's own. Two things
+  went wrong (0.3.6 the same):
+  * a static `i` keeps its value until the next call, which read the final
+    value (10) where a RETURN in the third pass leaves 2;
+  * with `declare arr (2) byte, i byte`, `arr(2)` read 0 after the loop
+    instead of 10.
+
+  A loop is no longer counted when its index can be reached without naming it,
+  or when the index is static and the body can RETURN.
 
 #### Division and MOD
 
@@ -379,6 +468,117 @@ Each fix has a regression test that fails without it.
   (SDIR's `token BASED pcb.token$adr (12) byte`, which it subscripts only
   with constants) and missed this one.
 
+#### Names and labels
+
+- **A GOTO from a nested procedure to a label of the procedure around it
+  did not assemble:** with `out:` in M1 and, nested in M1, `bail:
+  procedure; goto out; end bail;`, the output jumped to `@M1$BAIL$OUT`,
+  which nothing defines, at every level (0.3.6 assembled it at `-O3` only,
+  by inlining BAIL). PL/M-80 does not allow it: "the label in the GOTO must
+  be the label of a statement in the outermost level of the main program
+  module" (Programming Manual 9800268B, 5.3.2; 8.1.3 and 9.3 say the same).
+  It is a compile error now that cites the rule, and so are a GOTO into a
+  block it is not in, a GOTO to a name that is not a label, and a label
+  defined twice in one block. A GOTO out of a procedure to the main
+  program's outer level, one within a procedure, and one out of a DO block
+  to a label of a block around it work as before.
+- **A GOTO in a procedure went to the main program's label of the same
+  name,** not the procedure's own, silently: code generation found GOTO
+  targets through its symbol table, which has the main program's labels and
+  not a procedure's. `p: procedure; ... goto done; ... done: call pc('a');
+  end p;` with a `done:` in the main program jumped out of P.
+- **A label in each of two DO blocks** of the main program or of one
+  procedure was "multiply defined", both `LP:` or both `@P$LP:`, though
+  each DO block has labels of its own (9.3). The second is `LP?2` now (no
+  PL/M-80 identifier has a `?`). A `DECLARE l LABEL` in a procedure, and
+  the address of a procedure's label, `.there` in a statement or in a DATA
+  or INITIAL list, named the bare label.
+- **`.show`, of a procedure nested in another, did not assemble:** it named
+  `SHOW`, where the procedure is `@OUTER$SHOW`. A DATA or INITIAL list and
+  an AT found it already; an expression does now.
+- **`CALL q` through an ADDRESS variable (8.2.1) did not call the
+  procedure** whose address q holds: it was `call Q`, which ran the bytes
+  of Q itself, and `CALL s.p` was `jp (hl)` with no return address, so the
+  procedure returned to its caller's caller. The address goes to DE and a
+  new runtime routine, `??jpde`, jumps there from a CALL. The arguments are
+  pushed, as a PUBLIC or REENTRANT procedure takes them, and the last is
+  also left in HL and A, where a procedure private to its module takes its
+  only one; more than one argument draws a warning, since such a procedure
+  takes the others in storage the call cannot reach. The procedure called
+  does not share its frame in `??AUTO` with the caller (see Procedure
+  locals).
+- **Procedures of one name in different blocks.** Code generation files a
+  procedure under its enclosing procedures' names and its own, `P$Q`, and
+  finds a name as a procedure nested in an enclosing procedure before
+  anything else. So a procedure Q in each of two DO blocks of P was `@P$Q`
+  twice ("multiply defined"); a procedure N in a DO block of the main
+  program and a module variable N were both `N`; and, silently, a variable
+  X of a procedure nested in P read as P's procedure X, and a variable V of
+  P used outside the DO block of P that declares a procedure V as that
+  procedure. With `do; declare q byte; ... do; declare e byte; q:
+  procedure; ... end q; call q; end; ... end;` the procedure was generated
+  under the variable's label. Such a procedure is renamed now (`Q?2`), and
+  so is a procedure or a label that a DO block declares under the name of
+  a parameter of the procedure around it, which is `@P$X` when it is
+  static.
+- **A DO block's variables are named after the block's number, `@B1$X`,**
+  which is also procedure B1's X: the block's X took B1's place in
+  `??AUTO` and the program printed B1's value for it. The number skips any
+  that names a procedure.
+- **LITERALLYs of one name.** One in each of two procedures, with
+  different values, was `K EQU 1` and `K EQU 2`, and one named like a
+  module variable or a main-program label met its label: "Symbol 'K'
+  multiply defined". The later is `K?2` now. And code generation kept every
+  LITERALLY in one table, so once procedure PA had declared `K LITERALLY
+  '1'` a variable K of procedure PB read as 1 (silently, at `-O0` to
+  `-O2`); a name is a LITERALLY there only where the declaration of it in
+  scope is one.
+- **A name declared twice in one block** was generated twice, and did not
+  assemble; it is an error now. A LITERALLY declared again with the same
+  text is let be (an $INCLUDE file and the file including it often both
+  declare TRUE).
+- **A declaration hides the built-in of its name when it is called or
+  subscripted:** with `DECLARE size (4) BYTE`, `size(2)` was SIZE(2),
+  "SIZE() needs a declared variable", and `high(1)` of an array HIGH was
+  the high byte of 1. A variable already hid a condition flag read without
+  parentheses, as MP/M II's STAT needs.
+- **Names the assembler reads as something else.** um80 takes `A`, `HL` ...
+  as registers and `EQ NE LT LE GT GE SHL SHR NUL` as operators: `call A`
+  is "Register 'A' used as value", and `call EQ` calls 0FFFFH, `ld hl,SHL`
+  loads 0, without a word. A procedure or label so named is `@A`, `@EQ`
+  now, as a variable named like a register already was, and so is a
+  variable named like an operator. It takes `Z NZ NC PO PE P` after `jp`
+  for a condition ("JP with condition requires address"; the peephole
+  makes `call p / ret` into `jp P`): the jump is written `jp 0+P`. And it
+  takes a symbol whose letters end in one of its word operators (`MOD SHL
+  SHR AND OR XOR NOT EQ NE LT LE GT GE HIGH LOW NUL TYPE`), followed by +
+  or -, for that operator: `ld hl,TYPE+2` is TYPE(+2) and loads 0, and
+  `X1EQ+2` or a procedure's `@Q$NUL+1` does not parse. Such an offset is
+  written `2+TYPE`. (MP/M II's PIP has a variable TYPE, which it never
+  offsets; its output is unchanged.)
+- **`-O3` inlined the wrong one of two procedures of one name:** with a
+  procedure NUL at module level and another in a DO block of P, a call of
+  NUL in P after the block inlined the block's. And it inlined a procedure
+  reading a variable Q into a block with a label Q, which its model of
+  scope did not have (nor a scope for DO CASE): `qqqq` printed `q***`.
+- **`INPUT(p)` and `OUTPUT(p) = v` with a port that is not a constant did
+  not assemble:** they called `??inp` and `??outp`, which the runtime
+  library did not have.
+
+#### Diagnostics
+
+- **A warning or an error named no file, or the wrong line.** `uplm80
+  e.plm` printed `<unknown>:3:8: warning: comparison BYTE = 300 is always
+  false`. The parser numbers the lines of the file with its $INCLUDE files
+  spliced in and the lines a conditional skips taken out, so a warning in
+  an included file came out at a line of the including one, and a syntax
+  error there as `p.plm:1:1: error: ... at line 5, column 5`. Every
+  diagnostic names the file and line it is about now - the included file
+  for text from an $INCLUDE - and an error code generation raised without
+  a location is placed at the statement or declaration it was generating.
+  The warning for `IF 2` had no location at all, and an assignment was
+  placed at its `=`.
+
 #### Multi-file compiles
 
 - **An EXTERNAL procedure that none of the files defined had no `extrn`.**
@@ -387,38 +587,92 @@ Each fix has a regression test that fails without it.
   belongs to a third module did not assemble ("Undefined symbol"); A.PLM
   compiled alone had the `extrn`. Found by the integration verification;
   0.3.6 did the same.
+- **Two modules with a private name in common did not assemble:** `uplm80
+  a.plm b.plm`, with a procedure HELPER in each, gave "Symbol 'HELPER'
+  multiply defined", and, since locals are static, `@HELPER$N` too; two
+  module variables, DATA tables, labels or LITERALLYs of one name met the
+  same way, and a module could use another's private name, which compiled
+  alone it could not reach. PL/M-80 modules have separate name spaces for
+  everything not PUBLIC or EXTERNAL (Programming Manual, 10.4). Each
+  module's private names are now qualified with its name - `LIB?HELPER`,
+  `@LIB?HELPER$N`; a module without a name goes by its file's - so each
+  behaves as if compiled alone and linked. PUBLIC and EXTERNAL names bind
+  across the modules as before, and a PUBLIC procedure can still be called
+  from another module without an EXTERNAL declaration, as 80un's modules
+  do. Using another module's private name is an error that says what to
+  do.
+- **A GOTO to a PUBLIC label of the main program, from a module that
+  declares it EXTERNAL** (the third GOTO 9.3 allows), was "JR to 'AGAIN':
+  its target is the external symbol AGAIN" at `-O1` and up: the EXTERNAL
+  declaration was an EXTRN of a label the same assembly defines. No EXTRN
+  is emitted for a name one of the modules makes PUBLIC.
+- **Only the first of two modules with statements at their outer level was
+  compiled;** the second's statements were dropped without a word. It is
+  an error now: only the main program module may have them.
 
 ### Changed
 
-- **A procedure's local shares `??AUTO` only if every call assigns it
-  before anything reads it.** `??AUTO` overlays the storage of procedures
-  that are never active at the same time; what goes there now is the
-  parameters, which every call assigns, and the locals that a
-  definite-assignment analysis (`uplm80/local_storage.py`) shows are
-  assigned, on every path from the procedure's entry, before they are read.
-  It follows GOTOs and every form of DO; a call of a procedure nested in
-  this one that names the local reads it at the call, and a use of a BASED
-  variable reads its base; an array or structure is assigned once every
-  element has been, through constant subscripts. Every other local is
-  static, `@proc$name` among the variables: one that may be read first, one
-  whose address is taken (`.x`, in a statement, an AT or an INITIAL), one
-  subscripted outside its bounds, one named by a nested procedure whose
-  address is taken, and one declared with such a local in a factored
-  declaration (which 6.2.4 makes contiguous) or after one whose address is
-  taken, which a pointer run on from it can reach in DRI's layout.
-  `??AUTO` also no longer keeps a slot for a declaration that never used
-  it: an INITIAL, DATA, AT, BASED, PUBLIC, EXTERNAL or LABEL declaration in
-  a procedure, and a REENTRANT procedure's parameters and locals, which are
-  on its stack. In MP/M II and 80un, of the 82 outputs that assemble, 137
-  locals (4,729 bytes) are static now: 48 because they may be read first,
-  25 because their address is taken, and 64 declared with or after one of
-  those. The data comes to 48,514 bytes at -O0, -O2 and -O3, against
-  50,280: the unused slots were 1,947 bytes, and the static locals cost
-  181, since most of their bytes are buffers that also leave the frames
-  that set the size of `??AUTO`. The code is the same but for a
-  parameter's store at a procedure's entry in six outputs, which upeepz80
-  drops only when nothing else names its `??AUTO` address: 6 bytes more at
-  -O2, none at -O0 and -O3.
+- **A procedure's local shares `??AUTO` only if every call assigns it before
+  anything reads it, and only where a program cannot tell the difference from
+  DRI's layout.** `??AUTO` overlays the storage of procedures that are never
+  active at the same time. What goes there now is the parameters and locals
+  that a definite-assignment analysis (`uplm80/local_storage.py`) shows are
+  assigned, on every path from the procedure's entry, before anything reads
+  them. The analysis follows GOTOs and every form of DO. A call of a procedure
+  nested in this one that names the local counts as a read at the call. A use
+  of a BASED variable reads its base. A read through a subscript that is not a
+  constant reads every local declared after the array. An array or structure
+  counts as assigned once every element has been assigned through constant
+  subscripts. A subscript is a constant when it folds to one by PL/M-80's
+  rules (`a(1+1)`, `a(-1)`, which is `a(255)`, and `a(LAST(a))`), and every
+  level now decides this the same way; before, -O0 took `a(1+1)` for a
+  variable subscript and -O1 and up for a constant.
+
+  Every other local and parameter is static, `@proc$name` among the variables:
+  * one that may be read before it is assigned;
+  * one whose address is taken (`.x`, in a statement, an AT or an INITIAL);
+  * one reached outside its bounds: a scalar with any subscript but `(0)`, a
+    constant subscript past the end, or a one-element array with any subscript
+    but a constant 0;
+  * one named by a procedure nested in its own procedure whose address is
+    taken, or by anything that procedure calls, since it can run when the
+    local's procedure is not active;
+  * one declared with such a local in a factored declaration (6.2.4).
+
+  DRI lays out what a procedure's text declares in the order the text declares
+  it. The parameters come first: ERA's PRINT$FILE declares `k` before its
+  parameter `fcbp`, and DRI's ERA.PRL has `fcbp` at 067AH and `k` at 067CH. A
+  nested procedure's parameters and locals, and a DO block's variables, come
+  where the text has them: SUBMIT's FILLRBUFF has `ssbp` at 0E7AH, the
+  parameter of PUTRBUFF (declared next) at 0E7BH, and `reading` (declared
+  after PUTRBUFF) at 0E7CH. That order is now kept wherever a program can
+  tell:
+  * everything declared after a local whose address is taken, or which is
+    reached outside its bounds, is static too;
+  * from the first array or structure subscripted by anything but a constant,
+    a procedure's locals are either all static or all in `??AUTO`, and all
+    static if any one of them is (an INITIAL one included). For example,
+    `do i = 0 to n; a(i) = 'R'; end; return b(1);` with `declare a(2) byte,
+    b(2) byte` has to reach `b`; the release gate's a4 printed 0 where 0.3.6
+    printed 'R';
+  * where a nested procedure with storage, or a DO block with variables, comes
+    after either kind of local, what follows that local is static, and so is
+    the nested procedure's storage.
+
+  `??AUTO` also no longer keeps a slot for a declaration that never used one:
+  an INITIAL, DATA, AT, BASED, PUBLIC, EXTERNAL or LABEL declaration in a
+  procedure, and a REENTRANT procedure's parameters and locals, which are on
+  its stack.
+
+  In MP/M II and 80un, 205 locals and parameters (4,822 bytes) are now static
+  across the 82 outputs that assemble, the same at -O0, -O2 and -O3. The data
+  comes to 48,565 bytes at each of those levels, against 50,280. The unused
+  slots were 1,947 bytes, and most of the static locals' bytes are buffers
+  that also leave the frames that set the size of `??AUTO`. The code is the
+  same except for two things: a parameter's store at a procedure's entry,
+  which upeepz80 drops only when nothing else names its `??AUTO` address, and
+  the embedded-assignment stores described under Fixed. Together they add 12
+  bytes of code at -O0, 21 at -O2 and 15 at -O3.
 
 - **Constants in expressions are typed as PL/M-80 types them, so some
   programs compute something else.** `w = -1` stores 00FFH, since the
@@ -465,6 +719,27 @@ Each fix has a regression test that fails without it.
   SPOOL printed NULs for the first records of a file it spooled itself.
   In MP/M II and 80un the change only moves lines: every output holds the
   same instructions and data as before, in another order.
+- **What PL/M-80 does not allow is an error,** where it compiled to
+  something wrong or did not assemble: a GOTO out of a procedure except to
+  the main program's outer level or an EXTERNAL label, a GOTO into a block
+  or to a name that is not a label, a name declared twice in one block,
+  and, compiling several modules together, a second main program module or
+  a name another module declares without PUBLIC.
+- **Some names in the output are new.** In a multi-file compile a module's
+  private names are qualified, `MODULE?NAME`; where two declarations would
+  meet in one assembler name the later is `NAME?2`; and a procedure, label
+  or variable named like a register or an um80 operator is `@NAME`, PUBLIC
+  and EXTERNAL ones included, as a variable named like a register always
+  was, so an assembly module that defines or uses one has to use that
+  name. A static parameter is also named `?@proc$name`, by an EQU (see
+  Fixed, Procedure locals). The new names change no single-file output of
+  MP/M II and 80un, and the 80un multi-file programs' `.COM` files are byte
+  for byte what they are without them.
+- `docs/multi_file_compilation.md` said to call a PUBLIC procedure from
+  another file without declaring it EXTERNAL, and that declaring it
+  EXTERNAL would call it the wrong way; since a PUBLIC procedure takes its
+  arguments on the stack, the EXTERNAL declaration is right, and it is what
+  lets each module also be compiled alone.
 
 ### Added
 
@@ -475,6 +750,11 @@ Each fix has a regression test that fails without it.
   `-O0` to `-O3`, run under cpmemu and compared with a Python model of the
   manual's rules. The suite runs three programs; `scripts/difftest.py
   --seeds N` runs more.
+- **`tests/names_difftest.py`**, a differential test of name resolution:
+  random programs that declare a pool of ten names as variables,
+  LITERALLYs, procedures and labels at every depth, with the output their
+  scopes give, one module or three compiled together. The suite runs six;
+  `scripts/namestest.py --seeds N [--modules]` runs more.
 
 ### Known issues
 
@@ -507,16 +787,50 @@ Each fix has a regression test that fails without it.
 - **A REENTRANT procedure's parameter in a factored declaration with its
   locals,** `DECLARE (top, c) BYTE`, is taken for a local; declared on its own
   it is read from the stack as it should be.
-- **A procedure named like a register,** `H: PROCEDURE`, is not renamed as a
-  variable of that name is, and the assembler rejects `call H`.
-- **A counted loop trusts that a pointer made from `.x` reaches only `x`.**
-  A BYTE `DO i = 0 TO n` whose body does not name `i` counts its passes in
-  B, and is not used when anything can reach `i` another way: a procedure
-  that names it, `.i` anywhere, `i` AT or BASED. A pointer computed from the
-  address of the variable declared before `i` still can, and a store
-  through it does not end the loop. DRI's compiler never counts a loop.
+- **A counted loop trusts that a pointer made from `.x` reaches only `x`, for
+  a module-level `x`.** A BYTE `DO i = 0 TO n` whose body does not name `i`
+  counts its passes in B. It is not used when anything can reach `i` another
+  way: a procedure that names it, `.i` anywhere, `i` AT or BASED, and, for a
+  procedure's local, an overrun of an array or a pointer from a local declared
+  before it. For a module-level `i`, a pointer computed from the address of
+  the variable declared before it still can reach it, and a store through that
+  pointer does not end the loop. DRI's compiler never counts a loop.
+- **An overrun or a pointer that runs backwards from a local, past a
+  procedure's last local, or past a module-level variable** reaches what DRI's
+  layout has there (the variable the text declares before or after it,
+  possibly another procedure's) only where that variable is static. In
+  `??AUTO` it reaches another frame, or nothing (0.3.6 the same). Keeping all
+  of that in DRI's order would make every local static.
+- **upeepz80 drops a store at a procedure's entry when nothing names the
+  storage**, taking storage that nothing else names to be unreachable. uplm80
+  names every static parameter with an EQU so that its store is kept. The rule
+  itself should be fixed in upeepz80.
+- **A LITERALLY's name declared again in an inner block** is a syntax error:
+  the macro pass puts the LITERALLY's text in place of the name there too
+  (`declare n literally '5'` and, in a procedure, `declare n byte` reads
+  `declare 5 byte`), as it must for DRI's `mon1: procedure` with `mon1
+  literally 'ldmon1'`.
+- **A procedure named DOUBLE** is taken for the built-in where code generation
+  folds constants: `double(30h)` is 30H however the procedure is written.
+- A CALL through an address passes more than one argument only to a PUBLIC or
+  REENTRANT procedure (a warning says so).
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
+
+### Known issues — not this compiler
+
+- **um80 0.3.50 reads a symbol whose letters end in one of its word
+  operators, followed by + or -, as that operator** (`find_binary_addsub`
+  takes the letters before the sign, `[A-Za-z]+$`, for a word operator even
+  when they end a longer symbol), and `EQ`, `SHL`, `NUL` and the like on
+  their own as operators, without an error: `ld hl,TYPE+2` loads 0, `call
+  EQ` calls 0FFFFH. uplm80 renames or rewrites what it emits so as not to
+  meet it; an assembly module written by hand can.
+- **With `um80 -t` (PUBLIC and EXTERNAL names cut to six characters, as
+  MACRO-80 does), ul80 links two PUBLIC names that agree in their first six
+  characters as one** - PRINTCHAR and PRINTCRLF are both PRINTC - reporting
+  "Multiply defined global" and linking anyway. uplm80's output keeps its
+  names whole and is assembled without -t.
 
 ### Verified
 
@@ -598,6 +912,35 @@ Each fix has a regression test that fails without it.
   test that runs a program - the run tests, the differential test and the
   division oracle - now assembles, links and runs it with
   `tests/_toolchain.py`.
+- MP/M II built from source with the fixes to procedure locals above
+  (`build_all.sh --tree=src`, V2.0 and V2.1) passes mpm2's
+  `scripts/run_tests.sh all` for both: DIR, STAT, STAT drive, the resident
+  system processes, HTTP and SFTP.
+- A 122-command session of DIR, STAT, SDIR, TYPE, PIP, SET, SHOW, ED,
+  MPMSTAT and SCHED prints exactly what the same session prints with the
+  tools built by 86d2720, apart from MPMSTAT's snapshot of which processes
+  are delayed.
+- `80un.com` and `80unbas.com` at -O2 and -O3 extract the same files from
+  all 17 sample archives, and detokenise the BASIC samples the same, as
+  86d2720's builds.
+- The fixes to names and labels change none of that. Each of the 87
+  compiles of the current MP/M II and 80un sources (77 of them assemble)
+  gives the same `.mac` with them as without them, at -O0, -O2 and -O3,
+  but for the two 80un multi-file programs, whose private names are
+  qualified; those link to the same `80un.com` and `80unbas.com`, byte for
+  byte.
+- `scripts/difftest.py --seeds 200 --first 1000`: all 200 programs as the
+  model says at -O0 to -O3. The release gate's generator of locals (static
+  locals, nested readers, GOTOs, variable subscripts, pointers): 500
+  programs at -O0 to -O3, all as its model says. `scripts/namestest.py`:
+  1000 one-module and 480 three-module seeds before the fixes to locals
+  were merged, and 300 and 100 after, all at -O0 to -O3, all print what
+  their scopes say.
+- The release gate's adversarial programs a1 to a14 print at -O0 to -O3
+  what 86d2720's build printed, apart from a4, which prints `RST` at every
+  level where 86d2720's printed `T` at -O0 and `ST` above, and a5 and a6,
+  whose GOTO from a nested procedure to a label of its parent is a compile
+  error now (86d2720's output did not assemble).
 
 ## 0.3.6 — 2026-09-24
 
