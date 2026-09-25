@@ -443,6 +443,26 @@ Each fix has a regression test that fails without it.
   that names it, `.i` anywhere, `i` AT or BASED. A pointer computed from the
   address of the variable declared before `i` still can, and a store
   through it does not end the loop. DRI's compiler never counts a loop.
+- **A procedure's local variables do not keep their values from one call
+  to the next** unless they have `INITIAL`. uplm80 overlays the locals of
+  procedures that are never active together in one block, `??AUTO`, where
+  the manual (8.1.7) allocates a procedure's variables statically. A
+  procedure that keeps a count in an uninitialised local starts from
+  whatever another procedure left there:
+  `tick: procedure address; declare (count, seen) address; if seen <>
+  1234h then do; seen = 1234h; count = 0; end; count = count + 1; return
+  count; end tick;`, called in a loop with another procedure that has
+  locals of its own, returns 1 every time. Declare such a variable with
+  `INITIAL`, which keeps it out of `??AUTO`, or at module level. None of
+  MP/M II's or 80un's programs depends on it. (0.3.6 the same; by design.)
+- **A BYTE compared with a constant above 255 is rejected,** where the
+  manual (4.4) compares the two as unsigned numbers and DRI's compiler
+  accepts it: `IF b < 256 THEN ...` stops with "comparison BYTE < 256 is
+  always true", and so do `b <> 257`, `b = 300` and `(b + 1) < 256`. The
+  error is meant to catch a comparison that cannot come out both ways, but
+  only a constant on the right is checked (`IF 300 > b` compiles), and at
+  `-O3` a propagated value can hide it. Write `DOUBLE(b) < 256` to compile
+  the comparison as it stands. (0.3.6 the same.)
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
 
