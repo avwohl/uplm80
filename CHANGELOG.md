@@ -485,16 +485,27 @@ Each fix has a regression test that fails without it.
   0.3.49 as with 0.3.6 (the rest are single modules of multi-module programs,
   and MSCMN.PLM, which is only ever included). At -O2 every output changes
   from 0.3.6, if only by the layout, and every change is one of the entries
-  above. The 82 come to 224,925 bytes, against 227,511 with 0.3.6. `80un.com`
-  extracts the same files, with the same console output, from all 17 sample
-  archives as 0.3.6's, at -O2 and -O3, and `80unbas.com` detokenises
-  `PALLOPS.BAS` the same.
+  above: of 1,733 changed hunks (4,278 lines that only moved aside), 601 are
+  the DO-loop layout and counted loops, 272 shift and rotate counts, 221
+  constants loaded straight into the register wanted, 182 the `cseg`/`dseg`
+  split, 151 BYTE operations kept in A, 136 the runtime routines, 91 ATs
+  resolved to their root, 34 `SHR(x, 7)`, 23 DATA and INITIAL, 8 `CARRY`, 7
+  a BYTE argument widened, 5 `jp`/`jr` distances and 2 the `extrn` below.
+  The 82 come to 224,925 bytes, against 227,511 with 0.3.6. The fixes made
+  after the integration verification (the entries that name it) change no
+  output of MP/M II or 80un at -O0, -O2 or -O3 but the multi-file
+  `80un.com` and `80unbas.com` compiles, which now declare `extrn MON1` and
+  `extrn MON2`: 80un declares them EXTERNAL, and a CP/M-mode call goes to
+  BDOS directly. `80un.com` extracts the same files, with the same console
+  output, from all 17 sample archives as 0.3.6's, at -O2 and -O3, and
+  `80unbas.com` detokenises `PALLOPS.BAS` the same.
 - MP/M II built from source with this release - `tools/build.py` for V2.0
   and V2.1, 44 of 44 targets each - passes mpm2's `scripts/run_tests.sh all`
   on the V2.1 system and `scripts/run_tests.sh src`. SUBMIT and SPOOL were
   built from DRI's own `SUB.PLM` and `MSPL.PLM`, without the workarounds
-  mpm2 carried for the old layout, and compared on the emulator with DRI's
-  V2.0 `SUBMIT.PRL` and `SPOOL.PRL`: SUBMIT runs two 300-line command files
+  mpm2 carried for the old layout, and compared on the emulator, on the
+  V2.0 system built from source, with DRI's V2.0 `SUBMIT.PRL` and
+  `SPOOL.PRL`: SUBMIT runs two 300-line command files
   (3968 and 3328 bytes), a 250-line one of 15K, and one with parameters,
   printing exactly what DRI's does, where the release before the layout
   change printed its own messages over the 3968-byte file and ran none of
@@ -502,16 +513,27 @@ Each fix has a regression test that fails without it.
   prints a 150-line file and a 7936-byte one as DRI's does, where before it
   printed 512 NULs in place of their first records. `stat usr:` now prints
   what DRI's STAT prints. GENSYS built from source, whose DATA now follows
-  its code, makes the same MPM.SYS and SYSTEM.DAT under cpmemu as DRI's
-  GENSYS, with the same console output (V2.1 differs in the six bytes of
-  the serial number, which the build leaves as DRI's placeholder).
+  its code, prints what DRI's GENSYS prints under cpmemu, for V2.0 and
+  V2.1 and with three sets of answers, and makes the same MPM.SYS and
+  SYSTEM.DAT but for the six bytes of the serial number at 0B5H: the build
+  leaves DRI's placeholder there, "654321", and the V2.0 GENSYS.COM in DRI's
+  MPMLDR directory, which has the placeholder too, makes byte-identical
+  files. Against DRI's serialised GENSYS - V2.0's in CONTROL, V2.1's on the
+  distribution disk - the two files differ in those six bytes and nowhere
+  else.
 - The differential tests: `scripts/difftest.py --seeds 400 --first 1000`,
   all 400 random programs as the model says at `-O0` to `-O3` (seed 1063,
   which the second upeepz80 defect above broke, no longer meets it); and the
   integration verification's own generator, which covers DATA, INITIAL, AT,
   BASED, DO loops whose body moves the index or the bound, calls in
   arguments and module-level code: 497 programs at `-O0` to `-O3`, all as its
-  model says.
+  model says. The independent verification of the release wrote a third,
+  over typed expressions, calls that call back, nested and REENTRANT
+  procedures, BASED, AT, structures, DATA, every form of DO, and programs
+  of two modules built both separately and as one multi-file compile:
+  2001 programs, 12,276 builds, whose only compiler defects were the two
+  `-O3` unrolling defects above. Its seeds 1500 to 1599, 20480 to 20579 and
+  30001 to 30100, taken again with this release, all run as its model says.
 - The run tests compile with the checkout under test: they used to start the
   compiler with `python -P`, which found whatever uplm80 was installed. Every
   test that runs a program - the run tests, the differential test and the
