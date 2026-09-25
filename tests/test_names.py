@@ -15,7 +15,7 @@ import tempfile
 
 import pytest
 
-from ._toolchain import compile_cmd, compiler_env, run_plm
+from ._toolchain import compile_cmd, compiler_env, run_asm, run_plm, tools_missing
 
 LEVELS = (0, 1, 2, 3)
 
@@ -303,3 +303,126 @@ end t;
     assert ("T.PLM:8:1: warning: a CALL through an address passes more than one argument "
             "only to a PUBLIC or REENTRANT procedure") in r.stderr, r.stderr
 
+
+# ---- a multi-file compile --------------------------------------------------
+
+def _compile_modules(sources: list[str], opt: int = 2) -> subprocess.CompletedProcess:
+    """`uplm80 A.PLM B.PLM ... -o AB.MAC'; stdout is the assembly."""
+    with tempfile.TemporaryDirectory() as d:
+        paths = []
+        for i, text in enumerate(sources):
+            paths.append(os.path.join(d, f"M{i}.PLM"))
+            with open(paths[-1], "w") as fh:
+                fh.write(text)
+        mac = os.path.join(d, "AB.MAC")
+        r = subprocess.run(compile_cmd("-O", str(opt), "-o", mac, *paths), capture_output=True,
+                           text=True, timeout=60, env=compiler_env(), check=False)
+        if r.returncode == 0:
+            with open(mac) as fh:
+                r.stdout = fh.read()
+    return r
+
+
+def _run_modules(sources: list[str], opt: int) -> str:
+    reason = tools_missing()
+    if reason:
+        pytest.skip(reason)
+    r = _compile_modules(sources, opt)
+    assert r.returncode == 0, r.stderr
+    return run_asm(r.stdout).stdout.replace("\r", "")
+
+
+MAIN = """0100H:
+m: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+t2: procedure byte external; end t2;
+declare k literally '1';
+declare tag (2) byte data ('m', 'M');
+declare seen byte;
+helper: procedure byte;
+    declare (n, seen) byte;
+    if seen <> 77h then do; seen = 77h; n = 'a' - 1; end;
+    n = n + k;
+    return n;
+end helper;
+declare i byte;
+seen = 0;
+do i = 1 to 3;
+    call mon1(2, helper);
+    call mon1(2, t2);
+end;
+call mon1(2, tag(0));
+end m;
+"""
+
+LIB = """lib: do;
+declare k literally '2';
+declare tag (2) byte data ('l', 'L');
+declare seen byte;
+helper: procedure byte;
+    declare (n, seen) byte;
+    if seen <> 77h then do; seen = 77h; n = 'A' - 1; end;
+    n = n + k - 1;
+    return n;
+end helper;
+t2: procedure byte public;
+    return helper + tag(1) - 'L';
+end t2;
+end lib;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_each_module_of_a_multi_file_compile_has_its_own_names(opt):
+    """Modules have separate name spaces for everything not PUBLIC or
+    EXTERNAL (Programming Manual, 10.4).  Compiled together they made one
+    assembly in which two private procedures called HELPER, their static
+    locals, and the modules' own SEEN, TAG and K were each defined twice
+    ("Symbol 'HELPER' multiply defined", "'@HELPER$N' multiply defined").
+    Each is now qualified with its module's name (LIB?HELPER), and T2,
+    PUBLIC in one and EXTERNAL in the other, still binds."""
+    assert _run_modules([MAIN, LIB], opt) == "aAbBcCm"
+
+
+def test_the_qualified_names():
+    r = _compile_modules([MAIN, LIB])
+    assert r.returncode == 0, r.stderr
+    labels = {l.split(":")[0] for l in r.stdout.splitlines() if ":" in l.split("\t")[0]}
+    for name in ("M?HELPER", "LIB?HELPER", "M?SEEN", "LIB?SEEN", "M?TAG", "LIB?TAG",
+                 "T2", "@M?HELPER$N", "@LIB?HELPER$N"):
+        assert name in labels, sorted(labels)
+    assert "public\tT2" in r.stdout
+
+
+def test_a_private_name_of_another_module_is_an_error():
+    """Compiled alone, a module cannot reach another's private procedure;
+    together, it silently could.  Now it is an error that says what to do."""
+    r = _compile_modules([MAIN.replace("t2: procedure byte external; end t2;\n", ""),
+                          LIB.replace("t2: procedure byte public;", "t2: procedure byte;")])
+    assert r.returncode != 0
+    assert ("M0.PLM:17:18: error: T2 is not declared in module M; module LIB declares it but "
+            "does not make it PUBLIC (declare it PUBLIC there and EXTERNAL here)") in r.stderr
+
+
+@pytest.mark.parametrize("opt", (0, 2))
+def test_a_public_procedure_needs_no_external_declaration(opt):
+    """What a multi-file compile has always allowed, and 80un relies on."""
+    assert _run_modules([MAIN.replace("t2: procedure byte external; end t2;\n", ""), LIB],
+                        opt) == "aAbBcCm"
+
+
+def test_a_module_without_a_name_goes_by_its_files():
+    r = _compile_modules(["declare x byte public;\nq: procedure; x = 1; end q;\ncall q;\n",
+                          "declare x byte external;\nq: procedure; x = 2; end q;\n"])
+    assert r.returncode == 0, r.stderr
+    assert "M0?Q:" in r.stdout and "M1?Q:" in r.stdout, r.stdout
+
+
+def test_two_main_program_modules_are_an_error():
+    """Only the first module's statements were compiled; the second's were
+    dropped without a word."""
+    r = _compile_modules(["a: do; declare x byte; x = 1; end a;\n",
+                          "b: do; declare y byte; y = 2; end b;\n"])
+    assert r.returncode != 0
+    assert ("M1.PLM:1:24: error: modules A and B both have statements at their outer level; "
+            "only the main program module may") in r.stderr, r.stderr

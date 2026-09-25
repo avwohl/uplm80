@@ -2307,7 +2307,7 @@ class CodeGenerator:
             return self._generate_multi(modules)
 
     def _generate_multi(self, modules: list) -> str:
-        resolve_names(modules)
+        resolve_names(modules, multi=True)
         self.output = []
         self.data_segment = []
         self.at_defs = []

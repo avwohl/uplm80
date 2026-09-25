@@ -162,7 +162,8 @@ def test_several_modules_compiled_together_end_with_the_last_ones_variables():
             "A.PLM": "a: do; declare x byte public; declare s (*) byte data ('A$');\n"
                      "f: procedure public; x = s(0); end f; call f; end a;",
             "B.PLM": "b: do; declare x byte external; f: procedure external; end f;\n"
-                     "declare y (4) byte; declare tail byte; y(0) = x; tail = 1; end b;",
+                     "declare y (4) byte; declare tail byte;\n"
+                     "g: procedure public; y(0) = x; tail = 1; end g; end b;",
         }
         paths = []
         for name, text in srcs.items():
@@ -175,8 +176,9 @@ def test_several_modules_compiled_together_end_with_the_last_ones_variables():
         assert r.returncode == 0, r.stderr
         with open(mac) as fh:
             code, data = _segments(fh.read())
-    assert _storage(data)[-3:] == ["X", "Y", "TAIL"], data
-    assert any(l.startswith("S:") or l == "S:" for l in code), code
+    # Each module's private names are qualified with the module's name.
+    assert _storage(data)[-3:] == ["X", "B?Y", "B?TAIL"], data
+    assert any(l.startswith("A?S:") or l == "A?S:" for l in code), code
 
 
 def test_memory_is_still_the_end_of_the_whole_program():

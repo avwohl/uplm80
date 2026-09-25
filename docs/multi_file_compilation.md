@@ -13,19 +13,37 @@ uplm80 supports compiling multiple PL/M source files together in a single compil
 uplm80 file1.plm file2.plm file3.plm -o output.mac
 ```
 
-Files are processed in order, so definitions must come before uses.
+Each file is one PL/M-80 module.  Only one of them may be the main
+program module (the one with executable statements at its outer level).
 
-## Important: Procedure Declarations
+## Names
 
-**DO NOT use `external` for procedure declarations when compiling files together.**
+Each module keeps its own name space, exactly as if it were compiled
+alone and linked: a name that is not PUBLIC or EXTERNAL belongs to its
+module (Programming Manual, 10.4), and two modules may each have a
+procedure, variable, DATA table, label or LITERALLY of the same name
+without meeting.  In the combined assembly such names are qualified with
+their module's name: procedure `helper` of module `lib` is `LIB?HELPER`,
+and its locals `@LIB?HELPER$N`.  (No PL/M-80 identifier contains `?`, so
+a qualified name cannot meet one the program declares.)
 
-The compiler uses different calling conventions:
-- `external` procedures → stack-based calling (push args, call, pop)
-- Defined procedures → register-based calling (??AUTO locations)
+PUBLIC and EXTERNAL names are not qualified: they are what the linker
+binds, within the combined assembly as between separately compiled
+modules.
 
-When you declare a procedure as `external` in one file, but it's defined in another file being compiled together, the calling convention mismatch will cause incorrect behavior.
+A module that uses a name another module declares without PUBLIC is an
+error, as it would be at link time if the modules were compiled
+separately:
 
-### Correct Pattern
+```
+main.plm:17:18: error: T2 is not declared in module M; module LIB declares
+it but does not make it PUBLIC (declare it PUBLIC there and EXTERNAL here)
+```
+
+## Procedures
+
+Declare the procedure PUBLIC where it is defined, and EXTERNAL in each
+module that calls it:
 
 ```plm
 /* file1.plm - defines the procedure */
@@ -34,26 +52,28 @@ myproc: procedure(x, y) byte public;
     /* ... */
 end myproc;
 
-/* file2.plm - just calls it, no declaration needed */
-/* The procedure is visible because file1.plm is compiled first */
-result = myproc(1, 2);
-```
-
-### Incorrect Pattern (DO NOT USE)
-
-```plm
-/* file2.plm - WRONG: external declaration */
+/* file2.plm - calls it */
 myproc: procedure(x, y) byte external;
     declare (x, y) address;
 end myproc;
 
-/* This will use stack-based calling, but myproc expects register-based */
-result = myproc(1, 2);  /* BROKEN! */
+result = myproc(1, 2);
 ```
+
+A PUBLIC procedure takes its arguments on the stack, which is how a call
+to an EXTERNAL one passes them, so the two agree whether the modules are
+compiled together or apart.  (A procedure private to its module is
+called more cheaply: its arguments are stored straight into its own
+storage, and the last passed in a register.)
+
+When the modules are compiled together, a PUBLIC procedure can also be
+called from another module without an EXTERNAL declaration there, as
+older uplm80 multi-file programs do; the EXTERNAL declaration is what
+lets each module also be compiled on its own.
 
 ## Variables
 
-Variables CAN use `external` and `public` to share storage across files:
+Variables use `external` and `public` to share storage across files:
 
 ```plm
 /* file1.plm */

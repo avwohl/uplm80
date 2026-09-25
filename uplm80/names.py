@@ -35,6 +35,8 @@ generation the label each one jumps to.
 from __future__ import annotations
 
 import dataclasses
+import os
+import re
 from dataclasses import dataclass, field
 
 from . import _plm_parser as P
@@ -84,6 +86,12 @@ GOTO_RULE = ("PL/M-80 allows a GOTO out of a procedure only to a label at the "
 SCOPE_RULE = ("a GOTO reaches only a label in its own block or in a block "
               "enclosing it (Programming Manual 9800268B, 9.3)")
 
+# What every module can name without declaring it (symbols.SymbolTable).
+_BUILTINS = frozenset(
+    {"INPUT", "OUTPUT", "LOW", "HIGH", "DOUBLE", "LENGTH", "LAST", "SIZE", "SHL", "SHR",
+     "ROL", "ROR", "SCL", "SCR", "MOVE", "TIME", "CARRY", "SIGN", "ZERO", "PARITY", "DEC",
+     "MEMORY", "STACKPTR", "CPUTIME"})
+
 _DO_BLOCKS = (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock)
 
 
@@ -121,6 +129,18 @@ class _Module:
     name: str
     main: bool = False          # has executable statements at module level
     qualifier: str = ""
+    first: object = None        # its first item
+
+
+def _file_name(module) -> str | None:
+    """A module without a name of its own goes by its file's, made a name."""
+    for it in module.items:
+        origin = getattr(getattr(it, "pos", None), "origin", None)
+        if origin:
+            stem = os.path.splitext(os.path.basename(origin[0]))[0].upper()
+            stem = re.sub(r"[^A-Z0-9_]", "_", stem)
+            return stem if stem[:1].isalpha() else f"M{stem}"
+    return None
 
 
 @dataclass(eq=False)
@@ -170,7 +190,7 @@ class _Resolver:
         items = list(module.items)
         if items and isinstance(items[0], P.AddressLiteral):
             items = items[1:]
-        name = f"M{index + 1}"
+        name = _file_name(module) or f"M{index + 1}"
         # The module's label is outside the module (9.3): not declared.
         if len(items) == 1 and isinstance(items[0], P.LabeledStmt) and isinstance(
                 items[0].stmt, P.DoBlock):
@@ -178,6 +198,8 @@ class _Resolver:
             items = list(items[0].stmt.items)
         mod = _Module(index, name)
         mod.main = any(not isinstance(it, (P.ProcDecl, P.DeclareStmt)) for it in items)
+        mod.first = next((it for it in items
+                          if not isinstance(it, (P.ProcDecl, P.DeclareStmt))), None)
         self.modules.append(mod)
         block = _Block("module", self.globals, mod, None)
         self._visit(items, block)
@@ -368,6 +390,53 @@ class _Resolver:
             n += 1
         return f"{name}?{n}"
 
+    def qualify(self) -> None:
+        """Give each module's private module-level names its own name.
+
+        Modules have separate name spaces for everything not PUBLIC or
+        EXTERNAL (Programming Manual, 10.4); compiled one at a time they
+        are kept apart by the linker, which sees only the PUBLIC names.  A
+        multi-file compile makes one assembly of them, so a module-level
+        name - and anything code generation names as one: a procedure or
+        label in a DO block of the main program, and every LITERALLY's EQU
+        - is qualified with the module's name: HELPER of module LIB is
+        LIB?HELPER, its locals @LIB?HELPER$N.
+        """
+        taken: set[str] = set()
+        for m in self.modules:
+            q = m.name
+            while q in taken:
+                q = f"{q}{m.index + 1}"
+            taken.add(q)
+            m.qualifier = q
+        for d in list(self.decls):
+            if d.shared or "?" in d.name:
+                continue
+            if (d.block.kind == "module" or d.kind == "lit"
+                    or (d.kind in ("proc", "label") and d.block.proc is None)):
+                self.rename(d, f"{d.block.module.qualifier}?{d.name}")
+
+    def check_private(self) -> None:
+        """A name one module uses without declaring it, and another module
+        declares without making it PUBLIC, is an error: compiled alone,
+        the one module could not reach it."""
+        private: dict[str, _Decl] = {}
+        for d in self.decls:
+            if d.block.kind == "module" and not d.shared:
+                private.setdefault(d.orig, d)
+        for r in self.refs:
+            if r.decl is not None or r.goto:
+                continue
+            name = _key(getattr(r.node, r.attr))
+            d = private.get(name)
+            if d is None or name in _BUILTINS or d.block.module is r.block.module:
+                continue
+            text = ident_text(getattr(r.node, r.attr))
+            raise CodeGenError(
+                f"{text} is not declared in module {r.block.module.name}; module "
+                f"{d.block.module.name} declares it but does not make it PUBLIC "
+                "(declare it PUBLIC there and EXTERNAL here)", source_location(r.node))
+
     # The kind of declaration renamed first when two meet in one assembler
     # name: a label, which nothing outside its procedure names, before a
     # procedure, and a variable last.
@@ -457,14 +526,24 @@ class _Resolver:
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
 
 
-def resolve_names(modules: list) -> None:
-    """Bind the names of ``modules``, one compilation, rename what code
-    generation would confuse, and check the GOTOs (see the module
-    docstring).  Raises CodeGenError for a GOTO PL/M-80 does not allow."""
+def resolve_names(modules: list, multi: bool = False) -> None:
+    """Bind the names of ``modules``, rename what code generation would
+    confuse, and check the GOTOs (see the module docstring).  ``multi``:
+    the modules are separate modules compiled together into one assembly
+    (a multi-file compile), whose private names are qualified per module.
+    Raises CodeGenError for a GOTO PL/M-80 does not allow."""
     r = _Resolver()
     for i, m in enumerate(modules):
         r.add_module(m, i)
     r.bind()
+    if multi:
+        mains = [m for m in r.modules if m.main]
+        if len(mains) > 1:
+            raise CodeGenError(
+                f"modules {mains[0].name} and {mains[1].name} both have statements at their "
+                "outer level; only the main program module may", source_location(mains[1].first))
+        r.check_private()
+        r.qualify()
     r.settle()
     r.check_gotos()
     r.annotate()
