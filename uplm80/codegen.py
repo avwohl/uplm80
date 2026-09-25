@@ -5136,7 +5136,7 @@ class CodeGenerator:
         if sym.stack_offset is not None:
             return f"(ix+{sym.stack_offset})"
         if sym.based_on:
-            self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+            self._load_based_ptr(sym)
             return "(hl)"
         name = ident_text(var.name)
         if name in self.literal_macros or name.upper() == "STACKPTR":
@@ -5602,6 +5602,40 @@ class CodeGenerator:
             return base
         return f"{base}+{offset}" if offset > 0 else f"{base}-{-offset}"
 
+    def _load_based_ptr(self, sym, reg: str = "hl") -> None:
+        """Load the pointer behind the BASED variable ``sym`` into ``reg``
+        (``hl`` or ``de``).
+
+        A REENTRANT procedure's local or parameter holds it in the frame,
+        where no label names it: `ld l,(ix+d) / ld h,(ix+d+1)'.
+        """
+        base_sym = self.symbols.lookup(sym.based_on)
+        if base_sym is None or base_sym.stack_offset is None:
+            self._emit("ld", f"{reg},({self._based_ptr_operand(sym)})")
+            return
+        offset = base_sym.stack_offset + self._based_member_offset(sym, base_sym)
+        if not -128 <= offset <= 126:
+            raise CodeGenError(
+                f"{sym.name}: BASED on a member more than 128 bytes into the frame of "
+                f"REENTRANT procedure {self.current_proc}, beyond the reach of (ix+d)")
+        self._emit("ld", f"{reg[1]},(ix+{offset})")
+        self._emit("ld", f"{reg[0]},(ix+{offset + 1})")
+
+    @staticmethod
+    def _based_member_offset(sym, base_sym) -> int:
+        """The offset in ``base_sym`` of the member ``sym`` is BASED on, 0
+        when it is BASED on the whole variable."""
+        member = getattr(sym, "based_member", None)
+        if not member or not (base_sym and base_sym.struct_members):
+            return 0
+        offset = 0
+        for m in base_sym.struct_members:
+            if m.name == member:
+                return offset
+            width = 1 if m.data_type == DataType.BYTE else 2
+            offset += width * (m.dimension or 1)
+        return 0
+
     def _based_ptr_operand(self, sym) -> str:
         """Where the pointer behind a BASED variable lives.
 
@@ -5615,18 +5649,8 @@ class CodeGenerator:
         base_sym = self.symbols.lookup(sym.based_on)
         base_asm = (base_sym.asm_name if base_sym and base_sym.asm_name
                     else self._mangle_name(sym.based_on))
-        member = getattr(sym, "based_member", None)
-        if not member or not (base_sym and base_sym.struct_members):
-            return base_asm
-        offset = 0
-        for m in base_sym.struct_members:
-            if m.name == member:
-                break
-            width = 1 if m.data_type == DataType.BYTE else 2
-            offset += width * (m.dimension or 1)
-        else:
-            return base_asm
-        return self._sym_offset(base_asm, offset)
+        offset = self._based_member_offset(sym, base_sym)
+        return self._sym_offset(base_asm, offset) if offset else base_asm
 
     def _gen_expr(self, expr) -> DataType:
         """Generate code for a typed expression.
@@ -5911,10 +5935,7 @@ class CodeGenerator:
 
                 # Check for BASED variable
                 if sym.based_on:
-                    # Load the base pointer first - look up the actual asm_name
-                    base_sym = self.symbols.lookup(sym.based_on)
-                    base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else sym.based_on
-                    self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                    self._load_based_ptr(sym)
                     # Then load from the pointed-to address
                     if sym.data_type == DataType.BYTE:
                         self._emit("ld", "a,(hl)")
@@ -5980,15 +6001,12 @@ class CodeGenerator:
 
             # Check for BASED variable
             if sym and sym.based_on:
-                # Load base pointer - look up the actual asm_name
-                base_sym = self.symbols.lookup(sym.based_on)
-                base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else sym.based_on
                 if sym.data_type == DataType.BYTE:
                     # Value is in A (if val_type==BYTE) or L (if val_type==ADDRESS)
                     if val_type != DataType.BYTE:
                         self._emit("ld", "a,l")  # Get byte value into A
                     self._emit("ld", "b,a")  # Save value in B
-                    self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                    self._load_based_ptr(sym)
                     self._emit("ld", "a,b")  # Restore value
                     self._emit("ld", "(hl),a")  # Store via HL
                 else:
@@ -5999,7 +6017,7 @@ class CodeGenerator:
                         self._emit("ld", "h,0")
                     # Save value in HL
                     self._emit("push", "hl")
-                    self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                    self._load_based_ptr(sym)
                     self._emit("ex", "de,hl")  # DE = address
                     self._emit("pop", "hl")  # HL = value
                     self._emit("ex", "de,hl")  # HL = address, DE = value
@@ -7157,9 +7175,10 @@ class CodeGenerator:
                 self._emit("ld", "h,0")
                 sym = self.symbols.lookup(ident_text(base.name))
                 if sym and sym.based_on:
-                    base_sym = self.symbols.lookup(sym.based_on)
-                    base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
-                    self._emit("ld", f"de,({base_asm_name})")
+                    # The pointer, from the member it is in if it is BASED
+                    # on one: `token BASED pcb.tok (4) byte' read token(i)
+                    # through pcb's first word.
+                    self._load_based_ptr(sym, "de")
                 else:
                     asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(ident_text(base.name))
                     self._emit("ld", f"de,{asm_name}")
@@ -7172,9 +7191,7 @@ class CodeGenerator:
             if sym and sym.stack_offset is not None:
                 self._emit_frame_addr(sym)
             elif sym and sym.based_on:
-                base_sym = self.symbols.lookup(sym.based_on)
-                base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
-                self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                self._load_based_ptr(sym)
             else:
                 asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(ident_text(base.name))
                 self._emit("ld", f"hl,{asm_name}")
@@ -7271,16 +7288,12 @@ class CodeGenerator:
                 if sym.stack_offset is not None:
                     self._emit_frame_addr(sym)
                 elif sym.based_on:
-                    base_sym = self.symbols.lookup(sym.based_on)
-                    base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
-                    self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                    self._load_based_ptr(sym)
                 else:
                     asm_name = sym.asm_name or name
                     self._emit("ld", f"hl,{asm_name}")
             elif sym and sym.based_on:
-                base_sym = self.symbols.lookup(sym.based_on)
-                base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
-                self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                self._load_based_ptr(sym)
             else:
                 self._gen_expr(base)
         elif isinstance(base, P.Call):
@@ -7955,9 +7968,7 @@ class CodeGenerator:
                     self._emit("ld", f"de,{sym.stack_offset}")
                     self._emit("add", "hl,de")
             elif sym and sym.based_on:
-                base_sym = self.symbols.lookup(sym.based_on)
-                base_asm_name = base_sym.asm_name if base_sym and base_sym.asm_name else self._mangle_name(sym.based_on)
-                self._emit("ld", f"hl,({self._based_ptr_operand(sym)})")
+                self._load_based_ptr(sym)
             else:
                 asm_name = sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
                 self._emit("ld", f"hl,{asm_name}")

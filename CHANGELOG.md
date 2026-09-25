@@ -157,11 +157,14 @@ Each fix has a regression test that fails without it.
   which keeps `g` out of it for such a call in a procedure, never looked at
   the main program's calls.
 - **An array or structure local to a REENTRANT procedure did not
-  assemble.** The frame had room for it, but the code addressed it by a
-  label that was never defined (`ld (V),a`, "Undefined symbol 'V'"). It is
-  now reached as IX plus its offset, and placed after the procedure's
-  scalars, which `(ix+d)` has to reach; a scalar more than 128 bytes into
-  the frame is an error rather than a displacement the assembler rejects.
+  assemble,** nor did a BASED variable whose pointer is one of its locals
+  or parameters. The frame had room for them, but the code addressed them
+  by a label that was never defined (`ld (V),a`, "Undefined symbol 'V'").
+  An array or structure is now reached as IX plus its offset, and placed
+  after the procedure's scalars, which `(ix+d)` has to reach, and a pointer
+  is loaded with `ld l,(ix+d) / ld h,(ix+d+1)`; a scalar more than 128
+  bytes into the frame is an error rather than a displacement the
+  assembler rejects.
 - **A local declared in a DO block of a REENTRANT procedure was below
   SP.** The frame was sized from the procedure's own declarations before
   the body was read, so the block's locals were outside it, and the next
@@ -336,6 +339,13 @@ Each fix has a regression test that fails without it.
   the DATA came first: `DECLARE t (2) BYTE DATA (0C9H, 42H)` returned to
   CP/M before the first statement. In CP/M mode it now follows the code;
   BARE and MP/M modes keep DRI's layout.
+
+- **An element of an array BASED on a structure member, with a variable
+  BYTE subscript, took its pointer from the start of the structure:**
+  with `token BASED pcb.tok (4) BYTE`, `token(i)` read through
+  `pcb.state`. 0.3.6 fixed the other paths for a variable BASED on a member
+  (SDIR's `token BASED pcb.token$adr (12) byte`, which it subscripts only
+  with constants) and missed this one.
 
 #### Multi-file compiles
 

@@ -405,3 +405,55 @@ run: procedure;
 end run;
 call run;
 """, [7, 0xC8, 3, 0x1002, 8, 2, 0xABCD, 1, 0x1234, 0x24, 0x2C, 0x279, 10])
+
+
+def test_a_based_array_on_a_structure_member_indexed_by_a_byte():
+    """`token BASED pcb.tok (4) BYTE' keeps its pointer in the member
+    `pcb.tok'. An element with a variable BYTE subscript took the pointer
+    from the first word of `pcb' instead, so `token(i)' read `junk(2)' for
+    `buf(2)' at -O0 to -O2 (at -O3 `i' is known and the subscript constant);
+    0.3.6 did the same. A constant subscript and a scalar BASED on a member
+    were right."""
+    _check("""
+declare pcb structure (state address, tok address);
+declare token based pcb.tok (4) byte;
+declare buf (4) byte, junk (4) byte, i byte;
+run: procedure;
+  buf(2) = 43h; buf(1) = 42h; junk(2) = 58h;
+  pcb.state = .junk; pcb.tok = .buf;
+  i = 2;
+  call ph(token(i)); call ph(token(1));
+end run;
+call run;
+""", [0x43, 0x42])
+
+
+def test_a_reentrant_procedures_local_pointer_bases_a_variable():
+    """A BASED variable whose pointer is a REENTRANT procedure's local or
+    parameter read the pointer by a label nothing defines, and did not
+    assemble (0.3.6 the same). The pointer is in the frame, and each
+    activation has its own."""
+    _check("""
+declare g (3) byte;
+r: procedure (n) byte reentrant;
+  declare n byte, p address, x based p byte;
+  p = .g(n);
+  if n = 0 then return x;
+  return r(n - 1) + x;
+end r;
+s: procedure (q, n) address reentrant;
+  declare q address, n byte, w based q (1) address, t address;
+  if n = 0 then return w(0);
+  w(1) = w(1) + 1;
+  t = s(q, n - 1);
+  return t + w(1);
+end s;
+declare ws (2) address;
+run: procedure;
+  g(0) = 1; g(1) = 2; g(2) = 3;
+  call ph(r(2));
+  ws(0) = 100h; ws(1) = 0;
+  call ph(s(.ws, 3));
+end run;
+call run;
+""", [6, 0x100 + 3 + 3 + 3])
