@@ -1485,9 +1485,10 @@ class ASTOptimizer:
 
         Only when neither operand does anything: PL/M-80 leaves the order
         of evaluation open, and a swap changes the order code generation
-        picks. A literal moved to the right of a relation is marked derived,
-        since it is not where the programmer wrote it (see
-        CodeGenerator._check_impossible_comparison).
+        picks. A constant moved to the right of a relation goes over as a
+        typed constant, derived only if it was derived where it stood: the
+        programmer wrote `300 = b' as surely as `b = 300', and
+        CodeGenerator._check_impossible_comparison warns of either.
         """
         if kind not in self._COMMUTATIVE:
             return left, right
@@ -1509,14 +1510,13 @@ class ASTOptimizer:
         if right_key < left_key:
             if kind in RELATIONS:
                 # Any constant, not just a literal: `'AB' <> b', or a sum
-                # a PLUS in the procedure keeps from being folded, was
-                # rejected at -O3 alone. Its value is the relation's
-                # operand (the flags of computing it are dead after the
-                # compare), so it goes over as that value.
+                # a PLUS in the procedure keeps from being folded. Its value
+                # is the relation's operand (the flags of computing it are
+                # dead after the compare), so it goes over as that value.
                 typed = eval_typed(left)
                 if typed is not None:
                     left = make_typed_const(typed[0], typed[1], getattr(left, "pos", None),
-                                            derived=True)
+                                            derived=typed[2])
             return right, left
         return left, right
 

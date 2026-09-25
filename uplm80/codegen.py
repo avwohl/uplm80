@@ -631,6 +631,7 @@ class CodeGenerator:
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
         self.reg_debug = reg_debug  # Enable register tracking debug output
         self.warnings: list[str] = []  # Collected warnings
+        self._warned_comparisons: set = set()  # see _check_impossible_comparison
         self.symbols = SymbolTable()
         self.output: list[AsmLine] = []
         self.label_counter = 0
@@ -840,51 +841,73 @@ class CodeGenerator:
         except ValueError:
             return None
 
+    # The mirror of each relation, for a constant on the left: `c < b' is
+    # `b > c'.
+    _MIRRORED = {
+        BinaryOpKind.EQ: BinaryOpKind.EQ, BinaryOpKind.NE: BinaryOpKind.NE,
+        BinaryOpKind.LT: BinaryOpKind.GT, BinaryOpKind.GT: BinaryOpKind.LT,
+        BinaryOpKind.LE: BinaryOpKind.GE, BinaryOpKind.GE: BinaryOpKind.LE,
+    }
+
     def _check_impossible_comparison(self, left, right, op) -> None:
-        """Reject a BYTE compared with a constant it can never equal.
+        """Warn of a BYTE compared with a constant it can never reach.
 
         ``op`` is the typed-AST :class:`ast_view.BinaryOpKind` decoded
         by :func:`binop_kind` at every call site (``EQ``/``NE``/``LT``/
         ``LE``/``GT``/``GE``). A BYTE is zero-extended into a comparison
-        with an ADDRESS, so against a constant above 255 ``=`` is always
-        false, ``<>`` and ``<`` always true, and so on -- almost certainly
-        not what was meant, so it is an error.
+        with an ADDRESS (Programming Manual, 4.4), so against a constant
+        above 255 ``=`` is always false, ``<>`` and ``<`` always true, and so
+        on.  That is well defined, DRI's compiler accepts it, and it is
+        compiled as it stands; but it is seldom what was meant, so it is
+        worth a warning.  The constant may be on either side.
 
         The constant is typed and evaluated the way the program would
         compute it: ``-1`` and ``NOT 0`` are the BYTE 0FFH (4.2.2, 4.3), and
         ``7 MOD 0`` an ADDRESS 7. A constant the optimizer derived -- from
         a variable whose value it knew, or an operand it dropped -- is not
-        something the programmer wrote, and is not checked: the comparison
-        is compiled as it stands, as it is at -O 0.
+        something the programmer wrote, and is not held against it.
         """
-        left_type = self._get_expr_type(left)
-        if left_type != DataType.BYTE:
+        found = self._impossible_comparison(left, right, op)
+        if found is None:
+            found = self._impossible_comparison(right, left, self._MIRRORED.get(op))
+        if found is None:
             return
+        const, text = found
+        from .errors import SourceLocation
+        pos = getattr(const, 'pos', None)
+        where = (str(SourceLocation(pos.start_line, pos.start_column))
+                 if pos is not None and getattr(pos, 'start_line', 0) else None)
+        # The same comparison can be looked at more than once.
+        key = (where, text) if where else (id(const), text)
+        if key in self._warned_comparisons:
+            return
+        self._warned_comparisons.add(key)
+        self.warnings.append(f"{where}: warning: {text}" if where else f"warning: {text}")
+
+    def _impossible_comparison(self, byte_side, const_side, op):
+        """(the constant, the message) if ``byte_side op const_side`` compares
+        a BYTE with a constant above 255, else None."""
+        if op is None or self._get_expr_type(byte_side) != DataType.BYTE:
+            return None
         # Two constants make a constant, which the optimizer folds; the
         # check is about a BYTE the program computes.
-        if eval_typed(left, self._literal_macro_value) is not None:
-            return
-        typed = eval_typed(right, self._literal_macro_value)
+        if eval_typed(byte_side, self._literal_macro_value) is not None:
+            return None
+        typed = eval_typed(const_side, self._literal_macro_value)
         if typed is None:
-            return
+            return None
         value, _, derived = typed
         if derived or value <= 255:
-            return
-        from .errors import CodeGenError, SourceLocation
-        loc = None
-        pos = getattr(right, 'pos', None)
-        if pos is not None and getattr(pos, 'start_line', 0):
-            loc = SourceLocation(pos.start_line, pos.start_column)
+            return None
         verdict = {
             BinaryOpKind.EQ: ("=", "false"), BinaryOpKind.NE: ("<>", "true"),
             BinaryOpKind.LT: ("<", "true"), BinaryOpKind.LE: ("<=", "true"),
             BinaryOpKind.GT: (">", "false"), BinaryOpKind.GE: (">=", "false"),
         }.get(op)
         if verdict is None:
-            return
-        raise CodeGenError(
-            f"comparison BYTE {verdict[0]} {value} is always {verdict[1]} "
-            "(BYTE can only hold 0-255)", loc)
+            return None
+        return const_side, (f"comparison BYTE {verdict[0]} {value} is always {verdict[1]} "
+                            "(BYTE can only hold 0-255)")
 
     def _check_trivial_condition(self, condition, context: str = "condition") -> None:
         """Check for trivial constant conditions and raise an error.

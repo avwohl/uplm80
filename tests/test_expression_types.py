@@ -9,9 +9,8 @@ inlining -- has to leave the value and the type the unoptimized program
 computes, or the arithmetic around the rewritten operand changes width.
 
 Each case here printed something else, or did not compile, at some level
-before its fix -- except test_the_check_still_catches_what_was_written and
-test_restricted_expressions_are_plain_numbers, which hold what the fixes
-must not change. The last test runs random programs against a model of the
+before its fix -- except test_restricted_expressions_are_plain_numbers,
+which holds what the fixes must not change. The last test runs random programs against a model of the
 rules (tests/plm_difftest.py); scripts/difftest.py runs many more of them.
 """
 
@@ -89,18 +88,58 @@ call run;
     "t: do; declare (w, z) address, rb byte; w = 7; z = 3; rb = (w mod z) > 1000H; end t;",
     # A constant the optimizer derived is not one the programmer compared.
     "t: do; declare w address, b byte; w = 5000; if b < w then b = 1; end t;",
-    # Nor is one it moved to the right of a relation.
-    "t: do; declare b byte; if 300 = b then b = 1; end t;",
 ])
-def test_folding_does_not_make_a_comparison_impossible(src, opt):
+def test_folding_does_not_make_a_comparison_impossible(src, opt, capsys):
     """A remainder is an ADDRESS, so comparing it with 1000H is not the
-    `BYTE > 4096' uplm80 rejects (defect 2)."""
+    `BYTE > 4096' uplm80 warns of - and, before 0.3.7, rejected (defect 2)."""
     _asm(src, opt)
+    assert "comparison BYTE" not in capsys.readouterr().err
 
 
-def test_the_check_still_catches_what_was_written():
-    with pytest.raises(AssertionError):
-        _asm("t: do; declare b byte; if b = 300 then b = 1; end t;", 0)
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("src, text", [
+    ("if b < 256 then b = 1;", "comparison BYTE < 256 is always true"),
+    ("if b <> 257 then b = 1;", "comparison BYTE <> 257 is always true"),
+    ("if b = 300 then b = 1;", "comparison BYTE = 300 is always false"),
+    ("if (b + 1) < 256 then b = 1;", "comparison BYTE < 256 is always true"),
+    # A constant on the left is looked at too, whether or not the optimizer
+    # moves it to the right.
+    ("if 300 > b then b = 1;", "comparison BYTE < 300 is always true"),
+    ("if 300 = b then b = 1;", "comparison BYTE = 300 is always false"),
+])
+def test_a_byte_against_a_constant_above_255_is_a_warning(src, text, opt, capsys):
+    """The manual (4.4) compares a BYTE with an ADDRESS as unsigned 16-bit
+    numbers, and DRI's compiler accepts `IF b < 256'; uplm80 stopped with an
+    error.  The comparison is compiled, and what it is worth a warning for
+    is still said."""
+    _asm("t: do; declare b byte; " + src + " end t;", opt)
+    assert text in capsys.readouterr().err
+
+
+def test_a_byte_against_a_constant_above_255_compares_as_an_address():
+    """Compiled, it has to come out as the manual has it: the BYTE is
+    zero-extended, so it is below every such constant - and `b + 1' is a
+    BYTE, which wraps, so it is too when b is 0FFH."""
+    _check("""
+declare (b, r) byte;
+run: procedure;
+  declare bd (*) byte data (0, 0ffh);
+  declare i byte;
+  do i = 0 to 1;
+    b = bd(i);
+    r = b < 256; call ph(r);
+    r = b <> 257; call ph(r);
+    r = b = 300; call ph(r);
+    r = (b + 1) < 256; call ph(r);
+    r = 300 > b; call ph(r);
+    r = b >= 0ffffh; call ph(r);
+    if b < 256 then call ph(1); else call ph(0);
+    if (b + 1) >= 256 then call ph(1); else call ph(0);
+    if not (b = 1000h) then call ph(1); else call ph(0);
+  end;
+end run;
+call run;
+""", [0xFF, 0xFF, 0, 0xFF, 0xFF, 0, 1, 0, 1] * 2)
 
 
 def test_not_and_minus_of_a_byte_are_bytes():

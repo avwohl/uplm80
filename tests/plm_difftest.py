@@ -454,8 +454,6 @@ class Generator:
                            "xor", "=", "<>", "<", ">", "<=", ">="])
             left = self.expr(depth - 1, allow_calls)
             right = self.expr(depth - 1, allow_calls)
-            if op in _REL:
-                left, right = self._legal_relation(left, right)
             return Bin(op, left, right)
         if k < 0.65:
             return Un(r.choice(["-", "not"]), self.expr(depth - 1, allow_calls))
@@ -477,19 +475,6 @@ class Generator:
         # An operand the optimizer can see through: a constant it must type.
         return Bin(r.choice(["+", "-", "*", "and", "or", "xor", "mod", "/"]),
                    self._num(), self._num())
-
-    def _legal_relation(self, left: Expr, right: Expr) -> tuple[Expr, Expr]:
-        """uplm80 rejects a BYTE compared with a constant above 255 as always
-        true or false (unless both sides are constants it folds); keep such
-        a constant on the left, where it is not checked."""
-        if right.foldable() and left.foldable():
-            return left, right
-        if right.is_const():
-            v, _ = right.ev(Env(dict(self.env.vals), dict(self.env.types),
-                                dict(self.env.arrays)))
-            if v > 0xFF:
-                return right, left
-        return left, right
 
     def _typed_expr(self, depth: int) -> Expr:
         """An expression for a statement: calls allowed, at most one embedded

@@ -105,6 +105,17 @@ Each fix has a regression test that fails without it.
 
 #### Expression types
 
+- **A BYTE compared with a constant above 255 was rejected,** where the
+  manual (4.4) compares the two as unsigned numbers and DRI's compiler
+  accepts it: `IF b < 256 THEN ...` stopped with "comparison BYTE < 256 is
+  always true", and so did `b <> 257`, `b = 300` and `(b + 1) < 256` (the
+  integration verification's F5; 0.3.6 the same). It compiles, the BYTE
+  zero-extended to meet the ADDRESS constant, and the message is a warning.
+  The warning is given for a constant on either side - `IF 300 > b` said
+  nothing - and at every level: the optimizer, moving a constant to the
+  right of `=` or `<>`, marked it as one it had derived, which the check
+  lets pass. The differential test generates such comparisons now; it kept
+  a constant above 255 on the left, where it was not checked.
 - **A folded constant was typed by its size, not by PL/M-80's rules.**
   `(8 MOD 0FFH) + b` with `b = 0FFH` gave 7 at `-O1` and above: the remainder
   is the ADDRESS 8, and adding 0FFH carries into the high byte (107H). The
@@ -504,14 +515,6 @@ Each fix has a regression test that fails without it.
   that names it, `.i` anywhere, `i` AT or BASED. A pointer computed from the
   address of the variable declared before `i` still can, and a store
   through it does not end the loop. DRI's compiler never counts a loop.
-- **A BYTE compared with a constant above 255 is rejected,** where the
-  manual (4.4) compares the two as unsigned numbers and DRI's compiler
-  accepts it: `IF b < 256 THEN ...` stops with "comparison BYTE < 256 is
-  always true", and so do `b <> 257`, `b = 300` and `(b + 1) < 256`. The
-  error is meant to catch a comparison that cannot come out both ways, but
-  only a constant on the right is checked (`IF 300 > b` compiles), and at
-  `-O3` a propagated value can hide it. Write `DOUBLE(b) < 256` to compile
-  the comparison as it stands. (0.3.6 the same.)
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
 
@@ -551,7 +554,10 @@ Each fix has a regression test that fails without it.
   those built before it; GENSYS, one of the programs whose locals move,
   makes the same MPM.SYS and SYSTEM.DAT and prints the same, for V2.0 with
   the three sets of answers, at -O2. `scripts/difftest.py --seeds 200
-  --first 9000`: all 200 programs as the model says at `-O0` to `-O3`.
+  --first 9000`, with the generator as it was: all 200 programs as the
+  model says at `-O0` to `-O3`; and with the generator that now compares a
+  BYTE with a constant above 255 either way round, `--seeds 200 --first
+  11000`: all 200.
 - MP/M II built from source with this release - `tools/build.py` for V2.0
   and V2.1, 44 of 44 targets each - passes mpm2's `scripts/run_tests.sh all`
   on the V2.1 system and `scripts/run_tests.sh src`. SUBMIT and SPOOL were
