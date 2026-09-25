@@ -24,7 +24,7 @@ from uplm80.codegen import CodeGenerator, Mode
 from uplm80.compiler import Compiler
 from uplm80.frontend import parse_source
 
-from ._toolchain import run_plm
+from ._toolchain import run_asm, run_plm
 
 LEVELS = (0, 1, 2, 3)
 
@@ -609,6 +609,122 @@ def test_an_interrupt_procedure_overlays_no_other_frame(opt):
         for proc in frames:
             if proc != anytime:
                 assert not _overlap(frames, anytime, proc), (anytime, proc, frames)
+
+
+CALLBACK_ASM = """
+    .z80
+    cseg
+    public EXT, ICALL
+    extrn CB
+; ext: code outside the module that calls its PUBLIC procedure back.
+EXT:    jp CB
+; icall(a): calls the procedure at a.
+ICALL:  ld hl,2
+        add hl,sp
+        ld a,(hl)
+        inc hl
+        ld h,(hl)
+        ld l,a
+        jp (hl)
+    end
+"""
+
+CALLBACK = """
+ext: procedure external; end ext;
+icall: procedure (a) external; declare a address; end icall;
+cb: procedure public;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+end cb;
+cb2: procedure;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+end cb2;
+declare f address;
+back: procedure byte;
+    declare (k, m) byte;
+    k = 'E'; m = 'X';
+    call ext;
+    return k;
+end back;
+through: procedure byte;
+    declare (k, m) byte;
+    k = 'F'; m = 'Y';
+    call icall(f);
+    return k;
+end through;
+f = .cb2;
+call mon1(2, back);
+call mon1(2, through);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_code_outside_the_module_may_call_back_into_it(opt):
+    """`ext' calls the PUBLIC `cb' back, and `icall' calls `cb2', whose
+    address it was given.  Neither call is in the text, so `cb' and `cb2'
+    were never active with `back' and `through', and their frames were
+    put over those, whose `k' came back 0FFH."""
+    asm = Compiler(opt_level=opt).compile(_PRELUDE + CALLBACK + "\nend t;\n", "<test>")
+    assert asm is not None
+    out = run_asm(asm, CALLBACK_ASM).stdout.replace("\0", "").strip()
+    assert out == "EF", asm
+
+
+def test_a_call_through_an_address_may_call_any_procedure_whose_address_is_taken():
+    """`CALL f' calls the procedure at the address in `f' (8.2.1): `tgt',
+    whose address is taken, may be active with `caller' and whatever calls
+    it; `lone', whose address is not, need not be."""
+    body = """
+declare f address;
+tgt: procedure;
+    declare (u, v, w) address;
+    u = 1; v = u; w = v;
+end tgt;
+lone: procedure;
+    declare (u, v, w) address;
+    u = 2; v = u; w = v;
+end lone;
+caller: procedure byte;
+    declare (k, m) byte;
+    k = 'G'; m = 'Z';
+    call f;
+    return k;
+end caller;
+outer: procedure byte;
+    declare (n1, n2) byte;
+    n1 = 1; n2 = caller;
+    return n1 + n2;
+end outer;
+f = .tgt;
+call lone;
+call mon1(2, outer);
+"""
+    frames = _frames(body)
+    assert not _overlap(frames, "TGT", "CALLER"), frames
+    assert not _overlap(frames, "TGT", "OUTER"), frames
+    together = _generator(body).can_be_active_together
+    assert "LONE" not in together["CALLER"] | together["OUTER"], together
+
+
+def test_a_bdos_call_is_no_call_back():
+    """MON1 and MON2 with a constant function are the BDOS itself, which
+    calls nothing back: a PUBLIC procedure may still share ??AUTO with a
+    procedure that makes such a call."""
+    frames = _frames("""
+cb: procedure public;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+end cb;
+p: procedure;
+    declare (k, m) byte;
+    k = 'E'; m = k;
+    call mon1(2, m);
+end p;
+call p;
+call cb;
+""")
+    assert _overlap(frames, "CB", "P"), frames
 
 
 # ---- the memory saving, where it is safe -----------------------------------

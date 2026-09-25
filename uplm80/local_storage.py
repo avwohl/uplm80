@@ -317,6 +317,13 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         self.proc_addr_taken: set[str] = set()
         # INTERRUPT procedures, which run whenever the interrupt comes
         self.interrupts: set[str] = set()
+        # PUBLIC procedures, which code outside the module can call
+        self.public: set[str] = set()
+        # procedures with a CALL through an address (8.2.1)
+        self.indirect_callers: set[str] = set()
+        # each module's items and the names its declarations bring in
+        self.modules: list[tuple[list, dict]] = []
+        self._surveyed = False
         # procedure -> labels it jumps to that are not its own
         self.outward_gotos: dict[str, set[str]] = {}
         # (procedure, label) that can be jumped to from anywhere
@@ -330,8 +337,10 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
 
         ``items`` are the module's declarations and statements.
         """
-        decls, _ = block_items_split(items)
-        self._scan_items(items, None, [(None, _frame(decls, None))])
+        decls, _ = _module_split(items)
+        frame = _frame(decls, None)
+        self.modules.append((items, frame))
+        self._scan_items(items, None, [(None, frame)])
 
     def _scan_items(self, items, parent: Optional[str], chain: list) -> None:
         """Walk ``items`` (a body or block) for procedures, keeping the scope."""
@@ -363,6 +372,8 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         info = ProcInfo(full=full, decl=decl, chain=list(chain))
         if attrs.interrupt_num is not None:
             self.interrupts.add(full)
+        if attrs.is_public:
+            self.public.add(full)
         items = proc_body_items(decl)
         decls, stmts = block_items_split(items)
         if not attrs.is_reentrant:
@@ -380,12 +391,25 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
 
     # ---- the analysis ------------------------------------------------------
 
-    def static_locals(self) -> dict[str, set[str]]:
-        """procedure -> the locals of it that must not share ``??AUTO``."""
-        # First what needs no dataflow: the outer locals each procedure
-        # names, the addresses taken.
+    def survey(self) -> None:
+        """What needs no dataflow: the outer locals each procedure names,
+        the addresses taken - in the procedures and in each module's own
+        declarations and statements - and the calls through an address.
+        The call graph may be completed with them (see
+        CodeGenerator._complete_call_graph) before :meth:`static_locals`."""
+        if self._surveyed:
+            return
+        self._surveyed = True
         for info in self.procs.values():
             _Walk(self, info, dataflow=False).run()
+        for items, frame in self.modules:
+            main = ProcInfo(full="", decl=None, chain=[], frame=frame)
+            main.labels = _labels(_module_split(items)[1])
+            _Walk(self, main, dataflow=False).run(items)
+
+    def static_locals(self) -> dict[str, set[str]]:
+        """procedure -> the locals of it that must not share ``??AUTO``."""
+        self.survey()
         for f in self.proc_addr_taken:
             for owner, name in self.trans_refs(f):
                 self.make_static(owner, name, f"{f}, whose address is taken, names it")
@@ -549,6 +573,21 @@ def _frame(decls, owner: Optional[str], owned: Iterable[str] = ()) -> dict:
     return frame
 
 
+def _module_split(items) -> tuple[list, list]:
+    """(declarations, statements) of a module's items, whose declarations
+    come unwrapped from their DECLAREs (see ast_view.module_shape)."""
+    decls: list = []
+    stmts: list = []
+    for it in items:
+        if isinstance(it, (P.ProcDecl, P.DeclItem, P.DeclItemBasedGroup, P.LiterallyDecl)):
+            decls.append(it)
+        elif isinstance(it, P.DeclareStmt):
+            decls.extend(it.declarations)
+        else:
+            stmts.append(it)
+    return decls, stmts
+
+
 def _labels(stmts) -> set[str]:
     """Labels defined in a body, not counting nested procedures'."""
     out: set[str] = set()
@@ -587,9 +626,13 @@ class _Walk:
 
     # ---- driving -----------------------------------------------------------
 
-    def run(self) -> None:
-        """Walk the body; with dataflow, until the labels' states settle."""
-        decls, stmts = block_items_split(proc_body_items(self.info.decl))
+    def run(self, items: Optional[list] = None) -> None:
+        """Walk the body - or ``items``, the main program's - and with
+        dataflow, until the labels' states settle."""
+        if items is None:
+            decls, stmts = block_items_split(proc_body_items(self.info.decl))
+        else:
+            decls, stmts = _module_split(items)
         if not self.dataflow:
             self._declarations(decls)
             self._walk_stmts(stmts, frozenset())
@@ -671,6 +714,8 @@ class _Walk:
         if isinstance(s, P.CallStmt):
             eff = _Effects()
             self._effects(s.callee, eff)
+            if self.info.full and self._through_address(s.callee):
+                self.an.indirect_callers.add(self.info.full)
             return self._apply(eff, state)
         if isinstance(s, (P.IfStmt, P.IfStmtElse)):
             state = self._expr_state(s.condition, state)
@@ -699,6 +744,17 @@ class _Walk:
         # HALT waits for an interrupt and goes on; ENABLE, DISABLE and the
         # null statement do nothing to a variable.
         return state
+
+    def _through_address(self, call) -> bool:
+        """Whether a CALL statement calls the procedure at an address a
+        variable holds (8.2.1), not a procedure it names or a built-in."""
+        call = unwrap_paren(call)
+        target = call.callee if isinstance(call, (P.Call, P.CallNoArgs)) else call
+        target = unwrap_paren(target)
+        if isinstance(target, P.Identifier):
+            binding, _ = self._lookup(ident_text(target.name))
+            return binding is not None and binding[0] != "proc"
+        return True
 
     def _cases(self, stmts, state: State) -> State:
         out: State = None

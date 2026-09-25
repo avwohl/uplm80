@@ -1451,6 +1451,8 @@ class CodeGenerator:
         analysis = LocalStorage(self._resolve_proc_name, self.call_graph)
         for items in modules:
             analysis.add_module(items)
+        analysis.survey()
+        self._complete_call_graph(analysis)
         static = analysis.static_locals()
         self.local_storage = analysis
         self.interrupt_procs = set(analysis.interrupts)
@@ -1462,6 +1464,37 @@ class CodeGenerator:
             keep = {n for n, loc in info.locals.items()
                     if loc.kind in (AUTO, PARAM)} - static.get(proc, set())
             self.proc_storage[proc] = [entry for entry in storage if entry[0] in keep]
+
+    def _complete_call_graph(self, analysis: LocalStorage) -> None:
+        """Add the calls the program's text does not name.
+
+        A procedure whose address is taken may be called by any CALL
+        through an address (8.2.1), so every procedure that makes such a
+        call may call it.  Code outside the module - an EXTERNAL procedure,
+        or whatever a CALL through an address reaches - may call back into
+        the module's PUBLIC procedures and the ones whose address it was
+        given, so a call of an EXTERNAL procedure may call any of those.
+        Without these edges a procedure called only that way was never
+        active together with its caller, and ??AUTO put its frame over the
+        caller's.  (A call of MON1 or MON2 with a constant function is a
+        call of the BDOS itself, see _goes_to_bdos, and adds none.)
+        """
+        defined = set(analysis.procs)
+        callbacks = (analysis.public | analysis.proc_addr_taken) & defined
+        if not callbacks:
+            return
+        for proc, callees in self.call_graph.items():
+            if proc not in defined:
+                callees |= callbacks
+        for proc in analysis.indirect_callers:
+            if proc in self.call_graph:
+                self.call_graph[proc] |= callbacks
+
+    def _goes_to_bdos(self, name: str, args) -> bool:
+        """Whether a call of ``name`` with ``args`` is compiled as a call of
+        the BDOS itself, not of the procedure (see _gen_call_stmt)."""
+        return (name.upper() in ("MON1", "MON2") and len(args) == 2
+                and self._get_const_byte_value(args[0]) is not None)
 
     def _note_main_arg_overlaps(self, stmts) -> None:
         """Record the argument overlaps of the calls in the main program.
@@ -1636,6 +1669,8 @@ class CodeGenerator:
                 args = []
             if isinstance(callee_expr, P.Identifier):
                 callee = self._resolve_proc_name(ident_text(callee_expr.name), current_proc)
+                if callee and self._goes_to_bdos(ident_text(callee_expr.name), args):
+                    callee = None
                 if callee:
                     calls.add(callee)
             else:
@@ -1686,6 +1721,8 @@ class CodeGenerator:
         if isinstance(expr, P.Call):
             if isinstance(expr.callee, P.Identifier):
                 callee = self._resolve_proc_name(ident_text(expr.callee.name), current_proc)
+                if callee and self._goes_to_bdos(ident_text(expr.callee.name), expr.args):
+                    callee = None
                 if callee:
                     calls.add(callee)
             else:
