@@ -3,6 +3,214 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.4.0 — unreleased
+
+Procedures are now called the way Intel's PL/M-80 calls them, so code
+uplm80 compiles links, unmodified, with assembly written for PL/M-80 -
+Digital Research's `X0100.ASM` (`mon1 equ 0005h`), MP/M II's `LDMONX.ASM`
+(`ldmon1 equ 0d06h`) and `BRSPBI.ASM` - and with objects PL/M-80
+compiled. Up to 0.3.x no uplm80 module did: each of the three conventions
+it had differed from Intel's, and every program linked with DRI's
+interface modules needed a shim that turned one into the other.
+
+The convention is PL/M-80 V3.1's as its own output shows it: DRI's
+`PIP.PRL`, which PL/M-80 compiled, has `MOVE: PROCEDURE (S, D, N)` at
+0AACH,
+
+    LXI H,244EH / MOV M,E        ; N, the last argument, from E
+    DCX H / MOV M,B / DCX H / MOV M,C    ; D, the one before, from BC
+    DCX H / POP D                ; the return address
+    POP B / MOV M,B / DCX H / MOV M,C    ; S, pushed by the caller
+    PUSH D
+
+and V3.1's listings of test modules, and byte-for-byte rebuilds of DRI's
+utilities with Intel's compiler, agree.
+
+### Incompatible: calling convention
+
+**Rebuild every module.** A module built by 0.3.x does not work with one
+built by 0.4.0, and nothing at link time says so: they export and import
+the same names.
+
+| Arguments | Where they are at the `call` |
+|---|---|
+| 0 | nothing |
+| 1 | a1 in BC (C for a BYTE parameter) |
+| 2 | a1 in BC (C), a2 in DE (E) |
+| n ≥ 3 | a1 … a(n−2) pushed left to right, one word each; a(n−1) in BC (C); an in DE (E) |
+
+- **The callee takes the pushed words off the stack.** The caller no
+  longer pops anything after a call. At entry `[SP]` is the return
+  address, `[SP+2]` a(n−2), and so on to `[SP+2(n−2)]`, a1.
+- A BYTE argument in a register is in C or E, and B or D is undefined; a
+  pushed BYTE is the low byte of its word.
+- A BYTE result is in A and an ADDRESS one in HL, as before.
+- A call keeps SP, IX and IY, and nothing else: A, the flags, BC, DE and
+  HL are destroyed.
+- This is so for every procedure - PUBLIC, EXTERNAL, nested, REENTRANT -
+  but one exception. A procedure with one parameter that nothing outside
+  the compile can reach - not PUBLIC, EXTERNAL or REENTRANT, and its
+  address never taken - still takes it in A (a BYTE) or HL (an ADDRESS),
+  where its body wants it. No other module, no assembly and no `CALL`
+  through an address can tell.
+- A `CALL` through an address places the arguments the same way, each
+  widened to ADDRESS, with the address in HL, and calls `??jphl` (`jp
+  (hl)`), which replaces `??jpde`.
+- `MON1(f, a)` and `MON2(f, a)` with a constant `f` are still compiled as
+  the BDOS call itself, `ld de,a / ld c,f / call 5`, and the argument is
+  converted to the parameter's type like any other: a BYTE passed to
+  MON1's ADDRESS parameter is now `ld e,a / ld d,0`, where D was left as it
+  happened to be. PL/M-80 does the same (MP/M II's MPMLDR at 03D1H: `LHLD
+  char / MVI H,0 / XCHG / MVI C,2`), and a function that reads DE whole,
+  such as MP/M II's 141 (delay), needs it.
+- Two new errors. A direct call must pass as many arguments as the
+  procedure has parameters, as PL/M-80 V3.1 requires (153 and 154): with
+  the callee removing the pushed words, a call with too many or too few
+  would return with the stack moved. 0.3.x dropped extra arguments to a
+  procedure private to its module without a word. A `CALL` through an
+  address is not checked (8.2.1). And an INTERRUPT procedure may not have
+  parameters (8.1.6).
+
+      invalid number of arguments in call of P2, too few: 1 for 2 parameters
+      IH: an INTERRUPT procedure may not have parameters (8.1.6)
+
+- **upeepz80 0.2.6 or later is required.** 0.2.5 turned `push … / call p /
+  ret` into `push … / jp p`, and p then took its return address for its
+  first argument.
+
+What 0.3.x did: a procedure private to its module had all but its last
+argument written straight into its own storage by the caller and the last
+in A or HL; a PUBLIC, EXTERNAL or REENTRANT one had every argument pushed,
+left to right and each widened to 16 bits, and popped by the caller after
+the call; a `CALL` through an address passed only one, except to a PUBLIC
+or REENTRANT procedure.
+
+An assembly routine written for 0.3.x changes like this:
+
+| A 0.3.x assembly routine… | …becomes in 0.4.0 |
+|---|---|
+| read its one argument at SP+2; the caller popped it | reads BC (C for a BYTE); pops nothing |
+| read two at SP+4 and SP+2 | reads BC and DE |
+| read n ≥ 3 at SP+2n … SP+2 | pops the return address, pops the n−2 stacked words (last pushed first), takes BC = a(n−1) and DE = an, and puts the return address back |
+| returned with its arguments still pushed | returns with the stacked words removed |
+
+For example, the BDOS interface a CP/M program links with. MON1, MON2,
+MON2A and MON3 are equates now, as in DRI's `X0100.ASM`, since a call
+already has the function in C and the argument in DE:
+
+```asm
+; 0.3.x                                 ; 0.4.0
+MON1:   ld      hl,2                    MON1    equ     5
+        add     hl,sp                   MON2    equ     5
+        ld      e,(hl)                  MON2A   equ     5
+        inc     hl                      MON3    equ     5
+        ld      d,(hl)                          public  MON1,MON2,MON2A,MON3
+        inc     hl
+        ld      c,(hl)
+        jp      5
+```
+
+and a routine of three arguments, `cap3(a address, b byte, c address)`:
+
+```asm
+; 0.3.x: a, b, c pushed; the caller pops them
+CAP3:   ld      hl,2
+        add     hl,sp
+        ld      e,(hl)          ; c
+        inc     hl
+        ld      d,(hl)
+        ld      (VC),de
+        inc     hl
+        ld      a,(hl)          ; b
+        ld      (VB),a
+        inc     hl
+        inc     hl
+        ld      e,(hl)          ; a
+        inc     hl
+        ld      d,(hl)
+        ld      (VA),de
+        ret
+
+; 0.4.0: a pushed, b in C, c in DE; CAP3 takes a off the stack
+CAP3:   ld      (VC),de
+        ld      a,c
+        ld      (VB),a
+        pop     hl              ; the return address
+        ex      (sp),hl         ; a, and the return address back on top
+        ld      (VA),hl
+        ret
+```
+
+Assembly that calls a PL/M procedure does the same from the other side:
+it pushes the first arguments, loads the last two into BC and DE, and
+leaves the stack alone after the call.
+
+### Changed
+
+- **Smaller code.** Over MP/M II's PL/M (UTIL2 to UTIL7 and MPMLDR, 39
+  modules, SDIR's eight included) and 80un's two programs, at `-O2` with
+  upeepz80 0.2.6, the code is 111,144 bytes against 0.3.7's 113,348
+  (−2,204), and no module is larger. A pushed argument costs one `push`
+  where 0.3.x stored it into the callee's slot, the entry stores it once,
+  and the A/HL exception saves the `ld c,a` or `ld b,h / ld c,l` every
+  call of a one-parameter procedure would otherwise need (about 1,300
+  bytes of it). The data is 36,526 bytes against 36,531: nothing is stored
+  before a call, so the call graph no longer keeps a callee's frame apart
+  from the procedures its arguments call.
+- A procedure's entry stores its arguments (the last from DE, the one
+  before from BC, the pushed ones popped). With one or two parameters it
+  leaves BC and DE as they came, so DRI's CP/M 1.x `MON1: PROCEDURE (F,
+  A); … GO TO BDOS; END MON1;` passes them on to the BDOS.
+- A REENTRANT procedure pushes the arguments that came in BC and DE under
+  its return address, which is the frame 0.3.x had, and every exit takes
+  all of them off the stack, keeping A and HL.
+- `??jphl` replaces `??jpde`.
+
+### Fixed
+
+- **A `CALL` through an address passes any number of arguments to any
+  procedure.** 0.3.7 passed more than one only to a PUBLIC or REENTRANT
+  procedure, and warned (Known issues, 0.3.7).
+- A call with more arguments than a private procedure has parameters is
+  an error; 0.3.x dropped the extra ones.
+
+### Added
+
+- `tests/test_calling_convention.py`: the sequences, at `-O0`, for 0 to 5
+  arguments of either type in every order, conversions, BC kept while the
+  last argument is evaluated, entries, the A/HL exception and what takes
+  it away, REENTRANT entries and exits, calls through an address, MON1 and
+  MON2, and the two errors.
+- `tests/test_calling_convention_run.py`, at `-O0` to `-O3`: uplm80 code
+  with assembly written to the convention, both ways; REENTRANT and
+  recursive procedures across the boundary; calls through an address to
+  every kind of procedure; PUBLIC procedures across separately compiled
+  modules and in one multi-file compile; DRI's `MON1 … GO TO BDOS`; and
+  Intel's own code, `tests/fixtures/plm80_v31`: a module compiled by
+  PL/M-80 V3.1, its listing transcribed, with Intel's `MAIN` calling
+  uplm80's procedures and uplm80's `MAIN` calling Intel's.
+
+### Verified
+
+- The test suite: 706 tests pass. pylint rates the package 9.72, as before.
+- `scripts/difftest.py`, 200 seeds at `-O0` to `-O3`: none differs.
+  `scripts/namestest.py`, 200 seeds: none differs; with `--modules`, 100
+  seeds: none differs.
+- Every PL/M source of MP/M II (`mpm2src/*/*.PLM`), 80un and `sample_code`
+  that 0.3.7 compiles compiles, without the argument-count or INTERRUPT
+  error, and the 41 programs of the size figures above compile and
+  assemble at every level from `-O0` to `-O3`. `tests/run_tests.sh` prints what it prints with 0.3.7 for all 22
+  programs (21 pass; `test_byte_conditions` fails with both).
+- MP/M II, built from DRI's sources with DRI's `X0100.ASM`, `BRSPBI.ASM`
+  and `LDMONX.ASM` linked unmodified and the shims that stood in for them
+  gone, V2.0 and V2.1: every test of the emulator's battery passes on the
+  source-built system (DIR, STAT, the resident processes, HTTP, SFTP), and
+  the assembly-built files are still DRI's byte for byte
+  (`tools/verify_dri.py`).
+- 80un: `80un.com` and `80unbas.com` built by 0.4.0 write, on each of the
+  29 inputs in its tests, exactly the files and the output those built by
+  0.3.7 do.
+
 ## 0.3.7 — 2026-09-25
 
 Two sets of fixes, each checked against what Digital Research's own PL/M-80
