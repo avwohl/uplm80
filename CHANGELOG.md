@@ -76,7 +76,12 @@ the same names.
 
 - **upeepz80 0.2.6 or later is required.** 0.2.5 turned `push … / call p /
   ret` into `push … / jp p`, and p then took its return address for its
-  first argument.
+  first argument. At `-O1` and up the compiler now stops with an error
+  naming both versions if upeepz80's is below 0.2.6, unless that
+  upeepz80 keeps the `call` of such a routine: a development tree with the
+  fix, still numbered 0.2.5, does, and the release 0.2.5 does not.
+
+      upeepz80 0.2.5 is too old: uplm80 needs upeepz80 0.2.6 or later (…)
 
 What 0.3.x did: a procedure private to its module had all but its last
 argument written straight into its own storage by the caller and the last
@@ -189,10 +194,12 @@ leaves the stack alone after the call.
   Intel's own code, `tests/fixtures/plm80_v31`: a module compiled by
   PL/M-80 V3.1, its listing transcribed, with Intel's `MAIN` calling
   uplm80's procedures and uplm80's `MAIN` calling Intel's.
+- `tests/test_upeepz80_version.py`: the upeepz80 floor, against
+  pyproject.toml's, and what is refused and accepted below it.
 
 ### Verified
 
-- The test suite: 706 tests pass. pylint rates the package 9.72, as before.
+- The test suite: 719 tests pass. pylint rates the package 9.72, as before.
 - `scripts/difftest.py`, 200 seeds at `-O0` to `-O3`: none differs.
   `scripts/namestest.py`, 200 seeds: none differs; with `--modules`, 100
   seeds: none differs.

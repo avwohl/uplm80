@@ -5,8 +5,14 @@ Main entry point for the uplm80 compiler.
 """
 
 import argparse
+import functools
+import re
 import sys
 from pathlib import Path
+
+# Import peephole optimizer from upeepz80 library
+import upeepz80
+from upeepz80 import PeepholeOptimizer
 
 from . import __version__
 from .frontend import parse_source
@@ -16,8 +22,60 @@ from .names import fix_symbols
 
 # Import AST optimizer (PL/M-80 specific)
 from .ast_optimizer import ASTOptimizer
-# Import peephole optimizer from upeepz80 library
-from upeepz80 import PeepholeOptimizer
+
+# The oldest upeepz80 whose code is right under PL/M-80's calling convention,
+# as pyproject.toml's dependency has it (a test keeps the two the same).
+UPEEPZ80_MIN = "0.2.6"
+
+# A call of a procedure of three parameters, one of them pushed, which ends
+# its routine.  upeepz80 0.2.6 leaves the `call'; 0.2.5 makes it `jp P3'.
+_TAIL_CALL_PROBE = ("\textrn\tP3\nQ::\n\tld\thl,1111h\n\tpush\thl\n"
+                    "\tld\tbc,2222h\n\tld\tde,3333h\n\tcall\tP3\n\tret\n")
+
+
+def _release(version: str) -> tuple[int, ...]:
+    """The numbers a version string starts with: "0.2.6rc1" is (0, 2, 6)."""
+    m = re.match(r"\d+(?:\.\d+)*", version)
+    return tuple(int(n) for n in m.group().split(".")) if m else ()
+
+
+@functools.cache
+def upeepz80_problem() -> str | None:
+    """Why the upeepz80 in use cannot optimize this compiler's code, or None.
+
+    upeepz80 before 0.2.6 turns `push ... / call p / ret' into `push ... /
+    jp p'.  Jumped to, p finds its caller's return address where the word
+    pushed for it should be, and under PL/M-80's convention, in which the
+    callee takes the pushed words off the stack, it takes the return address
+    for its first argument and returns to where that argument points.
+
+    A version before UPEEPZ80_MIN is refused unless it keeps the `call' of
+    _TAIL_CALL_PROBE: a development tree with 0.2.6's fix that is still
+    numbered 0.2.5 does, and the release 0.2.5 does not.
+    """
+    found = str(getattr(upeepz80, "__version__", "")) or "(no version)"
+    if _release(found) >= _release(UPEEPZ80_MIN):
+        return None
+    probe = PeepholeOptimizer().optimize(_TAIL_CALL_PROBE)
+    if re.search(r"^\s*call\s+P3\b", probe, re.MULTILINE | re.IGNORECASE):
+        return None
+    return (f"upeepz80 {found} is too old: uplm80 needs upeepz80 {UPEEPZ80_MIN} "
+            f"or later (pip install --upgrade 'upeepz80>={UPEEPZ80_MIN}').  "
+            f"upeepz80 {found} turns `push ... / call p / ret' into `push ... / "
+            f"jp p', and p, which takes the words pushed for it off the stack, "
+            f"then takes its return address for its first argument.  A "
+            f"development upeepz80 numbered below {UPEEPZ80_MIN} is accepted "
+            f"if it has {UPEEPZ80_MIN}'s fix, which the one in "
+            f"{Path(upeepz80.__file__).parent} does not.  -O0 "
+            f"does not use upeepz80.")
+
+
+def require_upeepz80(opt_level: int) -> None:
+    """Stop, with CompilerError, if a compile at ``opt_level`` would use
+    upeepz80 and upeepz80_problem() finds a problem with it."""
+    problem = upeepz80_problem() if opt_level > 0 else None
+    if problem is not None:
+        raise CompilerError(problem)
 
 
 class Compiler:
@@ -68,6 +126,8 @@ class Compiler:
         Returns the assembly code string, or None if compilation failed.
         """
         try:
+            require_upeepz80(self.opt_level)
+
             # Phases 1-2: preprocess + uplox plm_full LR parse + AST lowering.
             if self.debug:
                 print(f"[DEBUG] Front-end (uplox plm_full) {filename}", file=sys.stderr)
@@ -187,8 +247,9 @@ class Compiler:
             return self.compile_file(input_paths[0], output_path)
 
         try:
-            modules = []
-            filenames = []
+            require_upeepz80(self.opt_level)
+
+            modules, filenames = [], []
 
             # Phase 1 & 2: Lex and parse all files
             for input_path in input_paths:
