@@ -207,9 +207,15 @@ class _Resolver:
     def _declare(self, block: _Block, name: str, kind: str, site, **kw) -> _Decl:
         old = block.decls.get(name)
         if old is not None:
-            # A second declaration of a name in one block is PL/M-80's error;
-            # the first stands, and the second is renamed with it.  A
-            # parameter's type declaration is one of these.
+            # A LITERALLY declared again as it was (an $INCLUDE file and
+            # the file including it often both have TRUE and FALSE) is
+            # harmless; anything else declared twice in one block is two
+            # definitions of one name.
+            if not (kind == "lit" and old.kind == "lit" and old.literal == kw.get("literal")):
+                node, attr = site
+                raise CodeGenError(
+                    f"{ident_text(getattr(node, attr))} is declared twice in the same block",
+                    source_location(node))
             old.sites.append(site)
             return old
         d = _Decl(name, kind, block, len(self.decls), [site], **kw)
@@ -300,7 +306,11 @@ class _Resolver:
     def _label(self, s: P.LabeledStmt, block: _Block) -> None:
         name = _key(s.label)
         old = block.decls.get(name)
-        if old is not None and old.kind == "label" and old.defined:
+        if old is not None and old.kind == "label" and not old.defined:
+            old.sites.append((s, "label"))      # declared a LABEL, and here it is
+            old.defined = True
+            return
+        if old is not None and old.kind == "label":
             raise CodeGenError(
                 f"label {ident_text(s.label)} is defined twice in the same block",
                 source_location(s))

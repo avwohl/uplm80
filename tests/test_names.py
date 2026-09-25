@@ -567,3 +567,19 @@ def test_two_main_program_modules_are_an_error():
     assert r.returncode != 0
     assert ("M1.PLM:1:24: error: modules A and B both have statements at their outer level; "
             "only the main program module may") in r.stderr, r.stderr
+
+
+def test_a_name_declared_twice_in_one_block_is_an_error():
+    """Both declarations were generated, and the assembler said "multiply
+    defined", or, for a procedure and a variable, took one for the other."""
+    err = _compile_error(PRELUDE + "declare i byte;\np: procedure; end p;\ndeclare p byte;\nend t;\n")
+    assert "T.PLM:7:9: error: P is declared twice in the same block" in err
+
+
+def test_a_literally_declared_again_as_it_was():
+    """An $INCLUDE file and the file including it often both declare TRUE."""
+    assert run_plm(PRELUDE + """declare true literally '0ffh';
+declare true literally '0ffh';
+if true then call pc('y');
+end t;
+""") == "y"
