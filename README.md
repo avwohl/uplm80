@@ -82,7 +82,7 @@ uplm80 main.plm helper.plm library.plm -o output.mac
 When multiple files are provided:
 - All files are parsed together before code generation
 - A unified call graph is built across all modules
-- Local variable storage (`??AUTO`) is optimally allocated based on which procedures can be active simultaneously across module boundaries
+- Procedures that are never active at the same time share storage for their parameters and for the locals that may share it (`??AUTO`, see [Procedure locals](#procedure-locals)), across module boundaries
 - A single combined output file is generated
 
 This produces better code than compiling files separately, as the compiler can share local variable storage between procedures in different modules that never call each other.
@@ -271,13 +271,37 @@ variables last:
   before the entry code at 100H.
 - **Data segment (`dseg`):** `??AUTO`, the procedures' shared locals; then the
   stack of BARE and MP/M modes (`??STACK`); then the variables, in the order
-  the source declares them.
+  the source declares them, a procedure's static locals among them.
 
 `ul80` places every module's data segment after all the code segments,
 including those of the runtime modules linked after it, so nothing follows a
 program's last variable and `.MEMORY` (the linker's `__END__`) is one past it.
 DRI's programs rely on that: MP/M II's `SUB.PLM` and `MSPL.PLM` use everything
 from their last variable up to `MAXB` as a buffer.
+
+### Procedure locals
+
+PL/M-80 allocates a procedure's variables statically (Programming Manual,
+8.1.7): a local keeps its value from one call to the next, and a program may
+count on it - a first-time flag, a running count.  uplm80 saves memory by
+overlaying the storage of procedures that are never active at the same time,
+`??AUTO`, but only for what no call can see the old value of:
+
+- **Parameters**, which every call assigns.
+- **A local that every call assigns before anything reads it.**  The
+  compiler follows each procedure's statements, GOTOs included, and counts
+  a call of a nested procedure that names the local as a read of it at the
+  call; a use of a BASED variable reads its base.  An array or structure is
+  assigned once every element has been, through constant subscripts.
+
+Every other local is static, `@proc$name` among the variables: one that may
+be read before it is assigned, one whose address is taken (`.x`, in a
+statement, an `AT` or an `INITIAL`), one subscripted outside its bounds, one
+named by a nested procedure whose address is taken, and one declared with
+such a local in a factored declaration (6.2.4 makes those contiguous) or
+after one whose address is taken, which a pointer run on from it can reach.
+A local with `INITIAL` is static in any case; a `REENTRANT` procedure's are
+on the stack.  The analysis is in `uplm80/local_storage.py`.
 
 ## Project Structure
 
@@ -289,6 +313,7 @@ uplm80/
 ├── ast_nodes.py     # AST definitions
 ├── ast_optimizer.py # AST-level optimizations
 ├── codegen.py       # Z80 code generator
+├── local_storage.py # Which procedure locals may share ??AUTO
 ├── runtime.py       # Runtime helpers
 ├── symbols.py       # Symbol table
 ├── errors.py        # Diagnostic exception types

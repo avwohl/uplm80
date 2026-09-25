@@ -40,9 +40,30 @@ Changed). DRI's programs use everything past their last variable as a
 buffer, and MP/M II's SUBMIT and SPOOL now build from DRI's own sources and
 behave as DRI's binaries do.
 
+A procedure's local variables are static, as the manual has them, except
+where no call can tell: a local shares the procedures' overlaid storage only
+if every call assigns it before anything reads it (see Changed).
+
 Each fix has a regression test that fails without it.
 
 ### Fixed
+
+#### Procedure locals
+
+- **A local without INITIAL did not keep its value from one call to the
+  next.** PL/M-80 allocates a procedure's variables statically (Programming
+  Manual, 8.1.7); uplm80 put every uninitialised local in `??AUTO`, overlaid
+  on the locals of procedures never active at the same time, so a count, a
+  first-time flag or a position kept in one came back as another procedure
+  had left it: `tick: procedure address; declare (count, seen) address; if
+  seen <> 1234h then do; seen = 1234h; count = 0; end; count = count + 1;
+  return count; end tick;`, called in a loop with another procedure that
+  has locals of its own, returned 1 every time, at every level (the
+  integration verification's F6; 0.3.6 the same). Such a local is static
+  now (see Changed). DRI's code counts on it: MP/M II's PIP, retrying a
+  multi-file copy after an error, calls MULTCOPY again, which goes on from
+  the directory entry and the count it keeps in NEXTDIR and NCOPIED
+  (`if eretry = 0 then NEXTDIR, NCOPIED = 0`); both are static.
 
 #### Division and MOD
 
@@ -358,6 +379,36 @@ Each fix has a regression test that fails without it.
 
 ### Changed
 
+- **A procedure's local shares `??AUTO` only if every call assigns it
+  before anything reads it.** `??AUTO` overlays the storage of procedures
+  that are never active at the same time; what goes there now is the
+  parameters, which every call assigns, and the locals that a
+  definite-assignment analysis (`uplm80/local_storage.py`) shows are
+  assigned, on every path from the procedure's entry, before they are read.
+  It follows GOTOs and every form of DO; a call of a procedure nested in
+  this one that names the local reads it at the call, and a use of a BASED
+  variable reads its base; an array or structure is assigned once every
+  element has been, through constant subscripts. Every other local is
+  static, `@proc$name` among the variables: one that may be read first, one
+  whose address is taken (`.x`, in a statement, an AT or an INITIAL), one
+  subscripted outside its bounds, one named by a nested procedure whose
+  address is taken, and one declared with such a local in a factored
+  declaration (which 6.2.4 makes contiguous) or after one whose address is
+  taken, which a pointer run on from it can reach in DRI's layout.
+  `??AUTO` also no longer keeps a slot for a declaration that never used
+  it: an INITIAL, DATA, AT, BASED, PUBLIC, EXTERNAL or LABEL declaration in
+  a procedure, and a REENTRANT procedure's parameters and locals, which are
+  on its stack. In MP/M II and 80un, of the 82 outputs that assemble, 137
+  locals (4,729 bytes) are static now: 48 because they may be read first,
+  25 because their address is taken, and 64 declared with or after one of
+  those. The data comes to 48,514 bytes at -O0, -O2 and -O3, against
+  50,280: the unused slots were 1,947 bytes, and the static locals cost
+  181, since most of their bytes are buffers that also leave the frames
+  that set the size of `??AUTO`. The code is the same but for a
+  parameter's store at a procedure's entry in six outputs, which upeepz80
+  drops only when nothing else names its `??AUTO` address: 6 bytes more at
+  -O2, none at -O0 and -O3.
+
 - **Constants in expressions are typed as PL/M-80 types them, so some
   programs compute something else.** `w = -1` stores 00FFH, since the
   manual makes `-1` the BYTE `0 - 1` (write 0FFFFH for all ones), and for the
@@ -453,18 +504,6 @@ Each fix has a regression test that fails without it.
   that names it, `.i` anywhere, `i` AT or BASED. A pointer computed from the
   address of the variable declared before `i` still can, and a store
   through it does not end the loop. DRI's compiler never counts a loop.
-- **A procedure's local variables do not keep their values from one call
-  to the next** unless they have `INITIAL`. uplm80 overlays the locals of
-  procedures that are never active together in one block, `??AUTO`, where
-  the manual (8.1.7) allocates a procedure's variables statically. A
-  procedure that keeps a count in an uninitialised local starts from
-  whatever another procedure left there:
-  `tick: procedure address; declare (count, seen) address; if seen <>
-  1234h then do; seen = 1234h; count = 0; end; count = count + 1; return
-  count; end tick;`, called in a loop with another procedure that has
-  locals of its own, returns 1 every time. Declare such a variable with
-  `INITIAL`, which keeps it out of `??AUTO`, or at module level. None of
-  MP/M II's or 80un's programs depends on it. (0.3.6 the same; by design.)
 - **A BYTE compared with a constant above 255 is rejected,** where the
   manual (4.4) compares the two as unsigned numbers and DRI's compiler
   accepts it: `IF b < 256 THEN ...` stops with "comparison BYTE < 256 is
@@ -491,7 +530,8 @@ Each fix has a regression test that fails without it.
   split, 151 BYTE operations kept in A, 136 the runtime routines, 91 ATs
   resolved to their root, 34 `SHR(x, 7)`, 23 DATA and INITIAL, 8 `CARRY`, 7
   a BYTE argument widened, 5 `jp`/`jr` distances and 2 the `extrn` below.
-  The 82 come to 224,925 bytes, against 227,511 with 0.3.6. The fixes made
+  The 82 come to 224,925 bytes, against 227,511 with 0.3.6, before the
+  change to the allocation of locals (see Changed). The other fixes made
   after the integration verification (the entries that name it) change no
   output of MP/M II or 80un at -O0, -O2 or -O3 but the multi-file
   `80un.com` and `80unbas.com` compiles, which now declare `extrn MON1` and
@@ -499,6 +539,19 @@ Each fix has a regression test that fails without it.
   BDOS directly. `80un.com` extracts the same files, with the same console
   output, from all 17 sample archives as 0.3.6's, at -O2 and -O3, and
   `80unbas.com` detokenises `PALLOPS.BAS` the same.
+- The allocation of locals (see Changed), measured with um80 0.3.50 and
+  upeepz80's `fix/peephole-live-registers` against the commit before it:
+  it changes 70 of the 82 outputs at each of -O0, -O2 and -O3, moving
+  locals out of `??AUTO` into the variables, and with them the `??AUTO`
+  offsets and the addresses of the variables that follow (the 82 go from
+  224,744 bytes to 222,984 at -O2). `80un.com`
+  and `80unbas.com` built from the new outputs, at -O2 and -O3, extract
+  the same files with the same console output from all 17 sample archives,
+  and detokenise `PALLOPS.BAS` and the four BASIC samples the same, as
+  those built before it; GENSYS, one of the programs whose locals move,
+  makes the same MPM.SYS and SYSTEM.DAT and prints the same, for V2.0 with
+  the three sets of answers, at -O2. `scripts/difftest.py --seeds 200
+  --first 9000`: all 200 programs as the model says at `-O0` to `-O3`.
 - MP/M II built from source with this release - `tools/build.py` for V2.0
   and V2.1, 44 of 44 targets each - passes mpm2's `scripts/run_tests.sh all`
   on the V2.1 system and `scripts/run_tests.sh src`. SUBMIT and SPOOL were

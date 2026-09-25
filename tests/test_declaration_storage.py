@@ -628,7 +628,9 @@ end t;
     rb = next(i for i, l in enumerate(lines) if l.startswith("RBUFF:") and "EQU" in l)
     assert where["MINIMUMBUFFER"] < rb, asm
     l3 = next(i for i, l in enumerate(lines) if "L3:" in l and "EQU" in l)
-    assert where["??AUTO"] < l3, asm
+    # `loc' has its address taken, so it is static (`@P$LOC'), not in ??AUTO.
+    loc = lines[l3].split("EQU")[1].strip().split("+")[0]
+    assert where[loc] < l3, asm
 
 
 def test_a_forward_at_writes_where_it_should_when_run():

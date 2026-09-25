@@ -53,6 +53,7 @@ from .ast_view import (
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
+from .local_storage import LocalStorage
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -1404,6 +1405,38 @@ class CodeGenerator:
             if not attrs.is_external:
                 self._analyze_proc_calls(decl, None)
         self._note_main_arg_overlaps(shape.stmts)
+        self._keep_carried_locals_static([list(shape.decls) + list(shape.stmts)])
+
+    def _keep_carried_locals_static(self, modules: list[list]) -> None:
+        """Take out of ??AUTO every local whose value a call might see.
+
+        PL/M-80 allocates a procedure's variables statically (Programming
+        Manual, 8.1.7), so a local keeps its value from one call to the next.
+        Overlaying locals in ??AUTO is only right for one that every call
+        assigns before it reads it; local_storage.LocalStorage finds those,
+        and every other local stays in the procedure's own static storage,
+        as `@proc$name'.  ``modules`` are each module's declarations and
+        statements.
+
+        Only what lives in ??AUTO keeps a slot there: parameters, and the
+        locals that may share it.  A REENTRANT procedure's parameters and
+        locals are on the stack, and an INITIAL, DATA, AT, BASED, PUBLIC,
+        EXTERNAL or LABEL declaration is not in ??AUTO either; each of them
+        used to be given a slot it never used.
+        """
+        analysis = LocalStorage(self._resolve_proc_name, self.call_graph)
+        for items in modules:
+            analysis.add_module(items)
+        static = analysis.static_locals()
+        self.local_storage = analysis
+        for proc, storage in self.proc_storage.items():
+            info = analysis.procs.get(proc)
+            if info is None or proc_attrs(info.decl).is_reentrant:
+                self.proc_storage[proc] = []
+                continue
+            keep = set(proc_param_names(info.decl))
+            keep |= set(info.locals) - static.get(proc, set())
+            self.proc_storage[proc] = [entry for entry in storage if entry[0] in keep]
 
     def _note_main_arg_overlaps(self, stmts) -> None:
         """Record the argument overlaps of the calls in the main program.
@@ -2451,6 +2484,8 @@ class CodeGenerator:
                 self._analyze_proc_calls(decl, None)
         for shape in shapes:
             self._note_main_arg_overlaps(shape.stmts)
+        self._keep_carried_locals_static(
+            [list(shape.decls) + list(shape.stmts) for shape in shapes])
 
     def _escape_string(self, s: str) -> str:
         """Escape a string for assembly output."""

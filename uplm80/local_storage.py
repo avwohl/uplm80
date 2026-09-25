@@ -1,0 +1,842 @@
+"""Which of a procedure's local variables may share ``??AUTO``.
+
+PL/M-80 allocates a procedure's variables statically (Programming Manual,
+8.1.7): a local keeps its value from one call of the procedure to the next,
+and a program may rely on that - a ``first$time`` flag, a running count.
+uplm80 saves memory by overlaying the locals of procedures that are never
+active together in one block, ``??AUTO``, which is only right for a local
+whose old value no call can see.  This module finds those locals.  A local
+may share ``??AUTO`` when
+
+* on every path from the procedure's entry it is written before it is read:
+  a definite-assignment analysis over the procedure's statements, GOTOs
+  included, in which a call that can reach a procedure nested in this one
+  and naming the local counts as a read of it at the call;
+* its address is never taken - no ``.x``, in a statement or in the INITIAL,
+  DATA or AT of any declaration - and it is not reached by subscripting it
+  outside its bounds (a subscripted scalar, a constant subscript past its
+  end, a variable subscript of a one-element array);
+* no procedure that names it has its address taken, since a call through an
+  address can come at any time; and
+* the same holds for every name declared with it in one factored
+  declaration, which the manual (6.2.4) makes contiguous.
+
+A local whose address is taken, or which is reached outside its bounds,
+takes every local declared after it to static storage with it: a pointer
+made from it can reach them, and code that does that assumes DRI's layout,
+which is declaration order.
+
+A BASED variable reads its base each time it is used, so a use of it is a
+read of the base.  An array or a structure is followed element by element
+(up to ``MAX_COMPONENTS`` of them): it is assigned once every element has
+been assigned through constant subscripts, and a read of one element through
+constant subscripts needs only that element.  Any other read needs the
+whole.  A store through a variable subscript assigns nothing.
+
+Parameters are written by every call, so they always share ``??AUTO``.
+Anything the analysis cannot follow leaves the local in static storage.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Optional
+
+from . import _plm_parser as P
+from .ast_view import (
+    DataType,
+    block_items_split,
+    decl_attrs,
+    decl_item_based,
+    decl_item_names,
+    decl_item_struct_members,
+    decl_item_type,
+    ident_text,
+    number_value,
+    proc_attrs,
+    proc_body_items,
+    proc_name,
+    proc_param_names,
+    struct_member_dim,
+    struct_member_names,
+    unwrap_paren,
+)
+
+# An array or structure with more elements than this is not followed element
+# by element: any read of it before... anything needs the whole, which no
+# store assigns.
+MAX_COMPONENTS = 64
+
+# Builtins whose argument is not evaluated: they give its size.
+_SIZE_BUILTINS = frozenset({"LENGTH", "LAST", "SIZE"})
+
+_DO_KINDS = (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock)
+
+# Passes over a loop or a body before the analysis gives up on it.
+_MAX_PASSES = 64
+
+# A dataflow state: the components definitely assigned, or None where no
+# path reaches (the identity of the meet).
+State = Optional[frozenset]
+
+# The one component of a local too large to follow element by element; no
+# store assigns it.
+_NEVER = ("?never",)
+
+
+def _meet(a: State, b: State) -> State:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a & b
+
+
+@dataclass
+class Local:
+    """A candidate for ``??AUTO``: a procedure's own uninitialised variable."""
+
+    name: str
+    order: int                    # position among the procedure's locals
+    group: int                    # which declaration it is in
+    dim: Optional[int]            # array dimension, None for a scalar
+    members: Optional[dict]       # structure member -> its dimension or None
+    keys: frozenset = frozenset()  # every component
+
+    def __post_init__(self) -> None:
+        keys = self._components()
+        self.keys = frozenset(keys) if keys is not None else frozenset({_NEVER})
+
+    def _components(self) -> Optional[list]:
+        per_elem: list[tuple] = []
+        if self.members is None:
+            per_elem.append(())
+        else:
+            for m, mdim in self.members.items():
+                if mdim is None:
+                    per_elem.append((m,))
+                elif 0 < mdim <= MAX_COMPONENTS:
+                    per_elem.extend((m, k) for k in range(mdim))
+                else:
+                    return None
+        if self.dim is None:
+            out = [(self.name,) + e for e in per_elem]
+        elif 0 < self.dim <= MAX_COMPONENTS:
+            out = [(self.name, i) + e for i in range(self.dim) for e in per_elem]
+        else:
+            return None
+        return out if len(out) <= MAX_COMPONENTS else None
+
+    @property
+    def followed(self) -> bool:
+        """Whether its elements are followed one by one."""
+        return _NEVER not in self.keys
+
+
+@dataclass
+class ProcInfo:
+    """What the analysis knows of one procedure."""
+
+    full: str
+    decl: object
+    chain: list                    # scope frames outside the body, outermost first
+    locals: dict[str, Local] = field(default_factory=dict)
+    labels: set[str] = field(default_factory=set)   # defined in its own body
+    frame: dict = field(default_factory=dict)       # its own names -> binding
+
+
+# A binding in a scope frame is (kind, owner, extra).  kind is "cand" (a
+# Local of procedure `owner'), "var" (any other variable), "proc", or "based"
+# (a BASED variable; extra is its declaration).  owner is None in a block.
+
+
+def _const(expr) -> Optional[int]:
+    """The value of a constant subscript, or None."""
+    expr = unwrap_paren(expr)
+    if isinstance(expr, P.NumberLiteral):
+        return number_value(expr)
+    if (isinstance(expr, P.Call) and isinstance(expr.callee, P.Identifier)
+            and ident_text(expr.callee.name) == "DOUBLE" and len(expr.args) == 1):
+        return _const(expr.args[0])
+    return None
+
+
+def _designator(expr):
+    """(root name, [part, ...]) for a variable reference, or None.
+
+    A part is ("idx", args) for a subscript and ("mem", name) for a member.
+    """
+    expr = unwrap_paren(expr)
+    if isinstance(expr, P.Identifier):
+        return ident_text(expr.name), []
+    if isinstance(expr, P.Call):
+        inner = _designator(expr.callee)
+        if inner is None:
+            return None
+        return inner[0], inner[1] + [("idx", list(expr.args))]
+    if isinstance(expr, P.MemberAccess):
+        inner = _designator(expr.base)
+        if inner is None:
+            return None
+        return inner[0], inner[1] + [("mem", ident_text(expr.member))]
+    return None
+
+
+def _subscript(part, dim: int) -> tuple[Optional[int], bool]:
+    """(constant index or None, whether it reaches outside the object)."""
+    args = part[1]
+    if part[0] != "idx" or len(args) != 1:
+        return None, True
+    k = _const(args[0])
+    if k is None:
+        # A one-element array is PL/M's open-ended array.
+        return None, dim <= 1
+    return (k, False) if 0 <= k < dim else (None, True)
+
+
+def _is_zero_subscript(rest: list) -> bool:
+    """Whether ``rest`` is exactly ``(0)``: x(0) is x itself."""
+    return (len(rest) == 1 and rest[0][0] == "idx" and len(rest[0][1]) == 1
+            and _const(rest[0][1][0]) == 0)
+
+
+def _path_prefix(local: Local, path: list) -> tuple[Optional[tuple], bool, bool]:  # pylint: disable=too-many-return-statements
+    """(component prefix, exact, reaches outside) of a reference into ``local``.
+
+    The reference touches the components that start with the prefix (all of
+    them if it is None); `exact' when a store to it assigns all of those.
+    """
+    rest = list(path)
+    prefix: tuple = (local.name,)
+    if local.dim is not None:
+        if not rest or rest[0][0] != "idx":
+            return None, False, False
+        k, reach = _subscript(rest.pop(0), local.dim)
+        if k is None:
+            return None, False, reach
+        prefix += (k,)
+    if local.members is None:
+        if not rest or _is_zero_subscript(rest):
+            return prefix, True, False
+        return None, False, True
+    if not rest:
+        return prefix, False, False
+    if rest[0][0] != "mem" or rest[0][1] not in local.members:
+        return None, False, True
+    member = rest.pop(0)[1]
+    mdim = local.members[member]
+    prefix += (member,)
+    if mdim is None:
+        if not rest or _is_zero_subscript(rest):
+            return prefix, True, False
+        return None, False, True
+    if not rest:
+        # An array member without a subscript is its first element: read
+        # the whole member, assign none of it.
+        return prefix, False, False
+    k, reach = _subscript(rest.pop(0), mdim)
+    if reach or rest:
+        return None, False, True
+    if k is None:
+        return prefix, False, False
+    return prefix + (k,), True, False
+
+
+def _select(local: Local, path: list) -> tuple[frozenset, bool, bool]:
+    """(components, exact, reaches outside) of a reference into ``local``."""
+    prefix, exact, reach = _path_prefix(local, path)
+    if prefix is None or not local.followed:
+        return local.keys, False, reach
+    n = len(prefix)
+    return frozenset(c for c in local.keys if c[:n] == prefix), exact, reach
+
+
+class _Effects:  # pylint: disable=too-few-public-methods
+    """What evaluating an expression does to the procedure's own locals."""
+
+    def __init__(self) -> None:
+        self.reads: list[tuple[str, frozenset]] = []
+        self.writes: list[frozenset] = []
+        self.calls: list[str] = []
+
+
+class LocalStorage:  # pylint: disable=too-many-instance-attributes
+    """The analysis over a program's modules; see the module docstring.
+
+    ``resolve_proc(name, current)`` gives the full name of the procedure
+    ``name`` means inside procedure ``current``, as the call graph names it,
+    and ``call_graph`` maps each procedure to the procedures it calls.
+    """
+
+    def __init__(self, resolve_proc: Callable[[str, str], Optional[str]],
+                 call_graph: dict[str, set[str]]) -> None:
+        self.resolve_proc = resolve_proc
+        self.call_graph = call_graph
+        self.procs: dict[str, ProcInfo] = {}
+        # procedure -> (owner, name) of the outer locals its body names
+        self.free_refs: dict[str, set[tuple[str, str]]] = {}
+        # (owner, name) -> why that local is static
+        self.reasons: dict[tuple[str, str], str] = {}
+        # locals whose address is taken or which are reached outside their
+        # bounds: they and everything declared after them are static
+        self.escapes: set[tuple[str, str]] = set()
+        self.proc_addr_taken: set[str] = set()
+        # procedure -> labels it jumps to that are not its own
+        self.outward_gotos: dict[str, set[str]] = {}
+        # (procedure, label) that can be jumped to from anywhere
+        self.label_addr_taken: set[tuple[str, str]] = set()
+        self._trans_cache: dict[str, set[tuple[str, str]]] = {}
+
+    # ---- collection --------------------------------------------------------
+
+    def add_module(self, items: list) -> None:
+        """Find every procedure of one module and the scope it is declared in.
+
+        ``items`` are the module's declarations and statements.
+        """
+        self._scan_items(items, None, [])
+
+    def _scan_items(self, items, parent: Optional[str], chain: list) -> None:
+        """Walk ``items`` (a body or block) for procedures, keeping the scope."""
+        for it in items:
+            if isinstance(it, P.ProcDecl):
+                self._add_proc(it, parent, chain)
+            elif isinstance(it, P.DeclareStmt):
+                for inner in it.declarations:
+                    if isinstance(inner, P.ProcDecl):
+                        self._add_proc(inner, parent, chain)
+            elif isinstance(it, _DO_KINDS):
+                decls, _ = block_items_split(it.items)
+                frame = _frame(decls, None)
+                self._scan_items(it.items, parent, chain + [(None, frame)])
+            elif isinstance(it, (P.IfStmt, P.IfStmtElse)):
+                self._scan_items([it.then_stmt], parent, chain)
+                if isinstance(it, P.IfStmtElse):
+                    self._scan_items([it.else_stmt], parent, chain)
+            elif isinstance(it, P.LabeledStmt):
+                self._scan_items([it.stmt], parent, chain)
+
+    def _add_proc(self, decl, parent: Optional[str], chain: list) -> None:
+        attrs = proc_attrs(decl)
+        if attrs.is_external:
+            return
+        name = proc_name(decl)
+        full = f"{parent}${name}" if parent and not attrs.is_public else name
+        params = proc_param_names(decl)
+        info = ProcInfo(full=full, decl=decl, chain=list(chain))
+        items = proc_body_items(decl)
+        decls, stmts = block_items_split(items)
+        if not attrs.is_reentrant:
+            info.locals = _candidates(decls, params)
+        for d in decls:
+            if (isinstance(d, P.DeclItem) and decl_item_type(d)[0] == DataType.LABEL
+                    and decl_attrs(d).is_public):
+                self.label_addr_taken.update((full, n) for n in decl_item_names(d))
+        info.frame = _frame(decls, full, info.locals)
+        for p in params:
+            info.frame.setdefault(p, ("var", full, None))
+        info.labels = _labels(stmts)
+        self.procs[full] = info
+        self._scan_items(items, full, chain + [(full, info.frame)])
+
+    # ---- the analysis ------------------------------------------------------
+
+    def static_locals(self) -> dict[str, set[str]]:
+        """procedure -> the locals of it that must not share ``??AUTO``."""
+        # First what needs no dataflow: the outer locals each procedure
+        # names, the addresses taken.
+        for info in self.procs.values():
+            _Walk(self, info, dataflow=False).run()
+        for f in self.proc_addr_taken:
+            for owner, name in self.trans_refs(f):
+                self.make_static(owner, name, f"{f}, whose address is taken, names it")
+        # Then definite assignment, with the reads the calls make.
+        for info in self.procs.values():
+            if info.locals:
+                _Walk(self, info, dataflow=True).run()
+        return self._close()
+
+    def _close(self) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for full, info in self.procs.items():
+            if not info.locals:
+                continue
+            static = {n for n in info.locals if (full, n) in self.reasons}
+            escaped = [loc for n, loc in info.locals.items() if (full, n) in self.escapes]
+            if escaped:
+                first = min(escaped, key=lambda loc: loc.order)
+                for m, loc in info.locals.items():
+                    if loc.order > first.order and m not in static:
+                        static.add(m)
+                        self.reasons[(full, m)] = f"declared after {first.name}"
+            groups = {info.locals[n].group for n in static}
+            for m, loc in info.locals.items():
+                if loc.group in groups and m not in static:
+                    static.add(m)
+                    self.reasons[(full, m)] = "declared with a static local"
+            out[full] = static
+        return out
+
+    def make_static(self, owner: str, name: str, why: str) -> None:
+        """Keep local ``name`` of ``owner`` out of ``??AUTO``."""
+        self.reasons.setdefault((owner, name), why)
+
+    def escape(self, owner: str, name: str, why: str) -> None:
+        """Local ``name`` of ``owner`` can be reached through a pointer."""
+        self.make_static(owner, name, why)
+        self.escapes.add((owner, name))
+
+    def trans_refs(self, proc: str) -> set[tuple[str, str]]:
+        """The outer locals named by ``proc`` or by anything it can call."""
+        got = self._trans_cache.get(proc)
+        if got is not None:
+            return got
+        seen = {proc}
+        work = [proc]
+        refs: set[tuple[str, str]] = set()
+        while work:
+            p = work.pop()
+            refs |= self.free_refs.get(p, set())
+            for c in self.call_graph.get(p, ()):
+                if c not in seen:
+                    seen.add(c)
+                    work.append(c)
+        self._trans_cache[proc] = refs
+        return refs
+
+    def entered_labels(self, info: ProcInfo) -> set[str]:
+        """Labels of ``info``'s body that control can reach from elsewhere:
+        through their address, or by a GOTO in a procedure nested in it."""
+        out = {lab for lab in info.labels if (info.full, lab) in self.label_addr_taken}
+        prefix = info.full + "$"
+        for p, labels in self.outward_gotos.items():
+            if p.startswith(prefix):
+                out |= labels & info.labels
+        return out
+
+
+def _candidates(decls, params: list[str]) -> dict[str, Local]:
+    """A procedure's candidates for ??AUTO, in declaration order."""
+    out: dict[str, Local] = {}
+    for group, d in enumerate(decls):
+        if not isinstance(d, P.DeclItem) or not _is_candidate(d):
+            continue
+        dt, dim = decl_item_type(d)
+        if dt == DataType.LABEL or (dim is not None and dim < 0):
+            continue
+        for n in decl_item_names(d):
+            if n not in params:
+                out[n] = Local(n, len(out), group, dim, _members(d))
+    return out
+
+
+def _is_candidate(d) -> bool:
+    """Whether a declaration's storage would be the procedure's own, in ??AUTO."""
+    a = decl_attrs(d)
+    based, _ = decl_item_based(d)
+    return not (a.is_public or a.is_external or based or a.at_location is not None
+                or a.data_values or a.initial_values)
+
+
+def _members(d) -> Optional[dict]:
+    members = decl_item_struct_members(d)
+    if members is None:
+        return None
+    out: dict = {}
+    for m in members:
+        mdim = struct_member_dim(m)
+        for n in struct_member_names(m):
+            out[n] = mdim
+    return out
+
+
+def _frame(decls, owner: Optional[str], cands: Iterable[str] = ()) -> dict:
+    """The names a list of declarations brings into scope."""
+    cands = set(cands)
+    frame: dict = {}
+    for d in decls:
+        if isinstance(d, P.ProcDecl):
+            frame[proc_name(d)] = ("proc", owner, None)
+        elif isinstance(d, P.DeclItem):
+            based = d.based is not None
+            for n in decl_item_names(d):
+                if n in cands:
+                    frame[n] = ("cand", owner, None)
+                elif based:
+                    frame[n] = ("based", owner, d.based.base)
+                else:
+                    frame[n] = ("var", owner, None)
+        elif isinstance(d, P.DeclItemBasedGroup):
+            for b in d.based_decls or []:
+                frame[ident_text(b.name)] = ("based", owner, b.base)
+    return frame
+
+
+def _labels(stmts) -> set[str]:
+    """Labels defined in a body, not counting nested procedures'."""
+    out: set[str] = set()
+    work = list(stmts)
+    while work:
+        s = work.pop()
+        if isinstance(s, P.LabeledStmt):
+            out.add(ident_text(s.label))
+            work.append(s.stmt)
+        elif isinstance(s, (P.IfStmt, P.IfStmtElse)):
+            work.append(s.then_stmt)
+            if isinstance(s, P.IfStmtElse):
+                work.append(s.else_stmt)
+        elif isinstance(s, _DO_KINDS):
+            work.extend(x for x in s.items if not isinstance(x, (P.ProcDecl, P.DeclareStmt)))
+    return out
+
+
+class _Walk:
+    """One analysis of one procedure's body.
+
+    Without ``dataflow`` it records what needs none: the outer locals the
+    body names, addresses taken, GOTOs out.  With it, it runs the
+    definite-assignment analysis of the procedure's own locals and makes
+    each one read where it may not have been assigned static.
+    """
+
+    def __init__(self, an: LocalStorage, info: ProcInfo, dataflow: bool) -> None:
+        self.an = an
+        self.info = info
+        self.dataflow = dataflow
+        self.frames: list = list(info.chain) + [(info.full, info.frame)]
+        self.label_in: dict[str, frozenset] = {}
+        self.goto_out: dict[str, frozenset] = {}
+        self.entered: set[str] = set()
+
+    # ---- driving -----------------------------------------------------------
+
+    def run(self) -> None:
+        """Walk the body; with dataflow, until the labels' states settle."""
+        decls, stmts = block_items_split(proc_body_items(self.info.decl))
+        if not self.dataflow:
+            self._declarations(decls)
+            self._walk_stmts(stmts, frozenset())
+            return
+        self.entered = self.an.entered_labels(self.info)
+        for _ in range(_MAX_PASSES):
+            self.goto_out = {}
+            self._walk_stmts(stmts, frozenset())
+            if self.goto_out == self.label_in:
+                return
+            self.label_in = dict(self.goto_out)
+        self._give_up()
+
+    def _give_up(self) -> None:
+        for n in self.info.locals:
+            self.an.make_static(self.info.full, n, "the flow analysis did not settle")
+
+    # ---- names -------------------------------------------------------------
+
+    def _lookup(self, name: str, depth: Optional[int] = None):
+        """(binding, frame index) of ``name``, searching out from ``depth``."""
+        top = len(self.frames) - 1 if depth is None else depth
+        for i in range(top, -1, -1):
+            b = self.frames[i][1].get(name)
+            if b is not None:
+                return b, i
+        return None, -1
+
+    def _local(self, binding, name: str) -> Optional[Local]:
+        if binding is None or binding[0] != "cand":
+            return None
+        owner = self.an.procs.get(binding[1])
+        return owner.locals.get(name) if owner else None
+
+    def _callee(self, name: str, binding) -> Optional[str]:
+        """The procedure ``name`` calls, if it names one."""
+        if binding is not None and binding[0] != "proc":
+            return None
+        return self.an.resolve_proc(name, self.info.full)
+
+    # ---- declarations ------------------------------------------------------
+
+    def _declarations(self, decls) -> None:
+        """Addresses taken in the INITIAL, DATA and AT of declarations."""
+        for d in decls:
+            if isinstance(d, (P.DeclItem, P.DeclItemBasedGroup)):
+                a = decl_attrs(d)
+                for v in (a.initial_values or []) + (a.data_values or []):
+                    self._effects(v, _Effects())
+                if a.at_location is not None:
+                    self._effects(a.at_location, _Effects())
+
+    # ---- statements --------------------------------------------------------
+
+    def _walk_stmts(self, stmts, state: State) -> State:
+        for s in stmts:
+            state = self._stmt(s, state)
+        return state
+
+    def _in_block(self, items, fn):
+        """Run ``fn(statements)`` with the block's declarations in scope."""
+        decls, stmts = block_items_split(items)
+        self.frames.append((None, _frame(decls, None)))
+        try:
+            if not self.dataflow:
+                self._declarations(decls)
+            return fn(stmts)
+        finally:
+            self.frames.pop()
+
+    def _stmt(self, s, state: State) -> State:  # pylint: disable=too-many-return-statements
+        if isinstance(s, P.AssignStmt):
+            eff = _Effects()
+            self._effects(s.value, eff)
+            for t in s.targets:
+                self._reference(t, eff, write=True)
+            return self._apply(eff, state)
+        if isinstance(s, P.CallStmt):
+            eff = _Effects()
+            self._effects(s.callee, eff)
+            return self._apply(eff, state)
+        if isinstance(s, (P.IfStmt, P.IfStmtElse)):
+            state = self._expr_state(s.condition, state)
+            then = self._stmt(s.then_stmt, state)
+            other = self._stmt(s.else_stmt, state) if isinstance(s, P.IfStmtElse) else state
+            return _meet(then, other)
+        if isinstance(s, P.DoBlock):
+            return self._in_block(s.items, lambda stmts: self._walk_stmts(stmts, state))
+        if isinstance(s, P.DoWhileBlock):
+            return self._loop(state, lambda head: self._expr_state(s.condition, head), s.items)
+        if isinstance(s, (P.DoIterBlock, P.DoIterByBlock)):
+            return self._do_iter(s, state)
+        if isinstance(s, P.DoCaseBlock):
+            state = self._expr_state(s.selector, state)
+            return self._in_block(s.items, lambda stmts: self._cases(stmts, state))
+        if isinstance(s, P.LabeledStmt):
+            return self._stmt(s.stmt, self._at_label(ident_text(s.label), state))
+        if isinstance(s, P.GotoStmt):
+            self._goto(ident_text(s.label), state)
+            return None
+        if isinstance(s, P.ReturnStmtValue):
+            self._expr_state(s.value, state)
+            return None
+        if isinstance(s, P.ReturnStmt):
+            return None
+        # HALT waits for an interrupt and goes on; ENABLE, DISABLE and the
+        # null statement do nothing to a variable.
+        return state
+
+    def _cases(self, stmts, state: State) -> State:
+        out: State = None
+        for c in stmts:
+            out = _meet(out, self._stmt(c, state))
+        return out if stmts else state
+
+    def _at_label(self, label: str, state: State) -> State:
+        if label in self.entered:
+            return frozenset()
+        if label in self.label_in:
+            return _meet(state, self.label_in[label])
+        return state
+
+    def _goto(self, label: str, state: State) -> None:
+        if label not in self.info.labels:
+            self.an.outward_gotos.setdefault(self.info.full, set()).add(label)
+        elif state is not None:
+            prev = self.goto_out.get(label)
+            self.goto_out[label] = state if prev is None else prev & state
+
+    def _do_iter(self, s, state: State) -> State:
+        by = isinstance(s, P.DoIterByBlock)
+        index = P.Identifier(name=s.index, pos=s.pos)
+        eff = _Effects()
+        self._effects(s.start, eff)
+        self._effects(s.bound, eff)
+        if by:
+            self._effects(s.step, eff)
+        self._reference(index, eff, write=True)
+        state = self._apply(eff, state)
+
+        def head_fn(head: State) -> State:
+            # The limit and step are evaluated again, and the step reads
+            # the index.
+            again = _Effects()
+            self._effects(s.bound, again)
+            if by:
+                self._effects(s.step, again)
+            self._effects(index, again)
+            return self._apply(again, head)
+
+        return self._loop(state, head_fn, s.items)
+
+    def _loop(self, entry: State, head_fn, items) -> State:
+        """A loop tested at the top: the state there is what holds on entry
+        and at the end of every pass, and the loop leaves from the test."""
+        head = entry
+        for _ in range(_MAX_PASSES):
+            tested = head_fn(head)
+            end = self._in_block(items, lambda stmts, t=tested: self._walk_stmts(stmts, t))
+            new_head = _meet(entry, end)
+            if new_head == head:
+                return tested
+            head = new_head
+        self._give_up()
+        return frozenset()
+
+    # ---- expressions -------------------------------------------------------
+
+    def _expr_state(self, expr, state: State) -> State:
+        eff = _Effects()
+        self._effects(expr, eff)
+        return self._apply(eff, state)
+
+    def _apply(self, eff: _Effects, state: State) -> State:
+        """Check what a statement reads against ``state``, then assign."""
+        if not self.dataflow or state is None:
+            return state
+        mine = self.info.full
+        reads = list(eff.reads)
+        for callee in eff.calls:
+            for owner, name in self.an.trans_refs(callee):
+                if owner == mine and name in self.info.locals:
+                    reads.append((name, self.info.locals[name].keys))
+        for name, keys in reads:
+            if not keys <= state:
+                self.an.make_static(mine, name, "it may be read before it is assigned")
+        for keys in eff.writes:
+            state = state | keys
+        return state
+
+    def _effects(self, expr, eff: _Effects) -> None:  # pylint: disable=too-many-branches
+        """Record what evaluating ``expr`` reads, assigns and calls."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, (P.Identifier, P.Call, P.CallNoArgs)):
+            node = expr if isinstance(expr, P.Identifier) else unwrap_paren(expr.callee)
+            args = expr.args if isinstance(expr, P.Call) else []
+            if isinstance(node, P.Identifier):
+                name = ident_text(node.name)
+                binding, _ = self._lookup(name)
+                if binding is None and name in _SIZE_BUILTINS and args:
+                    return
+                callee = self._callee(name, binding)
+                if callee is not None or binding is None:
+                    # A call, or a builtin: the arguments are values.
+                    if callee is not None:
+                        eff.calls.append(callee)
+                    for a in args:
+                        self._effects(a, eff)
+                    return
+            if isinstance(expr, P.CallNoArgs):
+                self._effects(node, eff)
+            else:
+                self._reference(expr, eff, write=False)
+        elif isinstance(expr, P.MemberAccess):
+            self._reference(expr, eff, write=False)
+        elif isinstance(expr, P.BinaryOp):
+            self._effects(expr.left, eff)
+            self._effects(expr.right, eff)
+        elif isinstance(expr, P.UnaryOp):
+            self._effects(expr.operand, eff)
+        elif isinstance(expr, P.EmbeddedAssign):
+            self._effects(expr.value, eff)
+            self._reference(expr.target, eff, write=True)
+        elif isinstance(expr, P.LocationOf):
+            self._location(expr.operand, eff)
+        elif isinstance(expr, P.LocationOfList):
+            for v in expr.values or []:
+                self._effects(v, eff)
+
+    def _subscripts(self, path: list, eff: _Effects) -> None:
+        for part in path:
+            if part[0] == "idx":
+                for a in part[1]:
+                    self._effects(a, eff)
+
+    def _reference(self, expr, eff: _Effects, write: bool) -> None:
+        """A read of - or with ``write`` a store to - a variable reference.
+
+        Its subscripts are read either way.
+        """
+        des = _designator(expr)
+        if des is None:
+            # An indirect callee or some other expression: all values.
+            if isinstance(expr, P.Call):
+                self._effects(expr.callee, eff)
+                for a in expr.args:
+                    self._effects(a, eff)
+            elif isinstance(expr, P.MemberAccess):
+                self._effects(expr.base, eff)
+            return
+        root, path = des
+        self._subscripts(path, eff)
+        binding, depth = self._lookup(root)
+        if binding is not None and binding[0] == "based":
+            self._read_base(binding, depth, eff)
+            return
+        local = self._local(binding, root)
+        if local is None:
+            return
+        owner = binding[1]
+        keys, exact, reach = _select(local, path)
+        if reach:
+            self.an.escape(owner, root, "it is subscripted outside its bounds")
+        if owner != self.info.full:
+            self.an.free_refs.setdefault(self.info.full, set()).add((owner, root))
+        elif write:
+            if exact:
+                eff.writes.append(keys)
+        else:
+            eff.reads.append((root, keys))
+
+    def _read_base(self, binding, depth: int, eff: _Effects) -> None:
+        """A use of a BASED variable reads its base, found where it is declared."""
+        des = _designator_of_base(binding[2])
+        if des is None:
+            return
+        base, members = des
+        base_binding, base_depth = self._lookup(base, depth)
+        if base_binding is not None and base_binding[0] == "based":
+            self._read_base(base_binding, base_depth, eff)
+            return
+        local = self._local(base_binding, base)
+        if local is None:
+            return
+        owner = base_binding[1]
+        if owner != self.info.full:
+            self.an.free_refs.setdefault(self.info.full, set()).add((owner, base))
+        else:
+            keys, _, _ = _select(local, [("mem", m) for m in members])
+            eff.reads.append((base, keys))
+
+    def _location(self, operand, eff: _Effects) -> None:
+        """``.operand``: the address of a variable, a procedure or a label."""
+        des = _designator(operand)
+        if des is None:
+            self._effects(operand, eff)
+            return
+        root, path = des
+        self._subscripts(path, eff)
+        binding, depth = self._lookup(root)
+        if binding is not None and binding[0] == "based":
+            # `.v' of a BASED v is computed from its base.
+            self._read_base(binding, depth, eff)
+            return
+        if self._local(binding, root) is not None:
+            self.an.escape(binding[1], root, "its address is taken")
+            if binding[1] != self.info.full:
+                self.an.free_refs.setdefault(self.info.full, set()).add((binding[1], root))
+            return
+        callee = self._callee(root, binding)
+        if callee is not None and not path:
+            self.an.proc_addr_taken.add(callee)
+        elif binding is None and not path:
+            # Perhaps a label: a jump through its address comes from anywhere.
+            self.an.label_addr_taken.add((self.info.full, root))
+
+
+def _designator_of_base(base) -> Optional[tuple[str, list[str]]]:
+    """(name, members) of a BASED declaration's base, ``p`` or ``s.m``."""
+    parts: list[str] = []
+    node = base
+    while isinstance(node, P.DottedMember):
+        parts.append(ident_text(node.member))
+        node = node.base
+    if not isinstance(node, P.DottedIdent):
+        return None
+    return ident_text(node.name), list(reversed(parts))
