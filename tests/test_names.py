@@ -529,6 +529,37 @@ end t;
 """, opt) == "PD"
 
 
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_or_label_in_a_block_named_like_a_static_parameter(opt):
+    """A parameter that is static (here X and Y, declared after A, whose
+    address is taken) is @P$X, as a local is; a procedure X or a label Y
+    in a DO block of P is @P$X and @P$Y too, and they were "multiply
+    defined".  Such a parameter has a label now as far as names.py is
+    concerned, and the procedure or label is renamed."""
+    assert run_plm(PRELUDE + """
+declare keep address, kv based keep byte;
+p: procedure (a, x, y);
+    declare (a, x, y) byte;
+    keep = .a;
+    do;
+        x: procedure; call pc('!'); end x;
+        call x;
+    end;
+    do;
+        goto y;
+        call pc('?');
+    y:  call pc(a);
+    end;
+end p;
+call p('A', 'B', 'C');
+keep = keep + 1;
+call pc(kv);
+keep = keep + 1;
+call pc(kv);
+end t;
+""", opt) == "!ABC"
+
+
 
 # ---- names the assembler reads as something else ---------------------------
 

@@ -342,7 +342,9 @@ class _Resolver:
         body = _Block("proc", block, block.module, d)
         params = p.signature.params
         for n in (params.names or []) if params is not None else []:
-            self._declare(body, _key(n.name), "param", (n, "name"), storage=False)
+            # Static, a parameter has a label as a local does (local_storage).
+            self._declare(body, _key(n.name), "param", (n, "name"),
+                          storage=not attrs.is_reentrant)
         self._visit(p.body.items, body)
 
     def _decl_item(self, item: P.DeclItem, block: _Block) -> None:
@@ -426,7 +428,9 @@ class _Resolver:
     def asm_name(self, d: _Decl) -> str | None:  # pylint: disable=too-many-return-statements
         """The label code generation gives a declaration, if it defines one
         that can meet another's: a DO block's variables are numbered apart
-        (@proc$Bn$name) and a parameter lives in ??AUTO."""
+        (@proc$Bn$name).  A procedure's local or parameter has one if it is
+        static, which local_storage decides later, so it is taken to have
+        one; a REENTRANT procedure's are on its stack."""
         parent = self.owner(d)
         if d.kind == "proc":
             if d.shared or parent is None:
@@ -442,7 +446,7 @@ class _Resolver:
             except ValueError:
                 return None     # no EQU
             return data_name(d.name)
-        if d.kind == "var" and d.storage:
+        if d.kind in ("var", "param") and d.storage:
             if d.block.kind == "module":
                 return data_name(d.name)
             if d.block.kind == "proc":
