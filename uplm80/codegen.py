@@ -52,8 +52,10 @@ from .ast_view import (
 )
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
-from .errors import CodeGenError
+from .errors import CodeGenError, CompilerError
+from .frontend import source_location
 from .local_storage import AUTO, PARAM, LocalStorage
+from .names import REGISTER_NAMES, data_name, resolve_names
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -403,6 +405,44 @@ class AsmLine:
         return "".join(parts)
 
 
+class _ScopedLiterals(dict):
+    """The LITERALLY macros, as a name in scope where code is being generated
+    has them.
+
+    The macro pass puts a LITERALLY's text in place of every name it
+    covers, with PL/M-80's scope; what reaches code generation under the
+    name is something else the program declares.  It was a flat table, so
+    once a procedure declared `K LITERALLY '1'' a variable K in another
+    procedure read as 1.  A name is a macro here only if the declaration
+    of it in scope is the LITERALLY (or, for a module-level one entered
+    before its declaration is generated, nothing is).
+    """
+
+    def __init__(self, symbols: SymbolTable) -> None:
+        super().__init__()
+        self._symbols = symbols
+
+    def _in_scope(self, name) -> Symbol | None | bool:
+        sym = self._symbols.lookup(name)
+        if sym is None:
+            return dict.__contains__(self, name)
+        return sym if sym.kind == SymbolKind.LITERAL else False
+
+    def __contains__(self, name) -> bool:
+        return bool(self._in_scope(name)) and dict.__contains__(self, name)
+
+    def __getitem__(self, name):
+        sym = self._in_scope(name)
+        if isinstance(sym, Symbol) and sym.literal_value is not None:
+            return sym.literal_value
+        if not sym:
+            raise KeyError(name)
+        return dict.__getitem__(self, name)
+
+    def get(self, name, default=None):
+        return self[name] if name in self else default
+
+
 class CodeGenerator:
     """
     Generates assembly code from PL/M-80 AST.
@@ -412,9 +452,8 @@ class CodeGenerator:
     addresses and 16-bit values.
     """
 
-    # Reserved assembler names that conflict with Z80 registers
-    RESERVED_NAMES = {'A', 'B', 'C', 'D', 'E', 'H', 'L', 'M', 'SP', 'PSW',
-                      'AF', 'BC', 'DE', 'HL', 'IX', 'IY', 'I', 'R'}
+    # Assembler names that are Z80 registers (names.REGISTER_NAMES).
+    RESERVED_NAMES = REGISTER_NAMES
 
     # Page-zero addresses a hosted program reaches directly.  Under CP/M they
     # are fixed locations and the literal is emitted.  Under MP/M page zero
@@ -631,8 +670,12 @@ class CodeGenerator:
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
         self.reg_debug = reg_debug  # Enable register tracking debug output
         self.warnings: list[str] = []  # Collected warnings
+        # The statement or declaration being generated (see _loc).
+        self._stmt_node = None
         self._warned_comparisons: set = set()  # see _check_impossible_comparison
         self.symbols = SymbolTable()
+        # The built-in variables, MEMORY and STACKPTR (see _declared).
+        self._predeclared = dict(self.symbols.global_scope.symbols)
         self.output: list[AsmLine] = []
         self.label_counter = 0
         self.string_counter = 0
@@ -671,6 +714,12 @@ class CodeGenerator:
         self._reentrant_deferred: list[Symbol] | None = None
         # Assembly names declared EXTRN, which _sym_offset folds offsets onto.
         self._extern_names: set[str] = {"__END__"}
+        # In a multi-file compile, the names one of the modules makes PUBLIC.
+        # Another's EXTERNAL declaration of one is no EXTRN: the name is
+        # defined in the same assembly, and um80 takes a symbol declared
+        # EXTRN for another module's, so `jr' to a PUBLIC label from the
+        # peephole is "JR to 'AGAIN': its target is the external symbol".
+        self._compile_publics: set[str] = set()
         # Every module-level DeclItem, for an AT that names a variable declared
         # further down (see _declared_later).
         self._module_decl_items: list = []
@@ -685,7 +734,7 @@ class CodeGenerator:
         self._page_zero_refs: set[str] = set()
         # Whether this module sets SP and so needs the ??STACK buffer.
         self._needs_stack = False
-        self.literal_macros: dict[str, str] = {}  # LITERALLY macro expansions
+        self.literal_macros: dict[str, str] = _ScopedLiterals(self.symbols)
         self.block_scope_counter = 0  # Counter for unique DO block scopes
         # Procedures declared at the head of a DO block.  They are
         # hoisted out of the block and emitted after the body of the
@@ -723,10 +772,9 @@ class CodeGenerator:
             return int(s, 0)  # Let Python auto-detect base (0x, 0b, 0o prefixes)
 
     def _mangle_name(self, name: str) -> str:
-        """Mangle variable names that conflict with assembler reserved words."""
-        if name.upper() in self.RESERVED_NAMES:
-            return f"@{name}"
-        return name
+        """The assembler's name for a variable: `@name' for a register or an
+        operator of um80's expressions (names.data_name)."""
+        return data_name(name)
 
     def _get_const_byte_value(self, expr) -> int | None:
         """Extract a constant byte value from an expression if possible.
@@ -867,16 +915,40 @@ class CodeGenerator:
         if found is None:
             return
         const, text = found
-        from .errors import SourceLocation
-        pos = getattr(const, 'pos', None)
-        where = (str(SourceLocation(pos.start_line, pos.start_column))
-                 if pos is not None and getattr(pos, 'start_line', 0) else None)
+        loc = self._loc(const)
+        where = str(loc) if loc is not None else None
         # The same comparison can be looked at more than once.
         key = (where, text) if where else (id(const), text)
         if key in self._warned_comparisons:
             return
         self._warned_comparisons.add(key)
-        self.warnings.append(f"{where}: warning: {text}" if where else f"warning: {text}")
+        self._warn(text, loc)
+
+    def _loc(self, node):
+        """Where ``node`` is in the source - its file (the included one, for
+        text from an $INCLUDE) and line - or, if it carries no position (the
+        optimizer made it), where the statement being generated is."""
+        loc = source_location(node) if node is not None else None
+        return loc if loc is not None else self._current_location()
+
+    def _current_location(self):
+        """Where the statement or declaration being generated is, if known."""
+        node = getattr(self, "_stmt_node", None)
+        return source_location(node) if node is not None else None
+
+    def _warn(self, text: str, loc) -> None:
+        self.warnings.append(f"{loc}: warning: {text}" if loc else f"warning: {text}")
+
+    @contextmanager
+    def _located_errors(self) -> Iterator[None]:
+        """Place an error raised without a location at the statement or
+        declaration being generated when it was raised."""
+        try:
+            yield
+        except CompilerError as e:
+            if e.location is None:
+                e.location = self._current_location()
+            raise
 
     def _impossible_comparison(self, byte_side, const_side, op):
         """(the constant, the message) if ``byte_side op const_side`` compares
@@ -912,10 +984,7 @@ class CodeGenerator:
         """
         const_val = self._try_eval_const(condition)
         if const_val is not None:
-            from .errors import CodeGenError, SourceLocation
-            loc = None
-            if hasattr(condition, 'span') and condition.span:
-                loc = SourceLocation(condition.span.start_line, condition.span.start_col)
+            loc = self._loc(condition)
 
             if const_val == 0:
                 msg = f"{context} is always false (constant 0)"
@@ -935,10 +1004,7 @@ class CodeGenerator:
 
         const_val = self._try_eval_const(condition)
         if const_val is not None:
-            from .errors import SourceLocation
-            loc = None
-            if hasattr(condition, 'span') and condition.span:
-                loc = SourceLocation(condition.span.start_line, condition.span.start_col)
+            loc = self._loc(condition)
 
             # Truth is bit 0, not non-zero (see _emit_truth_test), so the
             # diagnostic has to agree with the code the generator emits:
@@ -949,12 +1015,7 @@ class CodeGenerator:
                 msg = (f"IF condition is always false (constant {const_val}: "
                        "PL/M-80 tests bit 0)" if const_val
                        else "IF condition is always false (constant 0)")
-
-            if loc:
-                warning = f"{loc}: warning: {msg}"
-            else:
-                warning = f"warning: {msg}"
-            self.warnings.append(warning)
+            self._warn(msg, loc)
 
     # ========================================================================
     # Loop Index Usage Analysis
@@ -1966,7 +2027,8 @@ class CodeGenerator:
             proc_asm_name = f"@{parent_proc}${name}"
             full_proc_name = f"{parent_proc}${name}"
         else:
-            proc_asm_name = name
+            # A register or an operator of um80's is `@A', as a variable is.
+            proc_asm_name = data_name(name)
             full_proc_name = name
 
         # Extract parameter types from the procedure body's DeclItems
@@ -2029,6 +2091,11 @@ class CodeGenerator:
 
     def generate(self, module) -> str:
         """Generate assembly code for a module."""
+        with self._located_errors():
+            return self._generate(module)
+
+    def _generate(self, module) -> str:
+        resolve_names([module])
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2039,7 +2106,7 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self._page_zero_refs = set()
         self._needs_stack = False
-        self.literal_macros = {}
+        self.literal_macros = _ScopedLiterals(self.symbols)
         self._survey_aliases([module])
         self._number_declarations([module])
 
@@ -2128,13 +2195,13 @@ class CodeGenerator:
             if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS, call main, return to OS
                 self._emit_entry_stack()
-                self._emit("call", entry_proc_name)
+                self._emit("call", data_name(entry_proc_name))
                 self._emit("jp", self._pz(0x0000))  # Warm boot to return to CP/M
             else:
                 # BARE: Use locally-defined stack, jump to entry
                 self._emit("ld", "sp,??STACK")
                 self._needs_stack = True
-                self._emit("jp", entry_proc_name)
+                self._emit("jp", data_name(entry_proc_name))
 
         # Generate code for module-level statements
         if shape.stmts:
@@ -2235,7 +2302,16 @@ class CodeGenerator:
         """
         if len(modules) == 1:
             return self.generate(modules[0])
+        with self._located_errors():
+            return self._generate_multi(modules)
 
+    def _generate_multi(self, modules: list) -> str:
+        resolve_names(modules, multi=True)
+        self._compile_publics = {
+            data_name(n) for m in modules for d in module_shape(m).decls
+            for n in ([proc_name(d)] if isinstance(d, P.ProcDecl) and proc_attrs(d).is_public
+                      else decl_item_names(d) if isinstance(d, P.DeclItem)
+                      and decl_attrs(d).is_public else [])}
         self.output = []
         self.data_segment = []
         self.at_defs = []
@@ -2246,7 +2322,7 @@ class CodeGenerator:
         self.needs_end_symbol = False
         self._page_zero_refs = set()
         self._needs_stack = False
-        self.literal_macros = {}
+        self.literal_macros = _ScopedLiterals(self.symbols)
         self._survey_aliases(modules)
         self._number_declarations(modules)
 
@@ -2353,12 +2429,12 @@ class CodeGenerator:
             self._emit(comment="Entry point")
             if self.mode in (Mode.CPM, Mode.MPM):
                 self._emit_entry_stack()
-                self._emit("call", entry_proc_name)
+                self._emit("call", data_name(entry_proc_name))
                 self._emit("jp", self._pz(0x0000))
             else:
                 self._emit("ld", "sp,??STACK")
                 self._needs_stack = True
-                self._emit("call", entry_proc_name)
+                self._emit("call", data_name(entry_proc_name))
 
         # Procedures hoisted out of DO blocks in the module body.
         self._drain_block_procs([])
@@ -2500,6 +2576,7 @@ class CodeGenerator:
         :class:`P.LiterallyDecl` (LITERALLY macro), or
         :class:`P.ProcDecl` (procedure).
         """
+        self._stmt_node = decl
         if isinstance(decl, P.ProcDecl):
             self._gen_proc_decl(decl)
         elif isinstance(decl, P.LiterallyDecl):
@@ -2539,6 +2616,7 @@ class CodeGenerator:
         with multiple names emits one storage row per name with each
         getting its own symbol entry, except the names in ``skip``.
         """
+        self._stmt_node = decl
         start = len(self.data_segment)
         self._gen_var_decl_names(decl, skip)
         self._note_storage(decl, start)
@@ -2709,8 +2787,9 @@ class CodeGenerator:
                 )
             )
             if is_external:
-                self._emit("extrn", base_name)
-                self._extern_names.add(base_name)
+                if base_name not in self._compile_publics:
+                    self._emit("extrn", base_name)
+                    self._extern_names.add(base_name)
             elif is_public:
                 self._emit("public", base_name)
             return
@@ -2736,8 +2815,9 @@ class CodeGenerator:
 
         # External variables don't get storage here
         if is_external:
-            self._emit("extrn", asm_name)
-            self._extern_names.add(asm_name)
+            if asm_name not in self._compile_publics:
+                self._emit("extrn", asm_name)
+                self._extern_names.add(asm_name)
             return
 
         # Public declaration
@@ -2834,7 +2914,7 @@ class CodeGenerator:
                          dimension=dimension, struct_members=struct_members,
                          based_on=based_on, is_external=attrs.is_external,
                          asm_name=self._mangle_name(name))
-            if attrs.is_external:
+            if attrs.is_external and sym.asm_name not in self._compile_publics:
                 self._extern_names.add(sym.asm_name)
             if attrs.at_location is None or based_on:
                 return sym, None
@@ -3101,6 +3181,9 @@ class CodeGenerator:
             return self._format_number(number_value(expr))
         elif isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
+            label = getattr(expr, "uplm80_asm", None)
+            if label is not None:
+                return label        # a label: `@proc$label' in a procedure
             if name in self.literal_macros:
                 return self.literal_macros[name]
             sym = None
@@ -3281,6 +3364,7 @@ class CodeGenerator:
         old_proc_return_type = self.current_proc_return_type
         old_loop_words = self._loop_words
         self._loop_words = 0
+        self._stmt_node = decl
 
         attrs = proc_attrs(decl)
         name = proc_name(decl)
@@ -3295,7 +3379,7 @@ class CodeGenerator:
             full_proc_name = f"{old_proc}${name}"
             self.current_proc = full_proc_name  # Compound name for further nesting
         else:
-            proc_asm_name = name
+            proc_asm_name = data_name(name)
             full_proc_name = name
             self.current_proc = name
 
@@ -3308,9 +3392,10 @@ class CodeGenerator:
         saved_block_procs = self.deferred_block_procs
         self.deferred_block_procs = []
 
-        # Look up the procedure (already registered in pass 1)
-        # Use full_proc_name to find the correct symbol for nested procs
-        sym = self.symbols.lookup(full_proc_name)
+        # Look up the procedure (already registered in pass 1, in the
+        # outermost scope: through the scopes around a procedure a DO block
+        # declares, a variable of its name in an enclosing block came first)
+        sym = self.symbols.global_scope.lookup_local(full_proc_name)
         if sym is None:
             sym = Symbol(
                 name=full_proc_name,
@@ -3341,7 +3426,7 @@ class CodeGenerator:
 
         self._emit()
         if attrs.is_public:
-            self._emit("public", name)
+            self._emit("public", proc_asm_name)
 
         self._emit(comment=f"Procedure {name}")
         self._emit_label(proc_asm_name)
@@ -3596,6 +3681,16 @@ class CodeGenerator:
     # ========================================================================
 
     def _gen_stmt(self, stmt) -> None:
+        """Generate code for a single typed statement node, noting where it
+        is for a diagnostic about it (see :meth:`_located_errors`).  Left
+        set if an error is raised, so the error is placed at the innermost
+        statement."""
+        outer = self._stmt_node
+        self._stmt_node = stmt
+        self._gen_stmt_kind(stmt)
+        self._stmt_node = outer
+
+    def _gen_stmt_kind(self, stmt) -> None:
         """Generate code for a single typed statement node.
 
         Dispatches over the uplox-generated :mod:`uplm80._plm_parser`
@@ -3611,20 +3706,11 @@ class CodeGenerator:
         elif isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue)):
             self._gen_return(stmt)
         elif isinstance(stmt, P.GotoStmt):
-            # Check if target is a LITERALLY macro
-            target = ident_text(stmt.label)
-            if target in self.literal_macros:
-                target = self.literal_macros[target]
-            # Check if this is a module-level label or procedure-local label
-            # Module-level labels are defined without procedure prefix
-            module_label = self.symbols.lookup(target)
-            if module_label and module_label.kind == SymbolKind.LABEL:
-                # Module-level label - use as-is
-                pass
-            elif self.current_proc:
-                # Procedure-local label - prefix with current procedure
-                target = f"@{self.current_proc}${target}"
-            self._emit("jp", target)
+            # names.resolve_names found the label and checked the GOTO may
+            # reach it.  (The symbol table has a main-program label and not
+            # a procedure's, so a GOTO in a procedure went to the main
+            # program's label of the same name, if it had one.)
+            self._emit("jp", stmt.uplm80_asm)
         elif isinstance(stmt, P.HaltStmt):
             self._emit("halt")
         elif isinstance(stmt, P.EnableStmt):
@@ -3634,20 +3720,12 @@ class CodeGenerator:
         elif isinstance(stmt, P.NullStmt):
             pass  # No code
         elif isinstance(stmt, P.LabeledStmt):
-            raw_label = ident_text(stmt.label)
-            if self.current_proc:
-                # Procedure-local label - prefix with current procedure
-                label = f"@{self.current_proc}${raw_label}"
-            else:
-                # Module-level label - register in symbol table for GOTO lookups
-                self.symbols.define(
-                    Symbol(
-                        name=raw_label,
-                        kind=SymbolKind.LABEL,
-                    )
-                )
-                label = raw_label
-            self._emit_label(label)
+            # A procedure's label is `@proc$label', a main program's the
+            # label itself (names.resolve_names, which renames one that
+            # would meet another).
+            if not self.current_proc:
+                self.symbols.define(Symbol(name=ident_text(stmt.label), kind=SymbolKind.LABEL))
+            self._emit_label(stmt.uplm80_asm)
             self._gen_stmt(stmt.stmt)
         elif isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
             self._gen_if(stmt)
@@ -3869,13 +3947,13 @@ class CodeGenerator:
         else:
             self._gen_slot_args(sym, args, callee_name_str)
 
+        if callee_name_str is None or (sym is not None and sym.kind in (
+                SymbolKind.VARIABLE, SymbolKind.PARAMETER)):
+            self._gen_indirect_call(callee_expr, args)
+            return
+
         # Call the procedure
-        if callee_name_str is not None:
-            self._emit("call", call_name)
-        else:
-            # Indirect call through address
-            self._gen_expr(callee_expr)
-            self._emit("jp", "(hl)")
+        self._emit("call", call_name)
 
         # Clean up stack (caller cleanup) - only for stack-based calls
         if use_stack and args:
@@ -3894,6 +3972,35 @@ class CodeGenerator:
                 self._emit("ld", f"hl,{stack_bytes}")
                 self._emit("add", "hl,sp")
                 self._emit("ld", "sp,hl")
+
+    def _gen_indirect_call(self, target, args) -> None:
+        """``CALL target (args)`` where ``target`` is an ADDRESS variable (or
+        member) holding a procedure's address (Programming Manual, 8.2.1).
+
+        It was `call Q', which ran the bytes of Q itself, or, for `CALL
+        s.p', a `jp (hl)' with no return address, so the procedure returned
+        to the caller's caller.  The address goes to DE and ??jpde jumps
+        there with the return address pushed.  The caller has pushed the
+        arguments, the way a PUBLIC or REENTRANT procedure takes them; the
+        last is still in HL, and is left there and its low byte in A, where
+        a procedure private to its module takes its only one.
+        """
+        if len(args) > 1:
+            self._warn("a CALL through an address passes more than one argument only to a "
+                       "PUBLIC or REENTRANT procedure", self._current_location())
+        if args:
+            self._emit("push", "hl")
+        if self._gen_expr(target) == DataType.BYTE:
+            self._emit("ld", "l,a")
+            self._emit("ld", "h,0")
+        self._emit("ex", "de,hl")
+        if args:
+            self._emit("pop", "hl")
+            self._emit("ld", "a,l")
+        self.needs_runtime.add("jpde")
+        self._emit("call", "??jpde")
+        for _ in args:
+            self._emit("pop", "de")
 
     def _param_slot(self, sym, param_name: str, callee_name: str | None) -> str:
         """The label of parameter ``param_name`` of procedure ``sym``."""
@@ -4577,13 +4684,9 @@ class CodeGenerator:
         body and take its ``RET``.  The procedures are queued here and
         emitted out of line by :meth:`_drain_block_procs`, and they are
         named in the enclosing procedure's scope, which is the scope
-        pass 1 registered them in.
-
-        Two sibling blocks in one procedure that both declare a
-        procedure of the same name therefore collide on one asm label.
-        The assembler rejects that outright (``multiply defined``), so
-        it cannot go unnoticed; no PL/M-80 source in the CP/M or MP/M II
-        corpora writes it.
+        pass 1 registered them in.  (Two sibling blocks that each declare
+        a procedure of one name would meet there; names.resolve_names
+        renames the second.)
         """
         queued = [d for d in decls if isinstance(d, P.ProcDecl)]
         if not queued:
@@ -4638,10 +4741,13 @@ class CodeGenerator:
         # Save and extend current_proc to include block scope for unique asm names
         old_proc = self.current_proc
         if decls:  # Only modify if there are declarations
-            if self.current_proc:
-                self.current_proc = f"{self.current_proc}$B{block_id}"
-            else:
-                self.current_proc = f"B{block_id}"
+            outer = f"{self.current_proc}$" if self.current_proc else ""
+            # Not the name of a procedure: a block's X was a procedure B1's
+            # X, @B1$X, or took its slot in ??AUTO.
+            while f"{outer}B{block_id}" in self.call_graph:
+                self.block_scope_counter += 1
+                block_id = self.block_scope_counter
+            self.current_proc = f"{outer}B{block_id}"
 
         # Local declarations
         for decl in decls:
@@ -5303,7 +5409,8 @@ class CodeGenerator:
             if isinstance(callee, P.Identifier):
                 name = ident_text(callee.name).upper()
                 # Built-ins first, as _gen_call_expr dispatches them.
-                builtin_type = self._builtin_type(name, expr)
+                builtin_type = (None if self._declared(ident_text(callee.name))
+                                else self._builtin_type(name, expr))
                 if builtin_type is not None:
                     return builtin_type
                 sym = self._lookup_symbol(ident_text(callee.name))
@@ -7075,7 +7182,8 @@ class CodeGenerator:
         base = unwrap_paren(expr.callee)
         index = expr.args[0]
 
-        if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
+        if (isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS
+                and not self._declared(ident_text(base.name))):
             return self._gen_call_expr(expr)
 
         elem_type = DataType.BYTE
@@ -7106,7 +7214,8 @@ class CodeGenerator:
         base = unwrap_paren(expr.callee)
         index = unwrap_paren(expr.args[0])
 
-        if isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS:
+        if (isinstance(base, P.Identifier) and ident_text(base.name).upper() in self.BUILTIN_FUNCS
+                and not self._declared(ident_text(base.name))):
             self._gen_call_expr(expr)
             return
 
@@ -7320,7 +7429,7 @@ class CodeGenerator:
         # Handle built-in functions
         if isinstance(callee, P.Identifier):
             name = ident_text(callee.name)
-            result = self._gen_builtin(name, args)
+            result = None if self._declared(name) else self._gen_builtin(name, args)
             if result is not None:
                 return result
 
@@ -7410,17 +7519,26 @@ class CodeGenerator:
         else:
             self._gen_slot_args(sym, args, name)
 
-        if isinstance(callee, P.Identifier):
-            self._emit("call", call_name)
-        else:
-            self._gen_expr(callee)
-            self._emit("jp", "(hl)")
+        if not isinstance(callee, P.Identifier) or (sym is not None and sym.kind in (
+                SymbolKind.VARIABLE, SymbolKind.PARAMETER)):
+            self._gen_indirect_call(callee, args)
+            return DataType.ADDRESS
+        self._emit("call", call_name)
 
         if use_stack and args:
             for _ in args:
                 self._emit("pop", "de")
 
         return sym.return_type if sym and sym.return_type else DataType.ADDRESS
+
+    def _declared(self, name: str) -> bool:
+        """Whether ``name`` here is something the program declares, which
+        hides a built-in of the name: `DECLARE size (4) BYTE' makes
+        `size(2)' an element, not SIZE(2).  MEMORY and STACKPTR are in the
+        symbol table from the start, as built-in variables."""
+        sym = self._lookup_symbol(name)
+        return (sym is not None and sym.kind != SymbolKind.BUILTIN
+                and sym is not self._predeclared.get(sym.name))
 
     def _gen_builtin(self, name: str, args) -> DataType | None:
         """Generate code for built-in function. Returns type if handled, None otherwise.
@@ -7439,7 +7557,7 @@ class CodeGenerator:
                     # The port is a BYTE: `INPUT(-1)' reads port 0FFH.
                     self._emit("in", f"a,({self._format_number(port_num & 0xFF)})")
                 else:
-                    self._gen_expr(arg)
+                    self._gen_expr_to_a(arg)        # the port is a BYTE
                     self._emit("call", "??inp")
                     self.needs_runtime.add("inp")
             else:
@@ -7938,6 +8056,12 @@ class CodeGenerator:
                 self._emit("ld", "hl,__END__")
                 return DataType.ADDRESS
 
+            label = getattr(operand, "uplm80_asm", None)
+            if label is not None:
+                # The address of a label: `@proc$label' in a procedure.
+                self._emit("ld", f"hl,{label}")
+                return DataType.ADDRESS
+
             if name in self.literal_macros:
                 macro_val = self.literal_macros[name]
                 try:
@@ -7947,7 +8071,10 @@ class CodeGenerator:
                 except ValueError:
                     return self._gen_location(_make_location(_make_ident(macro_val)))
 
-            sym = self.symbols.lookup(name)
+            # Through the enclosing procedures, as a call finds it: a nested
+            # procedure is filed as `outer$name', so `.show' of one named
+            # the bare SHOW, which nothing defines.
+            sym = self._lookup_symbol(name)
 
             if sym and sym.stack_offset is not None:
                 self._emit("push", "ix")

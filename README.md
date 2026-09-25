@@ -83,6 +83,7 @@ When multiple files are provided:
 - All files are parsed together before code generation
 - A unified call graph is built across all modules
 - Procedures that are never active at the same time share storage for their parameters and for the locals that may share it (`??AUTO`, see [Procedure locals](#procedure-locals)), across module boundaries
+- Each module keeps its own name space, as if it were compiled alone and linked: a name that is not PUBLIC or EXTERNAL is qualified with the module's name in the output (`LIB?HELPER`), and PUBLIC and EXTERNAL names bind across the modules (see [docs/multi_file_compilation.md](docs/multi_file_compilation.md))
 - A single combined output file is generated
 
 This produces better code than compiling files separately, as the compiler can share local variable storage between procedures in different modules that never call each other.
@@ -173,17 +174,31 @@ uplm80 pip.plm -D CPM3 -D MPM -o pip.mac
 
 ## Runtime Library
 
-The compiler generates calls to these runtime routines (provide in a separate .rel file):
+A module carries the runtime routines it uses at the end of its code
+(`uplm80/runtime.py`):
 
 | Routine | Description |
 |---------|-------------|
-| `??MUL` | 16-bit unsigned multiply |
-| `??DIV` | 16-bit unsigned divide |
-| `??MOD` | 16-bit unsigned modulo |
-| `??SHL` | 16-bit shift left |
-| `??SHR` | 16-bit logical shift right |
-| `??SHRS` | 16-bit arithmetic shift right |
-| `??MOVE` | Block memory move |
+| `??mul16` | 16-bit multiply, HL = HL * DE |
+| `??div16`, `??mod16` | 16-bit divide and remainder, as DRI's PL/M-80 computes them |
+| `??mul8` | 8-bit multiply |
+| `??move` | Block memory move (MOVE) |
+| `??subde` | 16-bit subtract, HL = HL - DE |
+| `??jpde` | A CALL through an address (`CALL q`, Programming Manual 8.2.1) |
+| `??inp`, `??outp` | INPUT and OUTPUT of a port that is not a constant |
+
+## Names in the Output
+
+A module-level name is its own name in the assembly, and a procedure's
+names are `@proc$name` (its parameters and the locals that may share
+storage are in `??AUTO`).  Where PL/M-80 would let two declarations meet
+in one assembler name - a label in each of two DO blocks, a procedure in
+each of two blocks, a LITERALLY in each of two procedures - the second is
+renamed `NAME?2` (no PL/M-80 identifier has a `?`).  A name the assembler
+reads as a register or an operator (`A`, `HL`, `EQ`, `NUL`, ...) is
+`@NAME`.  `uplm80/names.py` binds every name to the declaration PL/M-80
+means and checks every GOTO against the Programming Manual (9.3): out of a
+procedure only to a label at the outer level of the main program module.
 
 ## Runtime Modes
 
@@ -367,6 +382,7 @@ uplm80/
 ├── ast_optimizer.py # AST-level optimizations
 ├── codegen.py       # Z80 code generator
 ├── local_storage.py # Which procedure locals may share ??AUTO
+├── names.py         # Which declaration each name means; GOTO rules; assembler names
 ├── runtime.py       # Runtime helpers
 ├── symbols.py       # Symbol table
 ├── errors.py        # Diagnostic exception types

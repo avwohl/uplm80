@@ -140,8 +140,21 @@ def _scope_of(items) -> dict:
         elif isinstance(it, P.LiterallyDecl):
             scope[ident_text(it.name)] = _Decl("other")
 
+    def label(it) -> None:
+        # A label is declared in the block whose statement it labels (9.3),
+        # an IF's arms included; the -O3 inliner put a procedure's use of a
+        # variable Q into a block with a label Q.
+        while isinstance(it, P.LabeledStmt):
+            scope.setdefault(ident_text(it.label), _Decl("other"))
+            it = it.stmt
+        if isinstance(it, (P.IfStmt, P.IfStmtElse)):
+            label(it.then_stmt)
+            if isinstance(it, P.IfStmtElse):
+                label(it.else_stmt)
+
     for it in items:
         declare(it)
+        label(it)
     # A procedure declared in a nested DO block belongs to the enclosing
     # procedure's scope (see iter_block_proc_decls).
     for proc in iter_block_proc_decls(items):
@@ -1333,6 +1346,11 @@ class ASTOptimizer:
                     return scope[name]
             return None
 
+        # The procedure itself, first: the table is by name, so a call of
+        # a procedure NUL outside the DO block that declares another NUL
+        # found that one, and inlined it.
+        if resolve(home, proc_name_) is not self._lookup(proc_name_):
+            return False
         for name in _all_names(proc.body):
             if resolve(home, name) is not self._lookup(name):
                 return False
@@ -2051,9 +2069,11 @@ class ASTOptimizer:
         # DO CASE and nothing any of them establishes survives the join.
         entry = self._snapshot_flow_state()
         new_cases: list = []
+        self._push_scope(stmt.items)    # its labels
         for c in stmt.items:
             self._restore_flow_state(entry)
             new_cases.append(self._optimize_stmt(c))
+        self._pop_scope()
         self._restore_flow_state(entry)
         self._invalidate_modified(list(stmt.items))
         # Drop None survivors by replacing with NullStmt so positional
