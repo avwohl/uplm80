@@ -45,6 +45,7 @@ from typing import Callable, Iterable, Optional
 from . import _plm_parser as P
 from .ast_view import (
     DataType,
+    binop_kind,
     block_items_split,
     decl_attrs,
     decl_item_based,
@@ -52,15 +53,16 @@ from .ast_view import (
     decl_item_struct_members,
     decl_item_type,
     ident_text,
-    number_value,
     proc_attrs,
     proc_body_items,
     proc_name,
     proc_param_names,
     struct_member_dim,
     struct_member_names,
+    unop_kind,
     unwrap_paren,
 )
+from .plm_types import fold_binary, fold_builtin, fold_unary, literal_type, typed_const
 
 # An array or structure with more elements than this is not followed element
 # by element: any read of it before... anything needs the whole, which no
@@ -150,21 +152,12 @@ class ProcInfo:
 # (a BASED variable; extra is its declaration).  owner is None in a block.
 
 
-def _const(expr) -> Optional[int]:
-    """The value of a constant subscript, or None."""
-    expr = unwrap_paren(expr)
-    if isinstance(expr, P.NumberLiteral):
-        return number_value(expr)
-    if (isinstance(expr, P.Call) and isinstance(expr.callee, P.Identifier)
-            and ident_text(expr.callee.name) == "DOUBLE" and len(expr.args) == 1):
-        return _const(expr.args[0])
-    return None
-
-
 def _designator(expr):
     """(root name, [part, ...]) for a variable reference, or None.
 
     A part is ("idx", args) for a subscript and ("mem", name) for a member.
+    :meth:`_Walk._fold_path` replaces each subscript's args with their
+    values, None where one is not constant, for :func:`_select`.
     """
     expr = unwrap_paren(expr)
     if isinstance(expr, P.Identifier):
@@ -184,10 +177,10 @@ def _designator(expr):
 
 def _subscript(part, dim: int) -> tuple[Optional[int], bool]:
     """(constant index or None, whether it reaches outside the object)."""
-    args = part[1]
-    if part[0] != "idx" or len(args) != 1:
+    values = part[1]
+    if part[0] != "idx" or len(values) != 1:
         return None, True
-    k = _const(args[0])
+    k = values[0]
     if k is None:
         # A one-element array is PL/M's open-ended array.
         return None, dim <= 1
@@ -197,7 +190,7 @@ def _subscript(part, dim: int) -> tuple[Optional[int], bool]:
 def _is_zero_subscript(rest: list) -> bool:
     """Whether ``rest`` is exactly ``(0)``: x(0) is x itself."""
     return (len(rest) == 1 and rest[0][0] == "idx" and len(rest[0][1]) == 1
-            and _const(rest[0][1][0]) == 0)
+            and rest[0][1][0] == 0)
 
 
 def _path_prefix(local: Local, path: list) -> tuple[Optional[tuple], bool, bool]:  # pylint: disable=too-many-return-statements
@@ -294,7 +287,8 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
 
         ``items`` are the module's declarations and statements.
         """
-        self._scan_items(items, None, [])
+        decls, _ = block_items_split(items)
+        self._scan_items(items, None, [(None, _frame(decls, None))])
 
     def _scan_items(self, items, parent: Optional[str], chain: list) -> None:
         """Walk ``items`` (a body or block) for procedures, keeping the scope."""
@@ -742,6 +736,60 @@ class _Walk:
             for v in expr.values or []:
                 self._effects(v, eff)
 
+    def _fold(self, expr) -> Optional[tuple[int, DataType]]:  # pylint: disable=too-many-return-statements
+        """(value, type) of a constant expression, as PL/M-80 computes it.
+
+        A subscript the optimizer folds - ``a(1+1)``, ``a(3-5)``, ``a(-1)``
+        - is a constant here at every level, so ``-O0`` decides what
+        ``-O1`` and up decide.  LENGTH and LAST of a local array are its
+        extent; a name the program declares is not a built-in.
+        """
+        e = unwrap_paren(expr)
+        if isinstance(e, (P.NumberLiteral, P.StringLiteral)):
+            got = typed_const(e)
+            return None if got is None else (got[0] & 0xFFFF, got[1])
+        if isinstance(e, P.UnaryOp):
+            inner = self._fold(e.operand)
+            return None if inner is None else fold_unary(unop_kind(e), *inner)
+        if isinstance(e, P.BinaryOp):
+            left, right = self._fold(e.left), self._fold(e.right)
+            if left is None or right is None:
+                return None
+            return fold_binary(binop_kind(e), left[0], left[1], right[0], right[1])
+        if not (isinstance(e, P.Call) and isinstance(unwrap_paren(e.callee), P.Identifier)):
+            return None
+        name = ident_text(unwrap_paren(e.callee).name)
+        if self._lookup(name)[0] is not None:
+            return None
+        if name.upper() in ("LENGTH", "LAST") and len(e.args) == 1:
+            arg = unwrap_paren(e.args[0])
+            if not isinstance(arg, P.Identifier):
+                return None
+            binding, _ = self._lookup(ident_text(arg.name))
+            local = self._local(binding, ident_text(arg.name))
+            if local is None or local.dim is None or local.dim <= 0:
+                return None
+            n = local.dim if name.upper() == "LENGTH" else local.dim - 1
+            return n, literal_type(n)
+        args = [self._fold(a) for a in e.args]
+        if not args or any(a is None for a in args):
+            return None
+        return fold_builtin(name, args)  # type: ignore[arg-type]
+
+    def _fold_path(self, path: list) -> list:
+        """``path`` with each subscript's args replaced by their values."""
+        out = []
+        for part in path:
+            if part[0] == "idx":
+                values = []
+                for a in part[1]:
+                    got = self._fold(a)
+                    values.append(None if got is None else got[0])
+                out.append(("idx", values))
+            else:
+                out.append(part)
+        return out
+
     def _subscripts(self, path: list, eff: _Effects) -> None:
         for part in path:
             if part[0] == "idx":
@@ -773,7 +821,7 @@ class _Walk:
         if local is None:
             return
         owner = binding[1]
-        keys, exact, reach = _select(local, path)
+        keys, exact, reach = _select(local, self._fold_path(path))
         if reach:
             self.an.escape(owner, root, "it is subscripted outside its bounds")
         if owner != self.info.full:

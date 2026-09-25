@@ -258,6 +258,61 @@ def test_pointers_from_a_local_reach_the_locals_declared_after_it(opt):
     assert _run(LAYOUT, opt) == "BD"
 
 
+# ---- declaration order ------------------------------------------------------
+
+FOLDED_RUN = """
+k2: procedure byte;
+    declare arr (2) byte, nxt byte;
+    arr(0) = 1; arr(1) = 2;
+    arr(1 + 1) = 'S';
+    return nxt;
+end k2;
+call mon1(2, k2);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_constant_subscript_expression_is_a_constant_at_every_level(opt):
+    """`arr(1 + 1)' is `nxt', declared after `arr' (the gate's a4 k2).  -O1
+    and up fold it before the analysis sees it and found it outside
+    `arr'; at -O0 it was a variable subscript, `arr' stayed in ??AUTO, and
+    the store went into ??AUTO, not into `nxt'."""
+    assert _run(FOLDED_RUN, opt) == "S"
+
+
+FOLDED = """
+k7: procedure byte;
+    declare arr (2) byte, nxt byte;
+    arr(0) = 1; arr(2 - 1) = 2;
+    nxt = arr(0) + arr(1);
+    return nxt;
+end k7;
+k8: procedure byte;
+    declare arr (3) byte, nxt byte;
+    arr(0) = 1; arr(1) = 2; arr(last(arr)) = 3;
+    nxt = arr(0) + arr(1) + arr(2);
+    return nxt;
+end k8;
+k9: procedure byte;
+    declare arr (3) byte, nxt byte;
+    arr(0) = 1; arr(1) = 2; arr(-1) = 3;
+    nxt = arr(0) + arr(1);
+    return nxt;
+end k9;
+call mon1(2, k7 + k8 + k9);
+"""
+
+
+def test_every_level_decides_the_same_for_a_constant_subscript():
+    """`arr(2 - 1)' and `arr(last(arr))' are elements, so the arrays are
+    assigned whole and may share ??AUTO; `arr(-1)' is `arr(255)', past the
+    end.  -O0 took the first two for variable subscripts and the last for
+    one inside the array; LAST was not folded at any level."""
+    for opt in LEVELS:
+        asm = _asm(FOLDED, opt)
+        assert _static(asm) == {"K9$ARR", "K9$NXT"}, (opt, asm)
+
+
 # ---- the memory saving, where it is safe -----------------------------------
 
 def test_locals_assigned_before_they_are_read_still_share_auto():
