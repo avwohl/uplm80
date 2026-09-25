@@ -492,6 +492,27 @@ end t;
 
 
 @pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_is_not_inlined_where_a_label_hides_its_variable(opt):
+    """-O3 inlined P, which reads the variable Q, into a block with a label
+    Q: its model of scope had no labels (the program printed `q***')."""
+    assert run_plm(PRELUDE + """
+declare q byte;
+p: procedure; call pc(q); end p;
+q = 'q';
+do;
+  call p;
+  goto q;
+  call pc('X');
+  q: call p;
+end;
+do case 0;
+  do; call p; goto q; call pc('X'); q: call p; end;
+end;
+end t;
+""", opt) == "qqqq"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
 def test_a_blocks_variables_are_not_a_procedure_b1s(opt):
     """A DO block's variables are named after the block's number, @B1$X;
     a procedure B1's X is @B1$X too, and the block's X took its place in
