@@ -188,6 +188,23 @@ RUNTIME_JPDE = """\
 	ret
 """
 
+# INPUT and OUTPUT of a port that is not a constant: the Z80's IN and OUT
+# take a variable port only in C.
+RUNTIME_INP = """\
+??inp:
+	; INPUT(port): A = port, returns the byte read in A
+	ld	c,a
+	in	a,(c)
+	ret
+"""
+
+RUNTIME_OUTP = """\
+??outp:
+	; OUTPUT(port) = value: C = port, A = value
+	out	(c),a
+	ret
+"""
+
 # Compare strings for equality
 RUNTIME_STRCMP = """\
 ??strcmp:
@@ -222,6 +239,8 @@ def get_runtime_library(needed: set[str] | None = None) -> str:
         "move": RUNTIME_MOVE,
         "subde": RUNTIME_SUBDE,
         "jpde": RUNTIME_JPDE,
+        "inp": RUNTIME_INP,
+        "outp": RUNTIME_OUTP,
     }
 
     # Dependencies: some routines call others

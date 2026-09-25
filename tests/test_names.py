@@ -501,6 +501,24 @@ def test_a_jump_to_a_symbol_named_like_a_condition():
         "\tjp\t0+P\n\tjr\t0+Z\t; z\nL1:\tjp\t0+NZ\n\tjp\tnz,P\n\tjp\tPX\n\tcall\tP")
 
 
+
+@pytest.mark.parametrize("opt", (0, 2))
+def test_input_and_output_of_a_port_that_is_not_a_constant(opt):
+    """They called ??inp and ??outp, which the runtime library did not have:
+    "Undefined symbol '??outp'"."""
+    src = PRELUDE + """
+declare (p, v) byte, w address;
+p = 1; v = 41h; w = 102h;
+output(p) = v;
+output(w) = v;
+v = input(p);
+v = input(w + 1);
+call pc('.');
+end t;
+"""
+    assert run_plm(src, opt) == "."
+
+
 # ---- a multi-file compile --------------------------------------------------
 
 def _compile_modules(sources: list[str], opt: int = 2) -> subprocess.CompletedProcess:
@@ -639,3 +657,4 @@ declare true literally '0ffh';
 if true then call pc('y');
 end t;
 """) == "y"
+

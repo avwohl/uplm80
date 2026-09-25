@@ -7596,7 +7596,7 @@ class CodeGenerator:
                     # The port is a BYTE: `INPUT(-1)' reads port 0FFH.
                     self._emit("in", f"a,({self._format_number(port_num & 0xFF)})")
                 else:
-                    self._gen_expr(arg)
+                    self._gen_expr_to_a(arg)        # the port is a BYTE
                     self._emit("call", "??inp")
                     self.needs_runtime.add("inp")
             else:
