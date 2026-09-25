@@ -444,14 +444,38 @@ class _Resolver:
     _RENAME_FIRST = {"lit": 0, "label": 1, "proc": 2, "var": 3, "param": 3}
 
     def settle(self) -> None:
-        """Rename declarations until no two code generation would give one
-        assembler name to are left."""
+        """Rename declarations until code generation keeps them all apart."""
         self.used = {d.name for d in self.decls}
+        for _ in range(len(self.decls) + 1):
+            if not (self._settle_procedures() or self._settle_labels()
+                    or self._settle_lookups()):
+                return
+
+    def _settle_procedures(self) -> bool:
+        """Code generation files every procedure under one table by its
+        key, its enclosing procedures' names and its own (P$Q).  Two in
+        sibling DO blocks of one procedure have one key and met there -
+        and in the assembly, @P$Q "multiply defined"."""
+        by_key: dict[str, list[_Decl]] = {}
+        for d in self.decls:
+            if d.kind == "proc":
+                by_key.setdefault(self.proc_key(d).upper(), []).append(d)
+        renamed = False
+        for group in by_key.values():
+            mine = [d for d in group if not d.shared]
+            for d in mine[1:] if len(mine) == len(group) else mine:
+                self.rename(d, self.fresh(d.name))
+                renamed = True
+        return renamed
+
+    def _settle_labels(self) -> bool:
+        """No two declarations defining one assembler label."""
         by_asm: dict[str, list[_Decl]] = {}
         for d in self.decls:
             name = self.asm_name(d)
             if name is not None:
                 by_asm.setdefault(name.upper(), []).append(d)
+        renamed = False
         for group in by_asm.values():
             if len(group) < 2:
                 continue
@@ -462,8 +486,51 @@ class _Resolver:
                 if d in keep or (d.kind == "lit" and all(
                         k.kind == "lit" and k.literal == d.literal for k in keep)):
                     continue
-                if d.kind in ("label", "lit"):
-                    self.rename(d, self.fresh(d.name))
+                self.rename(d, self.fresh(d.name))
+                renamed = True
+        return renamed
+
+    def _settle_lookups(self) -> bool:
+        """Every name found where code generation looks for it.
+
+        It looks a name up as a procedure nested in each procedure around
+        the use, innermost first, before anything else (CodeGenerator.
+        _lookup_symbol): a procedure declared in a DO block of P, or in P
+        itself, took the name from a variable declared in another of P's
+        blocks, or in a procedure nested in P, or outside P - silently the
+        wrong object.  Such a procedure is renamed.
+        """
+        procs: dict[str, _Decl] = {}
+        for d in self.decls:
+            if d.kind == "proc":
+                procs.setdefault(self.proc_key(d).upper(), d)
+        wrong: set[int] = set()
+        for r in self.refs:
+            if r.goto or r.decl is None:
+                continue
+            found = self._codegen_lookup(r.decl.name, r.block, procs)
+            if found is not None and found is not r.decl and found.kind == "proc" \
+                    and not found.shared and id(found) not in wrong:
+                wrong.add(id(found))
+                self.rename(found, self.fresh(found.name))
+        return bool(wrong)
+
+    def _codegen_lookup(self, name: str, block: _Block, procs: dict) -> _Decl | None:
+        """What code generation finds for ``name`` used in ``block``."""
+        if block.proc is not None:
+            parts = self.proc_key(block.proc).upper().split("$")
+            for i in range(len(parts), 0, -1):
+                d = procs.get("$".join(parts[:i]) + "$" + name)
+                if d is not None:
+                    return d
+        # Then its scopes, which hold everything but the nested procedures.
+        b: _Block | None = block
+        while b is not None:
+            d = b.decls.get(name)
+            if d is not None and (d.kind != "proc" or self.proc_key(d).upper() == name):
+                return d
+            b = b.parent
+        return procs.get(name)
 
     # ---- GOTO ----------------------------------------------------------
 

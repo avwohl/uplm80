@@ -347,6 +347,104 @@ end t;
 """, opt) == "25."
 
 
+
+# ---- procedures ------------------------------------------------------------
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_in_each_of_two_blocks(opt):
+    """Code generation files a procedure under its parent's name and its
+    own, P$Q, whichever block of P declares it; two Qs met there, and in
+    the assembly (@P$Q "multiply defined")."""
+    assert run_plm(PRELUDE + """
+p: procedure;
+  do;
+    q: procedure; call pc('1'); end q;
+    call q;
+  end;
+  do;
+    q: procedure (c); declare c byte; call pc(c); end q;
+    call q('2');
+  end;
+end p;
+call p;
+end t;
+""", opt) == "12"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_in_a_block_of_the_main_program_named_like_a_variable(opt):
+    """Both were the label N."""
+    assert run_plm(PRELUDE + """
+declare n byte;
+n = 7;
+do;
+  n: procedure; call pc('N'); end n;
+  call n;
+end;
+call pc('0' + n);
+end t;
+""", opt) == "N7"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_variable_hides_a_procedure_of_an_enclosing_procedure(opt):
+    """Q's X is its variable; code generation looks a name up as a
+    procedure nested in each enclosing procedure first, and took P's
+    procedure X for it (the program printed X0X)."""
+    assert run_plm(PRELUDE + """
+p: procedure;
+  x: procedure; call pc('X'); end x;
+  q: procedure;
+    declare x byte;
+    x = 5;
+    call pc('0' + x);
+  end q;
+  call q;
+  call x;
+end p;
+call p;
+end t;
+""", opt) == "5X"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_in_a_block_does_not_reach_past_it(opt):
+    """V and Y outside the DO block are the variables; both were taken for
+    the procedure the block declares (VV, YY)."""
+    assert run_plm(PRELUDE + """
+declare y byte;
+p: procedure;
+  declare v byte;
+  do;
+    v: procedure; call pc('V'); end v;
+    y: procedure; call pc('Y'); end y;
+    call v; call y;
+  end;
+  v = 'v'; y = 'y';
+  call pc(v); call pc(y);
+end p;
+call p;
+end t;
+""", opt) == "VYvy"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_blocks_variables_are_not_a_procedure_b1s(opt):
+    """A DO block's variables are named after the block's number, @B1$X;
+    a procedure B1's X is @B1$X too, and the block's X took its place in
+    ??AUTO (PP)."""
+    assert run_plm(PRELUDE + """
+b1: procedure; declare x byte; x = 'P'; call pc(x); end b1;
+do;
+  declare x byte;
+  x = 'D';
+  call b1;
+  call pc(x);
+end;
+end t;
+""", opt) == "PD"
+
+
 # ---- a multi-file compile --------------------------------------------------
 
 def _compile_modules(sources: list[str], opt: int = 2) -> subprocess.CompletedProcess:

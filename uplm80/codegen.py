@@ -4720,13 +4720,9 @@ class CodeGenerator:
         body and take its ``RET``.  The procedures are queued here and
         emitted out of line by :meth:`_drain_block_procs`, and they are
         named in the enclosing procedure's scope, which is the scope
-        pass 1 registered them in.
-
-        Two sibling blocks in one procedure that both declare a
-        procedure of the same name therefore collide on one asm label.
-        The assembler rejects that outright (``multiply defined``), so
-        it cannot go unnoticed; no PL/M-80 source in the CP/M or MP/M II
-        corpora writes it.
+        pass 1 registered them in.  (Two sibling blocks that each declare
+        a procedure of one name would meet there; names.resolve_names
+        renames the second.)
         """
         queued = [d for d in decls if isinstance(d, P.ProcDecl)]
         if not queued:
@@ -4781,10 +4777,13 @@ class CodeGenerator:
         # Save and extend current_proc to include block scope for unique asm names
         old_proc = self.current_proc
         if decls:  # Only modify if there are declarations
-            if self.current_proc:
-                self.current_proc = f"{self.current_proc}$B{block_id}"
-            else:
-                self.current_proc = f"B{block_id}"
+            outer = f"{self.current_proc}$" if self.current_proc else ""
+            # Not the name of a procedure: a block's X was a procedure B1's
+            # X, @B1$X, or took its slot in ??AUTO.
+            while f"{outer}B{block_id}" in self.call_graph:
+                self.block_scope_counter += 1
+                block_id = self.block_scope_counter
+            self.current_proc = f"{outer}B{block_id}"
 
         # Local declarations
         for decl in decls:
