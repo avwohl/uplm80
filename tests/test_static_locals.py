@@ -835,6 +835,51 @@ call f;
     assert _static(asm) == {"P$SAVED"}, asm
 
 
+ICALL_ASM = """
+    .z80
+    cseg
+    public ICALL
+; icall(a): calls the procedure at a.
+ICALL:  ld hl,2
+        add hl,sp
+        ld a,(hl)
+        inc hl
+        ld h,(hl)
+        ld l,a
+        jp (hl)
+    end
+"""
+
+CALLED_THROUGH_ADDRESS = """
+icall: procedure (a) external; declare a address; end icall;
+lc: procedure;
+    declare (n, m) byte;
+    rd: procedure byte; return n; end rd;
+    n = 'L';
+    m = rd;
+    call mon1(2, m);
+end lc;
+declare f address;
+f = .lc;
+call icall(f);
+call other;
+call icall(f);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_called_through_its_address_keeps_its_own_locals_in_auto(opt):
+    """`rd' names `n', but `rd' runs only while `lc' is active, however
+    `lc' was called, and `lc' assigns `n' before it calls `rd': only the
+    locals of the procedures `lc' is nested in, which a call through its
+    address may find inactive, have to be static.  (MP/M II's LOAD takes
+    the address of LOADCOM, and four of RELOC's locals went static.)"""
+    asm = _asm(CALLED_THROUGH_ADDRESS, opt)
+    assert _static(asm) == set(), asm
+    out = run_asm(asm, ICALL_ASM).stdout.replace("\0", "").strip()
+    assert out == "L.L", asm
+
+
 def test_storage_that_is_not_in_auto_gets_no_slot_there():
     """INITIAL, BASED, AT and LABEL declarations, and a REENTRANT procedure's
     parameters and locals, live elsewhere; each used to be given a slot in

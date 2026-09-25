@@ -410,9 +410,15 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
     def static_locals(self) -> dict[str, set[str]]:
         """procedure -> the locals of it that must not share ``??AUTO``."""
         self.survey()
+        # A call through an address can come when the procedures `f' is
+        # nested in are not active, and what they last left in their
+        # locals is what `f' finds.  A procedure that `f' calls, and the
+        # ones nested in it, are active whenever one of them names its
+        # locals, and that procedure's own analysis sees to those.
         for f in self.proc_addr_taken:
             for owner, name in self.trans_refs(f):
-                self.make_static(owner, name, f"{f}, whose address is taken, names it")
+                if f.startswith(owner + "$"):
+                    self.make_static(owner, name, f"{f}, whose address is taken, names it")
         # Then definite assignment, with the reads the calls make.
         for info in self.procs.values():
             if any(loc.kind == AUTO for loc in info.locals.values()):
