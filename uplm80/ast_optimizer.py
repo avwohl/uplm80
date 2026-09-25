@@ -1333,6 +1333,11 @@ class ASTOptimizer:
                     return scope[name]
             return None
 
+        # The procedure itself, first: the table is by name, so a call of
+        # a procedure NUL outside the DO block that declares another NUL
+        # found that one, and inlined it.
+        if resolve(home, proc_name_) is not self._lookup(proc_name_):
+            return False
         for name in _all_names(proc.body):
             if resolve(home, name) is not self._lookup(name):
                 return False

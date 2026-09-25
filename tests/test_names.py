@@ -471,6 +471,27 @@ end t;
 
 
 @pytest.mark.parametrize("opt", LEVELS)
+def test_a_call_of_the_outer_of_two_procedures_of_one_name(opt):
+    """The call outside the DO block is the module's NUL.  Code generation
+    found the block's, P$NUL, first (names renames it now), and -O3 inlined
+    the block's there: its table of procedures it may inline is by name,
+    and it checked that the names in the body mean the same at the call,
+    not that the procedure's own does."""
+    assert run_plm(PRELUDE + """
+nul: procedure; call pc('M'); end nul;
+p: procedure;
+  do;
+    nul: procedure; call pc('I'); end nul;
+    call nul;
+  end;
+  call nul;
+end p;
+call p;
+end t;
+""", opt) == "IM"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
 def test_a_blocks_variables_are_not_a_procedure_b1s(opt):
     """A DO block's variables are named after the block's number, @B1$X;
     a procedure B1's X is @B1$X too, and the block's X took its place in
