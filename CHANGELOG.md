@@ -872,6 +872,22 @@ Each fix has a regression test that fails without it.
   compiles to a CALL through x's value (`ld a,(X) / ... / call ??jpde`);
   0.3.6 compiled it to `call X`. PL/M-80 has no empty argument list; `f()`
   of a procedure is taken as `f`.
+- **`STACKPTR` read inside an expression can see a temporary the compiler
+  pushed.** Where an operand evaluated before it is kept on the stack,
+  STACKPTR reads 2 less than it does at the start of the statement. After
+  `sp0 = stackptr`, `sp0 <> stackptr` is true at `-O0` to `-O2`; `-O3`
+  evaluates `stackptr <> sp0` and `stackptr = sp0` in that order too, and
+  all three find the two unequal. Intel's PL/M-80 V3.1 does the same, in
+  other places: for `d = stackptr - sp0` it pushes a temporary and then
+  reads SP. (0.3.6 folded all three comparisons at `-O3` to "equal".) The
+  manual gives STACKPTR as the stack pointer register (11.2.3), not as it
+  was when the statement began.
+- **`.label`, the address of a label, is accepted in an expression.** The
+  dot operator takes a variable or a procedure (Programming Manual, 4.1.3),
+  and Intel's PL/M-80 V3.1 rejects `.label` in an expression (ERROR #158,
+  INVALID DOT OPERAND, LABEL ILLEGAL), whether or not the label is declared
+  LABEL; it accepts one in a DATA list. uplm80 compiles both to the label's
+  address, with no diagnostic, as 0.3.6 did.
 - **An INTERRUPT procedure nested in another procedure is accepted without
   a diagnostic.** PL/M-80 requires an INTERRUPT procedure to be at the outer
   level of the module; uplm80 compiles a nested one, and a local of the
