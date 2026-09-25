@@ -3471,6 +3471,12 @@ class CodeGenerator:
 
         # Procedure prologue
         if attrs.interrupt_num is not None:
+            if params:
+                # Nothing calls it to pass them, and its entry could not take
+                # pushed ones off the stack.
+                raise CodeGenError(
+                    f"{name}: an INTERRUPT procedure may not have parameters (8.1.6)",
+                    self._current_location())
             # Interrupt handler - save all registers
             self._emit("push", "af")
             self._emit("push", "bc")

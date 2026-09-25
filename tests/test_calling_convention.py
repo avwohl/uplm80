@@ -431,3 +431,11 @@ def test_a_private_procedure_called_with_too_many_arguments_is_an_error():
 def test_a_call_through_an_address_is_not_counted():
     """8.2.1: "the compiler does not check the number of parameters"."""
     _asm("t: do;\n" + DECLS + "q = .p2aa; call q(1, 2, 3);\nend t;\n")
+
+
+def test_an_interrupt_procedure_may_not_have_parameters():
+    """8.1.6: an INTERRUPT procedure is untyped and has none.  Nothing calls
+    it to pass them, and its entry could not take pushed ones off."""
+    errors = _errors("t: do;\nih: procedure (x) interrupt 3; declare x byte; end ih;\nend t;\n")
+    assert any("IH: an INTERRUPT procedure may not have parameters (8.1.6)" in e
+               for e in errors), errors
