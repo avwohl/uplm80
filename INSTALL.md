@@ -218,7 +218,9 @@ python -m uplm80.postopt output.mac -o output_opt.mac
 um80 output.mac
 
 # 4. Link, with the BDOS interface (see Runtime Library) if the program
-#    calls MON1 or MON2 with a function number that is not a constant
+#    uses any name it defines: MON2A, MON3, BOOT, a system variable such
+#    as FCB, TBUFF, BUFF, BDISK or MAXB, or MON1 or MON2 other than called
+#    with a constant function number (that call is the BDOS call itself)
 ul80 -o program.com output.rel x0100.rel
 
 # 5. Run the program
