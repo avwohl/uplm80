@@ -184,3 +184,60 @@ def test_a_goto_from_another_modules_procedure_in_one_compile(opt):
         with open(mac) as fh:
             asm = fh.read()
     assert run_asm(asm).stdout.replace("\r", "") == "00500."
+
+
+# A GOTO out of a procedure evaluated as an argument abandons, as well as
+# the return addresses, what the call being made has pushed: the arguments
+# before the last two, and BC, the next-to-last, kept round the last one.
+# The label sets SP again all the same.
+ARG_GOTOS = {
+    "the last of three arguments": ("""
+declare (n, sink) address;
+p3: procedure (a, b, c); declare (a, b, c) address; sink = a + b + c; end p3;
+f: procedure address; n = n + 1; if n < 1000 then goto again; return 7; end f;
+w: procedure; call p3(1, 2, f); end w;
+n = 0;
+again:
+    call w;
+    call pn(n); call pc('.'); call pn(sink); call pc('.');
+    call mon1(0, 0);
+end t;
+""", "01000.00010."),
+    "a REENTRANT procedure's callee": ("""
+declare (n, sink) address;
+bail: procedure; n = n + 1; goto again; end bail;
+r: procedure (a, b, c) address reentrant; declare (a, b, c) address;
+    declare k address;
+    k = a + b + c;
+    if n < 1000 then call bail;
+    return k;
+end r;
+n = 0;
+again:
+    sink = r(1, 2, r(3, 4, 5));
+    call pn(n); call pc('.'); call pn(sink); call pc('.');
+    call mon1(0, 0);
+end t;
+""", "01000.00015."),
+    "an argument of a CALL through an address": ("""
+declare (n, sink, q) address;
+p4: procedure (a, b, c, d); declare (a, b, c, d) address; sink = a + b + c + d; end p4;
+f: procedure address; n = n + 1; if n < 1000 then goto again; return 7; end f;
+n = 0; q = .p4;
+again:
+    call q(1, 2, f, 4);
+    call pn(n); call pc('.'); call pn(sink); call pc('.');
+    call mon1(0, 0);
+end t;
+""", "01000.00014."),
+}
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("where", ARG_GOTOS)
+def test_a_goto_out_of_an_argument(where, opt):
+    """1000 GOTOs out of a call in the middle of placing another's
+    arguments: more than the 64 bytes of `--mode bare''s stack, if SP were
+    not set again."""
+    src, want = ARG_GOTOS[where]
+    assert run_plm(PRELUDE + src, opt, mode="bare") == want

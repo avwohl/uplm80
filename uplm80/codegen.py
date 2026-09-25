@@ -512,7 +512,9 @@ class CodeGenerator:
         At a label of the main program's outer level that a GOTO in a
         procedure can reach (names.resolve_names marks it), as DRI's PL/M-80
         does: such a GOTO abandons the calls it leaves, and without this
-        their return addresses stayed on the stack, so a program that took
+        their return addresses stayed on the stack, and the words pushed
+        for a call whose arguments were being evaluated - the first ones,
+        and BC round the last (_gen_args) - so a program that took
         it over and over - MP/M II's PIP, whose ERROR ends `GO TO RETRY' -
         ran out of stack.  Nothing is on the stack at the outer level: a
         counted DO keeps its count there, but a label in a DO is not at the
