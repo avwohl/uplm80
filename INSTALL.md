@@ -217,8 +217,9 @@ python -m uplm80.postopt output.mac -o output_opt.mac
 # 3. Assemble to relocatable object
 um80 output.mac
 
-# 4. Link with runtime library (if needed)
-ul80 -o program.com output.rel runtime.rel
+# 4. Link, with the BDOS interface (see Runtime Library) if the program
+#    calls MON1 or MON2 with a function number that is not a constant
+ul80 -o program.com output.rel x0100.rel
 
 # 5. Run the program
 cpmemu program.com
@@ -267,20 +268,28 @@ See the `examples/` directory for complete working programs:
 
 ## Runtime Library
 
-The compiler may generate calls to runtime routines for certain operations. You'll need to provide these in a `runtime.rel` file or link with a runtime library:
+The runtime routines a module uses (multiply, divide, `??jphl` for a CALL
+through an address, ...) are in its own output; nothing needs linking for
+them.
 
-- `??MUL` - 16-bit unsigned multiplication
-- `??DIV` - 16-bit unsigned division
-- `??MOD` - 16-bit unsigned modulo
-- `??SHL` - 16-bit shift left
-- `??SHR` - 16-bit logical shift right
-- `??SHRS` - 16-bit arithmetic shift right
-- `??MOVE` - Block memory move
+A CP/M program links with the BDOS interface it declares EXTERNAL, which is
+equates, as DRI's `X0100.ASM` defines them: a call of `MON1(f, a)` already
+has f in C and a in DE (see the README, Calling Convention).
 
-For CP/M programs, you'll also need stubs for:
-- `MON1`, `MON2`, `MON3` - BDOS call interfaces
-- `BOOT` - Warm boot
-- System variables: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`
+```asm
+        public  MON1, MON2, MON2A, MON3, BOOT
+MON1    equ     5       ; BDOS call, no result
+MON2    equ     5       ; BYTE result in A
+MON2A   equ     5
+MON3    equ     5       ; ADDRESS result in HL
+BOOT    equ     0       ; warm boot
+        end
+```
+
+System variables such as `BDISK`, `MAXB`, `FCB`, `BUFF` and `IOBYTE` are
+equates too.  A call of `MON1` or `MON2` with a constant function number is
+compiled as the BDOS call itself, so a program that makes only those needs
+none of this.
 
 See [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md) for details on CP/M BDOS usage.
 

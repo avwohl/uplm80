@@ -60,11 +60,15 @@ end myproc;
 result = myproc(1, 2);
 ```
 
-A PUBLIC procedure takes its arguments on the stack, which is how a call
-to an EXTERNAL one passes them, so the two agree whether the modules are
-compiled together or apart.  (A procedure private to its module is
-called more cheaply: its arguments are stored straight into its own
-storage, and the last passed in a register.)
+Every call passes its arguments the way Intel's PL/M-80 does (README,
+Calling Convention): the last in DE, the one before it in BC, and any
+earlier ones pushed, which the callee takes off the stack.  A PUBLIC
+procedure takes them that way and a call of an EXTERNAL one passes them
+that way, so the two agree whether the modules are compiled together or
+apart, and with modules PL/M-80 compiled or assembly written for it.
+(A procedure with one parameter that no other module can reach - not
+PUBLIC or EXTERNAL, not REENTRANT, its address never taken - takes it in
+A or HL instead.)
 
 When the modules are compiled together, a PUBLIC procedure can also be
 called from another module without an EXTERNAL declaration there, as

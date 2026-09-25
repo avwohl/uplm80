@@ -55,11 +55,11 @@ cpmemu program.com arg1 arg2      # Run with arguments
    um80 output.mac
    ```
 
-3. Link (no runtime library to add; see below), with whatever defines the
-   program's EXTERNALs, such as the CP/M stubs:
+3. Link, with whatever defines the program's EXTERNALs; for a CP/M
+   program that is the BDOS interface (see CP/M Stubs). There is no runtime
+   library to add (see below):
    ```bash
-   ul80 -o output.com output.rel
-   ul80 -o output.com output.rel stubs.rel
+   ul80 -o output.com output.rel x0100.rel
    ```
 
 ## Runtime Library
@@ -71,11 +71,21 @@ guard (`uplm80/runtime.py`, emitted by `codegen.py` from `needs_runtime`):
 - `??mul16` - 16-bit multiply, HL = HL * DE
 - `??div16`, `??mod16` - 16-bit divide and remainder, as DRI's PL/M-80 computes them (a zero divisor gives quotient 0FFFFH, remainder = dividend)
 - `??subde` - 16-bit subtraction (HL = HL - DE)
-- `??jpde` - a CALL through an address (`CALL q`, Programming Manual 8.2.1): the address in DE, jumped to from a CALL
+- `??jphl` - a CALL through an address (`CALL q`, Programming Manual 8.2.1): the arguments where any call has them, the address in HL, jumped to (`jp (hl)`) from a CALL
 - `??inp`, `??outp` - INPUT and OUTPUT of a port that is not a constant
 
 MOVE is generated inline (`ldir`); `runtime.py` also has `??move` and
 `??mul8`, which code generation does not call.
+
+## Calling Convention
+
+Intel PL/M-80's, so code links with DRI's assembly and PL/M-80 objects
+(README, Calling Convention): one argument in BC (C for BYTE), two in BC
+then DE (E), more with the first ones pushed left to right; the callee
+removes the pushed words; BYTE results in A, ADDRESS in HL; a call keeps
+only SP, IX and IY.  Exception: a private, non-REENTRANT procedure with one
+parameter whose address is never taken takes it in A or HL
+(`Symbol.uses_reg_param`).  Needs upeepz80 >= 0.2.6.
 
 ## Runtime Modes
 
@@ -95,7 +105,7 @@ jp 0                  ; Return to CP/M (warm boot)
 **Features:**
 - Maximum available stack (all memory between program end and BDOS)
 - Clean return to CP/M on program exit
-- Requires CP/M stubs: `mon1`, `mon2`, `mon3`, `boot`
+- Requires `mon1`, `mon2`, `mon3`, `boot` as equates (see CP/M Stubs)
 - Requires memory locations: `bdisk`, `maxb`, `fcb`, `buff`, `iobyte`
 
 ### Bare Metal Mode (`-m bare`)
@@ -154,11 +164,18 @@ Command line: `python -m uplm80.compiler input.plm -D MPM -D CPM3`
 
 ## CP/M Stubs
 
-For CP/M programs (`-m cpm`), provide stubs for:
-- `mon1` - BDOS call (void return)
-- `mon2` - BDOS call (byte return)
-- `mon3` - BDOS call (address return)
-- `boot` - Warm boot
+For CP/M programs (`-m cpm`) the BDOS interface is equates, as in DRI's
+`X0100.ASM`: a call of `mon1(f, a)` already has f in C and a in DE.
+
+```asm
+        public  mon1, mon2, mon2a, mon3, boot
+mon1    equ     5       ; BDOS call (void return)
+mon2    equ     5       ; BDOS call (byte return, in A)
+mon2a   equ     5
+mon3    equ     5       ; BDOS call (address return, in HL)
+boot    equ     0       ; warm boot
+```
+
 - Memory locations: bdisk, maxb, fcb, buff, iobyte
 
 ## Optimizations
@@ -171,7 +188,8 @@ For CP/M programs (`-m cpm`), provide stubs for:
 External peephole optimizer library that works on Z80 assembly:
 - Register tracking, redundant load elimination, strength reduction
 - DJNZ for loops, relative jumps (jr), block instructions
-- Tail merging and other cross-procedure optimizations
+- Tail calls (`call x / ret` to `jp x`) where nothing is pushed under the
+  return address; liveness followed into and out of the module's routines
 
 ## Reference Binaries
 

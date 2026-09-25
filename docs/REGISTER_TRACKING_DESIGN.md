@@ -19,12 +19,17 @@ For uplm80, we need a simpler approach because:
 
 | Register | Primary Use | Notes |
 |----------|-------------|-------|
-| A | BYTE values, accumulator | Most 8-bit ops require A |
-| HL | ADDRESS values, primary 16-bit | Memory access via (HL), arithmetic |
-| DE | Secondary 16-bit operand | Used for binary ops, block moves |
-| BC | Loop counter, tertiary 16-bit | DJNZ uses B, LDIR uses BC |
-| IX | Local variable frame pointer | Indexed addressing (IX+d) |
+| A | BYTE values, accumulator | Most 8-bit ops require A; a BYTE result |
+| HL | ADDRESS values, primary 16-bit | Memory access via (HL), arithmetic; an ADDRESS result |
+| DE | Secondary 16-bit operand | Used for binary ops, block moves; a call's last argument |
+| BC | Loop counter, tertiary 16-bit | DJNZ uses B, LDIR uses BC; a call's next-to-last (or only) argument |
+| IX | Local variable frame pointer | Indexed addressing (IX+d); kept across calls |
 | SP | Stack pointer | Implicit in PUSH/POP/CALL/RET |
+
+A call keeps only SP, IX and IY: A, the flags, BC, DE and HL are all
+destroyed (PL/M-80's calling convention; README, Calling Convention).
+While a call's last argument is evaluated, the one before it is in BC;
+the code generator saves BC round that code if it may write B or C.
 
 ## Current Problems
 

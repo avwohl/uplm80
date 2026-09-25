@@ -16,8 +16,9 @@ PL/M-80 was the primary systems programming language for CP/M and other 8080/Z80
 - Full PL/M-80 language support
 - Targets Z80 instruction
 - Multi-file compilation with cross-module optimization
-- Multiple optimization passes (peephole, post-assembly tail merging)
+- Multiple optimization passes (AST optimizer, upeepz80 peephole optimizer)
 - Generates relocatable object files compatible with standard CP/M linkers
+- Calls procedures the way Intel's PL/M-80 does, so its code links with assembly and objects written for PL/M-80
 - Produces code competitive with the original Digital Research compiler
 
 ## Code Quality
@@ -83,6 +84,7 @@ When multiple files are provided:
 - All files are parsed together before code generation
 - A unified call graph is built across all modules
 - Procedures that are never active at the same time share storage for their parameters and for the locals that may share it (`??AUTO`, see [Procedure locals](#procedure-locals)), across module boundaries
+- Calls between the modules are made as between modules compiled apart (see [Calling Convention](#calling-convention)), so a module can as well be compiled alone and linked with the others
 - Each module keeps its own name space, as if it were compiled alone and linked: a name that is not PUBLIC or EXTERNAL is qualified with the module's name in the output (`LIB?HELPER`), and PUBLIC and EXTERNAL names bind across the modules (see [docs/multi_file_compilation.md](docs/multi_file_compilation.md))
 - A single combined output file is generated
 
@@ -94,12 +96,13 @@ Use your preferred Z80 assembler and linker. Example with um80/ul80:
 
 ```bash
 um80 output.mac                              # Assemble to .rel
-ul80 -o program.com output.rel               # Link to CP/M .com
+um80 x0100.asm                               # MON1 equ 5 and the rest (see CP/M Mode)
+ul80 -o program.com output.rel x0100.rel     # Link to CP/M .com
 ```
 
 The module carries the runtime routines it uses (see [Runtime
 Library](#runtime-library)); link with it only what defines the names it
-declares EXTERNAL.
+declares EXTERNAL, here `x0100.rel` for MON1.
 
 ## Language Reference
 
@@ -118,6 +121,10 @@ Example:
 hello: DO;
     DECLARE message DATA ('Hello, World!$');
     DECLARE i BYTE;
+
+    mon1: PROCEDURE(func, parm) EXTERNAL;   /* mon1 equ 5: see CP/M Mode */
+        DECLARE func BYTE, parm ADDRESS;
+    END mon1;
 
     print: PROCEDURE(addr) PUBLIC;
         DECLARE addr ADDRESS;
@@ -185,11 +192,81 @@ A module carries the runtime routines it uses at the end of its code
 |---------|-------------|
 | `??mul16` | 16-bit multiply, HL = HL * DE |
 | `??div16`, `??mod16` | 16-bit divide and remainder, as DRI's PL/M-80 computes them |
-| `??mul8` | 8-bit multiply |
-| `??move` | Block memory move (MOVE) |
 | `??subde` | 16-bit subtract, HL = HL - DE |
-| `??jpde` | A CALL through an address (`CALL q`, Programming Manual 8.2.1) |
+| `??jphl` | A CALL through an address (`CALL q`, Programming Manual 8.2.1): `jp (hl)` |
 | `??inp`, `??outp` | INPUT and OUTPUT of a port that is not a constant |
+
+## Calling Convention
+
+A call passes its arguments the way Intel's PL/M-80 does, so code uplm80
+compiles links with assembly written for PL/M-80 - DRI's `X0100.ASM`
+(`mon1 equ 0005h`), MP/M II's `LDMONX.ASM` and `BRSPBI.ASM` - and with what
+PL/M-80 compiled.  (Up to 0.3.x it did not: see CHANGELOG.md, 0.4.0.)
+
+| Arguments | Where they are at the `call` |
+|---|---|
+| 0 | nothing |
+| 1 | a1 in **BC** (C for a BYTE parameter) |
+| 2 | a1 in **BC** (C), a2 in **DE** (E) |
+| n >= 3 | a1 ... a(n-2) **pushed left to right**, one word each; a(n-1) in **BC** (C); an in **DE** (E) |
+
+- At entry `[SP]` is the return address, `[SP+2]` is a(n-2), and so on to
+  `[SP+2(n-2)]`, which is a1.
+- A BYTE argument in a register is in C or E; B or D is undefined.  A pushed
+  BYTE is the low byte of its word; the high byte is undefined.
+- **The callee takes the pushed words off the stack.**  The caller never
+  adjusts SP after a call: when the callee returns, SP is what it was before
+  the first push for the call.
+- A BYTE result is returned in **A**, an ADDRESS one in **HL**.
+- A call destroys A, the flags, BC, DE and HL.  It keeps SP, and **IX and
+  IY**: a REENTRANT procedure keeps its frame in IX across its calls.
+- The arguments are evaluated from left to right, each converted to its
+  parameter's type.  An EXTERNAL declaration only gives those types; PUBLIC, EXTERNAL, nested and REENTRANT procedures are all called
+  the same way, and a direct call must pass as many arguments as the
+  procedure has parameters.
+- A `CALL` through an address (8.2.1) places the arguments the same way,
+  each widened to ADDRESS, and calls `??jphl` with the address in HL.  It
+  may pass any number, to any procedure.
+- `MON1(f, a)` and `MON2(f, a)` with a constant `f` are compiled as the
+  BDOS call itself, `ld de,a / ld c,f / call 5` (`call ??BDOS` under
+  `-m mpm`): the registers PL/M-80 sets for `mon1 equ 5`.
+- An INTERRUPT procedure has no parameters (8.1.6).
+
+**One exception.**  A procedure with one parameter that nothing outside the
+compile can reach - not PUBLIC, EXTERNAL or REENTRANT, and its address
+never taken (`.p` anywhere, `INITIAL` and `DATA` included) - takes its
+argument in **A** (BYTE) or **HL** (ADDRESS) instead of C or BC, where its
+body usually wants it.  No other module, no assembly and no CALL through an
+address can see the difference.
+
+**Writing an assembly routine that PL/M calls.**  Take the arguments as the
+table says; take the pushed words off the stack before you return; return a
+BYTE in A and an ADDRESS in HL; and keep SP, IX and IY.  For
+
+```plm
+cap3: procedure (a, b, c) external; declare (a, c) address, b byte; end cap3;
+```
+
+```asm
+        public  CAP3
+CAP3:   ld      (VC),de         ; c, the last argument
+        ld      a,c             ; b, in C
+        ld      (VB),a
+        pop     hl              ; the return address
+        ex      (sp),hl         ; a, and the return address back on top
+        ld      (VA),hl
+        ret
+```
+
+With more pushed arguments, `pop` the return address, `pop` each pushed word
+(the last argument pushed comes first), and `push` the return address
+again.  Assembly that calls a PL/M procedure does the same from the other
+side: push the first arguments, load the last two into BC and DE, call, and
+leave the stack alone afterwards.
+
+Code built with 0.4.0 needs upeepz80 0.2.6 or later: 0.2.5 turned `push ... /
+call p / ret` into `push ... / jp p`, after which p takes its return address
+for its first argument.
 
 ## Names in the Output
 
@@ -239,7 +316,19 @@ preamble that takes maximum stack space under BDOS and returns cleanly to CP/M:
   jp   0            ; warm-boot return to CP/M when MAIN returns
   ```
 - Stack: maximum available — everything between program end and BDOS.
-- Requires CP/M stubs in your runtime: `MON1`, `MON2`, `MON3`, `BOOT`.
+- The BDOS interface procedures a program declares EXTERNAL - `MON1`, `MON2`,
+  `MON2A`, `MON3` - and `BOOT` are equates, as DRI's `X0100.ASM` defines
+  them: a call of `MON1` already has the function in C and the argument in
+  DE, which is what the BDOS at 5 takes.
+
+  ```asm
+          public  MON1, MON2, MON2A, MON3, BOOT
+  MON1    equ     5
+  MON2    equ     5
+  MON2A   equ     5
+  MON3    equ     5
+  BOOT    equ     0
+  ```
 - System variables: `BDISK`, `MAXB`, `FCB`, `BUFF`, `IOBYTE`.
 
 ### Bare Metal Mode (`-m bare`)
@@ -275,6 +364,12 @@ resolved *symbol* reference reaches a `.PRL` relocation bitmap.
   those addresses, using `ul80 --prl` (transient, linked at 100H) or
   `ul80 --spr` (system page, linked at 0); ul80 marks resolved page-zero symbol
   references for relocation.
+- The program's own externals - `MON1`, `MON2`, `MON2A`, `MON3`, `FCB`,
+  `TBUFF`, `BOOT` and the rest - can come from DRI's `PLM_WORK/X0100.ASM`,
+  linked unmodified, as DRI linked it (see [Calling
+  Convention](#calling-convention)); a banked resident process's from
+  `UTIL2/BRSPBI.ASM`.  `??BDOS`, `??BOOT` and `??MAXB` remain the compiler's
+  own.
 - Entry preamble (auto-generated), one three-byte instruction as DRI's PL/M-80
   emitted — DRI's sources enter themselves by a jump to `.start-3`:
 
@@ -313,8 +408,9 @@ count on it - a first-time flag, a running count.  uplm80 saves memory by
 overlaying the storage of procedures that are never active at the same time,
 `??AUTO`, but only for what no call can see the old value of:
 
-- **Parameters**, which every call assigns, unless a rule below makes
-  one static.
+- **Parameters**, which every call assigns - the procedure's own entry
+  stores the arguments it is passed (see [Calling
+  Convention](#calling-convention)) - unless a rule below makes one static.
 - **A local that every call assigns before anything reads it.**  The
   compiler follows each procedure's statements, GOTOs included, and counts
   a call of a nested procedure that names the local as a read of it at the
@@ -380,7 +476,10 @@ procedure may call back any `PUBLIC` procedure and any whose address is
 taken (a call of `MON1` or `MON2` with a constant function is a call of the
 BDOS, which calls nothing back); and an `INTERRUPT` procedure, and
 everything it calls, may run while any procedure is active, so their
-frames overlap no other.
+frames overlap no other.  A call's arguments need no edge: they are in
+registers or on the stack until the callee's entry stores them, when its
+caller is active too, so a procedure called while they are evaluated may
+overlay the callee's frame.
 
 ## Project Structure
 
