@@ -4,8 +4,16 @@ MP/M II's SDIR is linked from eight separately-compiled PL/M modules, and each
 of these produced a program that built cleanly and then misbehaved at run time.
 """
 
+import os
+import subprocess
+import tempfile
+
+import pytest
+
 from uplm80.codegen import Mode
 from uplm80.compiler import Compiler
+
+from ._toolchain import compile_cmd, compiler_env, run_asm, tools_missing
 
 
 def _asm(src: str, mode: Mode = Mode.CPM) -> str:
@@ -154,3 +162,43 @@ def test_a_top_level_procedures_return_type_is_unchanged():
     asm = _asm("t: do; declare h byte; top: procedure byte; return 7; end top; "
                "if top then h = 1; else h = 2; end t;")
     assert "bit\t0,a" in [l.strip() for l in asm.splitlines()], asm
+
+
+def test_a_multi_file_compile_declares_an_external_no_file_defines():
+    """`uplm80 A.PLM B.PLM' compiles both modules into one; an EXTERNAL
+    procedure that neither defines belongs to a third, and needs its
+    `extrn' as it does when A.PLM is compiled alone. The multi-file compile
+    left out every EXTERNAL procedure, so um80 stopped at `call BOOTX' with
+    "Undefined symbol" (0.3.6 too). One the other file defines, F here,
+    still gets none."""
+    reason = tools_missing()
+    if reason:
+        pytest.skip(reason)
+    a = """a: do;
+mon1: procedure (f, p) external; declare f byte, p address; end mon1;
+bootx: procedure external; end bootx;
+f: procedure external; end f;
+declare x byte public;
+x = 1; call f; call mon1(2, '0' + x); call bootx;
+end a;
+"""
+    b = """b: do;
+declare x byte external;
+f: procedure public; x = 2; end f;
+end b;
+"""
+    third = "\t.z80\n\tpublic\tBOOTX\n\tcseg\nBOOTX:\tld\tc,2\n\tld\te,'K'\n\tjp\t5\n\tend\n"
+    with tempfile.TemporaryDirectory() as d:
+        pa, pb, mac = (os.path.join(d, n) for n in ("A.PLM", "B.PLM", "AB.MAC"))
+        for path, text in ((pa, a), (pb, b)):
+            with open(path, "w") as fh:
+                fh.write(text)
+        r = subprocess.run(compile_cmd("-o", mac, pa, pb), capture_output=True, text=True,
+                           timeout=60, env=compiler_env(), check=False)
+        assert r.returncode == 0, r.stderr
+        with open(mac) as fh:
+            asm = fh.read()
+    lines = [l.strip() for l in asm.splitlines()]
+    assert "extrn\tBOOTX" in lines, asm
+    assert "extrn\tF" not in lines, asm
+    assert run_asm(asm, third).stdout.replace("\r", "") == "2K"

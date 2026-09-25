@@ -324,6 +324,15 @@ Each fix has a regression test that fails without it.
   CP/M before the first statement. In CP/M mode it now follows the code;
   BARE and MP/M modes keep DRI's layout.
 
+#### Multi-file compiles
+
+- **An EXTERNAL procedure that none of the files defined had no `extrn`.**
+  `uplm80 A.PLM B.PLM` left out every EXTERNAL procedure declaration, on the
+  grounds that one of the other files defines it, so a call to one that
+  belongs to a third module did not assemble ("Undefined symbol"); A.PLM
+  compiled alone had the `extrn`. Found by the integration verification;
+  0.3.6 did the same.
+
 ### Changed
 
 - **Constants in expressions are typed as PL/M-80 types them, so some

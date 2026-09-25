@@ -2335,9 +2335,17 @@ class CodeGenerator:
         # Procedures hoisted out of DO blocks in the module body.
         self._drain_block_procs([])
 
-        # Generate code for all procedures
+        # Generate code for all procedures.  An EXTERNAL procedure that one
+        # of the modules defines is the same program's; one that none of
+        # them defines is another's, and needs its `extrn' as it does in a
+        # module compiled alone.
+        defined = {pname for _, _, pname, attrs in all_procedures if not attrs.is_external}
         for module, proc, pname, attrs in all_procedures:
-            if not attrs.is_external:
+            if attrs.is_external:
+                if pname not in defined:
+                    defined.add(pname)
+                    self._gen_proc_decl(proc)
+            else:
                 self._emit()
                 # Find the matching shape's name for the per-module comment.
                 shape_name = next(
