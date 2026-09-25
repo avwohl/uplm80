@@ -287,21 +287,74 @@ count on it - a first-time flag, a running count.  uplm80 saves memory by
 overlaying the storage of procedures that are never active at the same time,
 `??AUTO`, but only for what no call can see the old value of:
 
-- **Parameters**, which every call assigns.
+- **Parameters**, which every call assigns, unless a rule below makes
+  one static.
 - **A local that every call assigns before anything reads it.**  The
   compiler follows each procedure's statements, GOTOs included, and counts
   a call of a nested procedure that names the local as a read of it at the
   call; a use of a BASED variable reads its base.  An array or structure is
   assigned once every element has been, through constant subscripts.
 
-Every other local is static, `@proc$name` among the variables: one that may
-be read before it is assigned, one whose address is taken (`.x`, in a
-statement, an `AT` or an `INITIAL`), one subscripted outside its bounds, one
-named by a nested procedure whose address is taken, and one declared with
-such a local in a factored declaration (6.2.4 makes those contiguous) or
-after one whose address is taken, which a pointer run on from it can reach.
-A local with `INITIAL` is static in any case; a `REENTRANT` procedure's are
-on the stack.  The analysis is in `uplm80/local_storage.py`.
+Every other local is static, `@proc$name` among the variables:
+
+- one that may be read before it is assigned;
+- one whose address is taken (`.x`, in a statement, an `AT` or an
+  `INITIAL`) - a parameter too;
+- one named by a procedure nested in its own whose address is taken, or
+  by anything that procedure calls: a call through the address can come
+  when the procedure the local belongs to is not active;
+- one reached outside its bounds through a subscript: a scalar with any
+  subscript but `(0)`, an array (or an array member of a structure) with a
+  constant subscript past its end, and a one-element array with any
+  subscript but a constant 0.  A subscript is a constant when it folds to
+  one - `a(1+1)`, `a(-1)` (which is `a(255)`), `a(LAST(a))` - and it is
+  decided the same way at every optimization level;
+- one declared with a static local in a factored declaration (6.2.4 makes
+  those contiguous).
+
+A local with `INITIAL` or `PUBLIC` is static in any case; a `REENTRANT`
+procedure's are on the stack.
+
+DRI lays out what a procedure's text declares in the order it declares it:
+its parameters and locals, and among them the parameters and locals of the
+procedures nested in it and the variables of its `DO` blocks, where the
+text has them (MP/M II's SUBMIT has FILLRBUFF's `ssbp` at 0E7AH, the
+parameter of PUTRBUFF, declared next, at 0E7BH, and `reading`, which
+FILLRBUFF declares after PUTRBUFF, at 0E7CH).  uplm80 keeps that order - the
+static locals among the variables in the order of the text, the others in
+the procedure's frame in `??AUTO`, the parameters first, as the
+`PROCEDURE` statement lists them - wherever a program can tell:
+
+- every local declared after one whose address is taken, or which is
+  reached outside its bounds, is static too: a pointer run on from it
+  reaches them;
+- an array or structure subscripted by anything but a constant may run on
+  into the locals declared after it, so from the first such array or
+  structure on, a procedure's locals are all static or all in `??AUTO`:
+  if any of them is static (an `INITIAL` one included), all of them are.
+  A read through such a subscript counts as a read of every local it can
+  run on into;
+- a frame in `??AUTO` holds only its procedure's own locals, so where a
+  procedure with parameters or locals, or a `DO` block with variables, is
+  declared after the local that either of those starts from, what comes
+  after that local is static, the nested procedure's storage too, in the
+  order of the text.
+
+A subscript or pointer that runs backwards, before the variable, is not
+covered, nor is one that runs past a procedure's last local, or past a
+module-level variable into the procedures declared after it.
+
+The analysis is in `uplm80/local_storage.py`.
+
+Two procedures' frames in `??AUTO` overlap only if the procedures are never
+active at the same time, which the call graph decides.  It has the calls
+the program's text does not name as well: a `CALL` through an address
+(8.2.1) may call any procedure whose address is taken; an `EXTERNAL`
+procedure may call back any `PUBLIC` procedure and any whose address is
+taken (a call of `MON1` or `MON2` with a constant function is a call of the
+BDOS, which calls nothing back); and an `INTERRUPT` procedure, and
+everything it calls, may run while any procedure is active, so their
+frames overlap no other.
 
 ## Project Structure
 

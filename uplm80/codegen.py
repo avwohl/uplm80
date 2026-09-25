@@ -53,7 +53,7 @@ from .ast_view import (
 from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError
-from .local_storage import LocalStorage
+from .local_storage import AUTO, PARAM, LocalStorage
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
     BYTE_BUILTINS,
@@ -702,12 +702,6 @@ class CodeGenerator:
         self.param_slots: dict[str, int] = {}  # param_key -> slot number
         self.slot_storage: list[tuple[str, int]] = []  # (label, size) for each slot
         self.proc_params: dict[str, list[tuple[str, str, DataType, int]]] = {}  # proc -> [(name, asm_name, type, size)]
-        # For liveness analysis: remaining statements in current scope
-        self.pending_stmts: list = []
-        # For tracking embedded assignment target for return optimization
-        self.embedded_assign_target: str | None = None  # Variable name of last embedded assignment
-        # Current IF statement being processed (for embedded assign optimization)
-        self.current_if_stmt = None  # P.IfStmt | P.IfStmtElse | None
         # Flag: A register contains L (low byte of HL) - for avoiding redundant ld a,L
         self.a_has_l: bool = False
         # Register allocator for automatic spill/restore
@@ -1200,10 +1194,13 @@ class CodeGenerator:
         if name in self._aliased:
             return False    # a store through its address does not name it
         owner = self._var_owner(sym, name)
-        if owner == self._UNKNOWN_OWNER:
+        if owner == self._UNKNOWN_OWNER or self._reached_unnamed(owner, name):
             return False
-        if after_return and owner != self.current_proc and self._stmts_contain_return(body_stmts):
-            return False    # whoever this returns to can read it
+        if after_return and self._stmts_contain_return(body_stmts) and (
+                owner != self.current_proc or self._keeps_its_value(sym)):
+            # Whoever this returns to can read it, and so can the next call
+            # of this procedure if the variable keeps its value (8.1.7).
+            return False
         shared = sym.is_public or sym.is_external
         for callee in self._callees_of(body_stmts):
             if callee in self.proc_body:
@@ -1212,6 +1209,19 @@ class CodeGenerator:
             elif shared:
                 return False    # another module's procedure, which may name it
         return True
+
+    def _reached_unnamed(self, owner: str | None, name: str) -> bool:
+        """Whether local ``name`` of ``owner`` can be read or written without
+        its name: through a pointer run on from a local declared before it,
+        or an overrun of an array declared before it (see local_storage)."""
+        storage = getattr(self, "local_storage", None)
+        return storage is not None and (owner, name) in storage.reachable
+
+    @staticmethod
+    def _keeps_its_value(sym: Symbol) -> bool:
+        """Whether a variable keeps its value from one call of its procedure
+        to the next: all but a REENTRANT procedure's, and those in ??AUTO."""
+        return sym.stack_offset is None and not (sym.asm_name or "").startswith("??AUTO")
 
     def _bound_is_fixed(self, bound, body_stmts, index_name: str) -> bool:
         """Whether a loop's bound is the same every time round.
@@ -1265,113 +1275,6 @@ class CodeGenerator:
         """
         return any(self._stmt_contains(s, P.GotoStmt) for s in stmts)
 
-    # ========================================================================
-    # Register Liveness Analysis
-    # ========================================================================
-
-    def _expr_clobbers_a(self, expr) -> bool:
-        """Check if evaluating expression will clobber A register.
-
-        Most expressions clobber A because they compute into A (for BYTE) or use A
-        as a scratch register. Only certain simple operations preserve A.
-        """
-        expr = unwrap_paren(expr)
-        if isinstance(expr, P.NumberLiteral):
-            return False  # ld hl,const doesn't touch A
-
-        if isinstance(expr, P.Identifier):
-            sym = self._lookup_symbol(ident_text(expr.name))
-            if sym and sym.data_type == DataType.BYTE:
-                return True  # ld a,(addr) clobbers A
-            return False  # ld hl,(addr) doesn't clobber A
-
-        if isinstance(expr, P.BinaryOp):
-            expr_type = self._get_expr_type(expr)
-            if expr_type == DataType.ADDRESS:
-                if binop_kind(expr) == BinaryOpKind.ADD:
-                    return (
-                        self._expr_clobbers_a(expr.left)
-                        or self._expr_clobbers_a(expr.right)
-                    )
-            return True
-
-        # Most other expressions clobber A
-        return True
-
-    def _stmt_clobbers_a(self, stmt) -> bool:
-        """Check if a statement will clobber the A register."""
-        if isinstance(stmt, P.NullStmt):
-            return False
-
-        if isinstance(stmt, P.LabeledStmt):
-            return self._stmt_clobbers_a(stmt.stmt)
-
-        if isinstance(stmt, P.AssignStmt):
-            for target in stmt.targets:
-                t = unwrap_paren(target)
-                if isinstance(t, P.Identifier):
-                    sym = self._lookup_symbol(ident_text(t.name))
-                    if not sym or sym.data_type == DataType.BYTE:
-                        return True
-                else:
-                    return True
-            return self._expr_clobbers_a(stmt.value)
-
-        if isinstance(stmt, P.CallStmt):
-            return True
-
-        if isinstance(stmt, P.ReturnStmtValue):
-            return True
-        if isinstance(stmt, P.ReturnStmt):
-            return False
-
-        if isinstance(stmt, P.GotoStmt):
-            return False
-
-        if isinstance(stmt, P.HaltStmt):
-            return False
-
-        if isinstance(stmt, (P.EnableStmt, P.DisableStmt)):
-            return False
-
-        if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
-            condition = unwrap_paren(stmt.condition)
-            if isinstance(condition, P.Identifier):
-                return True
-            if isinstance(condition, P.BinaryOp):
-                op = binop_kind(condition)
-                if op in (
-                    BinaryOpKind.EQ, BinaryOpKind.NE,
-                    BinaryOpKind.LT, BinaryOpKind.GT,
-                    BinaryOpKind.LE, BinaryOpKind.GE,
-                ):
-                    left_type = self._get_expr_type(condition.left)
-                    if left_type == DataType.BYTE:
-                        if isinstance(unwrap_paren(condition.right), P.NumberLiteral):
-                            then_clobbers = self._stmt_clobbers_a(stmt.then_stmt)
-                            else_clobbers = (
-                                isinstance(stmt, P.IfStmtElse)
-                                and self._stmt_clobbers_a(stmt.else_stmt)
-                            )
-                            return then_clobbers or else_clobbers
-            return True
-
-        if isinstance(stmt, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock,
-                             P.DoIterByBlock, P.DoCaseBlock)):
-            return True
-
-        if isinstance(stmt, P.DeclareStmt):
-            return False
-
-        return True
-
-    def _a_survives_stmts(self, stmts) -> bool:
-        """Check if A register survives through a list of statements."""
-        for stmt in stmts:
-            if self._stmt_clobbers_a(stmt):
-                return False
-        return True
-
     def _lookup_symbol(self, name: str) -> Symbol | None:
         """Look up a symbol in the current scope hierarchy."""
         # Check for LITERALLY macro first
@@ -1400,6 +1303,7 @@ class CodeGenerator:
         self.proc_body: dict[str, list] = {}           # statements of its body
         self.proc_parent: dict[str, str | None] = {}   # the procedure it is nested in
         self.proc_declared: dict[str, set[str]] = {}   # its parameters and locals
+        self.interrupt_procs: set[str] = set()          # INTERRUPT procedures
 
     def _build_call_graph(self, module) -> None:
         """Build call graph by analyzing all procedure bodies."""
@@ -1450,16 +1354,50 @@ class CodeGenerator:
         analysis = LocalStorage(self._resolve_proc_name, self.call_graph)
         for items in modules:
             analysis.add_module(items)
+        analysis.survey()
+        self._complete_call_graph(analysis)
         static = analysis.static_locals()
         self.local_storage = analysis
+        self.interrupt_procs = set(analysis.interrupts)
         for proc, storage in self.proc_storage.items():
             info = analysis.procs.get(proc)
             if info is None or proc_attrs(info.decl).is_reentrant:
                 self.proc_storage[proc] = []
                 continue
-            keep = set(proc_param_names(info.decl))
-            keep |= set(info.locals) - static.get(proc, set())
+            keep = {n for n, loc in info.locals.items()
+                    if loc.kind in (AUTO, PARAM)} - static.get(proc, set())
             self.proc_storage[proc] = [entry for entry in storage if entry[0] in keep]
+
+    def _complete_call_graph(self, analysis: LocalStorage) -> None:
+        """Add the calls the program's text does not name.
+
+        A procedure whose address is taken may be called by any CALL
+        through an address (8.2.1), so every procedure that makes such a
+        call may call it.  Code outside the module - an EXTERNAL procedure,
+        or whatever a CALL through an address reaches - may call back into
+        the module's PUBLIC procedures and the ones whose address it was
+        given, so a call of an EXTERNAL procedure may call any of those.
+        Without these edges a procedure called only that way was never
+        active together with its caller, and ??AUTO put its frame over the
+        caller's.  (A call of MON1 or MON2 with a constant function is a
+        call of the BDOS itself, see _goes_to_bdos, and adds none.)
+        """
+        defined = set(analysis.procs)
+        callbacks = (analysis.public | analysis.proc_addr_taken) & defined
+        if not callbacks:
+            return
+        for proc, callees in self.call_graph.items():
+            if proc not in defined:
+                callees |= callbacks
+        for proc in analysis.indirect_callers:
+            if proc in self.call_graph:
+                self.call_graph[proc] |= callbacks
+
+    def _goes_to_bdos(self, name: str, args) -> bool:
+        """Whether a call of ``name`` with ``args`` is compiled as a call of
+        the BDOS itself, not of the procedure (see _gen_call_stmt)."""
+        return (name.upper() in ("MON1", "MON2") and len(args) == 2
+                and self._get_const_byte_value(args[0]) is not None)
 
     def _note_main_arg_overlaps(self, stmts) -> None:
         """Record the argument overlaps of the calls in the main program.
@@ -1634,6 +1572,8 @@ class CodeGenerator:
                 args = []
             if isinstance(callee_expr, P.Identifier):
                 callee = self._resolve_proc_name(ident_text(callee_expr.name), current_proc)
+                if callee and self._goes_to_bdos(ident_text(callee_expr.name), args):
+                    callee = None
                 if callee:
                     calls.add(callee)
             else:
@@ -1684,6 +1624,8 @@ class CodeGenerator:
         if isinstance(expr, P.Call):
             if isinstance(expr.callee, P.Identifier):
                 callee = self._resolve_proc_name(ident_text(expr.callee.name), current_proc)
+                if callee and self._goes_to_bdos(ident_text(expr.callee.name), expr.args):
+                    callee = None
                 if callee:
                     calls.add(callee)
             else:
@@ -1776,12 +1718,24 @@ class CodeGenerator:
                     self.can_be_active_together[callee].add(g)
                     self.can_be_active_together[g].add(callee)
 
-        # Now handle the "common ancestor" case - if A calls B and A calls C,
-        # then B and C can be active together (B returns, then A calls C)
-        # Actually no - that's NOT "active together" - only one is on stack at a time
-        # The key insight: procs are active together only on a single call chain
+        # An INTERRUPT procedure runs when the interrupt comes, whatever is
+        # active then, and so does everything it calls (8.1.7): none of
+        # their frames may overlap any other.  Nothing called them, so the
+        # call graph put an interrupt handler's frame over the frames of
+        # the procedures it interrupts.
+        anytime: set[str] = set()
+        for proc in self.interrupt_procs:
+            if proc in self.can_be_active_together:
+                anytime |= {proc} | reachable[proc]
+        if anytime:
+            everyone = set(self.can_be_active_together)
+            for proc in everyone:
+                self.can_be_active_together[proc] |= anytime
+            for proc in anytime:
+                self.can_be_active_together[proc] = set(everyone)
 
-        # So the current computation is correct: procs on any call path from root to leaf
+        # Procedures that a common caller calls one after the other are
+        # not active together: only the procedures on one call chain are.
 
     def _get_reachable(self, proc: str, visited: set[str]) -> set[str]:
         """Get all procedures reachable from proc via calls."""
@@ -2576,20 +2530,20 @@ class CodeGenerator:
         except ValueError:
             pass  # Non-numeric replacement text, no EQU needed
 
-    def _gen_var_decl(self, decl) -> None:
+    def _gen_var_decl(self, decl, skip: frozenset = frozenset()) -> None:
         """Generate storage for a typed variable declaration.
 
         ``decl`` may be a :class:`P.DeclItem` (one or many names sharing
         a tail) or a :class:`P.DeclItemBasedGroup` (a parenthesised list
         of based names, each becoming one symbol). A single ``DeclItem``
         with multiple names emits one storage row per name with each
-        getting its own symbol entry.
+        getting its own symbol entry, except the names in ``skip``.
         """
         start = len(self.data_segment)
-        self._gen_var_decl_names(decl)
+        self._gen_var_decl_names(decl, skip)
         self._note_storage(decl, start)
 
-    def _gen_var_decl_names(self, decl) -> None:
+    def _gen_var_decl_names(self, decl, skip: frozenset = frozenset()) -> None:
         """The storage of each name :meth:`_gen_var_decl` declares."""
         if isinstance(decl, P.DeclItemBasedGroup):
             for bd in decl.based_decls or []:
@@ -2610,13 +2564,14 @@ class CodeGenerator:
         names = decl_item_names(decl)
         first = None
         for index, name in enumerate(names):
-            self._gen_one_var(
-                name=name,
-                based_on=based_on,
-                based_member=based_member,
-                item=decl,
-                factored=(index, len(names), first),
-            )
+            if name not in skip:
+                self._gen_one_var(
+                    name=name,
+                    based_on=based_on,
+                    based_member=based_member,
+                    item=decl,
+                    factored=(index, len(names), first),
+                )
             if index == 0:
                 first_sym = self._lookup_scoped(name)
                 first = first_sym.asm_name if first_sym else None
@@ -3470,12 +3425,23 @@ class CodeGenerator:
                 if use_shared_storage and param in self.storage_labels.get(full_proc_name, {}):
                     asm_name = self.storage_labels[full_proc_name][param]
                 else:
-                    # Fallback: individual storage
-                    asm_name = f"@{name}${self._mangle_name(param)}"
+                    # Static: the label a caller stores the argument at.
+                    # (`@name$param' left out the procedures a nested one
+                    # is in, which the caller's name for it has.)
+                    asm_name = self._param_slot(sym, param, name)
                     # Allocate individual storage in data segment
                     start = len(self.data_segment)
                     self.data_segment.append(
                         AsmLine(label=asm_name, opcode="ds", operands=str(param_size))
+                    )
+                    # upeepz80 drops the store of the last argument at a
+                    # procedure's entry when nothing else names its storage:
+                    # it takes a parameter to be reachable by its name only.
+                    # A static one can be reached from the address of the
+                    # parameter before it (`.a + 1'), so an EQU, which costs
+                    # nothing, names it once more.
+                    self.data_segment.append(
+                        AsmLine(label="?" + asm_name, opcode="equ", operands=asm_name)
                     )
                     self._note_storage(decl, start)
 
@@ -3548,10 +3514,13 @@ class CodeGenerator:
                 non_param_names = [n for n in local_names if n not in params]
                 if not non_param_names:
                     continue
-                # If the DeclItem declares a mix of params and non-params,
-                # still hand the whole item to _gen_declaration — the
-                # symbol-table side handles already-defined names.
-                self._gen_declaration(local_decl)
+                # A factored declaration can name parameters with locals,
+                # `DECLARE (B, I) BYTE': the parameters have their storage
+                # already.  (Declared again, a static parameter was
+                # defined twice.  A REENTRANT procedure's still comes out
+                # as a local: see CHANGELOG, Known issues.)
+                self._gen_var_decl(local_decl,
+                                   skip=frozenset() if attrs.is_reentrant else frozenset(params))
             else:
                 self._gen_declaration(local_decl)
 
@@ -3573,14 +3542,10 @@ class CodeGenerator:
             self._emit("ld", "sp,hl")
             frame_lines = self.output[start:]
 
-        # Generate code for statements with liveness tracking
         ends_with_return = False
-        for i, stmt in enumerate(body_stmts):
-            # Track remaining statements for liveness analysis
-            self.pending_stmts = body_stmts[i + 1:]
+        for stmt in body_stmts:
             self._gen_stmt(stmt)
             ends_with_return = isinstance(stmt, (P.ReturnStmt, P.ReturnStmtValue))
-        self.pending_stmts = []  # Clear after procedure
 
         if frame_lines:
             if self._reentrant_local_offset < 0:
@@ -4050,22 +4015,8 @@ class CodeGenerator:
         proc_attrs_view = self.current_proc_attrs
 
         if value is not None:
-            # Check if A already has the value from embedded assignment optimization
-            skip_load = False
-            if (
-                self.embedded_assign_target
-                and isinstance(value, P.Identifier)
-                and ident_text(value.name) == self.embedded_assign_target
-            ):
-                # A already has this value - skip the load
-                skip_load = True
-                self.embedded_assign_target = None  # Clear after use
-
-            if skip_load:
-                # A already contains the return value - just return
-                pass
             # Optimize: if returning BYTE and value is a small constant, use ld a,n directly
-            elif (
+            if (
                 return_type == DataType.BYTE
                 and isinstance(value, P.NumberLiteral)
                 and number_value(value) <= 255
@@ -4129,10 +4080,6 @@ class CodeGenerator:
         end_label = self._new_label("ENDIF")
         false_target = else_label if else_stmt is not None else end_label
 
-        # Track current IF statement for embedded assignment optimization
-        old_if_stmt = self.current_if_stmt
-        self.current_if_stmt = stmt
-
         # Try to generate optimized conditional jump for comparisons
         if self._gen_condition_jump_false(stmt.condition, false_target):
             # Condition jump was generated directly
@@ -4142,7 +4089,6 @@ class CodeGenerator:
             result_type = self._gen_expr(self._low_byte_form(stmt.condition))
             self._emit_truth_test(result_type, false_target, jump_when_true=False)
 
-        self.current_if_stmt = old_if_stmt  # Restore before generating body
 
         # Then branch
         self._gen_stmt(stmt.then_stmt)
@@ -5121,7 +5067,8 @@ class CodeGenerator:
         if (self.current_proc_decl is None or sym is None
                 or sym.kind != SymbolKind.VARIABLE or sym.based_on
                 or sym.is_public or sym.is_external or name in self._aliased
-                or self._var_owner(sym, name) != self.current_proc):
+                or self._var_owner(sym, name) != self.current_proc
+                or self._reached_unnamed(self.current_proc, name)):
             return True
         stack = [self.current_proc_decl.body]
         while stack:
@@ -5776,30 +5723,13 @@ class CodeGenerator:
             target = unwrap_paren(expr.target)
             target_name = ident_text(target.name) if isinstance(target, P.Identifier) else None
 
-            skip_store = False
-            if val_type == DataType.BYTE and target_name:
-                stmts_to_check: list = []
-                if self.current_if_stmt:
-                    stmts_to_check.append(self.current_if_stmt.then_stmt)
-                    if isinstance(self.current_if_stmt, P.IfStmtElse):
-                        stmts_to_check.append(self.current_if_stmt.else_stmt)
-
-                stmts_to_check.extend(self.pending_stmts)
-
-                if stmts_to_check:
-                    last_stmt = stmts_to_check[-1]
-                    preceding = stmts_to_check[:-1]
-
-                    if self._a_survives_stmts(preceding):
-                        if isinstance(last_stmt, P.ReturnStmtValue):
-                            val = unwrap_paren(last_stmt.value)
-                            if isinstance(val, P.Identifier) and ident_text(val.name) == target_name:
-                                skip_store = True
-                                self.embedded_assign_target = target_name
-
-            if skip_store:
-                pass
-            elif val_type == DataType.BYTE:
+            # The target is always stored.  (Its store was left out when the
+            # procedure's last statement returned it, for RETURN to take the
+            # value from A: but the rest of the statement may change A -
+            # MP/M II's LOAD has `CS = CS + (B := READBYTE); RETURN B;',
+            # which returned CS + B - and the variable is static, or not the
+            # procedure's at all, and keeps the value it is given.)
+            if val_type == DataType.BYTE:
                 store_clobbers_a = True
                 if isinstance(target, P.Identifier):
                     sym = self._lookup_symbol(target_name)

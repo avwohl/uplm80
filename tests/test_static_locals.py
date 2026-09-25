@@ -19,9 +19,12 @@ import re
 
 import pytest
 
+from uplm80.ast_optimizer import ASTOptimizer
+from uplm80.codegen import CodeGenerator, Mode
 from uplm80.compiler import Compiler
+from uplm80.frontend import parse_source
 
-from ._toolchain import run_plm
+from ._toolchain import run_asm, run_plm
 
 LEVELS = (0, 1, 2, 3)
 
@@ -258,6 +261,675 @@ def test_pointers_from_a_local_reach_the_locals_declared_after_it(opt):
     assert _run(LAYOUT, opt) == "BD"
 
 
+# ---- declaration order ------------------------------------------------------
+
+FOLDED_RUN = """
+k2: procedure byte;
+    declare arr (2) byte, nxt byte;
+    arr(0) = 1; arr(1) = 2;
+    arr(1 + 1) = 'S';
+    return nxt;
+end k2;
+call mon1(2, k2);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_constant_subscript_expression_is_a_constant_at_every_level(opt):
+    """`arr(1 + 1)' is `nxt', declared after `arr' (the gate's a4 k2).  -O1
+    and up fold it before the analysis sees it and found it outside
+    `arr'; at -O0 it was a variable subscript, `arr' stayed in ??AUTO, and
+    the store went into ??AUTO, not into `nxt'."""
+    assert _run(FOLDED_RUN, opt) == "S"
+
+
+FOLDED = """
+k7: procedure byte;
+    declare arr (2) byte, nxt byte;
+    arr(0) = 1; arr(2 - 1) = 2;
+    nxt = arr(0) + arr(1);
+    return nxt;
+end k7;
+k8: procedure byte;
+    declare arr (3) byte, nxt byte;
+    arr(0) = 1; arr(1) = 2; arr(last(arr)) = 3;
+    nxt = arr(0) + arr(1) + arr(2);
+    return nxt;
+end k8;
+k9: procedure byte;
+    declare arr (3) byte, nxt byte;
+    arr(0) = 1; arr(1) = 2; arr(-1) = 3;
+    nxt = arr(0) + arr(1);
+    return nxt;
+end k9;
+call mon1(2, k7 + k8 + k9);
+"""
+
+
+def test_every_level_decides_the_same_for_a_constant_subscript():
+    """`arr(2 - 1)' and `arr(last(arr))' are elements, so the arrays are
+    assigned whole and may share ??AUTO; `arr(-1)' is `arr(255)', past the
+    end.  -O0 took the first two for variable subscripts and the last for
+    one inside the array; LAST was not folded at any level."""
+    for opt in LEVELS:
+        asm = _asm(FOLDED, opt)
+        assert _static(asm) == {"K9$ARR", "K9$NXT"}, (opt, asm)
+
+
+RUN_ON = """
+k1: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte, nxt (2) byte;
+    declare i byte;
+    arr(0) = 1; arr(1) = 2;
+    do i = 0 to n; arr(i) = 'R'; end;
+    return nxt(1);
+end k1;
+call mon1(2, k1(3));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_variable_subscript_runs_on_into_the_local_declared_after(opt):
+    """DRI lays a procedure's locals out in declaration order, and so did
+    0.3.6, in its frame in ??AUTO: `arr(3)' is `nxt(1)' (the gate's a4, k1).
+    `nxt' is read before it is assigned, so it is static; `arr' was left in
+    ??AUTO, and the stores went there."""
+    assert _run(RUN_ON, opt) == "R"
+
+
+RUN_ON_READ = """
+rd: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte, nxt byte;
+    declare r byte;
+    arr(0) = 1; arr(1) = 2;
+    r = arr(n);
+    nxt = 'X';
+    return r;
+end rd;
+call mon1(2, rd(0) + 'A' - 1);
+call other;
+call mon1(2, rd(2));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_read_through_a_variable_subscript_reads_what_it_runs_on_into(opt):
+    """`arr(2)' is `nxt', which the call before left 'X'.  Every local is
+    assigned before it is read by name, so all three were overlaid, and
+    `other' filled them with 0FFH."""
+    assert _run(RUN_ON_READ, opt) == "A.X"
+
+
+RUN_ON_AUTO = """
+w: procedure byte;
+    declare arr (2) byte, nxt byte, i byte;
+    nxt = '?';
+    arr(0) = 0; arr(1) = 0;
+    do i = 0 to 2; arr(i) = 'W'; end;
+    return nxt;
+end w;
+call mon1(2, w);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_locals_run_on_into_may_share_auto_together(opt):
+    """Nothing here is read before it is assigned, so `arr', `nxt' and `i'
+    share ??AUTO - together, in declaration order."""
+    assert _run(RUN_ON_AUTO, opt) == "W"
+    asm = _asm(RUN_ON_AUTO, opt)
+    assert _static(asm) == set(), asm
+    # w's frame: arr at +0, nxt at +2, i at +3 (other's is overlaid on it).
+    offsets = [int(m) for m in re.findall(r"\?\?AUTO\+(\d+)", asm)]
+    assert {0, 2, 3} <= set(offsets), asm
+
+
+RUN_ON_INITIAL = """
+fx: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte initial (1, 2);
+    declare nxt byte;
+    nxt = '?';
+    arr(n) = 'F';
+    return nxt;
+end fx;
+call mon1(2, fx(2));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_initialised_array_runs_on_into_the_local_declared_after(opt):
+    """`arr' is static for its INITIAL, so `nxt', which `arr(2)' is, has to
+    follow it there."""
+    assert _run(RUN_ON_INITIAL, opt) == "F"
+
+
+ADDRESS_OF_INITIAL = """
+ax: procedure byte;
+    declare v byte initial (0);
+    declare nxt byte;
+    declare pp address, c based pp byte;
+    nxt = '?';
+    pp = .v + 1;
+    c = 'I';
+    return nxt;
+end ax;
+call mon1(2, ax);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_pointer_from_an_initialised_local_reaches_the_next_one(opt):
+    """A pointer run on from a local whose address is taken reaches what
+    is declared after it; `v' is static for its INITIAL, and was not
+    counted."""
+    assert _run(ADDRESS_OF_INITIAL, opt) == "I"
+
+
+RUN_ON_NESTED = """
+sp1: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte;
+    inner: procedure (v) byte;
+        declare v byte;
+        return v;
+    end inner;
+    declare nxt byte;
+    arr(0) = 1; arr(1) = 2;
+    nxt = 'N';
+    arr(n) = inner('I');
+    return nxt;
+end sp1;
+sp2: procedure (n) byte;
+    declare n byte;
+    declare arr (2) byte, nxt byte;
+    nxt = 'M';
+    arr(0) = 0; arr(1) = 0;
+    do;
+        declare blk byte;
+        blk = 'B';
+        arr(n) = 'X';
+        return blk;
+    end;
+end sp2;
+sp3: procedure byte;
+    declare x byte;
+    peek: procedure (v) byte;
+        declare v byte;
+        return v;
+    end peek;
+    declare nxt byte;
+    declare pp address, c based pp byte;
+    nxt = 'N';
+    pp = .x + 1;
+    c = 'Q';
+    return nxt + peek('P') - 'P';
+end sp3;
+call mon1(2, sp1(2));
+call mon1(2, sp2(3));
+call mon1(2, sp3);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_overrun_reaches_what_the_text_declares_next(opt):
+    """DRI lays out what a procedure's text declares in that order, a
+    nested procedure's parameters and locals and a DO block's variables
+    included: MP/M II's SUBMIT has FILLRBUFF's `ssbp' at 0E7AH, the
+    parameter of PUTRBUFF, declared next, at 0E7BH, and FILLRBUFF's
+    `reading', declared after PUTRBUFF, at 0E7CH.  So `arr(2)' is
+    `inner''s `v', not `nxt', and `arr(3)' in `sp2' is the block's `blk';
+    a pointer run on from `.x' in `sp3' reaches `peek''s `v' before `nxt'.
+    The frame in ??AUTO has only the procedure's own locals, and the
+    static ones left out the nested procedure's: `IBQ'."""
+    assert _run(RUN_ON_NESTED, opt) == "NXN"
+
+
+STATIC_ORDER = """
+so: procedure (n) byte;
+    declare n byte;
+    declare first byte;
+    declare arr (2) byte;
+    declare mid byte initial (7);
+    declare (x2, y2) byte;
+    declare last2 address;
+    arr(n) = 1;
+    return first + arr(0) + mid + x2 + y2 + low(last2);
+end so;
+call mon1(2, so(1));
+"""
+
+
+def test_the_static_locals_keep_declaration_order():
+    """From `arr' on, everything is static and contiguous, in the order it
+    is declared, the INITIAL `mid' among the rest."""
+    for opt in LEVELS:
+        asm = _asm(STATIC_ORDER, opt)
+        data = asm[asm.index("dseg"):]
+        labels = re.findall(r"^(@SO\$\w+):", data, re.MULTILINE)
+        assert labels == ["@SO$FIRST", "@SO$ARR", "@SO$MID", "@SO$X2", "@SO$Y2",
+                          "@SO$LAST2"], (opt, asm)
+        block = data[data.index("@SO$FIRST:"):data.index("@SO$LAST2:")]
+        assert re.findall(r"^([@?\w$]+):", block, re.MULTILINE) == labels[:-1], (opt, asm)
+
+
+# ---- parameters -------------------------------------------------------------
+
+PARAM_KEPT = """
+declare keep address, kept based keep byte;
+sv: procedure (v);
+    declare v byte;
+    keep = .v;
+end sv;
+call sv('P');
+call other;
+call mon1(2, kept);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_pointer_to_a_parameter_kept_after_the_call(opt):
+    """PL/M-80 allocates a parameter statically, like any other local, so
+    `.v' still points at 'P' after `sv' has returned; in ??AUTO, `other'
+    wrote 0FFH over it."""
+    assert _run(PARAM_KEPT, opt) == ".P"
+
+
+PARAM_RUN_ON = """
+sq: procedure (v) byte;
+    declare v byte;
+    declare nxt byte;
+    declare pp address, c based pp byte;
+    pp = .v + 1;
+    c = 'Q';
+    return nxt;
+end sq;
+call mon1(2, sq(0));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_pointer_run_on_from_a_parameter_reaches_the_first_local(opt):
+    """The parameters come first, then the locals: `.v + 1' is `nxt'.  `v'
+    stayed in ??AUTO while `nxt', read before it is assigned, was static,
+    and the store went into `pp'."""
+    assert _run(PARAM_RUN_ON, opt) == "Q"
+
+
+NESTED_PARAM = """
+outer: procedure (w) byte;
+    declare w byte;
+    inner: procedure (v) byte;
+        declare v byte;
+        declare pp address, c based pp byte;
+        pp = .v;
+        return c;
+    end inner;
+    return inner(w + 1);
+end outer;
+pub: procedure (v) byte public;
+    declare v byte;
+    declare pp address, c based pp byte;
+    pp = .v;
+    return c + 1;
+end pub;
+call mon1(2, outer('M'));
+call mon1(2, pub('N'));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_static_parameter_of_a_nested_and_of_a_public_procedure(opt):
+    """A static parameter is where the caller stores it: the nested
+    procedure's label has the procedures it is in, and a PUBLIC one takes
+    its arguments off the stack into it."""
+    assert _run(NESTED_PARAM, opt) == "NO"
+    asm = _asm(NESTED_PARAM, opt)
+    assert re.search(r"^@OUTER\$INNER\$V:\s+ds\s+1$", asm, re.MULTILINE), asm
+    assert "PUB$V" in _static(asm), asm
+
+
+FACTORED_PARAM = """
+declare keep address, kept based keep byte;
+fp: procedure (b) byte;
+    declare (b, i) byte;
+    keep = .b;
+    i = b + 1;
+    return i;
+end fp;
+call mon1(2, fp('A'));
+call other;
+call mon1(2, kept);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_static_parameter_declared_with_a_local(opt):
+    """`DECLARE (B, I) BYTE' declares the parameter with a local, as
+    MP/M II's LOAD does in SETMEM; the declaration gave the static
+    parameter its storage a second time, and it did not assemble."""
+    assert _run(FACTORED_PARAM, opt) == "B.A"
+
+
+PARAM_THROUGH_NEIGHBOUR = """0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+pq: procedure (a, b) byte;
+    declare (a, b) byte;
+    declare pp address, c based pp byte;
+    pp = .a + 1;
+    return c;
+end pq;
+call mon1(2, pq('A', 'B'));
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_parameter_reached_only_through_the_one_before_it(opt):
+    """`b' arrives in A and is stored at `pq''s entry, and nothing names
+    it after that: upeepz80 dropped the store at -O1 and up, taking the
+    parameter to be reachable by its name only (0.3.6 the same, when
+    nothing else happened to name its slot in ??AUTO)."""
+    got = run_plm(PARAM_THROUGH_NEIGHBOUR, opt).replace("\0", "").strip()
+    assert got == "B"
+
+
+def test_a_procedure_whose_address_is_taken_keeps_the_parameters_it_names():
+    """`show' can be called through its address after `p' has returned,
+    and reads `v', which is `p''s parameter."""
+    asm = _asm("""
+p: procedure (v) address;
+    declare v byte;
+    show: procedure; call mon1(2, v); end show;
+    return .show;
+end p;
+declare f address;
+f = p('A');
+call other;
+call f;
+""")
+    assert _static(asm) == {"P$V"}, asm
+
+
+# ---- a store before RETURN -------------------------------------------------
+
+RETURNED = """
+pw: procedure byte;
+    declare v byte;
+    declare old byte;
+    old = v;
+    old = (v := old + 1);
+    return v;
+end pw;
+declare i byte;
+do i = 1 to 4;
+    call mon1(2, '0' + pw);
+end;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_embedded_assignment_is_stored_before_a_return_of_it(opt):
+    """`v', read before it is assigned, is static and keeps what the call
+    before left.  Its store was left out because the next statement
+    returns it, for RETURN to take the value from A: `1111'."""
+    assert _run(RETURNED, opt) == "1234"
+
+
+READCS = """
+declare cs byte;
+rb: procedure byte; return 5; end rb;
+readcs: procedure byte;
+    declare v byte;
+    cs = cs + (v := rb);
+    return v;
+end readcs;
+cs = 1;
+call mon1(2, '0' + readcs);
+call mon1(2, '0' + cs);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_return_does_not_take_the_statement_before_it_for_the_value(opt):
+    """MP/M II's LOAD reads a HEX file through `READCS: PROCEDURE BYTE;
+    DECLARE B BYTE; CS = CS + (B := READBYTE); RETURN B;', which returned
+    CS + B, what A held when the statement was done: LOAD built from
+    source stopped with INVERTED LOAD ADDRESS on the first record."""
+    assert _run(READCS, opt) == "56"
+
+
+# ---- counted loops ------------------------------------------------------------
+
+COUNTED_RUN_ON = """
+ov: procedure byte;
+    declare arr (2) byte, i byte;
+    declare n byte;
+    arr(0) = 0; arr(1) = 0;
+    n = 2;
+    do i = 0 to 9; arr(0) = arr(0) + 1; end;
+    return arr(n);
+end ov;
+call mon1(2, 'A' + ov - 10);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_counted_loop_index_read_through_an_overrun(opt):
+    """A BYTE `DO i = 0 TO 9' whose body does not name `i' counts in B,
+    and gives `i' its final value only if something may read it; `arr(2)'
+    is `i', ten when the loop is done, and the loop left it 0."""
+    assert _run(COUNTED_RUN_ON, opt) == "A"
+
+
+COUNTED_RETURN = """
+declare cnt byte;
+rt: procedure byte;
+    declare (i, seen) byte;
+    if seen = 1 then return i;
+    seen = 1;
+    cnt = 0;
+    do i = 0 to 9;
+        cnt = cnt + 1;
+        if cnt = 3 then return 0;
+    end;
+    return 0ffh;
+end rt;
+call mon1(2, rt + 'A');
+call other;
+call mon1(2, rt + 'A');
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_return_from_a_counted_loop_leaves_the_index_it_had(opt):
+    """`i' is static (the second call reads it first), so the RETURN in
+    the third pass leaves it 2 for the next call; the counted loop stored
+    its final value, 10, before it started: `A.K'."""
+    assert _run(COUNTED_RETURN, opt) == "A.C"
+
+
+# ---- which frames ??AUTO may overlay ---------------------------------------
+
+def _generator(body: str, opt: int = 2) -> CodeGenerator:
+    """The code generator, once it has compiled ``body``."""
+    ast = parse_source(_PRELUDE + body + "\nend t;\n", "<test>")
+    if opt:
+        ast = ASTOptimizer(opt).optimize(ast)
+    cg = CodeGenerator(Mode.CPM)
+    cg.generate(ast)
+    return cg
+
+
+def _frames(body: str, opt: int = 2) -> dict[str, tuple[int, int]]:
+    """Each procedure's frame in ??AUTO, as [start, end)."""
+    cg = _generator(body, opt)
+    out = {}
+    for proc, storage in cg.proc_storage.items():
+        size = sum(entry[1] for entry in storage)
+        if size:
+            out[proc] = (cg.storage_offsets[proc], cg.storage_offsets[proc] + size)
+    return out
+
+
+def _overlap(frames: dict, a: str, b: str) -> bool:
+    (s1, e1), (s2, e2) = frames[a], frames[b]
+    return s1 < e2 and s2 < e1
+
+
+INTERRUPT = """
+helper: procedure;
+    declare h address;
+    h = 5;
+    call mon1(2, low(h));
+end helper;
+ih: procedure interrupt 7;
+    declare (x, y) byte;
+    x = 1; y = x + 1;
+    call helper;
+end ih;
+work: procedure byte;
+    declare (w1, w2, w3) byte;
+    w1 = 1; w2 = 2; w3 = w1 + w2;
+    return w3;
+end work;
+call mon1(2, work);
+call other;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_interrupt_procedure_overlays_no_other_frame(opt):
+    """An INTERRUPT procedure runs when the interrupt comes, while `work'
+    or `other' may be active, and so does `helper', which it calls
+    (8.1.7).  Nothing calls `ih', so its frame, and `helper''s, were put
+    over theirs."""
+    frames = _frames(INTERRUPT, opt)
+    for anytime in ("IH", "HELPER"):
+        for proc in frames:
+            if proc != anytime:
+                assert not _overlap(frames, anytime, proc), (anytime, proc, frames)
+
+
+CALLBACK_ASM = """
+    .z80
+    cseg
+    public EXT, ICALL
+    extrn CB
+; ext: code outside the module that calls its PUBLIC procedure back.
+EXT:    jp CB
+; icall(a): calls the procedure at a.
+ICALL:  ld hl,2
+        add hl,sp
+        ld a,(hl)
+        inc hl
+        ld h,(hl)
+        ld l,a
+        jp (hl)
+    end
+"""
+
+CALLBACK = """
+ext: procedure external; end ext;
+icall: procedure (a) external; declare a address; end icall;
+cb: procedure public;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+end cb;
+cb2: procedure;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+end cb2;
+declare f address;
+back: procedure byte;
+    declare (k, m) byte;
+    k = 'E'; m = 'X';
+    call ext;
+    return k;
+end back;
+through: procedure byte;
+    declare (k, m) byte;
+    k = 'F'; m = 'Y';
+    call icall(f);
+    return k;
+end through;
+f = .cb2;
+call mon1(2, back);
+call mon1(2, through);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_code_outside_the_module_may_call_back_into_it(opt):
+    """`ext' calls the PUBLIC `cb' back, and `icall' calls `cb2', whose
+    address it was given.  Neither call is in the text, so `cb' and `cb2'
+    were never active with `back' and `through', and their frames were
+    put over those, whose `k' came back 0FFH."""
+    asm = Compiler(opt_level=opt).compile(_PRELUDE + CALLBACK + "\nend t;\n", "<test>")
+    assert asm is not None
+    out = run_asm(asm, CALLBACK_ASM).stdout.replace("\0", "").strip()
+    assert out == "EF", asm
+
+
+def test_a_call_through_an_address_may_call_any_procedure_whose_address_is_taken():
+    """`CALL f' calls the procedure at the address in `f' (8.2.1): `tgt',
+    whose address is taken, may be active with `caller' and whatever calls
+    it; `lone', whose address is not, need not be."""
+    body = """
+declare f address;
+tgt: procedure;
+    declare (u, v, w) address;
+    u = 1; v = u; w = v;
+end tgt;
+lone: procedure;
+    declare (u, v, w) address;
+    u = 2; v = u; w = v;
+end lone;
+caller: procedure byte;
+    declare (k, m) byte;
+    k = 'G'; m = 'Z';
+    call f;
+    return k;
+end caller;
+outer: procedure byte;
+    declare (n1, n2) byte;
+    n1 = 1; n2 = caller;
+    return n1 + n2;
+end outer;
+f = .tgt;
+call lone;
+call mon1(2, outer);
+"""
+    frames = _frames(body)
+    assert not _overlap(frames, "TGT", "CALLER"), frames
+    assert not _overlap(frames, "TGT", "OUTER"), frames
+    together = _generator(body).can_be_active_together
+    assert "LONE" not in together["CALLER"] | together["OUTER"], together
+
+
+def test_a_bdos_call_is_no_call_back():
+    """MON1 and MON2 with a constant function are the BDOS itself, which
+    calls nothing back: a PUBLIC procedure may still share ??AUTO with a
+    procedure that makes such a call."""
+    frames = _frames("""
+cb: procedure public;
+    declare (u, v, w) address;
+    u = 0ffffh; v = u; w = v;
+end cb;
+p: procedure;
+    declare (k, m) byte;
+    k = 'E'; m = k;
+    call mon1(2, m);
+end p;
+call p;
+call cb;
+""")
+    assert _overlap(frames, "CB", "P"), frames
+
+
 # ---- the memory saving, where it is safe -----------------------------------
 
 def test_locals_assigned_before_they_are_read_still_share_auto():
@@ -297,29 +969,39 @@ call mon1(2, p(1, 2));
 ARRAYS = """
 p: procedure (i) byte;
     declare i byte;
-    declare whole (3) byte, part (3) byte, loop (3) byte;
+    declare part (3) byte;
+    declare whole (3) byte;
     declare s structure (x byte, y (2) address);
     declare (j, sum) byte;
-    whole(0) = 1; whole(1) = 2; whole(2) = 3;
     part(0) = 1; part(2) = 3;
-    do j = 0 to 2; loop(j) = j; end;
+    whole(0) = 1; whole(1) = 2; whole(2) = 3;
     s.x = 1; s.y(0) = 2; s.y(1) = 3;
+    j = 0; sum = 0;
     sum = whole(i) + part(0) + part(2) + s.x + low(s.y(i));
-    sum = sum + part(i) + loop(i);
+    sum = sum + part(1) + j;
     return sum;
 end p;
-call mon1(2, p(1));
+q: procedure (i) byte;
+    declare i byte;
+    declare loop (3) byte, k byte;
+    do k = 0 to 2; loop(k) = k; end;
+    return loop(i);
+end q;
+call mon1(2, p(1) + q(1));
 """
 
 
 def test_an_array_is_assigned_once_every_element_has_been():
     """An array or structure assigned element by element through constant
     subscripts is assigned when the last element is; a read of an element
-    through a constant subscript needs only that element.  A variable
-    subscript assigns nothing, so `loop' is static, and `part(i)' may read
-    the element that was not assigned."""
+    through a constant subscript needs only that element, and `part(1)'
+    reads the one that was not assigned.  A read through a variable
+    subscript may run on into the locals declared after the array, and
+    they are all assigned by then.  A store through a variable subscript
+    assigns nothing, so `loop' is static, and `k', which an overrun of
+    `loop' reaches, with it."""
     asm = _asm(ARRAYS)
-    assert _static(asm) == {"P$PART", "P$LOOP"}, asm
+    assert _static(asm) == {"P$PART", "Q$LOOP", "Q$K"}, asm
 
 
 def test_a_factored_declaration_stays_together():
@@ -354,6 +1036,51 @@ call other;
 call f;
 """)
     assert _static(asm) == {"P$SAVED"}, asm
+
+
+ICALL_ASM = """
+    .z80
+    cseg
+    public ICALL
+; icall(a): calls the procedure at a.
+ICALL:  ld hl,2
+        add hl,sp
+        ld a,(hl)
+        inc hl
+        ld h,(hl)
+        ld l,a
+        jp (hl)
+    end
+"""
+
+CALLED_THROUGH_ADDRESS = """
+icall: procedure (a) external; declare a address; end icall;
+lc: procedure;
+    declare (n, m) byte;
+    rd: procedure byte; return n; end rd;
+    n = 'L';
+    m = rd;
+    call mon1(2, m);
+end lc;
+declare f address;
+f = .lc;
+call icall(f);
+call other;
+call icall(f);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_procedure_called_through_its_address_keeps_its_own_locals_in_auto(opt):
+    """`rd' names `n', but `rd' runs only while `lc' is active, however
+    `lc' was called, and `lc' assigns `n' before it calls `rd': only the
+    locals of the procedures `lc' is nested in, which a call through its
+    address may find inactive, have to be static.  (MP/M II's LOAD takes
+    the address of LOADCOM, and four of RELOC's locals went static.)"""
+    asm = _asm(CALLED_THROUGH_ADDRESS, opt)
+    assert _static(asm) == set(), asm
+    out = run_asm(asm, ICALL_ASM).stdout.replace("\0", "").strip()
+    assert out == "L.L", asm
 
 
 def test_storage_that_is_not_in_auto_gets_no_slot_there():

@@ -16,15 +16,35 @@ may share ``??AUTO`` when
   DATA or AT of any declaration - and it is not reached by subscripting it
   outside its bounds (a subscripted scalar, a constant subscript past its
   end, a variable subscript of a one-element array);
-* no procedure that names it has its address taken, since a call through an
-  address can come at any time; and
+* no procedure nested in its own that names it, or that calls one that
+  does, has its address taken, since a call through that address can come
+  when the procedure the local belongs to is not active; and
 * the same holds for every name declared with it in one factored
   declaration, which the manual (6.2.4) makes contiguous.
 
-A local whose address is taken, or which is reached outside its bounds,
-takes every local declared after it to static storage with it: a pointer
-made from it can reach them, and code that does that assumes DRI's layout,
-which is declaration order.
+DRI lays a procedure's locals out in declaration order, and programs count
+on it, so the split keeps that order wherever a program can see it.  The
+locals with INITIAL or PUBLIC are static in any case, but they have their
+place in that order too.
+
+* A local whose address is taken, or which is reached outside its bounds,
+  takes every local declared after it to static storage with it: a pointer
+  made from it can reach them.
+* An array or structure subscripted by anything but a constant may run on
+  into the locals declared after it, as in DRI's layout (and in 0.3.6's
+  frame in ``??AUTO``), so it and every local declared after it are all
+  static, in declaration order, or all in ``??AUTO``, in the same order:
+  if any of them is static, all of them are.  A read through such a
+  subscript reads all of those locals.
+* DRI's order is the text's: a nested procedure's parameters and locals,
+  and a DO block's variables, come where the text declares them.  A frame
+  in ``??AUTO`` holds one procedure's locals only, so when a nested
+  procedure with storage, or a DO block with variables, comes after the
+  local one of those rules starts from, everything after that local is
+  static, the nested procedure's storage too.
+
+A subscript is a constant when it folds to one by PL/M-80's rules, as the
+optimizer folds it, so every level decides alike.
 
 A BASED variable reads its base each time it is used, so a use of it is a
 read of the base.  An array or a structure is followed element by element
@@ -33,9 +53,15 @@ been assigned through constant subscripts, and a read of one element through
 constant subscripts needs only that element.  Any other read needs the
 whole.  A store through a variable subscript assigns nothing.
 
-Parameters are written by every call, so they always share ``??AUTO``.
-Anything the analysis cannot follow leaves the local in static storage.
+Parameters are written by every call, so they share ``??AUTO`` unless
+their address is taken - a parameter is as static as any other local, and a
+pointer to it may be kept after the call - or a procedure whose address is
+taken names one.  They come first in the order that is kept, as the
+PROCEDURE statement lists them.  Anything the analysis cannot follow leaves
+the local in static storage.
 """
+
+# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -45,6 +71,7 @@ from typing import Callable, Iterable, Optional
 from . import _plm_parser as P
 from .ast_view import (
     DataType,
+    binop_kind,
     block_items_split,
     decl_attrs,
     decl_item_based,
@@ -52,15 +79,16 @@ from .ast_view import (
     decl_item_struct_members,
     decl_item_type,
     ident_text,
-    number_value,
     proc_attrs,
     proc_body_items,
     proc_name,
     proc_param_names,
     struct_member_dim,
     struct_member_names,
+    unop_kind,
     unwrap_paren,
 )
+from .plm_types import fold_binary, fold_builtin, fold_unary, literal_type, typed_const
 
 # An array or structure with more elements than this is not followed element
 # by element: any read of it before... anything needs the whole, which no
@@ -74,6 +102,10 @@ _DO_KINDS = (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCase
 
 # Passes over a loop or a body before the analysis gives up on it.
 _MAX_PASSES = 64
+
+# Where a procedure declared in a DO block comes among the declarations of
+# the procedure it is in: after all of them.
+_IN_A_BLOCK = 1 << 30
 
 # A dataflow state: the components definitely assigned, or None where no
 # path reaches (the identity of the meet).
@@ -92,15 +124,28 @@ def _meet(a: State, b: State) -> State:
     return a & b
 
 
+# What a Local is.  Only an AUTO local may share ??AUTO; a FIXED one - with
+# INITIAL, or PUBLIC - is static whatever the analysis finds, but it has its
+# place in the procedure's storage, next to the locals declared around it.
+# A PARAM is in ??AUTO unless its address is taken or a procedure whose
+# address is taken names it; the parameters come first, in the order the
+# PROCEDURE statement lists them.
+AUTO = "auto"
+FIXED = "fixed"
+PARAM = "param"
+
+
 @dataclass
-class Local:
-    """A candidate for ``??AUTO``: a procedure's own uninitialised variable."""
+class Local:  # pylint: disable=too-many-instance-attributes
+    """A variable with storage of the procedure's own, where DRI's layout
+    puts it: in declaration order."""
 
     name: str
     order: int                    # position among the procedure's locals
-    group: int                    # which declaration it is in
+    group: int                    # which declaration it is in; -1 for a parameter
     dim: Optional[int]            # array dimension, None for a scalar
     members: Optional[dict]       # structure member -> its dimension or None
+    kind: str = AUTO
     keys: frozenset = frozenset()  # every component
 
     def __post_init__(self) -> None:
@@ -134,7 +179,7 @@ class Local:
 
 
 @dataclass
-class ProcInfo:
+class ProcInfo:  # pylint: disable=too-many-instance-attributes
     """What the analysis knows of one procedure."""
 
     full: str
@@ -143,28 +188,23 @@ class ProcInfo:
     locals: dict[str, Local] = field(default_factory=dict)
     labels: set[str] = field(default_factory=set)   # defined in its own body
     frame: dict = field(default_factory=dict)       # its own names -> binding
+    # nested procedure -> its place among the body's declarations (Local.group)
+    head_procs: dict[str, int] = field(default_factory=dict)
+    block_storage: bool = False    # a DO block in the body declares a variable
 
 
-# A binding in a scope frame is (kind, owner, extra).  kind is "cand" (a
+# A binding in a scope frame is (kind, owner, extra).  kind is "local" (a
 # Local of procedure `owner'), "var" (any other variable), "proc", or "based"
-# (a BASED variable; extra is its declaration).  owner is None in a block.
-
-
-def _const(expr) -> Optional[int]:
-    """The value of a constant subscript, or None."""
-    expr = unwrap_paren(expr)
-    if isinstance(expr, P.NumberLiteral):
-        return number_value(expr)
-    if (isinstance(expr, P.Call) and isinstance(expr.callee, P.Identifier)
-            and ident_text(expr.callee.name) == "DOUBLE" and len(expr.args) == 1):
-        return _const(expr.args[0])
-    return None
+# (a BASED variable; extra is its declaration).  owner is None in a block
+# or at module level.
 
 
 def _designator(expr):
     """(root name, [part, ...]) for a variable reference, or None.
 
     A part is ("idx", args) for a subscript and ("mem", name) for a member.
+    :meth:`_Walk._fold_path` replaces each subscript's args with their
+    values, None where one is not constant, for :func:`_select`.
     """
     expr = unwrap_paren(expr)
     if isinstance(expr, P.Identifier):
@@ -184,20 +224,26 @@ def _designator(expr):
 
 def _subscript(part, dim: int) -> tuple[Optional[int], bool]:
     """(constant index or None, whether it reaches outside the object)."""
-    args = part[1]
-    if part[0] != "idx" or len(args) != 1:
+    values = part[1]
+    if part[0] != "idx" or len(values) != 1:
         return None, True
-    k = _const(args[0])
+    k = values[0]
     if k is None:
         # A one-element array is PL/M's open-ended array.
         return None, dim <= 1
     return (k, False) if 0 <= k < dim else (None, True)
 
 
+def _varies(path: list) -> bool:
+    """Whether a folded ``path`` has a subscript that is not a constant."""
+    return any(part[0] == "idx" and (len(part[1]) != 1 or part[1][0] is None)
+               for part in path)
+
+
 def _is_zero_subscript(rest: list) -> bool:
     """Whether ``rest`` is exactly ``(0)``: x(0) is x itself."""
     return (len(rest) == 1 and rest[0][0] == "idx" and len(rest[0][1]) == 1
-            and _const(rest[0][1][0]) == 0)
+            and rest[0][1][0] == 0)
 
 
 def _path_prefix(local: Local, path: list) -> tuple[Optional[tuple], bool, bool]:  # pylint: disable=too-many-return-statements
@@ -280,7 +326,23 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         # locals whose address is taken or which are reached outside their
         # bounds: they and everything declared after them are static
         self.escapes: set[tuple[str, str]] = set()
+        # arrays and structures subscripted by a variable, which may run on
+        # into the locals declared after them: they and those locals share
+        # one storage class, in declaration order
+        self.runs: set[tuple[str, str]] = set()
+        # locals a program can read or write without naming them: through a
+        # pointer run on from one declared before them, or an overrun
+        self.reachable: set[tuple[str, str]] = set()
         self.proc_addr_taken: set[str] = set()
+        # INTERRUPT procedures, which run whenever the interrupt comes
+        self.interrupts: set[str] = set()
+        # PUBLIC procedures, which code outside the module can call
+        self.public: set[str] = set()
+        # procedures with a CALL through an address (8.2.1)
+        self.indirect_callers: set[str] = set()
+        # each module's items and the names its declarations bring in
+        self.modules: list[tuple[list, dict]] = []
+        self._surveyed = False
         # procedure -> labels it jumps to that are not its own
         self.outward_gotos: dict[str, set[str]] = {}
         # (procedure, label) that can be jumped to from anywhere
@@ -294,7 +356,10 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
 
         ``items`` are the module's declarations and statements.
         """
-        self._scan_items(items, None, [])
+        decls, _ = _module_split(items)
+        frame = _frame(decls, None)
+        self.modules.append((items, frame))
+        self._scan_items(items, None, [(None, frame)])
 
     def _scan_items(self, items, parent: Optional[str], chain: list) -> None:
         """Walk ``items`` (a body or block) for procedures, keeping the scope."""
@@ -324,57 +389,157 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         full = f"{parent}${name}" if parent and not attrs.is_public else name
         params = proc_param_names(decl)
         info = ProcInfo(full=full, decl=decl, chain=list(chain))
+        if attrs.interrupt_num is not None:
+            self.interrupts.add(full)
+        if attrs.is_public:
+            self.public.add(full)
         items = proc_body_items(decl)
         decls, stmts = block_items_split(items)
         if not attrs.is_reentrant:
-            info.locals = _candidates(decls, params)
+            info.locals = _layout(decls, params)
         for d in decls:
             if (isinstance(d, P.DeclItem) and decl_item_type(d)[0] == DataType.LABEL
                     and decl_attrs(d).is_public):
                 self.label_addr_taken.update((full, n) for n in decl_item_names(d))
         info.frame = _frame(decls, full, info.locals)
         for p in params:
-            info.frame.setdefault(p, ("var", full, None))
+            info.frame.setdefault(p, ("local" if p in info.locals else "var", full, None))
         info.labels = _labels(stmts)
+        info.head_procs = {proc_name(d): g for g, d in enumerate(decls)
+                           if isinstance(d, P.ProcDecl)}
+        info.block_storage = _block_storage(stmts)
         self.procs[full] = info
         self._scan_items(items, full, chain + [(full, info.frame)])
 
     # ---- the analysis ------------------------------------------------------
 
-    def static_locals(self) -> dict[str, set[str]]:
-        """procedure -> the locals of it that must not share ``??AUTO``."""
-        # First what needs no dataflow: the outer locals each procedure
-        # names, the addresses taken.
+    def survey(self) -> None:
+        """What needs no dataflow: the outer locals each procedure names,
+        the addresses taken - in the procedures and in each module's own
+        declarations and statements - and the calls through an address.
+        The call graph may be completed with them (see
+        CodeGenerator._complete_call_graph) before :meth:`static_locals`."""
+        if self._surveyed:
+            return
+        self._surveyed = True
         for info in self.procs.values():
             _Walk(self, info, dataflow=False).run()
+        for items, frame in self.modules:
+            main = ProcInfo(full="", decl=None, chain=[], frame=frame)
+            main.labels = _labels(_module_split(items)[1])
+            _Walk(self, main, dataflow=False).run(items)
+
+    def static_locals(self) -> dict[str, set[str]]:
+        """procedure -> the locals of it that must not share ``??AUTO``."""
+        self.survey()
+        # A call through an address can come when the procedures `f' is
+        # nested in are not active, and what they last left in their
+        # locals is what `f' finds.  A procedure that `f' calls, and the
+        # ones nested in it, are active whenever one of them names its
+        # locals, and that procedure's own analysis sees to those.
         for f in self.proc_addr_taken:
             for owner, name in self.trans_refs(f):
-                self.make_static(owner, name, f"{f}, whose address is taken, names it")
+                if f.startswith(owner + "$"):
+                    self.make_static(owner, name, f"{f}, whose address is taken, names it")
         # Then definite assignment, with the reads the calls make.
         for info in self.procs.values():
-            if info.locals:
+            if any(loc.kind == AUTO for loc in info.locals.values()):
                 _Walk(self, info, dataflow=True).run()
-        return self._close()
-
-    def _close(self) -> dict[str, set[str]]:
+        # Then declaration order, which can make the storage of a nested
+        # procedure static, and that procedure's rules then apply to it.
         out: dict[str, set[str]] = {}
-        for full, info in self.procs.items():
-            if not info.locals:
-                continue
-            static = {n for n in info.locals if (full, n) in self.reasons}
-            escaped = [loc for n, loc in info.locals.items() if (full, n) in self.escapes]
+        grew = True
+        while grew:
+            grew = False
+            for full, info in self.procs.items():
+                if not info.locals:
+                    continue
+                out[full], spanned, why = self._close(full, info)
+                for q in spanned:
+                    for n, loc in self.procs[q].locals.items():
+                        self.reachable.add((q, n))
+                        if loc.kind != FIXED and (q, n) not in self.reasons:
+                            self.make_static(q, n, why)
+                            grew = True
+        return out
+
+    def _close(self, full: str, info: ProcInfo) -> tuple[set[str], list[str], str]:
+        """The parameters and AUTO locals of ``info`` that are static, once
+        declaration order is kept: after a local whose address is taken, or
+        which is subscripted outside its bounds, everything is static; a
+        factored declaration is all static or not at all (6.2.4); and from
+        the first array or structure subscripted by a variable on, the
+        locals are all static or all in ??AUTO - so that an overrun reaches
+        the local declared after it, as in DRI's layout.
+
+        DRI lays out what the procedure's text declares, in the order it
+        declares it, a nested procedure's parameters and locals and the
+        variables of its DO blocks included, so where those come after the
+        local such a pointer or overrun starts from, what it can reach has
+        to be static, in that order, for it to reach the same thing.  Also
+        returned: the nested procedures whose storage has to be static for
+        that, and why."""
+        locs = sorted(info.locals.values(), key=lambda loc: loc.order)
+        static = {loc.name for loc in locs
+                  if loc.kind == FIXED or (full, loc.name) in self.reasons}
+        escaped = [loc for loc in locs if (full, loc.name) in self.escapes]
+        runs = [loc for loc in locs if (full, loc.name) in self.runs]
+
+        def take(names: Iterable[str], why: str) -> bool:
+            added = False
+            for n in names:
+                if n not in static:
+                    static.add(n)
+                    self.reasons.setdefault((full, n), why)
+                    added = True
+            return added
+
+        run_spans = self._stored_after(full, info, runs[0]) if runs else []
+        changed = True
+        while changed:
+            changed = False
             if escaped:
-                first = min(escaped, key=lambda loc: loc.order)
-                for m, loc in info.locals.items():
-                    if loc.order > first.order and m not in static:
-                        static.add(m)
-                        self.reasons[(full, m)] = f"declared after {first.name}"
-            groups = {info.locals[n].group for n in static}
-            for m, loc in info.locals.items():
-                if loc.group in groups and m not in static:
-                    static.add(m)
-                    self.reasons[(full, m)] = "declared with a static local"
-            out[full] = static
+                first = escaped[0]
+                changed |= take([loc.name for loc in locs if loc.order > first.order],
+                                f"declared after {first.name}")
+            groups = {info.locals[n].group for n in static if info.locals[n].kind == AUTO}
+            changed |= take([loc.name for loc in locs
+                             if loc.kind == AUTO and loc.group in groups],
+                            "declared with a static local")
+            if runs:
+                tail = [loc for loc in locs if loc.order >= runs[0].order]
+                if (run_spans or info.block_storage
+                        or any(loc.name in static for loc in tail)):
+                    changed |= take([loc.name for loc in tail],
+                                    f"{runs[0].name}, subscripted by a variable, "
+                                    "runs on into a static local")
+        if escaped:
+            self.reachable.update((full, loc.name) for loc in locs
+                                  if loc.order >= escaped[0].order)
+        if runs:
+            self.reachable.update((full, loc.name) for loc in locs
+                                  if loc.order > runs[0].order)
+        spanned: list[str] = []
+        why = ""
+        if escaped:
+            spanned = self._stored_after(full, info, escaped[0])
+            why = f"a pointer from {full}'s {escaped[0].name} reaches it"
+        if runs and runs[0].name in static and not (escaped and escaped[0].order <= runs[0].order):
+            spanned = sorted(set(spanned) | set(run_spans))
+            why = why or f"{full}'s {runs[0].name}, subscripted by a variable, runs on into it"
+        return {n for n in static if info.locals[n].kind != FIXED}, spanned, why
+
+    def _stored_after(self, full: str, info: ProcInfo, first: Local) -> list[str]:
+        """The procedures nested in ``full`` with storage of their own that
+        its text declares after ``first``: in a DO block, or after it among
+        the declarations."""
+        prefix = full + "$"
+        out = []
+        for q, qi in self.procs.items():
+            if q.startswith(prefix) and qi.locals:
+                child = q[len(prefix):].split("$", 1)[0]
+                if info.head_procs.get(child, _IN_A_BLOCK) > first.group:
+                    out.append(q)
         return out
 
     def make_static(self, owner: str, name: str, why: str) -> None:
@@ -385,6 +550,12 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         """Local ``name`` of ``owner`` can be reached through a pointer."""
         self.make_static(owner, name, why)
         self.escapes.add((owner, name))
+
+    def run_on(self, owner: str, local: Local) -> list[tuple[str, frozenset]]:
+        """What a read of ``local`` of ``owner`` through a variable subscript
+        also reads: every AUTO local declared after it."""
+        return [(loc.name, loc.keys) for loc in self.procs[owner].locals.values()
+                if loc.kind == AUTO and loc.order > local.order]
 
     def trans_refs(self, proc: str) -> set[tuple[str, str]]:
         """The outer locals named by ``proc`` or by anything it can call."""
@@ -415,27 +586,37 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         return out
 
 
-def _candidates(decls, params: list[str]) -> dict[str, Local]:
-    """A procedure's candidates for ??AUTO, in declaration order."""
+def _layout(decls, params: list[str]) -> dict[str, Local]:
+    """A procedure's parameters and its locals with storage of their own,
+    in that order: the parameters as the PROCEDURE statement lists them,
+    the locals as they are declared."""
     out: dict[str, Local] = {}
+    for p in params:
+        out[p] = Local(p, len(out), -1, None, None, PARAM)
     for group, d in enumerate(decls):
-        if not isinstance(d, P.DeclItem) or not _is_candidate(d):
+        if not isinstance(d, P.DeclItem):
             continue
+        kind = _storage_kind(d)
         dt, dim = decl_item_type(d)
-        if dt == DataType.LABEL or (dim is not None and dim < 0):
+        if kind is None or dt == DataType.LABEL:
             continue
         for n in decl_item_names(d):
             if n not in params:
-                out[n] = Local(n, len(out), group, dim, _members(d))
+                out[n] = Local(n, len(out), group, dim, _members(d), kind)
     return out
 
 
-def _is_candidate(d) -> bool:
-    """Whether a declaration's storage would be the procedure's own, in ??AUTO."""
+def _storage_kind(d) -> Optional[str]:
+    """AUTO for a declaration whose storage may be in ??AUTO, FIXED for one
+    whose storage is static (INITIAL, PUBLIC), None for one with no storage
+    among the procedure's variables (EXTERNAL, BASED, AT, DATA)."""
     a = decl_attrs(d)
     based, _ = decl_item_based(d)
-    return not (a.is_public or a.is_external or based or a.at_location is not None
-                or a.data_values or a.initial_values)
+    if a.is_external or based or a.at_location is not None or a.data_values is not None:
+        return None
+    if a.is_public or a.initial_values is not None:
+        return FIXED
+    return AUTO
 
 
 def _members(d) -> Optional[dict]:
@@ -450,9 +631,9 @@ def _members(d) -> Optional[dict]:
     return out
 
 
-def _frame(decls, owner: Optional[str], cands: Iterable[str] = ()) -> dict:
+def _frame(decls, owner: Optional[str], owned: Iterable[str] = ()) -> dict:
     """The names a list of declarations brings into scope."""
-    cands = set(cands)
+    owned = set(owned)
     frame: dict = {}
     for d in decls:
         if isinstance(d, P.ProcDecl):
@@ -460,8 +641,8 @@ def _frame(decls, owner: Optional[str], cands: Iterable[str] = ()) -> dict:
         elif isinstance(d, P.DeclItem):
             based = d.based is not None
             for n in decl_item_names(d):
-                if n in cands:
-                    frame[n] = ("cand", owner, None)
+                if n in owned:
+                    frame[n] = ("local", owner, None)
                 elif based:
                     frame[n] = ("based", owner, d.based.base)
                 else:
@@ -470,6 +651,42 @@ def _frame(decls, owner: Optional[str], cands: Iterable[str] = ()) -> dict:
             for b in d.based_decls or []:
                 frame[ident_text(b.name)] = ("based", owner, b.base)
     return frame
+
+
+def _module_split(items) -> tuple[list, list]:
+    """(declarations, statements) of a module's items, whose declarations
+    come unwrapped from their DECLAREs (see ast_view.module_shape)."""
+    decls: list = []
+    stmts: list = []
+    for it in items:
+        if isinstance(it, (P.ProcDecl, P.DeclItem, P.DeclItemBasedGroup, P.LiterallyDecl)):
+            decls.append(it)
+        elif isinstance(it, P.DeclareStmt):
+            decls.extend(it.declarations)
+        else:
+            stmts.append(it)
+    return decls, stmts
+
+
+def _block_storage(stmts) -> bool:
+    """Whether a DO block among ``stmts`` (not in a nested procedure)
+    declares a variable with storage."""
+    work = list(stmts)
+    while work:
+        s = work.pop()
+        if isinstance(s, P.LabeledStmt):
+            work.append(s.stmt)
+        elif isinstance(s, (P.IfStmt, P.IfStmtElse)):
+            work.append(s.then_stmt)
+            if isinstance(s, P.IfStmtElse):
+                work.append(s.else_stmt)
+        elif isinstance(s, _DO_KINDS):
+            decls, inner = block_items_split(s.items)
+            if any(isinstance(d, P.DeclItem) and _storage_kind(d) is not None
+                   and decl_item_type(d)[0] != DataType.LABEL for d in decls):
+                return True
+            work.extend(inner)
+    return False
 
 
 def _labels(stmts) -> set[str]:
@@ -510,9 +727,13 @@ class _Walk:
 
     # ---- driving -----------------------------------------------------------
 
-    def run(self) -> None:
-        """Walk the body; with dataflow, until the labels' states settle."""
-        decls, stmts = block_items_split(proc_body_items(self.info.decl))
+    def run(self, items: Optional[list] = None) -> None:
+        """Walk the body - or ``items``, the main program's - and with
+        dataflow, until the labels' states settle."""
+        if items is None:
+            decls, stmts = block_items_split(proc_body_items(self.info.decl))
+        else:
+            decls, stmts = _module_split(items)
         if not self.dataflow:
             self._declarations(decls)
             self._walk_stmts(stmts, frozenset())
@@ -527,8 +748,9 @@ class _Walk:
         self._give_up()
 
     def _give_up(self) -> None:
-        for n in self.info.locals:
-            self.an.make_static(self.info.full, n, "the flow analysis did not settle")
+        for n, loc in self.info.locals.items():
+            if loc.kind == AUTO:
+                self.an.make_static(self.info.full, n, "the flow analysis did not settle")
 
     # ---- names -------------------------------------------------------------
 
@@ -542,7 +764,7 @@ class _Walk:
         return None, -1
 
     def _local(self, binding, name: str) -> Optional[Local]:
-        if binding is None or binding[0] != "cand":
+        if binding is None or binding[0] != "local":
             return None
         owner = self.an.procs.get(binding[1])
         return owner.locals.get(name) if owner else None
@@ -591,9 +813,7 @@ class _Walk:
                 self._reference(t, eff, write=True)
             return self._apply(eff, state)
         if isinstance(s, P.CallStmt):
-            eff = _Effects()
-            self._effects(s.callee, eff)
-            return self._apply(eff, state)
+            return self._call_stmt(s, state)
         if isinstance(s, (P.IfStmt, P.IfStmtElse)):
             state = self._expr_state(s.condition, state)
             then = self._stmt(s.then_stmt, state)
@@ -621,6 +841,24 @@ class _Walk:
         # HALT waits for an interrupt and goes on; ENABLE, DISABLE and the
         # null statement do nothing to a variable.
         return state
+
+    def _call_stmt(self, s, state: State) -> State:
+        eff = _Effects()
+        self._effects(s.callee, eff)
+        if self.info.full and self._through_address(s.callee):
+            self.an.indirect_callers.add(self.info.full)
+        return self._apply(eff, state)
+
+    def _through_address(self, call) -> bool:
+        """Whether a CALL statement calls the procedure at an address a
+        variable holds (8.2.1), not a procedure it names or a built-in."""
+        call = unwrap_paren(call)
+        target = call.callee if isinstance(call, (P.Call, P.CallNoArgs)) else call
+        target = unwrap_paren(target)
+        if isinstance(target, P.Identifier):
+            binding, _ = self._lookup(ident_text(target.name))
+            return binding is not None and binding[0] != "proc"
+        return True
 
     def _cases(self, stmts, state: State) -> State:
         out: State = None
@@ -694,8 +932,13 @@ class _Walk:
         reads = list(eff.reads)
         for callee in eff.calls:
             for owner, name in self.an.trans_refs(callee):
-                if owner == mine and name in self.info.locals:
-                    reads.append((name, self.info.locals[name].keys))
+                loc = self.info.locals.get(name) if owner == mine else None
+                if loc is None:
+                    continue
+                if loc.kind == AUTO:
+                    reads.append((name, loc.keys))
+                if (owner, name) in self.an.runs:
+                    reads.extend(self.an.run_on(owner, loc))
         for name, keys in reads:
             if not keys <= state:
                 self.an.make_static(mine, name, "it may be read before it is assigned")
@@ -742,6 +985,60 @@ class _Walk:
             for v in expr.values or []:
                 self._effects(v, eff)
 
+    def _fold(self, expr) -> Optional[tuple[int, DataType]]:  # pylint: disable=too-many-return-statements
+        """(value, type) of a constant expression, as PL/M-80 computes it.
+
+        A subscript the optimizer folds - ``a(1+1)``, ``a(3-5)``, ``a(-1)``
+        - is a constant here at every level, so ``-O0`` decides what
+        ``-O1`` and up decide.  LENGTH and LAST of a local array are its
+        extent; a name the program declares is not a built-in.
+        """
+        e = unwrap_paren(expr)
+        if isinstance(e, (P.NumberLiteral, P.StringLiteral)):
+            got = typed_const(e)
+            return None if got is None else (got[0] & 0xFFFF, got[1])
+        if isinstance(e, P.UnaryOp):
+            inner = self._fold(e.operand)
+            return None if inner is None else fold_unary(unop_kind(e), *inner)
+        if isinstance(e, P.BinaryOp):
+            left, right = self._fold(e.left), self._fold(e.right)
+            if left is None or right is None:
+                return None
+            return fold_binary(binop_kind(e), left[0], left[1], right[0], right[1])
+        if not (isinstance(e, P.Call) and isinstance(unwrap_paren(e.callee), P.Identifier)):
+            return None
+        name = ident_text(unwrap_paren(e.callee).name)
+        if self._lookup(name)[0] is not None:
+            return None
+        if name.upper() in ("LENGTH", "LAST") and len(e.args) == 1:
+            arg = unwrap_paren(e.args[0])
+            if not isinstance(arg, P.Identifier):
+                return None
+            binding, _ = self._lookup(ident_text(arg.name))
+            local = self._local(binding, ident_text(arg.name))
+            if local is None or local.dim is None or local.dim <= 0:
+                return None
+            n = local.dim if name.upper() == "LENGTH" else local.dim - 1
+            return n, literal_type(n)
+        args = [self._fold(a) for a in e.args]
+        if not args or any(a is None for a in args):
+            return None
+        return fold_builtin(name, args)  # type: ignore[arg-type]
+
+    def _fold_path(self, path: list) -> list:
+        """``path`` with each subscript's args replaced by their values."""
+        out = []
+        for part in path:
+            if part[0] == "idx":
+                values = []
+                for a in part[1]:
+                    got = self._fold(a)
+                    values.append(None if got is None else got[0])
+                out.append(("idx", values))
+            else:
+                out.append(part)
+        return out
+
     def _subscripts(self, path: list, eff: _Effects) -> None:
         for part in path:
             if part[0] == "idx":
@@ -770,19 +1067,30 @@ class _Walk:
             self._read_base(binding, depth, eff)
             return
         local = self._local(binding, root)
-        if local is None:
-            return
-        owner = binding[1]
+        if local is not None:
+            self._use(local, binding[1], self._fold_path(path), eff, write)
+
+    def _use(self, local: Local, owner: str, path: list, eff: _Effects, write: bool) -> None:
+        """A read or a store through the folded ``path`` into ``local`` of
+        ``owner``."""
         keys, exact, reach = _select(local, path)
+        runs_on = not reach and _varies(path)
         if reach:
-            self.an.escape(owner, root, "it is subscripted outside its bounds")
+            self.an.escape(owner, local.name, "it is subscripted outside its bounds")
+        elif runs_on:
+            self.an.runs.add((owner, local.name))
         if owner != self.info.full:
-            self.an.free_refs.setdefault(self.info.full, set()).add((owner, root))
+            self.an.free_refs.setdefault(self.info.full, set()).add((owner, local.name))
+        elif local.kind != AUTO:
+            return
         elif write:
             if exact:
                 eff.writes.append(keys)
         else:
-            eff.reads.append((root, keys))
+            eff.reads.append((local.name, keys))
+            if runs_on:
+                # An overrun reads the locals declared after it.
+                eff.reads.extend(self.an.run_on(owner, local))
 
     def _read_base(self, binding, depth: int, eff: _Effects) -> None:
         """A use of a BASED variable reads its base, found where it is declared."""
@@ -800,7 +1108,7 @@ class _Walk:
         owner = base_binding[1]
         if owner != self.info.full:
             self.an.free_refs.setdefault(self.info.full, set()).add((owner, base))
-        else:
+        elif local.kind == AUTO:
             keys, _, _ = _select(local, [("mem", m) for m in members])
             eff.reads.append((base, keys))
 
