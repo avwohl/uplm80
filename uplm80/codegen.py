@@ -2627,20 +2627,20 @@ class CodeGenerator:
         except ValueError:
             pass  # Non-numeric replacement text, no EQU needed
 
-    def _gen_var_decl(self, decl) -> None:
+    def _gen_var_decl(self, decl, skip: frozenset = frozenset()) -> None:
         """Generate storage for a typed variable declaration.
 
         ``decl`` may be a :class:`P.DeclItem` (one or many names sharing
         a tail) or a :class:`P.DeclItemBasedGroup` (a parenthesised list
         of based names, each becoming one symbol). A single ``DeclItem``
         with multiple names emits one storage row per name with each
-        getting its own symbol entry.
+        getting its own symbol entry, except the names in ``skip``.
         """
         start = len(self.data_segment)
-        self._gen_var_decl_names(decl)
+        self._gen_var_decl_names(decl, skip)
         self._note_storage(decl, start)
 
-    def _gen_var_decl_names(self, decl) -> None:
+    def _gen_var_decl_names(self, decl, skip: frozenset = frozenset()) -> None:
         """The storage of each name :meth:`_gen_var_decl` declares."""
         if isinstance(decl, P.DeclItemBasedGroup):
             for bd in decl.based_decls or []:
@@ -2661,13 +2661,14 @@ class CodeGenerator:
         names = decl_item_names(decl)
         first = None
         for index, name in enumerate(names):
-            self._gen_one_var(
-                name=name,
-                based_on=based_on,
-                based_member=based_member,
-                item=decl,
-                factored=(index, len(names), first),
-            )
+            if name not in skip:
+                self._gen_one_var(
+                    name=name,
+                    based_on=based_on,
+                    based_member=based_member,
+                    item=decl,
+                    factored=(index, len(names), first),
+                )
             if index == 0:
                 first_sym = self._lookup_scoped(name)
                 first = first_sym.asm_name if first_sym else None
@@ -3601,10 +3602,13 @@ class CodeGenerator:
                 non_param_names = [n for n in local_names if n not in params]
                 if not non_param_names:
                     continue
-                # If the DeclItem declares a mix of params and non-params,
-                # still hand the whole item to _gen_declaration — the
-                # symbol-table side handles already-defined names.
-                self._gen_declaration(local_decl)
+                # A factored declaration can name parameters with locals,
+                # `DECLARE (B, I) BYTE': the parameters have their storage
+                # already.  (Declared again, a static parameter was
+                # defined twice.  A REENTRANT procedure's still comes out
+                # as a local: see CHANGELOG, Known issues.)
+                self._gen_var_decl(local_decl,
+                                   skip=frozenset() if attrs.is_reentrant else frozenset(params))
             else:
                 self._gen_declaration(local_decl)
 

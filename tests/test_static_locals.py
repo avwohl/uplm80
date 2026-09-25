@@ -532,6 +532,28 @@ def test_a_static_parameter_of_a_nested_and_of_a_public_procedure(opt):
     assert "PUB$V" in _static(asm), asm
 
 
+FACTORED_PARAM = """
+declare keep address, kept based keep byte;
+fp: procedure (b) byte;
+    declare (b, i) byte;
+    keep = .b;
+    i = b + 1;
+    return i;
+end fp;
+call mon1(2, fp('A'));
+call other;
+call mon1(2, kept);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_static_parameter_declared_with_a_local(opt):
+    """`DECLARE (B, I) BYTE' declares the parameter with a local, as
+    MP/M II's LOAD does in SETMEM; the declaration gave the static
+    parameter its storage a second time, and it did not assemble."""
+    assert _run(FACTORED_PARAM, opt) == "B.A"
+
+
 def test_a_procedure_whose_address_is_taken_keeps_the_parameters_it_names():
     """`show' can be called through its address after `p' has returned,
     and reads `v', which is `p''s parameter."""
