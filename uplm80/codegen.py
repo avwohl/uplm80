@@ -3224,6 +3224,9 @@ class CodeGenerator:
             return self._format_number(number_value(expr))
         elif isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
+            label = getattr(expr, "uplm80_asm", None)
+            if label is not None:
+                return label        # a label: `@proc$label' in a procedure
             if name in self.literal_macros:
                 return self.literal_macros[name]
             sym = None

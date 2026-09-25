@@ -196,6 +196,27 @@ end t;
 """, opt) == "PM"
 
 
+@pytest.mark.parametrize("opt", LEVELS)
+def test_the_address_of_a_label_in_data_and_initial(opt):
+    """`.there' in a procedure's DATA or INITIAL list named the bare THERE."""
+    assert run_plm(PRELUDE + """
+declare m address data (.here);
+p: procedure;
+   declare t address data (.there);
+   declare q address initial (.there);
+   if t = q then call pc('=');
+   goto there;
+there:
+   call pc('P');
+end p;
+call p;
+if m = .here then call pc('m');
+here:
+call pc('.');
+end t;
+""", opt) == "=Pm."
+
+
 def test_a_declared_label():
     assert run_plm(PRELUDE + """
 p: procedure;
