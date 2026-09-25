@@ -1400,6 +1400,7 @@ class CodeGenerator:
         self.proc_body: dict[str, list] = {}           # statements of its body
         self.proc_parent: dict[str, str | None] = {}   # the procedure it is nested in
         self.proc_declared: dict[str, set[str]] = {}   # its parameters and locals
+        self.interrupt_procs: set[str] = set()          # INTERRUPT procedures
 
     def _build_call_graph(self, module) -> None:
         """Build call graph by analyzing all procedure bodies."""
@@ -1452,6 +1453,7 @@ class CodeGenerator:
             analysis.add_module(items)
         static = analysis.static_locals()
         self.local_storage = analysis
+        self.interrupt_procs = set(analysis.interrupts)
         for proc, storage in self.proc_storage.items():
             info = analysis.procs.get(proc)
             if info is None or proc_attrs(info.decl).is_reentrant:
@@ -1776,12 +1778,24 @@ class CodeGenerator:
                     self.can_be_active_together[callee].add(g)
                     self.can_be_active_together[g].add(callee)
 
-        # Now handle the "common ancestor" case - if A calls B and A calls C,
-        # then B and C can be active together (B returns, then A calls C)
-        # Actually no - that's NOT "active together" - only one is on stack at a time
-        # The key insight: procs are active together only on a single call chain
+        # An INTERRUPT procedure runs when the interrupt comes, whatever is
+        # active then, and so does everything it calls (8.1.7): none of
+        # their frames may overlap any other.  Nothing called them, so the
+        # call graph put an interrupt handler's frame over the frames of
+        # the procedures it interrupts.
+        anytime: set[str] = set()
+        for proc in self.interrupt_procs:
+            if proc in self.can_be_active_together:
+                anytime |= {proc} | reachable[proc]
+        if anytime:
+            everyone = set(self.can_be_active_together)
+            for proc in everyone:
+                self.can_be_active_together[proc] |= anytime
+            for proc in anytime:
+                self.can_be_active_together[proc] = set(everyone)
 
-        # So the current computation is correct: procs on any call path from root to leaf
+        # Procedures that a common caller calls one after the other are
+        # not active together: only the procedures on one call chain are.
 
     def _get_reachable(self, proc: str, visited: set[str]) -> set[str]:
         """Get all procedures reachable from proc via calls."""

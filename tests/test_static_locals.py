@@ -19,7 +19,10 @@ import re
 
 import pytest
 
+from uplm80.ast_optimizer import ASTOptimizer
+from uplm80.codegen import CodeGenerator, Mode
 from uplm80.compiler import Compiler
+from uplm80.frontend import parse_source
 
 from ._toolchain import run_plm
 
@@ -544,6 +547,68 @@ call other;
 call f;
 """)
     assert _static(asm) == {"P$V"}, asm
+
+
+# ---- which frames ??AUTO may overlay ---------------------------------------
+
+def _generator(body: str, opt: int = 2) -> CodeGenerator:
+    """The code generator, once it has compiled ``body``."""
+    ast = parse_source(_PRELUDE + body + "\nend t;\n", "<test>")
+    if opt:
+        ast = ASTOptimizer(opt).optimize(ast)
+    cg = CodeGenerator(Mode.CPM)
+    cg.generate(ast)
+    return cg
+
+
+def _frames(body: str, opt: int = 2) -> dict[str, tuple[int, int]]:
+    """Each procedure's frame in ??AUTO, as [start, end)."""
+    cg = _generator(body, opt)
+    out = {}
+    for proc, storage in cg.proc_storage.items():
+        size = sum(entry[1] for entry in storage)
+        if size:
+            out[proc] = (cg.storage_offsets[proc], cg.storage_offsets[proc] + size)
+    return out
+
+
+def _overlap(frames: dict, a: str, b: str) -> bool:
+    (s1, e1), (s2, e2) = frames[a], frames[b]
+    return s1 < e2 and s2 < e1
+
+
+INTERRUPT = """
+helper: procedure;
+    declare h address;
+    h = 5;
+    call mon1(2, low(h));
+end helper;
+ih: procedure interrupt 7;
+    declare (x, y) byte;
+    x = 1; y = x + 1;
+    call helper;
+end ih;
+work: procedure byte;
+    declare (w1, w2, w3) byte;
+    w1 = 1; w2 = 2; w3 = w1 + w2;
+    return w3;
+end work;
+call mon1(2, work);
+call other;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_interrupt_procedure_overlays_no_other_frame(opt):
+    """An INTERRUPT procedure runs when the interrupt comes, while `work'
+    or `other' may be active, and so does `helper', which it calls
+    (8.1.7).  Nothing calls `ih', so its frame, and `helper''s, were put
+    over theirs."""
+    frames = _frames(INTERRUPT, opt)
+    for anytime in ("IH", "HELPER"):
+        for proc in frames:
+            if proc != anytime:
+                assert not _overlap(frames, anytime, proc), (anytime, proc, frames)
 
 
 # ---- the memory saving, where it is safe -----------------------------------

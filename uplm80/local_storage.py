@@ -315,6 +315,8 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         # one storage class, in declaration order
         self.runs: set[tuple[str, str]] = set()
         self.proc_addr_taken: set[str] = set()
+        # INTERRUPT procedures, which run whenever the interrupt comes
+        self.interrupts: set[str] = set()
         # procedure -> labels it jumps to that are not its own
         self.outward_gotos: dict[str, set[str]] = {}
         # (procedure, label) that can be jumped to from anywhere
@@ -359,6 +361,8 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         full = f"{parent}${name}" if parent and not attrs.is_public else name
         params = proc_param_names(decl)
         info = ProcInfo(full=full, decl=decl, chain=list(chain))
+        if attrs.interrupt_num is not None:
+            self.interrupts.add(full)
         items = proc_body_items(decl)
         decls, stmts = block_items_split(items)
         if not attrs.is_reentrant:
