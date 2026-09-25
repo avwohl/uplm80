@@ -796,6 +796,10 @@ Each fix has a regression test that fails without it.
   EXTERNAL would call it the wrong way; since a PUBLIC procedure takes its
   arguments on the stack, the EXTERNAL declaration is right, and it is what
   lets each module also be compiled alone.
+- `CLAUDE.md` and the README's example of linking said to link a
+  `runtime.rel`, and `CLAUDE.md`'s list of runtime routines left out
+  `??jpde`, `??inp` and `??outp`. A module carries the runtime routines it
+  uses at the end of its code; nothing is linked for them.
 - **uplm80 requires upeepz80 0.2.5.** upeepz80 0.2.4 deleted register
   loads that were still needed, at `-O1` and above; the differential test
   found each, and each was in 0.3.6's output as well. `b, w = -(NOT b)` left

@@ -94,8 +94,12 @@ Use your preferred Z80 assembler and linker. Example with um80/ul80:
 
 ```bash
 um80 output.mac                              # Assemble to .rel
-ul80 -o program.com output.rel runtime.rel   # Link to CP/M .com
+ul80 -o program.com output.rel               # Link to CP/M .com
 ```
+
+The module carries the runtime routines it uses (see [Runtime
+Library](#runtime-library)); link with it only what defines the names it
+declares EXTERNAL.
 
 ## Language Reference
 

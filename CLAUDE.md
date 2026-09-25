@@ -55,20 +55,27 @@ cpmemu program.com arg1 arg2      # Run with arguments
    um80 output.mac
    ```
 
-3. Link with runtime library:
+3. Link (no runtime library to add; see below), with whatever defines the
+   program's EXTERNALs, such as the CP/M stubs:
    ```bash
-   ul80 -o output.com output.rel runtime.rel
+   ul80 -o output.com output.rel
+   ul80 -o output.com output.rel stubs.rel
    ```
 
 ## Runtime Library
 
-The compiler generates code that uses these runtime routines (must be provided in a runtime.rel):
+There is no separate runtime library. Each output module carries the
+runtime routines it uses at the end of its code, after a `jp ??RTEND`
+guard (`uplm80/runtime.py`, emitted by `codegen.py` from `needs_runtime`):
 
-- `??move` - Block memory move
-- `??div16` - 16-bit unsigned division
-- `??mul16` - 16-bit unsigned multiplication
-- `??mod16` - 16-bit unsigned modulo
+- `??mul16` - 16-bit multiply, HL = HL * DE
+- `??div16`, `??mod16` - 16-bit divide and remainder, as DRI's PL/M-80 computes them (a zero divisor gives quotient 0FFFFH, remainder = dividend)
 - `??subde` - 16-bit subtraction (HL = HL - DE)
+- `??jpde` - a CALL through an address (`CALL q`, Programming Manual 8.2.1): the address in DE, jumped to from a CALL
+- `??inp`, `??outp` - INPUT and OUTPUT of a port that is not a constant
+
+MOVE is generated inline (`ldir`); `runtime.py` also has `??move` and
+`??mul8`, which code generation does not call.
 
 ## Runtime Modes
 
