@@ -381,6 +381,16 @@ Each fix has a regression test that fails without it.
   left `y` 0FDH, not 9 (0.3.6 was wrong at `-O3` too).
 - **`-O3` turned `SIZE(b)` into `SIZE(5)`** after `b = 5`, which does not
   compile; SIZE, LENGTH and LAST name a variable, not its value.
+- **`-O3` took a subscripted scalar's name for its value.** PL/M-80 lets a
+  scalar be subscripted: `x(1)` is the byte after `x`, and DRI's code reads a
+  following local that way. The optimizer put in place of the name the
+  constant or the variable last assigned to `x`. After `x = 'x'`, `return
+  x(1)` became a CALL through address 78H with the argument 1, and the
+  program ran into page zero; after `w = 1234H`, `w(1)` was a CALL through
+  1234H. After `x = y`, `x(1)` read the byte after `y`. 0.3.6 did this for a
+  numeric constant and for some copies; once constants were typed, a
+  character constant hit it too. The name of a subscripted variable is a
+  place, like the target of an assignment, and is now left as it is.
 - **`-O3` rejected a constant it had moved right of a relation:**
   `w = 'AB' <> b` was "comparison BYTE <> 16706 is always true" at `-O3`
   only. A constant the optimizer moves is marked as derived, like one it
@@ -814,6 +824,14 @@ Each fix has a regression test that fails without it.
   folds constants: `double(30h)` is 30H however the procedure is written.
 - A CALL through an address passes more than one argument only to a PUBLIC or
   REENTRANT procedure (a warning says so).
+- **A name that is declared nowhere is not an error.** `y = nosuch + 1`
+  compiles to `ld hl,(NOSUCH)`, and only um80 reports it, as an undefined
+  symbol (0.3.6 the same).
+- **An INTERRUPT procedure nested in another procedure is accepted without
+  a diagnostic.** PL/M-80 requires an INTERRUPT procedure to be at the outer
+  level of the module; uplm80 compiles a nested one, and a local of the
+  procedure around it that the interrupt reads may be in `??AUTO`, where
+  another procedure's frame is (0.3.6 the same).
 - `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
   non-zero truth test, and fails against 0.3.6 and this release alike.
 
@@ -941,6 +959,15 @@ Each fix has a regression test that fails without it.
   level where 86d2720's printed `T` at -O0 and `ST` above, and a5 and a6,
   whose GOTO from a nested procedure to a label of its parent is a compile
   error now (86d2720's output did not assemble).
+- The release gate's next round found one defect, `-O3` taking a subscripted
+  scalar's name for its value (see Fixed, -O3). With the fix, its programs
+  that subscript a scalar print at `-O3` what they print at -O0, and its
+  other programs, b1 to b23, a1 to a14 and the multi-file sets, print at
+  -O0 to -O3 what they printed without it. Each of the 87 compiles of MP/M
+  II and 80un gives the same `.mac` with the fix as without it, at -O0, -O2
+  and -O3. `scripts/difftest.py --seeds 200 --first 2000`: all 200 programs
+  as the model says at -O0 to -O3; the gate's generator of locals, 100 seeds
+  of each of its two versions: all 200 as its model says.
 
 ## 0.3.6 — 2026-09-24
 
