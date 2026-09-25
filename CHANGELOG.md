@@ -674,11 +674,13 @@ Each fix has a regression test that fails without it.
   procedure, and a REENTRANT procedure's parameters and locals, which are on
   its stack.
 
-  In MP/M II and 80un, 205 locals and parameters (4,822 bytes) are now static
-  across the 82 outputs that assemble, the same at -O0, -O2 and -O3. The data
-  comes to 48,565 bytes at each of those levels, against 50,280. The unused
-  slots were 1,947 bytes, and most of the static locals' bytes are buffers
-  that also leave the frames that set the size of `??AUTO`. The code is the
+  In MP/M II (mpm2 at ef0a098, 87 compiles of which 77 assemble) and 80un,
+  197 locals and parameters (4,687 bytes) are now static, the same at -O0,
+  -O2 and -O3. The data comes to 45,095 bytes at each of those levels,
+  against 46,754 before this change. The unused slots were 1,891 bytes. The
+  static locals add back 216, since most of their bytes are buffers that also
+  leave the frames that set the size of `??AUTO`, and the calls through an
+  address and back from outside the module (see Fixed) 16. The code is the
   same except for two things: a parameter's store at a procedure's entry,
   which upeepz80 drops only when nothing else names its `??AUTO` address, and
   the embedded-assignment stores described under Fixed. Together they add 12
