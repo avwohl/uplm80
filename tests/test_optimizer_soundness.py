@@ -173,3 +173,54 @@ def test_o3_inlining_and_propagation_keep_what_the_program_does(opt):
 
     -O2 is the reference."""
     assert run_plm(O3_SRC, opt).strip() == "123351123.2111.22.7.", opt
+
+
+SUBSCRIPTED_SCALAR_SRC = """
+0100H:
+t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
+declare b byte, c byte, w address, v address, k byte;
+/* after a character constant */
+q1: procedure byte;
+    declare (x, y) byte;
+    x = 'x'; y = 'y';
+    return x(1);
+end q1;
+/* after a copy: x(1) is the byte after x, not the byte after y */
+q2: procedure byte;
+    declare (x, y, z) byte;
+    y = k; z = 'z';
+    x = y;
+    return x(1);
+end q2;
+b = 'b'; c = 'c';
+call putc(b(1));
+w = 1234h; v = 4443h;
+call putc(low(w(1))); call putc(high(w(1)));
+call putc(q1);
+k = 'k';
+call putc(q2);
+call putc('.');
+end t;
+"""
+
+
+@pytest.mark.parametrize("opt", [0, 1, 2, 3])
+def test_a_subscripted_scalar_is_a_place_not_its_value(opt):
+    """PL/M-80 lets a scalar be subscripted: `x(1)' is the byte after x.
+
+    -O3 propagated into the name what it knew x held.  After `x = 'x'',
+    `return x(1)' became a CALL through 78H with the argument 1, and the
+    program ran into page zero; after `w = 1234H', `w(1)' was a CALL
+    through 1234H.  After `x = y', `x(1)' read the byte after y.  The name
+    of a subscripted variable is a place, like the target of an
+    assignment.  -O0 to -O2 did not propagate there and are the reference."""
+    assert run_plm(SUBSCRIPTED_SCALAR_SRC, opt) == "cCDyk.", opt
+
+
+def test_a_subscripted_scalar_is_not_called():
+    """The same at the level of the code: nothing in the program is an
+    indirect call, so ??jpde is never needed."""
+    asm = _asm(SUBSCRIPTED_SCALAR_SRC, opt=3)
+    assert "??jpde" not in asm.lower(), asm

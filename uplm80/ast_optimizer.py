@@ -1548,7 +1548,8 @@ class ASTOptimizer:
         ``A = 5`` into the literal ``5`` turns the assignment into a
         store *through address 5* — on CP/M, straight into the BDOS
         entry vector. Only an array element's subscript is a value, and
-        only that is optimized here.
+        only that is optimized here. The operand of ``.`` and the name a
+        call in an expression subscripts or calls are places too.
         """
         inner = unwrap_paren(target)
         if isinstance(inner, P.Call):
@@ -2133,7 +2134,13 @@ class ASTOptimizer:
             return P.MemberAccess(base=opt_base, member=expr.member, pos=expr.pos)
 
         if isinstance(expr, P.Call):
-            opt_callee = self._optimize_expr(expr.callee)
+            # The callee of a call in an expression names a procedure, a
+            # built-in or a variable, never a value, so it is a place as an
+            # assignment target is. PL/M-80 lets a scalar be subscripted --
+            # `x(1)' is the byte after x -- and propagating into it turned
+            # `x = 'x'; return x(1)' into a CALL through 78H, and
+            # `x = y; return x(1)' into a read of the byte after y.
+            opt_callee = self._optimize_target(expr.callee)
             callee = unwrap_paren(opt_callee)
             if (isinstance(callee, P.Identifier)
                     and ident_text(callee.name).upper() in ("SIZE", "LENGTH", "LAST")
@@ -2162,7 +2169,7 @@ class ASTOptimizer:
             return P.Call(callee=opt_callee, args=opt_args, pos=expr.pos)
 
         if isinstance(expr, P.CallNoArgs):
-            opt_callee = self._optimize_expr(expr.callee)
+            opt_callee = self._optimize_target(expr.callee)
             return P.CallNoArgs(callee=opt_callee, pos=expr.pos)
 
         if isinstance(expr, P.LocationOf):
