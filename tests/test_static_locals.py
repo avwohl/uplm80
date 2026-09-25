@@ -702,6 +702,56 @@ def test_a_return_does_not_take_the_statement_before_it_for_the_value(opt):
     assert _run(READCS, opt) == "56"
 
 
+# ---- counted loops ------------------------------------------------------------
+
+COUNTED_RUN_ON = """
+ov: procedure byte;
+    declare arr (2) byte, i byte;
+    declare n byte;
+    arr(0) = 0; arr(1) = 0;
+    n = 2;
+    do i = 0 to 9; arr(0) = arr(0) + 1; end;
+    return arr(n);
+end ov;
+call mon1(2, 'A' + ov - 10);
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_counted_loop_index_read_through_an_overrun(opt):
+    """A BYTE `DO i = 0 TO 9' whose body does not name `i' counts in B,
+    and gives `i' its final value only if something may read it; `arr(2)'
+    is `i', ten when the loop is done, and the loop left it 0."""
+    assert _run(COUNTED_RUN_ON, opt) == "A"
+
+
+COUNTED_RETURN = """
+declare cnt byte;
+rt: procedure byte;
+    declare (i, seen) byte;
+    if seen = 1 then return i;
+    seen = 1;
+    cnt = 0;
+    do i = 0 to 9;
+        cnt = cnt + 1;
+        if cnt = 3 then return 0;
+    end;
+    return 0ffh;
+end rt;
+call mon1(2, rt + 'A');
+call other;
+call mon1(2, rt + 'A');
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_return_from_a_counted_loop_leaves_the_index_it_had(opt):
+    """`i' is static (the second call reads it first), so the RETURN in
+    the third pass leaves it 2 for the next call; the counted loop stored
+    its final value, 10, before it started: `A.K'."""
+    assert _run(COUNTED_RETURN, opt) == "A.C"
+
+
 # ---- which frames ??AUTO may overlay ---------------------------------------
 
 def _generator(body: str, opt: int = 2) -> CodeGenerator:

@@ -1194,10 +1194,13 @@ class CodeGenerator:
         if name in self._aliased:
             return False    # a store through its address does not name it
         owner = self._var_owner(sym, name)
-        if owner == self._UNKNOWN_OWNER:
+        if owner == self._UNKNOWN_OWNER or self._reached_unnamed(owner, name):
             return False
-        if after_return and owner != self.current_proc and self._stmts_contain_return(body_stmts):
-            return False    # whoever this returns to can read it
+        if after_return and self._stmts_contain_return(body_stmts) and (
+                owner != self.current_proc or self._keeps_its_value(sym)):
+            # Whoever this returns to can read it, and so can the next call
+            # of this procedure if the variable keeps its value (8.1.7).
+            return False
         shared = sym.is_public or sym.is_external
         for callee in self._callees_of(body_stmts):
             if callee in self.proc_body:
@@ -1206,6 +1209,19 @@ class CodeGenerator:
             elif shared:
                 return False    # another module's procedure, which may name it
         return True
+
+    def _reached_unnamed(self, owner: str | None, name: str) -> bool:
+        """Whether local ``name`` of ``owner`` can be read or written without
+        its name: through a pointer run on from a local declared before it,
+        or an overrun of an array declared before it (see local_storage)."""
+        storage = getattr(self, "local_storage", None)
+        return storage is not None and (owner, name) in storage.reachable
+
+    @staticmethod
+    def _keeps_its_value(sym: Symbol) -> bool:
+        """Whether a variable keeps its value from one call of its procedure
+        to the next: all but a REENTRANT procedure's, and those in ??AUTO."""
+        return sym.stack_offset is None and not (sym.asm_name or "").startswith("??AUTO")
 
     def _bound_is_fixed(self, bound, body_stmts, index_name: str) -> bool:
         """Whether a loop's bound is the same every time round.
@@ -5051,7 +5067,8 @@ class CodeGenerator:
         if (self.current_proc_decl is None or sym is None
                 or sym.kind != SymbolKind.VARIABLE or sym.based_on
                 or sym.is_public or sym.is_external or name in self._aliased
-                or self._var_owner(sym, name) != self.current_proc):
+                or self._var_owner(sym, name) != self.current_proc
+                or self._reached_unnamed(self.current_proc, name)):
             return True
         stack = [self.current_proc_decl.body]
         while stack:

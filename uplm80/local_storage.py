@@ -330,6 +330,9 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
         # into the locals declared after them: they and those locals share
         # one storage class, in declaration order
         self.runs: set[tuple[str, str]] = set()
+        # locals a program can read or write without naming them: through a
+        # pointer run on from one declared before them, or an overrun
+        self.reachable: set[tuple[str, str]] = set()
         self.proc_addr_taken: set[str] = set()
         # INTERRUPT procedures, which run whenever the interrupt comes
         self.interrupts: set[str] = set()
@@ -454,6 +457,7 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
                 out[full], spanned, why = self._close(full, info)
                 for q in spanned:
                     for n, loc in self.procs[q].locals.items():
+                        self.reachable.add((q, n))
                         if loc.kind != FIXED and (q, n) not in self.reasons:
                             self.make_static(q, n, why)
                             grew = True
@@ -509,6 +513,12 @@ class LocalStorage:  # pylint: disable=too-many-instance-attributes
                     changed |= take([loc.name for loc in tail],
                                     f"{runs[0].name}, subscripted by a variable, "
                                     "runs on into a static local")
+        if escaped:
+            self.reachable.update((full, loc.name) for loc in locs
+                                  if loc.order >= escaped[0].order)
+        if runs:
+            self.reachable.update((full, loc.name) for loc in locs
+                                  if loc.order > runs[0].order)
         spanned: list[str] = []
         why = ""
         if escaped:
