@@ -477,3 +477,35 @@ def test_uplm80s_main_calls_intels_procedures(opt):
     _, main = _t2_parts()
     program = _t2_program(_T2_EXTERNALS, _show_after_each_call(main))
     assert _t2_run(opt, program, _fixture("t2_procs.asm")) == T2_EXPECT
+
+
+# STACKPTR in a call's last argument reads SP with what is pushed while that
+# argument is evaluated.  PL/M-80 V3.1 compiled this program, and its code
+# printed STACKPTR_EXPECT: it pushes the first arguments, and for these calls
+# nothing more.  uplm80 pushes BC round the last argument's code where that
+# may write B or C, and `stackptr - sp0' calls ??subde, which does not.
+STACKPTR_ARGS = PRELUDE[:PRELUDE.index("declare res")] + """
+declare (sp0, r, pp) address, bv byte;
+p5: procedure (a, b, c, d, e); declare (a, d) byte, (b, c, e) address; r = e; end p5;
+p3: procedure (a, b, c); declare (a, b, c) address; r = c; end p3;
+p2: procedure (a, b); declare (a, b) address; r = b; end p2;
+pb: procedure (a, b); declare a byte, b address; r = b; end pb;
+bv = 7; pp = .p2;
+sp0 = stackptr;
+call p5(1, 2, 3, 4, stackptr - sp0); call ph(r);
+call p5(1, 2, 3, 4, stackptr); call ph(r - sp0);
+call p3(1, 2, stackptr - sp0); call ph(r);
+call p2(4, stackptr - sp0); call ph(r);
+call pb(bv, stackptr - sp0); call ph(r);
+call p2(4, stackptr - sp0 - 2); call ph(r);
+call pp(4, stackptr - sp0); call ph(r);
+end t;
+"""
+
+STACKPTR_EXPECT = "FFFA FFFA FFFE 0000 0000 FFFE 0000"
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_stackptr_in_the_last_argument_reads_what_plm80s_code_reads(opt):
+    out = run_plm(STACKPTR_ARGS, opt)
+    assert out.replace("\0", "").strip() == STACKPTR_EXPECT

@@ -180,6 +180,20 @@ leaves the stack alone after the call.
   procedure's callee (`tests/test_goto_stack.py`). A GOTO to a label in a
   DO block of the main program, which draws a warning, leaves them, as
   Intel's PL/M-80 does.
+- `STACKPTR` in a call's arguments reads SP with the arguments pushed for
+  the call so far, as in PL/M-80's code. After `sp0 = stackptr`, `call
+  p5(1, 2, 3, 4, stackptr - sp0)` passes 0FFFAH, three words down, and
+  `call p2(4, stackptr - sp0)` passes 0, as PL/M-80 V3.1's code does;
+  0.3.7 passed 0 to both, p5 and p2 being private. BC, the next-to-last
+  argument, is saved round the last one's code only where that may write
+  B or C: round a call of a procedure, `??mul16`, `??div16`, `??mod16` or
+  `??inp`, and not of `??subde`, which leaves BC as it is. The two
+  compilers still differ in two cases. V3.1 loads a next-to-last argument
+  that is a constant or a variable into BC after the last one's code, and
+  so saves nothing round it: with `one` = 1, `call p2(4, (stackptr - sp0)
+  * one)` passes 0 there and 0FFFEH here. And it pushes a next-to-last
+  argument it has computed while it evaluates the last: `call p2(sp0 -
+  stackptr, stackptr - sp0)` passes 0FFFEH there and 0 here.
 - `??jphl` replaces `??jpde`.
 
 ### Fixed
@@ -194,17 +208,19 @@ leaves the stack alone after the call.
 
 - `tests/test_calling_convention.py`: the sequences, at `-O0`, for 0 to 5
   arguments of either type in every order, conversions, BC kept while the
-  last argument is evaluated, entries, the A/HL exception and what takes
-  it away, REENTRANT entries and exits, calls through an address, MON1 and
-  MON2, and the two errors.
+  last argument is evaluated where its code may write B or C (and what
+  each runtime routine writes, read from its code), entries, the A/HL
+  exception and what takes it away, REENTRANT entries and exits, calls
+  through an address, MON1 and MON2, and the two errors.
 - `tests/test_calling_convention_run.py`, at `-O0` to `-O3`: uplm80 code
   with assembly written to the convention, both ways; REENTRANT and
   recursive procedures across the boundary; calls through an address to
   every kind of procedure; PUBLIC procedures across separately compiled
-  modules and in one multi-file compile; DRI's `MON1 … GO TO BDOS`; and
-  Intel's own code, `tests/fixtures/plm80_v31`: a module compiled by
-  PL/M-80 V3.1, its listing transcribed, with Intel's `MAIN` calling
-  uplm80's procedures and uplm80's `MAIN` calling Intel's.
+  modules and in one multi-file compile; DRI's `MON1 … GO TO BDOS`;
+  `STACKPTR` in a call's last argument, against what PL/M-80 V3.1's code
+  passes; and Intel's own code, `tests/fixtures/plm80_v31`: a module
+  compiled by PL/M-80 V3.1, its listing transcribed, with Intel's `MAIN`
+  calling uplm80's procedures and uplm80's `MAIN` calling Intel's.
 - `tests/test_upeepz80_version.py`: the upeepz80 floor, against
   pyproject.toml's, and what is refused and accepted below it.
 - `tests/abi_fuzz.py`, a fuzz test of the convention across modules: random

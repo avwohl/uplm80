@@ -14,7 +14,8 @@ runs them against assembly written to the convention.
 
 import pytest
 
-from uplm80.codegen import Mode
+from uplm80 import runtime
+from uplm80.codegen import AsmLine, CodeGenerator, Mode
 from uplm80.compiler import Compiler
 
 DECLS = """
@@ -140,10 +141,18 @@ def test_an_argument_is_converted_to_its_parameters_type(stmt, code):
     ("call p2ab(a1, 5);", False),
     ("call p2aa(a1, a2 + a3);", False),
     ("call p4(b1, a2, b3, fa);", True),
+    # runtime routines: ??subde leaves BC, the others write B or C
+    ("call p2aa(a1, a2 - a3);", False),
+    ("call p4(b1, a2, b3, a4 - a1);", False),
+    ("call p2aa(a1, a2 * a3);", True),
+    ("call p2aa(a1, a2 / a3);", True),
+    ("call p2aa(a1, a2 mod a3);", True),
+    ("call p2ab(a1, input(b2));", True),
 ])
 def test_the_next_to_last_argument_is_kept_while_the_last_is_evaluated(stmt, saved):
     """The last argument's code runs with the one before it in BC: where it
-    may write B or C - it calls a procedure - BC is saved round it."""
+    may write B or C - it calls a procedure, or a runtime routine that
+    writes them - BC is saved round it."""
     code = _main(stmt)
     i = code.index("ld\tbc,(A1)") if "ld\tbc,(A1)" in code else \
         max(i for i, l in enumerate(code) if l.startswith("ld\tc,"))
@@ -152,6 +161,39 @@ def test_the_next_to_last_argument_is_kept_while_the_last_is_evaluated(stmt, sav
         assert rest[0] == "push\tbc" and rest[-2] == "pop\tbc", code
     else:
         assert "push\tbc" not in rest and "pop\tbc" not in rest, code
+
+
+def _routines() -> dict[str, list[AsmLine]]:
+    """Each routine of runtime.py, by name, as lines of code."""
+    routines = {}
+    for const, text in vars(runtime).items():
+        if not const.startswith("RUNTIME_"):
+            continue
+        name = text.split(":", 1)[0]
+        code = []
+        for line in text.splitlines():
+            line = line.split(";", 1)[0].strip()
+            if line and not line.endswith(":"):
+                op, _, operands = line.partition("\t")
+                code.append(AsmLine(opcode=op, operands=operands.strip()))
+        routines[name] = code
+    return routines
+
+
+def test_a_runtime_routine_is_taken_to_write_what_its_code_writes():
+    """BC is kept round the last argument's code where that may write B or C.
+    A call of a runtime routine writes what the routine's code writes of B,
+    C, D and E, a call in it counting for what its callee writes; a call of
+    anything else - another routine, a procedure - may write all four."""
+    routines = _routines()
+    table = CodeGenerator._RUNTIME_WRITES
+    assert set(table) <= set(routines)
+    for name, written in table.items():
+        assert {r for r in "bcde" if CodeGenerator._writes(routines[name], {r})} == written, name
+    for name in sorted(set(routines) - set(table)) + ["P", "5"]:
+        assert CodeGenerator._writes([AsmLine(opcode="call", operands=name)], {"b"}), name
+    assert not CodeGenerator._writes([AsmLine(opcode="call", operands="nz,??subde")], set("bcde"))
+    assert CodeGenerator._writes([AsmLine(opcode="call", operands="nz,P")], {"c"})
 
 
 def test_a_call_in_an_argument_is_made_before_anything_is_placed_after_it():

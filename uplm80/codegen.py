@@ -4149,8 +4149,16 @@ class CodeGenerator:
     # What an instruction of an argument's code can write of B, C, D and E.
     # These may write any of them:
     _WRITES_ANY = frozenset((
-        "call", "rst", "djnz", "exx", "ldi", "ldir", "ldd", "lddr", "cpi", "cpir",
+        "rst", "exx", "ldi", "ldir", "ldd", "lddr", "cpi", "cpir",
         "cpd", "cpdr", "ini", "inir", "ind", "indr", "outi", "otir", "outd", "otdr"))
+    # What a call of each runtime routine (runtime.py) writes of them; a call
+    # of anything else - a procedure, ??move, ??jphl - may write any.  BC
+    # pushed round `call ??subde' would make STACKPTR in `call p(4, stackptr
+    # - sp0)' read 2 less than it does in PL/M-80's code, which pushes nothing.
+    _RUNTIME_WRITES = {
+        "??subde": frozenset(), "??outp": frozenset(), "??inp": frozenset("c"),
+        "??mod16": frozenset("bc"), "??div16": frozenset("bc"),
+        "??mul8": frozenset("bde"), "??mul16": frozenset("bcde")}
     # These write the register their first operand names (`ld c,a', `pop bc'),
     # with the number of operands each has:
     _WRITES_FIRST = {"ld": 2, "in": 2, "pop": 1, "inc": 1, "dec": 1, "rl": 1, "rr": 1,
@@ -4165,31 +4173,43 @@ class CodeGenerator:
     @classmethod
     def _writes(cls, code: list[AsmLine], regs: set[str]) -> bool:
         """Whether a line of ``code`` may write one of ``regs`` (of b, c, d
-        and e).  A condition is not a register: `jp c,x' writes no C."""
+        and e)."""
         if not regs:
             return False
         for line in code:
-            op = line.opcode.lower()
-            if not op or op in cls._WRITES_NONE:
-                continue
-            if op in cls._WRITES_ANY:
-                return True
-            operands = [o.strip().lower() for o in line.operands.split(",")] \
-                if line.operands else []
-            if op == "ex" and operands in (["af", "af'"], ["(sp)", "hl"],
-                                           ["(sp)", "ix"], ["(sp)", "iy"]):
-                continue
-            if op == "ex" and operands == ["de", "hl"]:
-                dest = "de"
-            elif op in ("set", "res") and len(operands) == 2:
-                dest = operands[1]
-            elif op in cls._WRITES_FIRST and len(operands) == cls._WRITES_FIRST[op]:
-                dest = operands[0]
-            else:
-                return True             # not known
-            if set(dest if dest in ("bc", "de") else (dest,)) & regs:
+            written = cls._line_writes(line)
+            if written is None or written & regs:
                 return True
         return False
+
+    @classmethod
+    def _line_writes(cls, line: AsmLine) -> frozenset[str] | None:
+        """What ``line`` writes of b, c, d and e; None if it may write any.
+        A condition is not a register: `jp c,x' writes no C."""
+        op = line.opcode.lower()
+        if not op or op in cls._WRITES_NONE:
+            return frozenset()
+        if op in cls._WRITES_ANY:
+            return None
+        operands = [o.strip().lower() for o in line.operands.split(",")] \
+            if line.operands else []
+        if op == "ex" and operands in (["af", "af'"], ["(sp)", "hl"],
+                                       ["(sp)", "ix"], ["(sp)", "iy"]):
+            return frozenset()
+        if op == "call":
+            # `call cc,x' has its target second.
+            return cls._RUNTIME_WRITES.get(operands[-1] if operands else "")
+        if op == "ex" and operands == ["de", "hl"]:
+            dest = "de"
+        elif op == "djnz":
+            dest = "b"
+        elif op in ("set", "res") and len(operands) == 2:
+            dest = operands[1]
+        elif op in cls._WRITES_FIRST and len(operands) == cls._WRITES_FIRST[op]:
+            dest = operands[0]
+        else:
+            return None                 # not known
+        return frozenset(dest if dest in ("bc", "de") else (dest,)) & frozenset("bcde")
 
     def _param_slot(self, sym, param_name: str, callee_name: str | None) -> str:
         """The label of parameter ``param_name`` of procedure ``sym``."""
