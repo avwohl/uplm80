@@ -407,6 +407,38 @@ call run;
 """, [7, 0xC8, 3, 0x1002, 8, 2, 0xABCD, 1, 0x1234, 0x24, 0x2C, 0x279, 10])
 
 
+def test_a_reentrant_procedures_parameter_factored_with_its_locals():
+    """`DECLARE (TOP, C) BYTE' names a REENTRANT procedure's parameter with
+    a local. The parameter was declared a second time, as a local in the
+    frame that nothing had set, and every use of it read that: rp(3) was 1
+    (0.3.6 the same). Declared on its own it was right. Intel's PL/M-80
+    V3.1 compiles this program to print what is expected here."""
+    _check("""
+rp: procedure (top) byte reentrant;
+  declare (top, c) byte;
+  c = top + 1;
+  if top = 0 then return c;
+  return rp(top - 1) + c;
+end rp;
+rq: procedure (n, s) address reentrant;
+  declare (k, n) byte, (s, w) address;
+  k = n; w = s + k;
+  if n = 0 then return w;
+  return rq(n - 1, w) + k;
+end rq;
+rr: procedure (a, b, c) address reentrant;
+  declare (a, x, b) address, (y, c) byte;
+  x = a + 1; y = c + 2;
+  if c = 0 then return x + b + y;
+  return rr(x, b, c - 1) + y;
+end rr;
+run: procedure;
+  call ph(rp(3)); call ph(rq(3, 100h)); call ph(rr(10h, 200h, 2));
+end run;
+call run;
+""", [0xA, 0x10C, 0x21C])
+
+
 def test_a_based_array_on_a_structure_member_indexed_by_a_byte():
     """`token BASED pcb.tok (4) BYTE' keeps its pointer in the member
     `pcb.tok'. An element with a variable BYTE subscript took the pointer

@@ -30,6 +30,14 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **A REENTRANT procedure's parameter declared with its locals,**
+  `DECLARE (top, c) BYTE`, was declared a second time, as a local in the
+  frame, which nothing set, and every use of it read that: `rp(3)` of a
+  recursive `rp` returned 1 where it returns 0AH (Known issues, 0.3.7;
+  0.3.6 the same). It is the parameter, on the stack, as it was when
+  declared on its own; the local beside it is the frame's first byte.
+  Intel's PL/M-80 V3.1 compiles `tests/test_calls_and_loops.py`'s
+  program to print what uplm80's prints at `-O0` to `-O3`.
 - `tests/run_tests.sh`'s `test_byte_conditions` expected an IF and a DO
   WHILE to test for non-zero, as uplm80 did before 0.3.5, and failed.
   They test the least significant bit (5.1.2): 128, 10, 2 and 256 are
@@ -1174,9 +1182,6 @@ Each fix has a regression test that fails without it.
   PL/M-80 increments with INX and INR too (PIP.PLM declares a variable
   `ONE = 1` so that `DEC(C1 + ONE)` gets an ADD and its carry), and the
   manual (12.1) warns that the flags cannot be relied on.
-- **A REENTRANT procedure's parameter in a factored declaration with its
-  locals,** `DECLARE (top, c) BYTE`, is taken for a local; declared on its own
-  it is read from the stack as it should be.
 - **A counted loop trusts that a pointer made from `.x` reaches only `x`, for
   a module-level `x`.** A BYTE `DO i = 0 TO n` whose body does not name `i`
   counts its passes in B. It is not used when anything can reach `i` another

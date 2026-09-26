@@ -3553,11 +3553,11 @@ class CodeGenerator:
                     continue
                 # A factored declaration can name parameters with locals,
                 # `DECLARE (B, I) BYTE': the parameters have their storage
-                # already.  (Declared again, a static parameter was
-                # defined twice.  A REENTRANT procedure's still comes out
-                # as a local: see CHANGELOG, Known issues.)
-                self._gen_var_decl(local_decl,
-                                   skip=frozenset() if attrs.is_reentrant else frozenset(params))
+                # already, static or in a REENTRANT procedure's frame.
+                # (Declared again, a static parameter was defined twice,
+                # and a REENTRANT procedure's became a local in its frame,
+                # which nothing had set.)
+                self._gen_var_decl(local_decl, skip=frozenset(params))
             else:
                 self._gen_declaration(local_decl)
 
