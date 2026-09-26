@@ -30,7 +30,7 @@ any.
   nothing did where the optimizer dropped the use (Known issues, 0.3.7;
   0.3.6 the same). A built-in needs no declaration, and in a multi-file
   compile a module still names another's PUBLIC name without declaring it
-  EXTERNAL.
+  EXTERNAL, unless it is a built-in's name, which is the built-in (Fixed).
 
       NOSUCH is not declared (Programming Manual 9800268B, 6.1)
 
@@ -137,6 +137,20 @@ any.
   that declares no built-in's name compiles to the code 0.4.0 compiles it
   to: the 87 MP/M II and 80un compiles, and 300 random programs and the
   test programs, at `-O0` to `-O3`.
+
+  In a multi-file compile, the other way round: a module that does not
+  declare a built-in's name means the built-in, as it does compiled alone
+  and linked, though another module makes a procedure or a variable of
+  that name PUBLIC (10.4). With module MA's `shl: procedure (a, b) address
+  public` and `double: procedure (a) address public`, module MB's `shl(w,
+  4)` called MA's SHL at `-O0` to `-O2`, and `w * 8`, which the optimizer
+  makes SHL(w, 3), at `-O2` and `-O3`; `double(30h)` was MA's DOUBLE at
+  `-O0` and 30H from `-O1` up; and a MEMORY or a STACKPTR another module
+  made PUBLIC was MB's `memory(0)`, `.memory` and `stackptr` (0.4.0 the
+  same). The optimizer took each for the built-in, and code generation,
+  which holds one PUBLIC name for every module, for MA's. Now MB's are the
+  built-ins at every level, and a module that declares the name EXTERNAL
+  gets MA's, as it did. The 80un programs compile as before.
 - **PLUS, MINUS, SCL and SCR after `+ 4` or `- 4` of an ADDRESS read the
   carry that the addition or subtraction sets**, as in Intel's PL/M-80
   V3.1. uplm80 stepped an ADDRESS by 1 to 4 with `inc hl` and `dec hl`,
@@ -271,6 +285,8 @@ any.
   in an expression, an INTERRUPT procedure in a procedure and in a DO
   block, a LITERALLY's name declared again - and every built-in compiling
   undeclared.
+- `tests/test_names.py`: a module compiled with one that makes SHL, SHR,
+  DOUBLE, MEMORY and STACKPTR PUBLIC, declaring them EXTERNAL and not.
 - `tests/test_expression_types.py`: a procedure named like each built-in
   that is one, and a variable named like each that can be one; PLUS,
   MINUS, SCL and SCR after `+ 4` and `- 4`, and 1 to 3 still `inc hl`.

@@ -859,6 +859,80 @@ def test_a_public_procedure_needs_no_external_declaration(opt):
                         opt) == "aAbBcCm"
 
 
+_BUILTINS_LIB = """lib: do;
+shl: procedure (a, b) address public;
+  declare a address, b byte;
+  return 0abcdh;
+end shl;
+shr: procedure (a, b) address public;
+  declare a address, b byte;
+  return 0dcbah;
+end shr;
+double: procedure (a) address public;
+  declare a byte;
+  return 0bbbbh;
+end double;
+declare memory (4) byte public initial ('L', 'L', 'L', 'L');
+declare stackptr address public initial (1234h);
+peek: procedure byte public;
+  return memory(0);
+end peek;
+own: procedure address public;
+  return shl(1, 1) + double(1) + stackptr;
+end own;
+end lib;
+"""
+
+_BUILTINS_USER = """0100H:
+m: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+peek: procedure byte external; end peek;
+own: procedure address external; end own;
+%s
+hexd: procedure (d);
+  declare d byte;
+  d = d and 0fh;
+  if d < 10 then call mon1(2, d + '0');
+  else call mon1(2, d + 37h);
+end hexd;
+ph: procedure (v);
+  declare v address;
+  call hexd(shr(high(v), 4)); call hexd(high(v));
+  call hexd(shr(low(v), 4)); call hexd(low(v));
+  call mon1(2, ' ');
+end ph;
+declare w address, b byte;
+w = 1234h; b = 5;
+call ph(shl(w, 4)); call ph(w * 8); call ph(double(b)); call ph(double(30h));
+call ph(w / 2);
+memory(0) = 'Q'; call ph(peek);
+call ph(stackptr = 1234h);
+call ph(own);
+end m;
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("external, expect", [
+    ("", "2340 91A0 0005 0030 091A 004C 0000 79BC "),
+    ("shl: procedure (a, b) address external; declare a address, b byte; end shl;\n"
+     "double: procedure (a) address external; declare a byte; end double;",
+     "ABCD 91A0 BBBB BBBB 091A 004C 0000 79BC "),
+])
+def test_a_built_in_another_module_makes_public_is_still_the_built_in(opt, external, expect):
+    """A module that does not declare SHL, DOUBLE, MEMORY or STACKPTR
+    means the built-in, as it does compiled alone: another module's PUBLIC
+    procedure or variable of the name is not declared in it (9.2, 10.4).
+    Compiled together with a module that makes them PUBLIC, it called that
+    module's SHL for `shl(w, 4)' at -O0 to -O2, and at -O2 and -O3 for
+    `w * 8' too, which the optimizer makes SHL(w, 3); `double(30h)' was
+    the PUBLIC DOUBLE at -O0 and 30H from -O1 up; `memory(0) = 'Q'' stored
+    to the other module's MEMORY, and STACKPTR was its variable (0.4.0 the
+    same).  Declared EXTERNAL, each is the other module's."""
+    user = _BUILTINS_USER % external
+    assert _run_modules([user, _BUILTINS_LIB], opt) == expect
+
+
 def test_a_module_without_a_name_goes_by_its_files():
     r = _compile_modules(["declare x byte public;\nq: procedure; x = 1; end q;\ncall q;\n",
                           "declare x byte external;\nq: procedure; x = 2; end q;\n"])

@@ -99,6 +99,14 @@ class SymbolTable:
         self.global_scope = Scope(level=0, name="<global>")
         self.current_scope = self.global_scope
         self._init_builtins()
+        # The built-ins, procedures and variables, whatever the program
+        # declares later.
+        self.builtins = dict(self.global_scope.symbols)
+        # The names of the built-ins that the module being compiled does not
+        # declare and that another module of a multi-file compile makes
+        # PUBLIC or EXTERNAL: here they are still the built-ins (see
+        # CodeGenerator._kept_builtins).
+        self.kept_builtins: frozenset[str] = frozenset()
 
     def _init_builtins(self) -> None:
         """Initialize built-in symbols."""
@@ -195,7 +203,10 @@ class SymbolTable:
         """Look up a symbol by name."""
         if name == DOUBLE_MARK:
             return self._double
-        return self.current_scope.lookup(name)
+        sym = self.current_scope.lookup(name)
+        if name in self.kept_builtins and sym is self.global_scope.symbols.get(name):
+            return self.builtins[name]
+        return sym
 
     def lookup_local(self, name: str) -> Symbol | None:
         """Look up a symbol in current scope only."""

@@ -150,13 +150,14 @@ where:
 
 - Every name is declared, the built-ins aside (6.1); in a multi-file
   compile a module may name another's PUBLIC name without declaring it
-  EXTERNAL.
+  EXTERNAL, but for a built-in's name, which is the built-in in a module
+  that does not declare it, as it is compiled alone.
 - Each parameter is declared once, by a DECLARE of its procedure, as a
   BYTE or an ADDRESS scalar, not BASED and with no other attribute
   (8.1.1).
 - A declaration hides the built-in of its name (9.2): a procedure DOUBLE
-  or a variable OUTPUT, MEMORY or STACKPTR of the program's is the
-  program's, and the compiler never takes it for the built-in.
+  or a variable OUTPUT, MEMORY or STACKPTR that a module declares is the
+  module's there, and the compiler never takes it for the built-in.
 - A LITERALLY's text takes its name's place throughout its scope (6.4), a
   declaration of the name in an inner block included: after `DECLARE N
   LITERALLY '5'`, an inner `DECLARE N BYTE` is `DECLARE 5 BYTE`, an error.

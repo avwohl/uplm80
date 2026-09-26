@@ -76,7 +76,11 @@ A or HL instead.)
 When the modules are compiled together, a PUBLIC procedure can also be
 called from another module without an EXTERNAL declaration there, as
 older uplm80 multi-file programs do; the EXTERNAL declaration is what
-lets each module also be compiled on its own.
+lets each module also be compiled on its own.  A procedure or a variable
+named like a built-in - SHL, DOUBLE, MEMORY, STACKPTR - is the
+exception: in a module that does not declare the name it is the
+built-in, as it is when that module is compiled alone, and the module
+declares it EXTERNAL to reach the other module's.
 
 ## Variables
 

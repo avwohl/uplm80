@@ -524,11 +524,14 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def lookup(name: str, block: _Block | None) -> _Decl | None:
-        """The declaration ``name`` means in ``block``: the innermost."""
+        """The declaration ``name`` means in ``block``: the innermost.  What
+        another module makes PUBLIC does not hide a built-in: a module that
+        does not declare SHL means the built-in, as it does compiled alone
+        (CodeGenerator._kept_builtins)."""
         while block is not None:
             d = block.decls.get(name)
             if d is not None:
-                return d
+                return None if block.kind == "global" and name in _BUILTINS else d
             block = block.parent
         return None
 

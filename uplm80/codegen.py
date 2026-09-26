@@ -695,8 +695,8 @@ class CodeGenerator:
         self._stmt_node = None
         self._warned_comparisons: set = set()  # see _check_impossible_comparison
         self.symbols = SymbolTable()
-        # The built-in variables, MEMORY and STACKPTR (see _declared).
-        self._predeclared = dict(self.symbols.global_scope.symbols)
+        # The built-ins, MEMORY and STACKPTR among them (see _declared).
+        self._predeclared = self.symbols.builtins
         self.output: list[AsmLine] = []
         self.label_counter = 0
         self.string_counter = 0
@@ -2404,6 +2404,8 @@ class CodeGenerator:
         shapes = [module_shape(m) for m in modules]
         self._module_decl_items = [d for sh in shapes for d in sh.decls
                                    if isinstance(d, P.DeclItem)]
+        kept = self._kept_builtins(shapes)
+        module_kept = {id(m): k for m, k in zip(modules, kept)}
 
         # Header
         module_names = ', '.join(s.name for s in shapes)
@@ -2434,8 +2436,10 @@ class CodeGenerator:
                     self.literal_macros[lit_name] = lit_text
 
         # Pre-register all procedures from all modules for forward references
-        for shape in shapes:
+        for shape, k in zip(shapes, kept):
+            self.symbols.kept_builtins = k
             self._collect_procedures(shape.decls, parent_proc=None, stmts=shape.stmts)
+        self.symbols.kept_builtins = frozenset()
 
         # Build unified call graph across all modules
         self._build_call_graph_multi(modules)
@@ -2474,6 +2478,7 @@ class CodeGenerator:
         # in CP/M mode among the constants after the code (see generate).
         self.emit_data_inline = True
         for module, decl in all_data_decls:
+            self.symbols.kept_builtins = module_kept[id(module)]
             self._gen_var_decl(decl)
         if self.code_data_segment and self._module_data_leads():
             self.output.extend(self.code_data_segment)
@@ -2482,10 +2487,12 @@ class CodeGenerator:
 
         # Process non-DATA declarations (allocate storage)
         for module, decl in all_other_decls:
+            self.symbols.kept_builtins = module_kept[id(module)]
             self._gen_declaration(decl)
 
         # Emit initialization/entry code
         if first_module_with_stmts:
+            self.symbols.kept_builtins = module_kept[id(first_module_with_stmts)]
             # Has module-level statements - emit init + statements
             self._emit()
             self._emit(comment="Module initialization")
@@ -2520,6 +2527,7 @@ class CodeGenerator:
         # module compiled alone.
         defined = {pname for _, _, pname, attrs in all_procedures if not attrs.is_external}
         for module, proc, pname, attrs in all_procedures:
+            self.symbols.kept_builtins = module_kept[id(module)]
             if attrs.is_external:
                 if pname not in defined:
                     defined.add(pname)
@@ -2533,6 +2541,7 @@ class CodeGenerator:
                 )
                 self._emit(comment=f"Module: {shape_name}")
                 self._gen_proc_decl(proc)
+        self.symbols.kept_builtins = frozenset()
 
         # Emit runtime library if needed
         if self.needs_runtime:
@@ -2583,6 +2592,35 @@ class CodeGenerator:
         self._emit("end")
 
         return "\n".join(str(line) for line in self.output)
+
+    def _kept_builtins(self, shapes) -> list[frozenset[str]]:
+        """For each module of a multi-file compile, the names of built-ins
+        that another module makes PUBLIC or EXTERNAL and that it does not
+        declare itself.  A name a module does not declare is the built-in
+        there (9.2), as it is when the module is compiled alone and linked:
+        another module's PUBLIC SHL is not declared in it (10.4).  The
+        symbol table holds each PUBLIC or EXTERNAL name once, for every
+        module, so while code is generated for such a module, lookups of
+        these names give the built-in (SymbolTable.kept_builtins)."""
+        declared: list[set[str]] = []
+        shared: set[str] = set()
+        for shape in shapes:
+            names: set[str] = set()
+            for d in shape.decls:
+                if isinstance(d, P.ProcDecl):
+                    attrs = proc_attrs(d)
+                    here = [proc_name(d)]
+                elif isinstance(d, P.DeclItem):
+                    attrs = decl_attrs(d)
+                    here = decl_item_names(d)
+                else:
+                    continue
+                names.update(here)
+                if attrs.is_public or attrs.is_external:
+                    shared.update(here)
+            declared.append(names)
+        builtin = shared & set(self.symbols.builtins)
+        return [frozenset(builtin - names) for names in declared]
 
     def _build_call_graph_multi(self, modules: list) -> None:
         """Build call graph by analyzing all procedures across multiple modules."""
