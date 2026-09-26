@@ -1,8 +1,6 @@
 # Work in progress — 2026-09-26
 
-Everything from the 2026-09-23 handoff is finished, merged and released.
-uplm80 0.4.1 is in progress on the branch `fix/0.4.1`, in the worktree
-`~/src/uplm80-041`: not pushed, and its version not bumped.  Every other
+Everything from the 2026-09-23 handoff is finished, merged and released.  Every
 repository below is on `main`, has no other branches and no extra worktrees, and
 nothing is left unpushed.  What remains are the follow-ups listed under
 **Still open**, none of which blocks anything.
@@ -57,35 +55,20 @@ python3.14 tools/verify_dri.py        # XDOS, BNKXDOS, RESBDOS, TMP, RDT, DDT id
   `mpm2/mpm2_external/mpm2src/PLM_WORK`) in about 1.5 CPU seconds per small
   compile; a 174-line test program already prints the same 66 lines from both
   compilers.  The next step is a `scripts/` oracle that feeds the random-program
-  difftest through it.  0.4.1's items were each checked against V3.1 that way
-  by hand, through a native ISIS emulator (`isis.cc`), again in a session
-  scratch directory.  (A native ISIS emulator written during the 0.4.0
+  difftest through it.  (A native ISIS emulator written during the 0.4.0
   research rebuilt 18 DRI programs byte for byte; it lived only in a session
   scratch directory.  Intel's binaries cannot be vendored into this repository.)
-* 0.4.1 (`fix/0.4.1`, CHANGELOG `## 0.4.1 — unreleased`) settles the Known
-  issues 0.3.7 listed and 0.4.0 carried, each against Intel's PL/M-80 V3.1's
-  listing, diagnostics and linked build: names declared nowhere, empty
-  parentheses, `.label`, nested INTERRUPT procedures, undeclared parameters,
-  a LITERALLY used before its declaration, a dimension that is not a number
-  and built-in names (in a multi-file compile too) are checked as V3.1
-  checks them; a counted loop over a module-level or static index sees
-  pointers and overruns, run on or back, of a structure's members too;
-  PLUS/MINUS/SCL/SCR after `+ 4`; a REENTRANT procedure's factored parameter.
-  Its own Known issues list what V3.1 still rejects and uplm80 compiles (`f()`
-  of a procedure, a subscript on a scalar, an array without a subscript,
-  INITIAL in a procedure, a procedure with no statements, a forward call),
-  and a counted loop over a local in `??AUTO`, which a store from another
-  frame or the module's variables does not end (counting none would cost ED,
-  PIP and 80un 17 to 20 bytes each).  Left for the release: bump the
-  version, rerun the Verified checks on the release commit, merge, tag, push.
+* The CHANGELOG's Known issues, 0.3.7 and 0.4.0: a procedure named DOUBLE is
+  taken for the built-in; a LITERALLY's name declared again in an inner block is
+  a syntax error; `STACKPTR` read inside an expression can see a pushed
+  temporary (Intel V3.1 does too); `.label` is accepted; a name declared nowhere
+  is not an error; a REENTRANT procedure's parameter factored with its locals.
 * Argument evaluation order differs from Intel V3.1 where the last argument
   changes a variable passed next-to-last; the language leaves it undefined
   (9800268B 4.5.1), so it is documented, not changed.
-* The workaround for um80 0.3.50's operator words (names.fix_symbols) is
-  harmless and can go once uplm80 requires um80 0.3.51 or later.  Nothing
-  requires it yet: pyproject.toml names only `upeepz80>=0.2.6`, and um80 is
-  installed on its own (0.4.0 and 0.4.1 are checked with 0.3.51 and 0.3.52).
-  0.4.1 drops the other, the `?` EQU for upeepz80 0.2.5's dead-store rule.
+* The workarounds for upeepz80 0.2.5's dead-store rule (the `?` EQU) and um80
+  0.3.50's operator words (names.fix_symbols) are harmless and can go now that
+  0.4.0 requires the fixed releases.
 
 ### um80_and_friends (0.3.52)
 

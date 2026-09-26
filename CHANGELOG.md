@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## 0.4.1 — unreleased
+## 0.4.1 — 2026-09-26
 
 The Known issues 0.3.7 listed, and 0.4.0 carried, each settled by the
 Programming Manual (9800268B) and, where it leaves room, by what Intel's
@@ -374,6 +374,16 @@ And one that V3.1 compiles to other code (0.4.0 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+- A loop over the last module-level variable is still counted where a
+  store through MEMORY reaches it: MEMORY follows the last variable, in
+  V3.1's layout as in uplm80's, so `p = .memory - 1` with a BASED `b`, or
+  `memory(0ffffh) = 20`, sets that variable, and the loop runs its count
+  (000B 0014 at `-O0` to `-O3`, where V3.1's build prints 0003 0015; 0.4.0
+  the same).
+- A label on an END statement, `out: end p;` (Programming Manual A.4.4.1),
+  is a syntax error; V3.1 compiles it (0.4.0 the same).
+- V3.1 rejects a zero dimension, `declare b (0) byte` (ERROR #57), and the
+  address of a built-in, `.double`; uplm80 accepts both (0.4.0 the same).
 
 ### Verified
 
