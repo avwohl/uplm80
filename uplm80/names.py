@@ -300,6 +300,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         # declare the name), by id: (call, the _Ref of its name).
         self.extent_calls: dict[int, tuple] = {}
         self._do_labels: dict[int, set[str]] = {}   # a DO block's labels, by id
+        # Whether to hold the program to what Intel's PL/M-80 V3.1 takes
+        # (intel): check_names does, on the parser's tree; resolve_names,
+        # on the optimizer's, which may have emptied a procedure, does not.
+        self.checking = False
 
     # ---- collecting ----------------------------------------------------
 
@@ -539,6 +543,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         """What Intel's PL/M-80 V3.1 rejects, with the errors ``numbers``:
         an error, or, where programs written for uplm80 rely on it
         (``warn``), a warning; ``text`` then says how it is compiled."""
+        if not self.checking:
+            return
         why = "Intel's PL/M-80 V3.1 rejects it (ERROR " + ", and ".join(
             f"#{n}, {self.INTEL_ERRORS[n]}" for n in numbers) + ")"
         if warn:
@@ -1301,6 +1307,7 @@ def check_names(modules: list, multi: bool = False) -> list[tuple]:
     empty parentheses, `f()', and INITIAL below module level.
     """
     r = _Resolver()
+    r.checking = True
     for i, m in enumerate(modules):
         r.add_module(m, i)
     r.bind()

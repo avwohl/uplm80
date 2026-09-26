@@ -17,6 +17,9 @@ import tempfile
 import pytest
 
 from uplm80.compiler import Compiler
+from uplm80.errors import CodeGenError
+from uplm80.frontend import parse_source
+from uplm80.names import check_names, resolve_names
 
 from ._toolchain import compile_cmd, compiler_env, run_asm, run_plm, tools_missing
 from .test_expression_types import _PRELUDE as _PH_PRELUDE
@@ -1397,6 +1400,17 @@ lp: do;
   q = tab(0); call q(3, 4); call ph(n);
 end lp;
 """
+
+
+def test_only_the_parsers_tree_is_held_to_what_v31_takes():
+    """check_names holds the program as the parser gives it to what V3.1
+    takes, at every level; resolve_names, which code generation runs on
+    the optimizer's tree, whose procedure's statements may be gone, does
+    not do it again."""
+    src = "t: do;\np: procedure;\n  declare k byte;\nend p;\nend t;\n"
+    with pytest.raises(CodeGenError, match="ERROR #174"):
+        check_names([parse_source(src, "T.PLM")])
+    resolve_names([parse_source(src, "T.PLM")])
 
 
 def test_what_v31_takes_of_those_forms_is_compiled_without_a_word(capsys):
