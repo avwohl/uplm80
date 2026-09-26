@@ -2633,22 +2633,17 @@ class ASTOptimizer:
         return make_typed_const(folded[0], folded[1], pos,
                                 derived=any(is_derived(a) for a in args))
 
-    def _fold_builtin_untyped(self, name: str, args: list, pos):
-        """A built-in of constants in a restricted expression, as numbers."""
-        if not all(_is_number(a) for a in args):
+    @staticmethod
+    def _fold_builtin_untyped(name: str, args: list, pos):
+        """The optimizer's own DOUBLE of a constant in a restricted
+        expression: the constant.  A built-in the program writes there is
+        an error, as Intel's PL/M-80 V3.1 has it (names.py,
+        _check_restricted); this folded SHL, SHR, ROL, ROR, LOW, HIGH and
+        DOUBLE of constants at -O1 and up, SHL and SHR of a BYTE in 16
+        bits, which -O0 refused."""
+        if name != DOUBLE_MARK or len(args) != 1 or not _is_number(args[0]):
             return None
-        values = [_num_value(a) for a in args]
-        name = "DOUBLE" if name == DOUBLE_MARK else name.upper()
-        if len(values) == 1:
-            v = values[0]
-            result = {"LOW": v & 0xFF, "HIGH": (v >> 8) & 0xFF, "DOUBLE": v & 0xFFFF}.get(name)
-        elif len(values) == 2 and name in ("SHL", "SHR", "ROL", "ROR"):
-            folded = fold_builtin(name, [(values[0], ADDRESS if name in ("SHL", "SHR") else BYTE),
-                                         (values[1], BYTE)])
-            result = None if folded is None else folded[0]
-        else:
-            result = None
-        return None if result is None else make_number_literal(result, pos=pos)
+        return make_number_literal(_num_value(args[0]), pos=pos)
 
     def _log2_if_power_of_2(self, n: int) -> int | None:
         """Return log2(n) if n is a power of 2, else None."""

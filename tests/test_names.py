@@ -1296,6 +1296,72 @@ V31_REJECTS = {
     "forward-call-from-a-reentrant": ("r: procedure reentrant;\n  call s;\nend r;\n"
                                       "s: procedure;\n  b = 1;\nend s;\ncall r;\n", (169,),
                                       "error: S: procedure S is declared after this call of it"),
+    # 0.4.3's Known issues: a built-in in a restricted expression, which
+    # -O1 and up folded (SHL and SHR of a BYTE in 16 bits) and -O0 refused
+    # with a message of its own, or took `.a + low(3)' and `at (double(12h))'
+    # for something else.
+    "shl-in-data": ("declare d address data (shl(0f0h, 4));\nw = d;\n", (151, 152),
+                    "T.PLM:8:25: error: SHL(0f0h, 4): SHL is a built-in, and a DATA or INITIAL "
+                    "value is a restricted expression, of constants and locations only; Intel's "
+                    "PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                    "EXPRESSION, and #152, MISSING ')' AFTER CONSTANT LIST)"),
+    "shr-in-initial": ("declare d address initial (shr(0f00h, 4));\nw = d;\n", (151, 152),
+                       "T.PLM:8:28: error: SHR(0f00h, 4): SHR is a built-in, and a DATA or "
+                       "INITIAL value is a restricted expression"),
+    "rol-in-data": ("declare d byte data (rol(81h, 1));\nb = d;\n", (151, 152),
+                    "T.PLM:8:22: error: ROL(81h, 1): ROL is a built-in"),
+    "ror-in-a-sum-in-data": ("declare d byte data (1 + ror(81h, 1));\nb = d;\n", (151, 152),
+                             "T.PLM:8:26: error: ROR(81h, 1): ROR is a built-in"),
+    "low-in-data": ("declare d(2) byte data (low(1234h), 5);\nb = d(1);\n", (151, 152),
+                    "T.PLM:8:25: error: LOW(1234h): LOW is a built-in"),
+    "high-in-initial": ("declare d byte initial (high(1234h));\nb = d;\n", (151, 152),
+                        "T.PLM:8:25: error: HIGH(1234h): HIGH is a built-in"),
+    "double-in-data": ("declare d address data (double(12h));\nw = d;\n", (151, 152),
+                       "T.PLM:8:25: error: DOUBLE(12h): DOUBLE is a built-in"),
+    "size-in-data": ("declare a(5) byte, d address data (.a + size(a));\nw = d;\n", (151, 152),
+                     "T.PLM:8:41: error: SIZE(A): SIZE is a built-in"),
+    "length-in-initial": ("declare a(5) byte;\ndeclare d address initial (length(a) - last(a));\n"
+                          "w = d;\n", (151, 152),
+                          "T.PLM:9:28: error: LENGTH(A): LENGTH is a built-in"),
+    "shl-in-at": ("declare d byte at (shl(1, 12));\nb = d;\n", (151, 146),
+                  "T.PLM:8:20: error: SHL(1, 12): SHL is a built-in, and an AT address is a "
+                  "restricted expression, a constant or a location plus or minus constants; "
+                  "Intel's PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                  "EXPRESSION, and #146, MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION)"),
+    "double-in-at": ("declare d byte at (double(12h));\nb = d;\n", (151, 146),
+                     "T.PLM:8:20: error: DOUBLE(12h): DOUBLE is a built-in, and an AT address"),
+    "size-in-at": ("declare a(5) byte, d byte at (.a + size(a));\nb = d;\n", (151, 146),
+                   "T.PLM:8:36: error: SIZE(A): SIZE is a built-in, and an AT address"),
+    "low-in-a-subscript-in-data": ("declare a(5) byte, d address data (.a(low(1)));\nw = d;\n",
+                                   (151, 150),
+                                   "T.PLM:8:39: error: LOW(1): LOW is a built-in, and a DATA or "
+                                   "INITIAL value is a restricted expression, of constants and "
+                                   "locations only; Intel's PL/M-80 V3.1 rejects it (ERROR #151, "
+                                   "INVALID OPERAND IN RESTRICTED EXPRESSION, and #150, MISSING "
+                                   "')' AT END OF RESTRICTED SUBSCRIPT)"),
+    "shl-in-a-subscript-in-at": ("declare a(5) byte, d byte at (.a(shl(1, 1)));\nb = d;\n",
+                                 (151, 150), "T.PLM:8:34: error: SHL(1, 1): SHL is a built-in, "
+                                 "and an AT address"),
+    "memory-in-data": ("declare d address data (memory);\nw = d;\n", (151,),
+                       "T.PLM:8:25: error: MEMORY: MEMORY is a built-in, and a DATA or INITIAL "
+                       "value is a restricted expression, of constants and locations only; "
+                       "Intel's PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN "
+                       "RESTRICTED EXPRESSION)\n"),
+    "stackptr-in-at": ("declare d byte at (stackptr);\nb = d;\n", (151,),
+                       "T.PLM:8:20: error: STACKPTR: STACKPTR is a built-in, and an AT address"),
+    "dot-stackptr-in-at": ("declare d byte at (.stackptr);\nb = d;\n", (211,),
+                           "T.PLM:8:21: error: .STACKPTR: STACKPTR is a built-in, and the "
+                           "location in an AT address is a variable's, or MEMORY's; Intel's "
+                           "PL/M-80 V3.1 rejects it (ERROR #211, INVALID IDENTIFIER IN 'AT' "
+                           "RESTRICTED REFERENCE)"),
+    "shl-in-a-constant-list": ("w = .(shl(1, 2), 3);\n", (151, 152),
+                               "T.PLM:8:7: error: SHL(1, 2): SHL is a built-in, and a constant "
+                               "list holds constants only; Intel's PL/M-80 V3.1 rejects it "
+                               "(ERROR #151, INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, "
+                               "MISSING ')' AFTER CONSTANT LIST)"),
+    "memory-in-a-constant-list": ("w = .(memory, 7);\n", (151,),
+                                  "T.PLM:8:7: error: MEMORY: MEMORY is a built-in, and a "
+                                  "constant list holds constants only"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
@@ -1338,9 +1404,12 @@ def test_what_v31_rejects_is_an_error(opt, name):
     parentheses in a subscript of LENGTH, LAST or SIZE's argument; a
     procedure with no statements; `shl(w, 3)' of a scalar SHL; an array
     or a member array without a subscript; a procedure called before its
-    declaration (0.4.2's).  uplm80 compiled each; Intel's PL/M-80 V3.1
-    rejects each, with the error the message names.  No program of MP/M
-    II, 80un, sample_code or tests/ has one (as tests/ now)."""
+    declaration (0.4.2's).  uplm80 compiled each.  A built-in in a DATA or
+    INITIAL list, an AT address or a constant list (0.4.3's), which -O1
+    and up folded and -O0 refused, or took for something else.  Intel's
+    PL/M-80 V3.1 rejects each, with the errors the message names.  No
+    program of MP/M II, 80un, sample_code or tests/ has one (as tests/
+    now)."""
     stmts, _, message = V31_REJECTS[name]
     err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
     assert message in err, err

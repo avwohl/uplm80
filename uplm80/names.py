@@ -256,6 +256,8 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     in_list: bool = False       # in a DATA or INITIAL list
     empty: bool = False         # followed by empty parentheses, `name()'
     in_at: bool = False         # in an AT clause
+    in_consts: bool = False     # in a constant list, `.(1, 'a')'
+    in_subscript: bool = False  # in a subscript of the operand of a dot, `.a(1)'
     # the member or the subscripted reference it starts that empty
     # parentheses follow, `s.m()', `a(1)()'
     after: object = None
@@ -293,6 +295,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.used: set[str] = set()     # every name a declaration has
         self._lists = 0                 # DATA and INITIAL lists being visited
         self._at = 0                    # AT clauses being visited
+        self._consts = 0                # constant lists being visited
+        self._dot_subscripts = 0        # subscripts of a dot's operand being visited
         # Structure members used, as (member access, block, the reference's
         # _Ref-like flags): dot, the LENGTH/LAST/SIZE call, subscripted.
         self.member_uses: list[tuple] = []
@@ -439,6 +443,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._at += 1
             self._visit(n.address, block)
             self._at -= 1
+        elif isinstance(n, P.LocationOfList):
+            self._consts += 1
+            self._visit(n.values, block)
+            self._consts -= 1
         elif isinstance(n, P.AttrInitial) or hasattr(n, "data_values"):
             # A DATA or an INITIAL list, where the address of a label may be.
             for f in n.__dataclass_fields__:
@@ -472,7 +480,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
 
     def _ref(self, block: _Block, node, **kw) -> _Ref:
         """A use of the name ``node`` spells, in ``block``."""
-        r = _Ref(block, node, "name", in_list=self._lists > 0, in_at=self._at > 0, **kw)
+        r = _Ref(block, node, "name", in_list=self._lists > 0, in_at=self._at > 0,
+                 in_consts=self._consts > 0, in_subscript=self._dot_subscripts > 0, **kw)
         self.refs.append(r)
         return r
 
@@ -497,7 +506,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self.extent_calls[id(n)] = (n, self.refs[start])
                 self._reference(n.args[0], block, extent=n)
                 return
+            self._dot_subscripts += dot
             self._visit(n.args, block)
+            self._dot_subscripts -= dot
         elif isinstance(n, P.MemberAccess):
             self.member_uses.append((n, block, dot, extent, args))
             start = len(self.refs)
@@ -534,9 +545,14 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
+        146: "MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION",
+        150: "MISSING ')' AT END OF RESTRICTED SUBSCRIPT",
+        151: "INVALID OPERAND IN RESTRICTED EXPRESSION",
+        152: "MISSING ')' AFTER CONSTANT LIST",
         169: "ILLEGAL FORWARD CALL",
         174: "INVALID NULL PROCEDURE",
         201: "INVALID DO CASE BLOCK, AT LEAST ONE CASE REQUIRED",
+        211: "INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE",
     }
 
     def intel(self, node, text: str, *numbers: int, warn: bool = False) -> None:
@@ -866,6 +882,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     f"{after}(): {after} is {kind}, and PL/M-80 has neither an empty "
                     "subscript nor an empty argument list", source_location(r.node))
             if d is None:
+                self._check_restricted(r, text)
                 self._check_builtin_use(r, text)
                 continue
             if r.empty and d.kind in self._KIND_WORDS:
@@ -1008,6 +1025,45 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 ref = unwrap_paren(ref.callee)
             else:
                 ref = unwrap_paren(ref.base)
+
+    def _check_restricted(self, r: _Ref, text: str) -> None:
+        """A built-in in a restricted expression - a DATA or INITIAL value,
+        an AT address, a constant list `.(1, 'a')' - which is made of
+        constants and, but in a constant list, locations: `shl(0f0h, 4)',
+        `size(a)', `.a(low(1))', `memory' (0.4.3's Known issues).  MEMORY's
+        location, `.memory', is one; `.stackptr' in an AT is not, and in a
+        list it is refused as in an expression (_check_builtin_use).
+        uplm80 folded SHL, SHR, ROL, ROR, LOW, HIGH and DOUBLE of constants
+        there at -O1 and up, SHL and SHR of a BYTE in 16 bits, and at -O0
+        refused them, or took them for something else.  Intel's PL/M-80
+        V3.1: ERROR 151, INVALID OPERAND IN RESTRICTED EXPRESSION, and, at
+        the parenthesis after the name, 152, MISSING ')' AFTER CONSTANT
+        LIST, 146, MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION, or in a
+        subscript 150, MISSING ')' AT END OF RESTRICTED SUBSCRIPT; ERROR
+        211, INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE, of
+        `.stackptr' in an AT."""
+        name = _key(getattr(r.node, r.attr))
+        if not (r.in_list or r.in_at or r.in_consts) or name not in _BUILTINS or r.empty:
+            return
+        if r.dot:
+            if r.in_at and name != "MEMORY":
+                self.intel(r.node, f".{text}: {text} is a built-in, and the location in an AT "
+                           "address is a variable's, or MEMORY's", 211)
+            return
+        numbers = [151]
+        if r.args is not None:
+            numbers.append(150 if r.in_subscript else 146 if r.in_at and not r.in_consts
+                           else 152)
+        if r.in_consts:
+            where = "a constant list holds constants only"
+        elif r.in_at:
+            where = ("an AT address is a restricted expression, a constant or a location plus "
+                     "or minus constants")
+        else:
+            where = ("a DATA or INITIAL value is a restricted expression, of constants and "
+                     "locations only")
+        what = expr_text(r.call) if r.call is not None else text
+        self.intel(r.node, f"{what}: {text} is a built-in, and {where}", *numbers)
 
     @staticmethod
     def _check_builtin_use(r: _Ref, text: str) -> None:
