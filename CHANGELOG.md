@@ -12,7 +12,8 @@ and the code it generates, linked with DRI's `X0100` and run. Four of
 them were code the compiler got wrong, four were programs it should
 have refused; one is PL/M-80's own rule, one a test's wrong
 expectation, and the others were fixed by 0.4.0, upeepz80 0.2.6 and
-um80 0.3.51.
+um80 0.3.51. What V3.1 rejects and uplm80 still compiles is listed under
+Known issues.
 
 ### Incompatible: errors Intel's PL/M-80 gives
 
@@ -273,30 +274,48 @@ the same):
 
 ### Verified
 
-On 1b210ad, with upeepz80 0.2.6 and um80 0.3.51.
+On 84bea83, with upeepz80 0.2.6 and um80 0.3.51.
 
-- The suite: 873 tests pass. pylint rates the package 9.73.
+- The suite: 924 tests pass. pylint rates the package 9.73.
 - `tests/run_tests.sh`: all 22 programs pass.
-- `scripts/difftest.py --seeds 200`: every program prints what the model
-  says at `-O0` to `-O3`. `scripts/abifuzz.py --seeds 200`: every program
+- `scripts/difftest.py --seeds 300`: every program prints what the model
+  says at `-O0` to `-O3`. `scripts/abifuzz.py --seeds 300`: every program
   prints, in each of its builds, what its `-O0` build prints.
   `scripts/namestest.py --seeds 200`, and `--modules --seeds 40`: every
   program prints what its scopes say.
 - The 87 compiles of MP/M II's and 80un's PL/M (DRI's tree and mpm2's
   overrides, each in the mode `tools/build.py` uses; 80un's files one at a
   time and its two programs), at each of `-O0` to `-O3`: 75 of the 77 that
-  assemble compile to 0.4.0's assembly less its 25 EQUs, line for line,
-  80un's two programs among them; MSPL.PLM, DRI's and mpm2's, is 7 bytes
-  larger at `-O1` to `-O3` and 8 at `-O0` (a loop no longer counted,
-  Fixed); the other ten, which never assembled, stop at compile time with
-  "is not declared". The code at `-O2` is 165,326 bytes against 165,312,
-  the data 45,088 as before.
-- `sample_code`: the five programs that compile compile to the same
-  assembly as with 0.4.0; the others stop where they stopped, three of
-  them now saying that the number they stopped at is a LITERALLY's text.
+  assemble compile to 0.4.0's assembly less its 25 EQUs, line for line -
+  73 of them to 0.4.0's exactly, 80un's two programs among them, and
+  LOAD.PLM and STAT.PLM less 21 and 4; MSPL.PLM, DRI's and mpm2's, is 7
+  bytes larger at `-O1` to `-O3` and 8 at `-O0` (a loop no longer
+  counted, Fixed); the other ten, which never assembled, stop at compile
+  time with "is not declared". The code at `-O2` is 165,326 bytes against
+  165,312, the data 45,088 as before.
+- `sample_code`, at `-O0` to `-O3`: of the five programs that compile,
+  CP/M 2.0's ED.PLM and PIP.PLM compile to 0.4.0's assembly, and its
+  LOAD.PLM, STAT.PLM and SUBMIT.PLM to 0.4.0's less its 21, 14 and 1
+  EQUs; the fourteen others stop where they stopped, five of them - CP/M
+  1.1's CCP-ORIGINAL.PLM, CCP.PLM, HELLO.PLM and LOAD.PLM, and 1.3's
+  BDOS.PLM (Zeidman) - now saying that the number they stopped at is a
+  LITERALLY's text.
 - 300 random programs, 150 each of `tests/plm_difftest.py` and
   `tests/names_difftest.py`, and the 47 test programs compile, at `-O0` to
-  `-O3`, to 0.4.0's assembly less the EQUs, line for line.
+  `-O3`, to 0.4.0's assembly, line for line.
+- 600 random programs with module-level BYTE and ADDRESS scalars and
+  arrays, structures and arrays of structures, and a counted loop over a
+  module-level index whose body stores once through a subscript or a
+  member - constant or not, inside its variable or past its end - and 300
+  with those variables local to the procedure, print at `-O0` to `-O3`
+  what each prints compiled by Intel's PL/M-80 V3.1; c71574d's `-O2`
+  build of 11 of the 600 printed something else.
+- ogdenpm/intel80tools' 469 PL/M files, with the `.ipx` files
+  `scripts/genipx.py` makes from the packs' `.pex`, at `-O2`: 176
+  compile, 144 to 0.4.0's assembly and 32 to 0.4.0's less its EQUs;
+  IXREF.PLM of ixref 1.2 and 1.3, which 0.4.0 compiled and um80 did not
+  assemble, stop at WRITE, which nothing they include declares; the
+  other 291 compile with neither.
 
 ## 0.4.0 — 2026-09-25
 
