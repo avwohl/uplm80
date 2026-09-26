@@ -177,7 +177,18 @@ where:
   has no parameters (8.1.6); so is a PUBLIC or EXTERNAL procedure or
   variable, not in a procedure or a DO block.  INITIAL there initializes
   the variable once, when the program is loaded, with a warning.
-- A direct call passes as many arguments as the procedure has parameters.
+- A direct call passes as many arguments as the procedure has parameters,
+  and follows the procedure's declaration, but a call by a REENTRANT
+  procedure of one that is REENTRANT too; `.p(1)` of a procedure is no
+  address.  `CALL q(1, 2)` of an ADDRESS q calls through it (8.2.1).
+- An END that names a block names its own, the procedure or a label of
+  the DO block; a DO CASE has a case, and a procedure a statement.
+- An array, or a member array, is named without a subscript only after a
+  dot or as the argument of LENGTH, LAST or SIZE (3.6.2), whose
+  subscripts have nothing in parentheses in them.  A scalar takes no
+  subscript: `x(1)`, the element that far past x, and `s2.m(1)` of an
+  array of structures, `s2(0).m(1)`, are compiled with a warning, as
+  programs written for uplm80 rely on them.
 - SHL and SHR of a BYTE are a BYTE (11.1.4), and the bits shifted out of
   it are lost; `SHL(DOUBLE(b), n)` keeps them.  uplm80 before 0.4.3
   shifted a BYTE in 16 bits, and where a SHL of a BYTE can shift a set bit
@@ -637,20 +648,25 @@ V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
 after a statement (26), `NOT NOT x` (102), and a `CALL` of a typed
 procedure (129); and what the CHANGELOG lists under Known issues: a
-subscript on a scalar (127), an array without a subscript (133, 134), a
-procedure with no statements (174), a call of a procedure its block
-declares after the call (169), an `END` that names another block, `p:
-procedure; ... end q;` (20), a DO CASE with no case (201), `.p(1)` of a
-procedure (104), and a subscript that calls a procedure inside SIZE,
-LENGTH or LAST, `size(ab(f(1)))` (32).  uplm80 compiles, with a warning that
-names V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
-`INITIAL` in a procedure or a DO block (73), on which programs written
-for it rely.  It rejects, as V3.1 does, a name declared nowhere, empty
-parentheses after a variable or a built-in, `.label` in an expression, an
-`INTERRUPT` procedure below module level, a parameter no `DECLARE`
-declares, and a `LITERALLY` used before its declaration (since 0.4.1);
-and a dimension of 0, the address of a built-in but MEMORY, and a PUBLIC
-or EXTERNAL procedure or variable below module level (since 0.4.2).
+non-REENTRANT procedure's call of itself (170), a procedure nested in a
+REENTRANT one or a REENTRANT one nested in another (88, 39), and more
+`INITIAL` or `DATA` values than a scalar holds (209).  uplm80 compiles,
+with a warning that names V3.1's error, `f()` and `CALL g()` of a
+procedure (102, 153), `INITIAL` in a procedure or a DO block (73), a
+subscript on a scalar, `x(1)` (127), and a member of an array of
+structures without its subscript, `s2.m(1)` (133), on which programs
+written for it rely.  It rejects, as V3.1 does, a name declared nowhere,
+empty parentheses after a variable or a built-in, `.label` in an
+expression, an `INTERRUPT` procedure below module level, a parameter no
+`DECLARE` declares, and a `LITERALLY` used before its declaration (since
+0.4.1); a dimension of 0, the address of a built-in but MEMORY, and a
+PUBLIC or EXTERNAL procedure or variable below module level (since
+0.4.2); and an `END` that names another block (20), a DO CASE with no
+case (201), `.p(1)` of a procedure (104), anything in parentheses in a
+subscript of the argument of SIZE, LENGTH or LAST, `size(ab(f(1)))` (32),
+a procedure with no statements (174), two subscripts on a scalar (127,
+114), an array or a member array without a subscript (133, 134), and a
+call of a procedure declared further on (169) (since 0.4.3).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),

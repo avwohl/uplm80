@@ -609,7 +609,7 @@ def test_an_element_of_untyped_data_is_a_byte():
 declare i byte, r address;
 run: procedure;
   declare hx data ('0123');
-  declare hy byte data ('0123');
+  declare hy(*) byte data ('0123');
   i = 1;
   r = hx(i) + 0ffh; call ph(r);
   r = hy(i) + 0ffh; call ph(r);

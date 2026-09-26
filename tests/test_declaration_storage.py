@@ -471,7 +471,7 @@ sched: do;
 declare restarts literally '{restarts}';
 declare stkp address data (.stk+38);
 declare stk (20) address initial (restarts,.sched);
-sched: procedure; end sched;
+sched: procedure; halt; end sched;
 end sched;
 """))
     i = lines.index("STK:")

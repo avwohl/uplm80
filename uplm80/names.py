@@ -54,11 +54,17 @@ from . import _plm_parser as P
 from .ast_view import (
     DataType,
     decl_attrs,
+    decl_item_struct_members,
     decl_item_type,
+    expr_text,
     ident_text,
+    is_end_of_block,
     literally_value,
     parse_plm_number,
     proc_attrs,
+    string_value,
+    struct_member_dim,
+    struct_member_names,
     unwrap_paren,
 )
 from .errors import CodeGenError
@@ -199,6 +205,9 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     reentrant: bool = False     # a REENTRANT procedure
     from_proc: bool = False     # a label a GOTO in a procedure jumps to
     orig: str = ""              # the name as declared
+    dim: int | None = None      # a variable's: None for a scalar
+    members: dict | None = None     # a structure's: member -> its dimension
+    node: object = None         # a procedure's declaration
 
     def __post_init__(self) -> None:
         self.orig = self.name
@@ -250,6 +259,11 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     # the member or the subscripted reference it starts that empty
     # parentheses follow, `s.m()', `a(1)()'
     after: object = None
+    args: int | None = None     # how many subscripts or arguments follow it
+    extent: object = None       # the call of LENGTH, LAST or SIZE it is the argument of
+    call: object = None         # the subscripted reference or call it names
+    called: bool = False        # a CALL's: `call q(1, 2)' of an ADDRESS calls through it
+    member: object = None       # the member of what it names, `s.m', if any
 
 
 def _key(tok) -> str:
@@ -279,6 +293,13 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.used: set[str] = set()     # every name a declaration has
         self._lists = 0                 # DATA and INITIAL lists being visited
         self._at = 0                    # AT clauses being visited
+        # Structure members used, as (member access, block, the reference's
+        # _Ref-like flags): dot, the LENGTH/LAST/SIZE call, subscripted.
+        self.member_uses: list[tuple] = []
+        # The calls of LENGTH, LAST or SIZE (if the program does not
+        # declare the name), by id: (call, the _Ref of its name).
+        self.extent_calls: dict[int, tuple] = {}
+        self._do_labels: dict[int, set[str]] = {}   # a DO block's labels, by id
 
     # ---- collecting ----------------------------------------------------
 
@@ -292,6 +313,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         if len(items) == 1 and isinstance(items[0], P.LabeledStmt) and isinstance(
                 items[0].stmt, P.DoBlock):
             name = _key(items[0].label)
+            self._do_labels[id(items[0].stmt)] = {name}
+            self._check_do(items[0].stmt)
             items = list(items[0].stmt.items)
         mod = _Module(index, name)
         mod.main = any(not isinstance(it, (P.ProcDecl, P.DeclareStmt)) for it in items)
@@ -320,7 +343,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.decls.append(d)
         return d
 
-    def _visit(self, n, block: _Block) -> None:  # pylint: disable=too-many-branches
+    def _visit(self, n, block: _Block) -> None:  # pylint: disable=too-many-branches,too-many-statements
         if n is None or isinstance(n, (str, int)):
             return
         if isinstance(n, (list, tuple)):
@@ -335,17 +358,24 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._decl_item(n, block)
         elif isinstance(n, P.DeclItemBasedGroup):
             for bd in n.based_decls or []:
-                self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False)
+                self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False,
+                              dim=_dimension(n), members=_members(n))
                 self._visit(bd.base, block)
             self._visit([n.array_size, n.tail], block)
         elif isinstance(n, P.LiterallyDecl):
             self._declare(block, _key(n.name), "lit", (n, "name"), literal=literally_value(n))
         elif isinstance(n, P.LabeledStmt):
             self._label(n, block)
+            inner = n.stmt
+            while isinstance(inner, P.LabeledStmt):
+                inner = inner.stmt
+            # The labels of a DO block, which its END may name.
+            self._do_labels.setdefault(id(inner), set()).add(_key(n.label))
             self._visit(n.stmt, block)
         elif isinstance(n, P.GotoStmt):
             self.refs.append(_Ref(block, n, "label", goto=True))
         elif isinstance(n, _DO_BLOCKS):
+            self._check_do(n)
             inner = _Block("do", block, block.module, block.proc)
             if isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
                 self.refs.append(_Ref(inner, n, "index"))
@@ -353,7 +383,11 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self._visit(getattr(n, f, None), inner)
         elif self._visit_use(n, block):
             pass
-        elif isinstance(n, (P.MemberAccess, P.DottedMember)):
+        elif isinstance(n, P.CallStmt) and isinstance(unwrap_paren(n.callee), P.Call):
+            self._reference(unwrap_paren(n.callee), block, called=True)
+        elif isinstance(n, (P.Call, P.MemberAccess)):
+            self._reference(n, block)
+        elif isinstance(n, P.DottedMember):
             self._visit(n.base, block)      # a member's name is not in scope
         elif isinstance(n, (P.StructMember, P.StructMemberUntyped)):
             self._visit(n.array_size, block)    # a member's name is not in scope
@@ -393,14 +427,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._ref(block, unwrap_paren(n.callee), empty=True)
         elif isinstance(n, P.CallNoArgs):
             self._empty_after(unwrap_paren(n.callee), block)
-        elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Identifier):
-            self._ref(block, unwrap_paren(n.operand), dot=True)
-        elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Call) \
-                and isinstance(unwrap_paren(unwrap_paren(n.operand).callee), P.Identifier):
-            # `.a(i)', `.output(3)': the dot is the subscripted name's.
-            call = unwrap_paren(n.operand)
-            self._ref(block, unwrap_paren(call.callee), dot=True)
-            self._visit(call.args, block)
+        elif isinstance(n, P.LocationOf) and isinstance(
+                unwrap_paren(n.operand), (P.Identifier, P.Call, P.MemberAccess)):
+            # `.a', `.a(i)', `.output(3)', `.s.m': the dot is the reference's.
+            self._reference(unwrap_paren(n.operand), block, dot=True)
         elif isinstance(n, P.AttrAt):
             self._at += 1
             self._visit(n.address, block)
@@ -436,10 +466,85 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         raise CodeGenError(f"{text}(): PL/M-80 has neither an empty subscript nor an "
                            "empty argument list", source_location(callee))
 
-    def _ref(self, block: _Block, node, **kw) -> None:
+    def _ref(self, block: _Block, node, **kw) -> _Ref:
         """A use of the name ``node`` spells, in ``block``."""
-        self.refs.append(_Ref(block, node, "name", in_list=self._lists > 0,
-                              in_at=self._at > 0, **kw))
+        r = _Ref(block, node, "name", in_list=self._lists > 0, in_at=self._at > 0, **kw)
+        self.refs.append(r)
+        return r
+
+    def _reference(self, n, block: _Block, dot: bool = False, *, extent=None,  # pylint: disable=too-many-arguments
+                   args: int | None = None, call=None, called: bool = False) -> None:
+        """A reference: a name, a member of what a reference names, or
+        either subscripted, or a call.  ``dot``: it is the operand of a dot;
+        ``extent``: the argument of the call of LENGTH, LAST or SIZE given;
+        ``args``: the subscripts or arguments of ``call`` that follow it;
+        ``called``: it is what a CALL statement calls.  What is inside a
+        subscript is visited on its own."""
+        n = unwrap_paren(n)
+        if isinstance(n, P.Identifier):
+            self._ref(block, n, dot=dot, extent=extent, args=args, call=call, called=called)
+        elif isinstance(n, P.Call):
+            callee = unwrap_paren(n.callee)
+            name = _key(callee.name) if isinstance(callee, P.Identifier) else ""
+            start = len(self.refs)
+            self._reference(callee, block, dot, extent=extent, args=len(n.args), call=n,
+                            called=called)
+            if name in ("LENGTH", "LAST", "SIZE") and len(n.args) == 1 and not dot:
+                self.extent_calls[id(n)] = (n, self.refs[start])
+                self._reference(n.args[0], block, extent=n)
+                return
+            self._visit(n.args, block)
+        elif isinstance(n, P.MemberAccess):
+            self.member_uses.append((n, block, dot, extent, args))
+            start = len(self.refs)
+            self._reference(n.base, block, dot, extent=extent)
+            if len(self.refs) > start and self.refs[start].member is None \
+                    and unwrap_paren(n.base) is self.refs[start].node:
+                self.refs[start].member = n
+        else:
+            self._visit(n, block)
+
+    def _check_do(self, n) -> None:
+        """A DO block's END names a label of the block, if any; a DO CASE
+        has a case.  Intel's PL/M-80 V3.1: ERROR 20, MISMATCHED IDENTIFIER
+        AT END OF BLOCK; ERROR 201, INVALID DO CASE BLOCK, AT LEAST ONE
+        CASE REQUIRED."""
+        end = n.end_label
+        labels = self._do_labels.get(id(n), set())
+        if end is not None and _key(end.name) not in labels:
+            text = ident_text(end.name)
+            which = (f"a block labelled {', '.join(sorted(labels))}" if labels
+                     else "a block with no label")
+            self.intel(end, f"END {text}: the END of {which} names {text}", 20)
+        if isinstance(n, P.DoCaseBlock) and not any(
+                not is_end_of_block(it) and not isinstance(it, P.DeclareStmt)
+                for it in n.items):
+            self.intel(n, "DO CASE: a DO CASE block has at least one case", 201)
+
+    # V3.1's text of each of its errors a message here names.
+    INTEL_ERRORS = {
+        20: "MISMATCHED IDENTIFIER AT END OF BLOCK",
+        32: "INVALID SYNTAX, TEXT IGNORED UNTIL ';'",
+        104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
+        114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
+        127: "INVALID SUBSCRIPT ON NON-ARRAY",
+        133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
+        134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
+        169: "ILLEGAL FORWARD CALL",
+        174: "INVALID NULL PROCEDURE",
+        201: "INVALID DO CASE BLOCK, AT LEAST ONE CASE REQUIRED",
+    }
+
+    def intel(self, node, text: str, *numbers: int, warn: bool = False) -> None:
+        """What Intel's PL/M-80 V3.1 rejects, with the errors ``numbers``:
+        an error, or, where programs written for uplm80 rely on it
+        (``warn``), a warning; ``text`` then says how it is compiled."""
+        why = "Intel's PL/M-80 V3.1 rejects it (ERROR " + ", and ".join(
+            f"#{n}, {self.INTEL_ERRORS[n]}" for n in numbers) + ")"
+        if warn:
+            self.intel_warnings.append((source_location(node), f"{text}; {why}"))
+            return
+        raise CodeGenError(f"{text}; {why}", source_location(node))
 
     def _proc(self, p: P.ProcDecl, block: _Block) -> None:
         attrs = proc_attrs(p)
@@ -463,10 +568,20 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 "Intel's PL/M-80 V3.1 rejects it (ERROR #39, INVALID ATTRIBUTE OR "
                 "INITIALIZATION, NOT AT MODULE LEVEL)", source_location(p))
         d = self._declare(block, _key(p.name), "proc", (p, "name"), public=attrs.is_public,
-                          external=attrs.is_external, reentrant=attrs.is_reentrant)
+                          external=attrs.is_external, reentrant=attrs.is_reentrant, node=p)
         end = p.body.end_label
         if end is not None and _key(end.name) == d.name:
             d.sites.append((end, "name"))
+        elif end is not None:
+            # Intel's PL/M-80 V3.1: ERROR 20.
+            text = ident_text(end.name)
+            self.intel(end, f"END {text}: the END of procedure {d.orig} names {text}", 20)
+        if not attrs.is_external and not any(
+                not isinstance(it, (P.DeclareStmt, P.ProcDecl)) and not is_end_of_block(it)
+                for it in p.body.items):
+            # Intel's PL/M-80 V3.1: ERROR 174, a label on its END or not.
+            self.intel(p, f"{d.orig}: a procedure has at least one statement, and {d.orig} "
+                       "has none", 174)
         body = _Block("proc", block, block.module, d)
         params = p.signature.params
         for n in (params.names or []) if params is not None else []:
@@ -504,7 +619,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self._below_module_level(node, attrs, block)
             kind = "label" if dtype == DataType.LABEL else "var"
             self._declare(block, name, kind, (node, "name"), public=attrs.is_public,
-                          external=attrs.is_external, storage=storage and kind == "var")
+                          external=attrs.is_external, storage=storage and kind == "var",
+                          dim=_dimension(item), members=_members(item))
         if item.based is not None:
             self._visit(item.based.base, block)
         self._visit([item.array_size, item.tail], block)
@@ -771,6 +887,122 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     "of a label may be given only in a DATA or an INITIAL list",
                     source_location(r.node))
 
+    def check_forms(self) -> None:
+        """How each name is used, as Intel's PL/M-80 V3.1 allows (0.4.2's
+        Known issues): no subscript on a scalar, nor more than one; an
+        array, or a member array, without one only after a dot or in
+        LENGTH, LAST and SIZE; not `.p(1)' of a procedure; no procedure
+        used before its declaration; nothing in parentheses in a subscript
+        of LENGTH, LAST or SIZE's argument."""
+        for r in self.refs:
+            d = r.decl
+            if r.goto or d is None or r.empty or r.after is not None:
+                continue
+            text = ident_text(getattr(r.node, r.attr))
+            if d.kind == "proc":
+                if r.dot and r.args is not None:
+                    self.intel(r.node, f".{expr_text(r.call)}: {text} is a procedure, and "
+                               "the dot operator takes the address of a procedure, not of a "
+                               "call of it (Programming Manual 9800268B, 4.1.3)", 104)
+                self._check_forward(r, d, text)
+            elif d.kind in ("var", "param") and r.args is not None and d.dim is None \
+                    and not r.called:
+                self._check_scalar(r, text)
+            elif d.kind == "var" and r.args is None and d.dim is not None and not r.dot \
+                    and not self._extent(r.extent):
+                self._check_unsubscripted(r, text)
+        for n, block, dot, extent, args in self.member_uses:
+            self._check_member(n, block, dot or args is not None or self._extent(extent))
+        for call, ref in self.extent_calls.values():
+            if ref.decl is None:
+                self._check_extent(call)
+
+    def _check_scalar(self, r: _Ref, text: str) -> None:
+        """A scalar with a subscript.  `x(1)' is taken for the element of
+        x's type that far past x, as if x were an array, as programs
+        written for uplm80 rely on (tests/test_optimizer_soundness.py);
+        `shl(w, 3)' of a scalar SHL is an error.  Intel's PL/M-80 V3.1:
+        ERROR 127, INVALID SUBSCRIPT ON NON-ARRAY, and 114."""
+        what = expr_text(r.call)
+        if r.args > 1:
+            self.intel(r.node, f"{what}: {text} is not an array, and only an array takes a "
+                       "subscript, and only one", 127, 114)
+            return
+        self.intel(r.node, f"{what}: {text} is not an array, and this is taken for the "
+                   f"element that far past {text}, as if {text} were an array", 127, warn=True)
+
+    def _check_unsubscripted(self, r: _Ref, text: str) -> None:
+        """An array without a subscript, but after a dot or in LENGTH, LAST
+        or SIZE (3.6.2).  A member of an array of structures, `s2.m(4)', is
+        taken for `s2(0).m(4)', as tests/test_calls_and_loops.py relies
+        on; the rest is an error.  Intel's PL/M-80 V3.1: ERROR 133, ILLEGAL
+        REFERENCE TO UNSUBSCRIPTED ARRAY."""
+        if r.member is not None:
+            member = ident_text(r.member.member)
+            self.intel(r.node, f"{text}.{member}: {text} is an array, and this is taken for "
+                       f"{text}(0).{member}", 133, warn=True)
+            return
+        self.intel(r.node, f"{text}: {text} is an array, and an array is named without a "
+                   "subscript only as the operand of a dot or the argument of LENGTH, LAST or "
+                   "SIZE (Programming Manual 9800268B, 3.6.2)", 133)
+
+    def _extent(self, call) -> bool:
+        """Whether ``call`` is a call of the built-in LENGTH, LAST or SIZE."""
+        return call is not None and id(call) in self.extent_calls \
+            and self.extent_calls[id(call)][1].decl is None
+
+    def _check_forward(self, r: _Ref, d: _Decl, text: str) -> None:
+        """A procedure is called after its declaration, but by a REENTRANT
+        procedure, if it is REENTRANT too (MP/M II's SN.PLM has them call
+        one another); its address, `.p', may be taken before.  Intel's
+        PL/M-80 V3.1: ERROR 169, ILLEGAL FORWARD CALL."""
+        caller = r.block.proc
+        if d.node is None or r.block.module is not d.block.module or r.dot:
+            return
+        if d.reentrant and caller is not None and caller.reentrant:
+            return
+        here = (r.node.pos.start_line, r.node.pos.start_column)
+        if here < (d.node.pos.start_line, d.node.pos.start_column):
+            self.intel(r.node, f"{text}: procedure {text} is declared after this call of "
+                       "it, and a procedure is called only after its declaration, but by a "
+                       "REENTRANT procedure if it is REENTRANT too", 169)
+
+    def _check_member(self, n: P.MemberAccess, block: _Block, placed: bool) -> None:
+        """A member array without a subscript, where it is not ``placed``
+        after a dot or in LENGTH, LAST or SIZE.  Intel's PL/M-80 V3.1:
+        ERROR 134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY."""
+        if placed:
+            return
+        root = unwrap_paren(n.base)
+        while isinstance(root, (P.Call, P.MemberAccess)):
+            root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
+        d = self.lookup(_key(root.name), block) if isinstance(root, P.Identifier) else None
+        member = _key(n.member)
+        if d is None or not d.members or d.members.get(member) is None:
+            return
+        text = expr_text(n)
+        self.intel(n, f"{text}: {ident_text(n.member)} is an array, and a member array is named "
+                   "without a subscript only as the operand of a dot or the argument of LENGTH, "
+                   "LAST or SIZE (Programming Manual 9800268B, 3.6.2)", 134)
+
+    def _check_extent(self, call: P.Call) -> None:
+        """The subscripts of the argument of LENGTH, LAST or SIZE, which
+        are not evaluated: Intel's PL/M-80 V3.1 takes none with anything in
+        parentheses, a call, a subscript or a parenthesized expression
+        (ERROR 32, INVALID SYNTAX)."""
+        ref = unwrap_paren(call.args[0])
+        while isinstance(ref, (P.Call, P.MemberAccess)):
+            if isinstance(ref, P.Call):
+                if any(_has_parentheses(a) for a in ref.args):
+                    name = ident_text(unwrap_paren(call.callee).name)
+                    self.intel(call, f"{expr_text(call)}: the subscripts of {name}'s "
+                               "argument are not evaluated, and none has anything in "
+                               "parentheses in it, a call, a subscript or an expression", 32)
+                    return
+                ref = unwrap_paren(ref.callee)
+            else:
+                ref = unwrap_paren(ref.base)
+
     @staticmethod
     def _check_builtin_use(r: _Ref, text: str) -> None:
         """A built-in's name after a dot, or before empty parentheses: of
@@ -992,6 +1224,40 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
 
 
+def _has_parentheses(expr) -> bool:
+    """Whether ``expr`` has anything in parentheses: a call, a subscript,
+    `f()', `( )', `.(list)'."""
+    if isinstance(expr, (list, tuple)):
+        return any(_has_parentheses(x) for x in expr)
+    if isinstance(expr, (P.ParenExpr, P.Call, P.CallNoArgs, P.LocationOfList)):
+        return True
+    return any(_has_parentheses(getattr(expr, f)) for f in getattr(expr, "__dataclass_fields__", ())
+               if f != "pos")
+
+
+def _dimension(item) -> int | None:
+    """A variable's dimension, -1 for (*), None for a scalar: an untyped
+    DATA of several values, or a string of several characters, is an array
+    as long as they are, as uplm80 has always taken it (and as the
+    oracle's --normalize writes it for Intel's PL/M-80)."""
+    _, dim = decl_item_type(item)
+    tail = getattr(item, "tail", None)
+    if dim is None and isinstance(tail, P.DeclTailData):
+        values = decl_attrs(item).data_values or []
+        if len(values) > 1 or (len(values) == 1 and isinstance(values[0], P.StringLiteral)
+                               and len(string_value(values[0])) > 1):
+            return -1
+    return dim
+
+
+def _members(item) -> dict | None:
+    """A structure's members, and the dimension of each (None, a scalar)."""
+    nodes = decl_item_struct_members(item)
+    if nodes is None:
+        return None
+    return {n.upper(): struct_member_dim(m) for m in nodes for n in struct_member_names(m)}
+
+
 def _reference_text(expr) -> str:
     """A member or a subscripted reference as the source spells it, but
     for a subscript that is neither a name nor a number: ``SA(...).M``."""
@@ -1041,6 +1307,7 @@ def check_names(modules: list, multi: bool = False) -> list[tuple]:
     if multi:
         r.check_private()
     r.check_uses()
+    r.check_forms()
     return r.intel_warnings
 
 

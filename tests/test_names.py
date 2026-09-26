@@ -19,6 +19,8 @@ import pytest
 from uplm80.compiler import Compiler
 
 from ._toolchain import compile_cmd, compiler_env, run_asm, run_plm, tools_missing
+from .test_expression_types import _PRELUDE as _PH_PRELUDE
+from .test_expression_types import _check
 
 LEVELS = (0, 1, 2, 3)
 
@@ -972,7 +974,7 @@ def test_two_main_program_modules_are_an_error():
 def test_a_name_declared_twice_in_one_block_is_an_error():
     """Both declarations were generated, and the assembler said "multiply
     defined", or, for a procedure and a variable, took one for the other."""
-    err = _compile_error(PRELUDE + "declare i byte;\np: procedure; end p;\ndeclare p byte;\nend t;\n")
+    err = _compile_error(PRELUDE + "declare i byte;\np: procedure; return; end p;\ndeclare p byte;\nend t;\n")
     assert "T.PLM:7:9: error: P is declared twice in the same block" in err
 
 
@@ -1042,7 +1044,7 @@ def test_a_public_label_that_labels_no_statement_at_the_outer_level_is_an_error(
             "at the outer level of the main program module") in err, err
     assert "9800268B, 9.3" in err and "the AGAIN: in a DO block is another label" in err
     err = _compile_error("0100H:\nt: do;\ndeclare x label public;\n"
-                         "p: procedure public; end p;\nend t;\n")
+                         "p: procedure public; return; end p;\nend t;\n")
     assert "T.PLM:3:9: error: X is declared a PUBLIC LABEL but labels no statement" in err
 
 
@@ -1215,6 +1217,82 @@ V31_REJECTS = {
                                       + "procedure P"),
     "external-procedure-in-do": ("do;\n  r: procedure external;\n  end r;\n  call r;\nend;\n",
                                  (39,), "error: R: an EXTERNAL procedure " + _OUTER + "a DO block"),
+    # 0.4.2's Known issues, 0.4.3.
+    "end-names-another-procedure": ("p: procedure;\n  b = 1;\nend q;\ncall p;\n", (20,),
+                                    "T.PLM:10:5: error: END Q: the END of procedure P names Q; "
+                                    "Intel's PL/M-80 V3.1 rejects it (ERROR #20, MISMATCHED "
+                                    "IDENTIFIER AT END OF BLOCK)"),
+    "labelled-end-names-another": ("p: procedure;\n  b = 1;\nout: end q;\ncall p;\n", (20,),
+                                   "T.PLM:10:10: error: END Q: the END of procedure P names Q"),
+    "end-names-another-block": ("l: do;\n  b = 1;\nend m;\n", (20,),
+                                "T.PLM:10:5: error: END M: the END of a block labelled L names M"),
+    "end-of-a-block-with-no-label": ("do;\n  b = 1;\nend n;\n", (20,),
+                                     "error: END N: the END of a block with no label names N"),
+    "do-case-with-no-case": ("do case b;\nend;\n", (201,),
+                             "T.PLM:8:1: error: DO CASE: a DO CASE block has at least one case; "
+                             "Intel's PL/M-80 V3.1 rejects it (ERROR #201, INVALID DO CASE "
+                             "BLOCK, AT LEAST ONE CASE REQUIRED)"),
+    "do-case-with-a-labelled-end": ("do case b;\nl: end;\n", (201,),
+                                    "error: DO CASE: a DO CASE block has at least one case"),
+    "dot-call": ("h: procedure (x) byte; declare x byte; return x; end h;\nw = .h(1);\n", (104,),
+                 "T.PLM:9:6: error: .H(1): H is a procedure, and the dot operator takes the "
+                 "address of a procedure, not of a call of it (Programming Manual 9800268B, "
+                 "4.1.3); Intel's PL/M-80 V3.1 rejects it (ERROR #104, ILLEGAL PROCEDURE "
+                 "INVOCATION WITH DOT OPERATOR)"),
+    "size-of-a-call": ("declare ab(4) byte;\nh: procedure (x) byte; declare x byte; return x; "
+                       "end h;\nw = size(ab(h(1)));\n", (32,),
+                       "T.PLM:10:5: error: SIZE(AB(H(1))): the subscripts of SIZE's argument are "
+                       "not evaluated, and none has anything in parentheses in it, a call, a "
+                       "subscript or an expression; Intel's PL/M-80 V3.1 rejects it (ERROR #32, "
+                       "INVALID SYNTAX, TEXT IGNORED UNTIL ';')"),
+    "length-of-a-parenthesized-subscript": ("declare sa(3) structure (z(2) byte);\n"
+                                            "w = length(sa((b)).z);\n", (32,),
+                                            "error: LENGTH(SA((B)).Z): the subscripts of "
+                                            "LENGTH's argument are not evaluated"),
+    "null-procedure": ("p: procedure;\n  declare k byte;\nend p;\ncall p;\n", (174,),
+                       "T.PLM:8:1: error: P: a procedure has at least one statement, and P has "
+                       "none; Intel's PL/M-80 V3.1 rejects it (ERROR #174, INVALID NULL "
+                       "PROCEDURE)"),
+    "null-procedure-labelled-end": ("p: procedure;\nl: end p;\ncall p;\n", (174,),
+                                    "error: P: a procedure has at least one statement"),
+    "two-subscripts-on-a-scalar": ("declare shl address;\nw = shl(w, 3);\n", (127, 114),
+                                   "T.PLM:9:5: error: SHL(W, 3): SHL is not an array, and only an "
+                                   "array takes a subscript, and only one; Intel's PL/M-80 V3.1 "
+                                   "rejects it (ERROR #127, INVALID SUBSCRIPT ON NON-ARRAY, and "
+                                   "#114, INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL)"),
+    "unsubscripted-array": ("declare a(4) byte;\na = 3;\n", (133,),
+                            "T.PLM:9:1: error: A: A is an array, and an array is named without a "
+                            "subscript only as the operand of a dot or the argument of LENGTH, "
+                            "LAST or SIZE (Programming Manual 9800268B, 3.6.2); Intel's PL/M-80 "
+                            "V3.1 rejects it (ERROR #133, ILLEGAL REFERENCE TO UNSUBSCRIPTED "
+                            "ARRAY)"),
+    "unsubscripted-array-read": ("declare a(4) byte;\nb = a + 1;\n", (133,),
+                                 "T.PLM:9:5: error: A: A is an array"),
+    "unsubscripted-array-subscript": ("declare a(4) byte, sz(3) byte;\nb = sz(a);\n", (133,),
+                                      "T.PLM:9:8: error: A: A is an array"),
+    "unsubscripted-array-argument": ("declare a(4) byte;\ncall pc(a);\n", (133,),
+                                     "T.PLM:9:9: error: A: A is an array"),
+    "unsubscripted-member-array": ("declare s structure (m(3) byte, n byte);\ns.m = 4;\n", (134,),
+                                   "T.PLM:9:1: error: S.M: M is an array, and a member array is "
+                                   "named without a subscript only as the operand of a dot or the "
+                                   "argument of LENGTH, LAST or SIZE (Programming Manual 9800268B, "
+                                   "3.6.2); Intel's PL/M-80 V3.1 rejects it (ERROR #134, ILLEGAL "
+                                   "REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY)"),
+    "forward-call": ("p: procedure;\n  call q;\nend p;\nq: procedure;\n  b = 1;\nend q;\n"
+                     "call p;\n", (169,),
+                     "T.PLM:9:8: error: Q: procedure Q is declared after this call of it, and a "
+                     "procedure is called only after its declaration, but by a REENTRANT "
+                     "procedure if it is REENTRANT too; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                     "#169, ILLEGAL FORWARD CALL)"),
+    "forward-typed-call": ("p: procedure;\n  b = h + 1;\nend p;\nh: procedure byte;\n  return 2;"
+                           "\nend h;\ncall p;\n", (169,),
+                           "T.PLM:9:7: error: H: procedure H is declared after this call of it"),
+    "forward-call-of-a-reentrant": ("p: procedure;\n  call q;\nend p;\nq: procedure reentrant;\n"
+                                    "  b = 1;\nend q;\ncall p;\n", (169,),
+                                    "error: Q: procedure Q is declared after this call of it"),
+    "forward-call-from-a-reentrant": ("r: procedure reentrant;\n  call s;\nend r;\n"
+                                      "s: procedure;\n  b = 1;\nend s;\ncall r;\n", (169,),
+                                      "error: S: procedure S is declared after this call of it"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
@@ -1232,6 +1310,17 @@ V31_WARNS = {
                              "Intel's PL/M-80 V3.1 rejects it (ERROR #73"),
     "initial-in-do": ("do;\n  declare k byte initial (7);\n  b = k;\nend;\n", (73,),
                       "warning: K: INITIAL in a DO block initializes the variable once"),
+    # 0.4.2's Known issues, 0.4.3: tests/test_optimizer_soundness.py and
+    # tests/test_calls_and_loops.py test what uplm80 makes of these.
+    "subscripted-scalar": ("b = c(1);\n", (127,),
+                           "T.PLM:8:5: warning: C(1): C is not an array, and this is taken for the "
+                           "element that far past C, as if C were an array; Intel's PL/M-80 V3.1 "
+                           "rejects it (ERROR #127, INVALID SUBSCRIPT ON NON-ARRAY)"),
+    "member-of-an-unsubscripted-array": ("declare s2(2) structure (m(2) byte);\ns2.m(1) = 3;\n",
+                                         (133,),
+                                         "T.PLM:9:1: warning: S2.M: S2 is an array, and this is "
+                                         "taken for S2(0).M; Intel's PL/M-80 V3.1 rejects it "
+                                         "(ERROR #133, ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY)"),
 }
 
 
@@ -1241,9 +1330,14 @@ def test_what_v31_rejects_is_an_error(opt, name):
     """A dimension of 0, `declare z (0) byte', of an array or a member; the
     address of a built-in but MEMORY, `.double'; empty parentheses after a
     built-in, `carry()'; and a PUBLIC or EXTERNAL variable or procedure
-    in a procedure or a DO block.  uplm80 compiled each (0.4.1, Known
-    issues); Intel's PL/M-80 V3.1 rejects each, with the error the message
-    names.  No program of MP/M II, 80un, sample_code or tests/ has one."""
+    in a procedure or a DO block (0.4.1's Known issues).  An END that
+    names another block; a DO CASE with no case; `.h(1)'; anything in
+    parentheses in a subscript of LENGTH, LAST or SIZE's argument; a
+    procedure with no statements; `shl(w, 3)' of a scalar SHL; an array
+    or a member array without a subscript; a procedure called before its
+    declaration (0.4.2's).  uplm80 compiled each; Intel's PL/M-80 V3.1
+    rejects each, with the error the message names.  No program of MP/M
+    II, 80un, sample_code or tests/ has one (as tests/ now)."""
     stmts, _, message = V31_REJECTS[name]
     err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
     assert message in err, err
@@ -1259,6 +1353,65 @@ def test_what_v31_rejects_and_programs_rely_on_is_a_warning(name):
     r = _compile(PRELUDE + V31_DECLS + stmts + "end t;\n")
     assert r.returncode == 0, r.stderr
     assert message in r.stderr, r.stderr
+
+
+# What Intel's PL/M-80 V3.1 takes of the forms above: an array without a
+# subscript after a dot and in LENGTH, LAST and SIZE, whose subscripts may
+# be expressions but for anything in parentheses; REENTRANT procedures that
+# call each other before their declarations (MP/M II's SN.PLM); the address
+# of a procedure declared later, in an INITIAL list and elsewhere; a call
+# through an address with arguments.  V3.1 compiles the program to print
+# what is expected (tests/test_intel_oracle.py builds it again), and
+# uplm80 compiles it without a word.
+V31_ALLOWS = """
+declare (b, n) byte, (w, q) address;
+declare a(4) byte, ab(6) byte, s structure (m(3) byte, k byte);
+declare s2(2) structure (m(5) byte), sa(3) structure (z(2) byte);
+declare hx(*) byte data ('0123');
+declare tab(2) address initial (.later, .ev);
+f: procedure byte; return 2; end f;
+ev: procedure (x) byte reentrant;
+  declare x byte;
+  if x = 0 then return 1;
+  return od(x - 1);
+end ev;
+od: procedure (x) byte reentrant;
+  declare x byte;
+  if x = 0 then return 0;
+  return ev(x - 1);
+end od;
+later: procedure (x, y);
+  declare (x, y) byte;
+  n = x + y;
+end later;
+lp: do;
+  w = .a; call ph(w - .a);
+  w = length(a) + last(a) + size(a); call ph(w);
+  w = .s.m - .s; call ph(w);
+  w = size(s.m) + length(s2.m) + last(sa.z); call ph(w);
+  call move(2, .hx, .a); call ph(a(1));
+  b = 1;
+  w = size(ab(b + 1)) + size(ab(f)) + size(sa(b).z) + size(ab(.w)); call ph(w);
+  call ph(hx(2));
+  call ph(ev(7)); call ph(od(7));
+  q = tab(0); call q(3, 4); call ph(n);
+end lp;
+"""
+
+
+def test_what_v31_takes_of_those_forms_is_compiled_without_a_word(capsys):
+    _check(V31_ALLOWS, [0, 0xB, 0, 9, 0x31, 5, 0x32, 0, 1, 7])
+    capsys.readouterr()
+    assert Compiler(opt_level=0).compile(_PH_PRELUDE + V31_ALLOWS + "end t;\n", "T.PLM")
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_an_untyped_data_string_is_an_array():
+    """uplm80 takes `declare hx data ('0123')', which V3.1 does not (ERROR
+    #61), for an array of the string's bytes, as 80un's bas.plm has it:
+    `hx(i)' is no subscript on a scalar."""
+    r = _compile(PRELUDE + "declare hx data ('0123'), i byte;\ni = 1;\ncall pc(hx(i));\nend t;\n")
+    assert r.returncode == 0 and "warning" not in r.stderr, r.stderr
 
 
 def test_the_address_of_memory_is_no_error():

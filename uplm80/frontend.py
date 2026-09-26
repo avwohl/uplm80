@@ -101,8 +101,13 @@ def label_the_ends(src: str, substitutions: list | None = None,
         if not fill and substitutions is not None:
             substitutions[:] = [(o + 1 if o >= at else o, name, text)
                                 for o, name, text in substitutions]
-    # Where each `;' is in the text returned: each put in before it on its
-    # line has moved it on one.
+    return src, _semicolons(places, blank, put_in)
+
+
+def _semicolons(places, blank, put_in) -> set[tuple[int, int]]:
+    """(line, column) of each `;' label_the_ends put at ``places``, in the
+    text it returns: each put in before it on its line, where no ``blank``
+    was, has moved it on one; and those in ``put_in``."""
     ends: set[tuple[int, int]] = set()
     moved: dict[int, int] = {}
     for (_, line, column), fill in zip(places, blank):
@@ -112,7 +117,7 @@ def label_the_ends(src: str, substitutions: list | None = None,
             moved[line] = moved.get(line, 0) + 1
             if put_in is not None:
                 put_in.setdefault(line, []).append(column)
-    return src, ends
+    return ends
 
 
 def _mark_ends(tree, ends: set[tuple[int, int]]) -> None:

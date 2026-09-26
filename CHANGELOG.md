@@ -67,6 +67,77 @@ The warnings, of the programs checked:
 Of the 87 compiles of MP/M II's and 80un's PL/M, 24 of MP/M II's and 12
 of 80un's are smaller, by 619 and 209 bytes in all at `-O2`.
 
+### Incompatible: more errors Intel's PL/M-80 gives
+
+What 0.4.2's Known issues listed as compiled by uplm80 and rejected by
+Intel's PL/M-80 V3.1 is refused as V3.1 refuses it, with its error's
+number and text, when the parser gives the program, at every `-O` level.
+Two forms uplm80's own tests exist to test are compiled as before, with a
+warning that names V3.1's error.  No program of MP/M II (DRI's tree and
+mpm2's overrides), of 80un or of `sample_code` has any of these; the tests
+whose programs had one in passing, a procedure with no statements or a
+call of one declared further on, have it no more.  V3.1 rejects each
+program of `tests/test_names.py` with the error the message names
+(`tests/test_intel_oracle.py`), and compiles the program of the forms it
+takes to print what uplm80's build prints.
+
+- **An END that names another block** (ERROR #20, MISMATCHED IDENTIFIER
+  AT END OF BLOCK): `p: procedure; ... end q;`, `out: end q;`, `l: do;
+  ... end m;`, `do; ... end n;`.  uplm80 took no notice of the name.
+
+      END Q: the END of procedure P names Q; Intel's PL/M-80 V3.1 rejects
+      it (ERROR #20, MISMATCHED IDENTIFIER AT END OF BLOCK)
+
+- **A DO CASE with no case**, `do case n; end;` or `do case n; l: end;`
+  (ERROR #201, INVALID DO CASE BLOCK, AT LEAST ONE CASE REQUIRED).
+- **The address of a call**, `.h(1)` of a procedure H (ERROR #104,
+  ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR); `.h` is its address.
+- **Anything in parentheses in a subscript of the argument of LENGTH,
+  LAST or SIZE** - a call, `size(ab(h(1)))`, a subscript, `size(ab(ab(1)))`,
+  a built-in or a parenthesized expression, `size(ab((i)))` (ERROR #32,
+  INVALID SYNTAX, TEXT IGNORED UNTIL ';'): V3.1 takes no such subscript,
+  and uplm80, which does not evaluate the subscripts there, did not call
+  `h`.  `size(ab(i + 1))`, `size(ab(f))` of a typed procedure and
+  `size(sa(i).z)` are taken, as V3.1 takes them.
+- **A procedure with no statements** (ERROR #174, INVALID NULL
+  PROCEDURE), `g: procedure; declare k byte; end g;`, a label on its END
+  or not; uplm80 made it return.
+- **An array or a member array without a subscript**, but after a dot and
+  as the argument of LENGTH, LAST or SIZE (3.6.2): `a = 3`, `x = a`,
+  `call p(a)`, `sz(a)` (ERROR #133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+  ARRAY) and `s.m = 4` (ERROR #134, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+  MEMBER ARRAY), which uplm80 took for `a(0)` and `s.m(0)`.  A member of an
+  array of structures named without its subscript, `s2.m(4)`, is taken
+  for `s2(0).m(4)` as before, with a warning:
+  `tests/test_calls_and_loops.py` tests what a store through it reaches.
+
+      A: A is an array, and an array is named without a subscript only as
+      the operand of a dot or the argument of LENGTH, LAST or SIZE
+      (Programming Manual 9800268B, 3.6.2); Intel's PL/M-80 V3.1 rejects
+      it (ERROR #133, ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY)
+      warning: S2.M: S2 is an array, and this is taken for S2(0).M;
+      Intel's PL/M-80 V3.1 rejects it (ERROR #133, ...)
+
+- **A subscript on a scalar** (ERROR #127, INVALID SUBSCRIPT ON
+  NON-ARRAY): `x(1)` is taken, as before, for the element that far past x,
+  with a warning - `tests/test_optimizer_soundness.py` tests it - and
+  `shl(w, 3)` of a program's ADDRESS SHL, two subscripts, which uplm80
+  took for a call through SHL's value, is an error (#127, and #114,
+  INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL).  `call q(1, 2)` of an
+  ADDRESS q calls through it (8.2.1), as V3.1 has it.
+- **A call of a procedure declared further on** (ERROR #169, ILLEGAL
+  FORWARD CALL): `p: procedure; call q; end p; q: procedure; ...`, and `y
+  = f + 1` of a typed `f` declared after.  A REENTRANT procedure may call
+  one declared after it that is REENTRANT too, as V3.1 allows and MP/M
+  II's SN.PLM does, and the address of a procedure, `.q`, may be taken
+  before its declaration, as the INITIAL lists of MP/M II's resident
+  processes take theirs.
+
+      Q: procedure Q is declared after this call of it, and a procedure is
+      called only after its declaration, but by a REENTRANT procedure if
+      it is REENTRANT too; Intel's PL/M-80 V3.1 rejects it (ERROR #169,
+      ILLEGAL FORWARD CALL)
+
 ### Fixed
 
 - **The columns after a label's colon against END**, `out:end p; b =
@@ -90,42 +161,30 @@ of 80un's are smaller, by 619 and 209 bytes in all at `-O2`.
 
 ### Known issues
 
-uplm80 still compiles these, which Intel's PL/M-80 V3.1 rejects (0.4.2
-the same):
+uplm80 still compiles these, which Intel's PL/M-80 V3.1 rejects, with a
+warning that names V3.1's error (Incompatible):
 
-- `f()` and `CALL g()` of a procedure, taken for `f` and `g`, with a
-  warning (ERROR #102, MISSING PRIMARY OPERAND, and #153, INVALID NUMBER
-  OF ARGUMENTS IN CALL; Incompatible).
-- A subscript on a scalar, `x(0)` or `x(1)`, the byte at X's address
-  plus the subscript (#127, INVALID SUBSCRIPT ON NON-ARRAY); and `shl(w,
-  3)` where the program declares SHL an ADDRESS, a call through SHL's
-  value (#127, and #114, MULTIPLE SUBSCRIPTS ILLEGAL).
-- An array, or an array member, without a subscript anywhere but in a
-  location reference or LENGTH, LAST and SIZE (3.6.2): `a = 3` and `x =
-  a` are `a(0)`, `s.m = 4` is `s.m(0)`, `s2.m(1)` of an array of
-  structures is `s2(0).m(1)`, and `size(a)`, SIZE an array of the
-  program's, is `size(a(0))` (#133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
-  ARRAY, and #134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY).
-- INITIAL in a procedure's declaration, or a DO block's, which
-  initializes the variable once, when the program is loaded, with a
-  warning (#73, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL;
-  Incompatible).
-- A procedure with no statements, `g: procedure; end g;`, which returns
-  (#174, INVALID NULL PROCEDURE).
-- A call of a procedure that its block declares after the call, `p:
-  procedure; call q; end p; q: procedure; ... end q;`, and `y = f + 1`
-  of a typed procedure `f` declared after it (#169, ILLEGAL FORWARD
+- `f()` and `CALL g()` of a procedure, taken for `f` and `g` (ERROR #102,
+  MISSING PRIMARY OPERAND, and #153, INVALID NUMBER OF ARGUMENTS IN
   CALL).
-- These four, which 0.4.2's release check found, each rejected by V3.1
-  with the error named: an END that names another block, `p: procedure;
-  ... end q;` or `out: end q;` (#20, MISMATCHED IDENTIFIER AT END OF
-  BLOCK); a DO CASE with no case, `do case n; end;`, and, since a label
-  on an END is taken, `do case n; l: end;` (#201, INVALID DO CASE BLOCK,
-  AT LEAST ONE CASE REQUIRED); `.p(1)` of a procedure (#104, ILLEGAL
-  PROCEDURE INVOCATION WITH DOT OPERATOR); and a subscript that calls a
-  procedure inside SIZE, LENGTH or LAST, `size(ab(f(1)))` or
-  `length(sa(f(1)).z)` (#32, INVALID SYNTAX), which uplm80 compiles
-  without calling `f`.
+- A subscript on a scalar, `x(1)`, the element that far past x (#127).
+- A member of an array of structures without its subscript, `s2.m(1)`,
+  taken for `s2(0).m(1)` (#133).
+- INITIAL in a procedure's declaration, or a DO block's, which
+  initializes the variable once, when the program is loaded (#73, INVALID
+  ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL).
+
+And these, without a word, which checking 0.4.3 against V3.1 found:
+
+- A call of a procedure, not REENTRANT, from inside itself, `r:
+  procedure; ... call r; end r;` (#170, ILLEGAL RECURSIVE CALL).
+- A procedure declared in a REENTRANT one (#88, INVALID PROCEDURE
+  NESTING, ILLEGAL IN REENTRANT PROCEDURE), and a REENTRANT procedure
+  declared in another procedure (#39, INVALID ATTRIBUTE OR
+  INITIALIZATION, NOT AT MODULE LEVEL).
+- More INITIAL or DATA values than a scalar holds, `declare y byte
+  initial (1, 2)`, which fill the bytes after it (#209, ILLEGAL
+  INITIALIZATION OF MORE SPACE THAN DECLARED).
 
 And this V3.1 compiles to other code (0.4.2 the same):
 

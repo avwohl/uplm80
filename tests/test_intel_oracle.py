@@ -25,7 +25,7 @@ from tests.plm_intel import generate
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
-from tests.test_names import V31_DECLS, V31_REJECTS, V31_WARNS
+from tests.test_names import V31_ALLOWS, V31_DECLS, V31_REJECTS, V31_WARNS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -47,6 +47,7 @@ RELEASE_PROGRAMS = {
     **{f"memory-runs-back-{k}": v for k, v in MEMORY_RUNS_BACK.items()},
     "end-labels": END_LABELS,                    # 0.4.2, out: end p;
     "byte-shifts": BYTE_SHIFTS,                  # 0.4.3, shl(b, 4) of a BYTE
+    "v31-allows": V31_ALLOWS,                    # 0.4.3, size(ab(b + 1)), forward REENTRANT
 }
 
 

@@ -42,11 +42,11 @@ class TestAddressStructMemberComparison:
 b: do;
 declare p address;
 declare rec based p structure (type byte, len address, rec(1) byte);
+bar: procedure external; end;
 foo: procedure;
     if rec.len <= 1025 then
         call bar;
 end foo;
-bar: procedure external; end;
 end b;
 """
 

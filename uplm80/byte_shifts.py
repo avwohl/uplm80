@@ -46,6 +46,7 @@ from .ast_view import (
     decl_item_names,
     decl_item_struct_members,
     decl_item_type,
+    expr_text,
     ident_text,
     is_end_of_block,
     iter_block_proc_decls,
@@ -168,12 +169,7 @@ def _pinned(tree) -> set[str]:
     """The names whose address ``tree`` takes, `.x' or `.x(i).m', or
     that an AT names: a store through a pointer may change them."""
     out: set[str] = set()
-    stack = [tree]
-    while stack:
-        n = stack.pop()
-        if isinstance(n, (list, tuple)):
-            stack.extend(n)
-            continue
+    for n in _nodes(tree):
         if isinstance(n, (P.LocationOf, P.AttrAt)):
             root = unwrap_paren(n.operand if isinstance(n, P.LocationOf) else n.address)
             while isinstance(root, (P.Call, P.MemberAccess, P.LocationOf)):
@@ -182,9 +178,6 @@ def _pinned(tree) -> set[str]:
                                     else root.operand)
             if isinstance(root, (P.Identifier, P.DottedIdent)):
                 out.add(ident_text(root.name))
-        for f in getattr(n, "__dataclass_fields__", ()):
-            if f != "pos":
-                stack.append(getattr(n, f, None))
     return out
 
 
@@ -215,30 +208,6 @@ def _const(expr) -> int | None:
     if isinstance(e, P.NumberLiteral):
         return number_value(e) & 0xFFFF
     return None
-
-
-def expr_text(expr) -> str:  # pylint: disable=too-many-return-statements
-    """``expr`` as the source spells it (names in upper case, as the macro
-    pass leaves them), but ``...`` for what it does not spell out."""
-    e = expr
-    if isinstance(e, P.ParenExpr):
-        return f"({expr_text(e.inner)})"
-    if isinstance(e, P.Identifier):
-        return ident_text(e.name)
-    if isinstance(e, (P.NumberLiteral, P.StringLiteral)):
-        return e.value.text
-    if isinstance(e, P.Call):
-        return f"{expr_text(e.callee)}({', '.join(expr_text(a) for a in e.args)})"
-    if isinstance(e, P.MemberAccess):
-        return f"{expr_text(e.base)}.{ident_text(e.member)}"
-    if isinstance(e, P.BinaryOp):
-        return f"{expr_text(e.left)} {e.op.text.upper()} {expr_text(e.right)}"
-    if isinstance(e, P.UnaryOp):
-        op = "-" if unop_kind(e) == UnaryOpKind.NEG else "NOT "
-        return f"{op}{expr_text(e.operand)}"
-    if isinstance(e, P.LocationOf):
-        return f".{expr_text(e.operand)}"
-    return "..."
 
 
 class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-attributes
@@ -707,20 +676,18 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
 def _nodes(tree, into_procs: bool = True):
     """Every node of ``tree``; not those of a procedure's body, but for
     ``into_procs``."""
-    stack = [tree]
-    while stack:
-        n = stack.pop()
-        if isinstance(n, (list, tuple)):
-            stack.extend(n)
-            continue
-        if not hasattr(n, "__dataclass_fields__") or hasattr(n, "file_id"):
-            continue
-        yield n
-        if isinstance(n, P.ProcDecl) and not into_procs:
-            continue
-        for f in n.__dataclass_fields__:
-            if f != "pos":
-                stack.append(getattr(n, f, None))
+    if isinstance(tree, (list, tuple)):
+        for x in tree:
+            yield from _nodes(x, into_procs)
+        return
+    if not hasattr(tree, "__dataclass_fields__") or hasattr(tree, "file_id"):
+        return
+    yield tree
+    if isinstance(tree, P.ProcDecl) and not into_procs:
+        return
+    for f in tree.__dataclass_fields__:
+        if f != "pos":
+            yield from _nodes(getattr(tree, f, None), into_procs)
 
 
 def _callees(tree) -> set[tuple[str, bool]]:

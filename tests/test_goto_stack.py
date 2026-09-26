@@ -157,8 +157,8 @@ end t;
 LIB = """lib: do;
 declare again label external;
 declare n address external;
-bail: procedure public; call deeper; end bail;
 deeper: procedure; n = n + 1; goto again; end deeper;
+bail: procedure public; call deeper; end bail;
 end lib;
 """
 

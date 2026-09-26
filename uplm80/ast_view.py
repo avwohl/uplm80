@@ -566,6 +566,30 @@ def literally_value(decl: P.LiterallyDecl) -> str:
     return text
 
 
+def expr_text(expr) -> str:  # pylint: disable=too-many-return-statements
+    """``expr`` as the source spells it (names in upper case, as the macro
+    pass leaves them), but ``...`` for what it does not spell out."""
+    e = expr
+    if isinstance(e, P.ParenExpr):
+        return f"({expr_text(e.inner)})"
+    if isinstance(e, P.Identifier):
+        return ident_text(e.name)
+    if isinstance(e, (P.NumberLiteral, P.StringLiteral)):
+        return e.value.text
+    if isinstance(e, P.Call):
+        return f"{expr_text(e.callee)}({', '.join(expr_text(a) for a in e.args)})"
+    if isinstance(e, P.MemberAccess):
+        return f"{expr_text(e.base)}.{ident_text(e.member)}"
+    if isinstance(e, P.BinaryOp):
+        return f"{expr_text(e.left)} {e.op.text.upper()} {expr_text(e.right)}"
+    if isinstance(e, P.UnaryOp):
+        op = "-" if unop_kind(e) == UnaryOpKind.NEG else "NOT "
+        return f"{op}{expr_text(e.operand)}"
+    if isinstance(e, P.LocationOf):
+        return f".{expr_text(e.operand)}"
+    return "..."
+
+
 # ---- synthetic node construction ------------------------------------------
 
 
