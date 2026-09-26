@@ -79,3 +79,13 @@ def test_an_assignment_is_placed_at_its_target():
     r = _compile({"sz.plm": "t: do;\ndeclare x address;\n\n   x = size(3);\nend t;\n"}, "sz.plm")
     assert r.returncode != 0
     assert "sz.plm:4:4: error: SIZE() needs a variable" in r.stderr, r.stderr
+
+
+def test_a_literally_over_two_lines_does_not_move_the_lines_after_it():
+    """The macro pass put a LITERALLY's text in with its line ends, and each
+    use moved every line after it down: MP/M II's ERA.PLM, which uses a
+    PROCESS$DESCRIPTOR of 16 lines once, was reported at line 357 for 341."""
+    r = _compile({"m.plm": "t: do;\ndeclare two literally 'b byte,\n  c byte';\ndeclare two;\n"
+                           "if b = 300 then b = 1;\nend t;\n"}, "m.plm")
+    assert r.returncode == 0, r.stderr
+    assert "m.plm:5:8: warning: comparison BYTE = 300 is always false" in r.stderr, r.stderr

@@ -69,6 +69,13 @@ of 80un's are smaller, by 619 and 209 bytes in all at `-O2`.
 
 ### Fixed
 
+- **A LITERALLY whose text runs over several lines no longer moves the
+  lines after its use.**  The macro pass put the text in with its line
+  ends, so every message about a later line named a line too far on, by
+  the text's line ends at each use: MP/M II's ERA, REN and SET use
+  `PROCES.LIT`'s PROCESS$DESCRIPTOR once, whose text, with the texts it
+  names, has 16 line ends, and were reported 16 lines on.  The text goes in on one line, as a line end in it is a blank;
+  the 87 MP/M II and 80un compiles are unchanged.
 - `UPEEPZ80_MIN`, the upeepz80 the compiler takes at its word, is 0.2.7,
   the floor `pyproject.toml` has required since 0.4.2; it said 0.2.6, and
   `tests/test_upeepz80_version.py` failed.  An upeepz80 numbered below it

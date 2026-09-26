@@ -599,8 +599,13 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
             ):
                 out.append(body.strip())
                 continue
-            sub_tokens = _tokenize_for_macros(body)
-            pending = list(sub_tokens) + pending
+            # A text that runs over several lines is put in on one: its
+            # line ends would move every line after the use, and what a
+            # message says of them (a newline in a PL/M text is a blank).
+            sub_tokens = [_Tok(t.kind, t.text.replace("\n", " "), t.line, t.col)
+                          if t.kind in ("WS", "COMMENT") else t
+                          for t in _tokenize_for_macros(body)]
+            pending = sub_tokens + pending
             continue
 
         # Plain identifier — emit as-is.
