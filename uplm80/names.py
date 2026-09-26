@@ -52,7 +52,10 @@ from dataclasses import dataclass, field
 
 from . import _plm_parser as P
 from .ast_view import (
+    BinaryOpKind,
     DataType,
+    UnaryOpKind,
+    binop_kind,
     decl_attrs,
     decl_item_struct_members,
     decl_item_type,
@@ -65,6 +68,8 @@ from .ast_view import (
     string_value,
     struct_member_dim,
     struct_member_names,
+    struct_member_type,
+    unop_kind,
     unwrap_paren,
 )
 from .errors import CodeGenError
@@ -256,8 +261,6 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     in_list: bool = False       # in a DATA or INITIAL list
     empty: bool = False         # followed by empty parentheses, `name()'
     in_at: bool = False         # in an AT clause
-    in_consts: bool = False     # in a constant list, `.(1, 'a')'
-    in_subscript: bool = False  # in a subscript of the operand of a dot, `.a(1)'
     # the member or the subscripted reference it starts that empty
     # parentheses follow, `s.m()', `a(1)()'
     after: object = None
@@ -295,8 +298,11 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.used: set[str] = set()     # every name a declaration has
         self._lists = 0                 # DATA and INITIAL lists being visited
         self._at = 0                    # AT clauses being visited
-        self._consts = 0                # constant lists being visited
-        self._dot_subscripts = 0        # subscripts of a dot's operand being visited
+        # The restricted expressions (check_restricted): (where, value,
+        # its index in its list, how many the list has), where is "list"
+        # (a DATA or INITIAL list), "at" or "consts" (a constant list).
+        self.restricted: list[tuple] = []
+        self._byte_values: set[int] = set()     # the values in them that fill a BYTE, by id
         # Structure members used, as (member access, block, the reference's
         # _Ref-like flags): dot, the LENGTH/LAST/SIZE call, subscripted.
         self.member_uses: list[tuple] = []
@@ -440,19 +446,24 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             # `.a', `.a(i)', `.output(3)', `.s.m': the dot is the reference's.
             self._reference(unwrap_paren(n.operand), block, dot=True)
         elif isinstance(n, P.AttrAt):
+            self.restricted.append(("at", n.address, 0, 1))
             self._at += 1
             self._visit(n.address, block)
             self._at -= 1
         elif isinstance(n, P.LocationOfList):
-            self._consts += 1
+            values = list(n.values or [])
+            self.restricted.extend(("consts", v, i, len(values)) for i, v in enumerate(values))
             self._visit(n.values, block)
-            self._consts -= 1
         elif isinstance(n, P.AttrInitial) or hasattr(n, "data_values"):
             # A DATA or an INITIAL list, where the address of a label may be.
             for f in n.__dataclass_fields__:
                 if f == "pos":
                     continue
                 inside = f in ("values", "data_values")
+                if inside:
+                    values = list(getattr(n, f) or [])
+                    self.restricted.extend(("list", v, i, len(values))
+                                           for i, v in enumerate(values))
                 self._lists += inside
                 self._visit(getattr(n, f), block)
                 self._lists -= inside
@@ -480,8 +491,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
 
     def _ref(self, block: _Block, node, **kw) -> _Ref:
         """A use of the name ``node`` spells, in ``block``."""
-        r = _Ref(block, node, "name", in_list=self._lists > 0, in_at=self._at > 0,
-                 in_consts=self._consts > 0, in_subscript=self._dot_subscripts > 0, **kw)
+        r = _Ref(block, node, "name", in_list=self._lists > 0, in_at=self._at > 0, **kw)
         self.refs.append(r)
         return r
 
@@ -506,9 +516,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self.extent_calls[id(n)] = (n, self.refs[start])
                 self._reference(n.args[0], block, extent=n)
                 return
-            self._dot_subscripts += dot
             self._visit(n.args, block)
-            self._dot_subscripts -= dot
         elif isinstance(n, P.MemberAccess):
             self.member_uses.append((n, block, dot, extent, args))
             start = len(self.refs)
@@ -542,16 +550,21 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         32: "INVALID SYNTAX, TEXT IGNORED UNTIL ';'",
         104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
+        125: "ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
         146: "MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION",
+        147: "MISSING IDENTIFIER FOLLOWING DOT OPERATOR",
         150: "MISSING ')' AT END OF RESTRICTED SUBSCRIPT",
         151: "INVALID OPERAND IN RESTRICTED EXPRESSION",
         152: "MISSING ')' AFTER CONSTANT LIST",
         169: "ILLEGAL FORWARD CALL",
+        172: "INVALID LABEL: UNDEFINED",
         174: "INVALID NULL PROCEDURE",
         201: "INVALID DO CASE BLOCK, AT LEAST ONE CASE REQUIRED",
+        209: "ILLEGAL INITIALIZATION OF MORE SPACE THAN DECLARED",
+        210: "ILLEGAL INITIALIZATION OF A BYTE TO A VALUE > 255",
         211: "INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE",
     }
 
@@ -582,13 +595,17 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         if block.kind != "module" and (attrs.is_public or attrs.is_external):
             # Intel's PL/M-80 V3.1: ERROR 39, INVALID ATTRIBUTE OR
             # INITIALIZATION, NOT AT MODULE LEVEL, in a procedure and in a
-            # DO block of the module alike.
+            # DO block of the module alike; and V3.1 then takes it for a
+            # procedure of its own, which, with no statements, as an
+            # EXTERNAL one has none, is ERROR 174, INVALID NULL PROCEDURE.
             what = "PUBLIC" if attrs.is_public else "EXTERNAL"
+            null = not _has_statements(p)
             raise CodeGenError(
                 f"{ident_text(p.name)}: a{'n' if what[0] == 'E' else ''} {what} procedure must be "
                 f"declared at the outer level of the module, not in {self._where(block)}; "
                 "Intel's PL/M-80 V3.1 rejects it (ERROR #39, INVALID ATTRIBUTE OR "
-                "INITIALIZATION, NOT AT MODULE LEVEL)", source_location(p))
+                "INITIALIZATION, NOT AT MODULE LEVEL"
+                + (", and #174, INVALID NULL PROCEDURE)" if null else ")"), source_location(p))
         d = self._declare(block, _key(p.name), "proc", (p, "name"), public=attrs.is_public,
                           external=attrs.is_external, reentrant=attrs.is_reentrant, node=p)
         end = p.body.end_label
@@ -598,9 +615,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             # Intel's PL/M-80 V3.1: ERROR 20.
             text = ident_text(end.name)
             self.intel(end, f"END {text}: the END of procedure {d.orig} names {text}", 20)
-        if not attrs.is_external and not any(
-                not isinstance(it, (P.DeclareStmt, P.ProcDecl)) and not is_end_of_block(it)
-                for it in p.body.items):
+        if not attrs.is_external and not _has_statements(p):
             # Intel's PL/M-80 V3.1: ERROR 174, a label on its END or not.
             self.intel(p, f"{d.orig}: a procedure has at least one statement, and {d.orig} "
                        "has none", 174)
@@ -645,6 +660,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                           dim=_dimension(item), members=_members(item))
         if item.based is not None:
             self._visit(item.based.base, block)
+        self._byte_values.update(_byte_values(item))
         self._visit([item.array_size, item.tail], block)
 
     @staticmethod
@@ -882,7 +898,6 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     f"{after}(): {after} is {kind}, and PL/M-80 has neither an empty "
                     "subscript nor an empty argument list", source_location(r.node))
             if d is None:
-                self._check_restricted(r, text)
                 self._check_builtin_use(r, text)
                 continue
             if r.empty and d.kind in self._KIND_WORDS:
@@ -1018,52 +1033,285 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             if isinstance(ref, P.Call):
                 if any(_has_parentheses(a) for a in ref.args):
                     name = ident_text(unwrap_paren(call.callee).name)
+                    # LENGTH and LAST: and ERROR 125, ILLEGAL ARGUMENT FOR
+                    # BUILT-IN PROCEDURE, of what V3.1 read before the text
+                    # it ignores.
+                    numbers = (32,) if _key(unwrap_paren(call.callee).name) == "SIZE" else (125, 32)
                     self.intel(call, f"{expr_text(call)}: the subscripts of {name}'s "
                                "argument are not evaluated, and none has anything in "
-                               "parentheses in it, a call, a subscript or an expression", 32)
+                               "parentheses in it, a call, a subscript or an expression", *numbers)
                     return
                 ref = unwrap_paren(ref.callee)
             else:
                 ref = unwrap_paren(ref.base)
 
-    def _check_restricted(self, r: _Ref, text: str) -> None:
-        """A built-in in a restricted expression - a DATA or INITIAL value,
-        an AT address, a constant list `.(1, 'a')' - which is made of
-        constants and, but in a constant list, locations: `shl(0f0h, 4)',
-        `size(a)', `.a(low(1))', `memory' (0.4.3's Known issues).  MEMORY's
-        location, `.memory', is one; `.stackptr' in an AT is not, and in a
-        list it is refused as in an expression (_check_builtin_use).
-        uplm80 folded SHL, SHR, ROL, ROR, LOW, HIGH and DOUBLE of constants
-        there at -O1 and up, SHL and SHR of a BYTE in 16 bits, and at -O0
-        refused them, or took them for something else.  Intel's PL/M-80
-        V3.1: ERROR 151, INVALID OPERAND IN RESTRICTED EXPRESSION, and, at
-        the parenthesis after the name, 152, MISSING ')' AFTER CONSTANT
-        LIST, 146, MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION, or in a
-        subscript 150, MISSING ')' AT END OF RESTRICTED SUBSCRIPT; ERROR
-        211, INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE, of
-        `.stackptr' in an AT."""
-        name = _key(getattr(r.node, r.attr))
-        if not (r.in_list or r.in_at or r.in_consts) or name not in _BUILTINS or r.empty:
+    # What a restricted expression - a DATA or INITIAL value, an AT
+    # address, a constant in a constant list `.(1, 'a')', or the subscript
+    # of a location in one of them - does not take, and the errors Intel's
+    # PL/M-80 V3.1 gives for it there, in the order of _CONTEXTS (each form
+    # checked with scripts/intel_oracle.py, in each place and first, second
+    # and alone in a constant list):
+    _RESTRICTED = {
+        "operator": ((152,), (146,), (152,), (150,)),           # 2 * 3, 1 < 2
+        "not": ((151, 152), (146, 151), (151, 152), (150, 151)),
+        "paren": ((151, 152), (146, 151), (32, 151, 152), (150, 151)),     # (1), -(1)
+        "call": ((151, 152), (146, 151), (32, 151, 152), (150, 151)),      # a(1), shl(1, 2)
+        "member": ((151, 152), (146, 151), (151, 152), (150, 151)),        # s.k
+        "string": ((151, 152), (146, 151), (151, 152), (150, 151)),        # 1 + 'A'
+        "string-first": ((152,), (146, 151), (152,), (150, 151)),          # 'A' + 1
+        "location": ((151, 152), (146, 151), (151, 152), (150, 151)),      # 1 + .a, -.a
+        "name": ((151,), (151,), (151,), (151,)),                          # x, memory
+        "negation": ((151,), (151,), (151,), (151,)),                      # - -1
+        "constants": ((147,), (147,), (32, 147), (147,)),                  # .(5)
+        "text": ((147,), (147,), (147,), (147,)),                          # .'AB'
+        "at-builtin": ((), (211,), (), ()),                                # at (.stackptr)
+        "constant-location": ((), (), (), ()),                             # .(.a)
+        "byte-location": ((), (), (), ()),                                 # byte data (.a)
+        "range": ((210,), (), (210,), ()),                                 # .(300)
+    }
+    _CONTEXTS = ("list", "at", "consts", "subscript")
+    # What V3.1 reads past, going on to the rest of the value.
+    _READ_PAST = frozenset({"name", "negation", "range", "constant-location", "byte-location",
+                            "at-builtin"})
+    # The order V3.1 lists its errors in.
+    _V31_ORDER = (151, 152, 146, 150, 147, 32, 210, 209, 211, 172)
+    _RULES = {
+        "list": ("a DATA or INITIAL value", "is a restricted expression, of constants and "
+                 "locations only"),
+        "at": ("an AT address", "is a restricted expression, a constant or a location plus "
+               "or minus constants"),
+        "consts": ("a constant list", "holds constants only"),
+    }
+
+    def check_restricted(self) -> None:
+        """Each restricted expression - a DATA or INITIAL value, an AT
+        address, a constant of a constant list `.(1, 'a')' - is what
+        Intel's PL/M-80 V3.1 takes (Programming Manual 9800268B, 4.1.3,
+        6.2.8, 6.2.9): numbers, added and subtracted, a minus sign before a
+        number; in a DATA or INITIAL list a string alone, and a location,
+        `.a', `.s.m(2)', `.memory', plus or minus numbers; in an AT a
+        location; in a constant list a string alone, and numbers a byte
+        holds.  A subscript of a location is numbers too.  Anything else
+        is an error, with V3.1's errors: an operator but + and -, NOT,
+        parentheses, a name not after a dot - a variable, a procedure, a
+        built-in, `x', `a(1)', `s.k', `shl(1, 2)', `memory' - a string in a
+        sum, a location anywhere but first, a constant list or `.'text''
+        (V3.1 takes neither there), and in a constant list, or in a value
+        that fills a BYTE, a location or what a byte does not hold,
+        `.(300)', `byte data (300)'.  uplm80 took most of them, for
+        the address of a name, the low byte of a number, or, at -O1 and
+        up, a built-in folded (0.4.3's Known issues).  A name the program
+        does not declare is left to check_uses."""
+        refs = {id(r.node): r for r in self.refs if r.attr == "name" and not r.goto}
+        for where, expr, index, count in self.restricted:
+            faults: list = []
+            self._restricted(expr, where, "top", refs, faults)
+            byte = where == "consts" or id(expr) in self._byte_values
+            if byte and not faults:
+                self._restricted_range(expr, where, faults)
+            if byte and not faults and where == "list" and isinstance(_lead(expr), P.LocationOf):
+                faults.append(("byte-location", expr, where))
+            if faults:
+                self._restricted_error(faults, where, expr, (index, count, byte), refs)
+
+    def _restricted(self, e, ctx: str, role: str, refs: dict, faults: list) -> None:  # pylint: disable=too-many-return-statements,too-many-branches
+        """The faults of ``e``, part of a restricted expression in ``ctx``,
+        in the order V3.1 reads them: (kind, node, context).  ``role``:
+        "top", the whole value; "left" or "right", an operand of + or -;
+        "neg", the operand of a minus sign."""
+        if isinstance(e, P.NumberLiteral):
             return
-        if r.dot:
-            if r.in_at and name != "MEMORY":
-                self.intel(r.node, f".{text}: {text} is a built-in, and the location in an AT "
-                           "address is a variable's, or MEMORY's", 211)
+        if isinstance(e, P.StringLiteral):
+            if ctx in ("at", "subscript") or role in ("right", "neg"):
+                faults.append(("string", e, ctx))
+            elif role == "left":
+                faults.append(("string-first", e, ctx))
             return
-        numbers = [151]
-        if r.args is not None:
-            numbers.append(150 if r.in_subscript else 146 if r.in_at and not r.in_consts
-                           else 152)
-        if r.in_consts:
-            where = "a constant list holds constants only"
-        elif r.in_at:
-            where = ("an AT address is a restricted expression, a constant or a location plus "
-                     "or minus constants")
-        else:
-            where = ("a DATA or INITIAL value is a restricted expression, of constants and "
-                     "locations only")
-        what = expr_text(r.call) if r.call is not None else text
-        self.intel(r.node, f"{what}: {text} is a built-in, and {where}", *numbers)
+        if isinstance(e, P.ParenExpr):
+            faults.append(("paren", e, ctx))
+        elif isinstance(e, P.UnaryOp):
+            inner = e.operand
+            if unop_kind(e) == UnaryOpKind.NOT:
+                faults.append(("not", e, ctx))
+            elif isinstance(inner, P.LocationOf):
+                faults.append(("location", e, ctx))
+            elif isinstance(inner, P.UnaryOp) and unop_kind(inner) == UnaryOpKind.NEG:
+                faults.append(("negation", e, ctx))
+                self._restricted(inner.operand, ctx, "neg", refs, faults)
+            else:
+                self._restricted(inner, ctx, "neg", refs, faults)
+        elif isinstance(e, P.BinaryOp):
+            self._restricted(e.left, ctx, "left", refs, faults)
+            if faults and faults[-1][0] not in self._READ_PAST:
+                return
+            if binop_kind(e) not in (BinaryOpKind.ADD, BinaryOpKind.SUB):
+                faults.append(("operator", e, ctx))
+            elif isinstance(e.right, P.LocationOf):
+                faults.append(("location", e.right, ctx))
+            else:
+                self._restricted(e.right, ctx, "right", refs, faults)
+        elif isinstance(e, P.LocationOf):
+            if role in ("right", "neg") or ctx == "subscript":
+                faults.append(("location", e, ctx))
+                return
+            self._restricted_location(e.operand, ctx, refs, faults)
+            if ctx == "consts":
+                faults.append(("constant-location", e, ctx))
+        elif isinstance(e, (P.LocationOfList, P.LocationOfString)) and ctx == "subscript":
+            faults.append(("location", e, ctx))
+        elif isinstance(e, P.LocationOfList):
+            faults.append(("constants", e, ctx))
+        elif isinstance(e, P.LocationOfString):
+            faults.append(("text", e, ctx))
+        elif isinstance(e, (P.Identifier, P.Call, P.MemberAccess)):
+            root = e
+            while isinstance(root, (P.Call, P.MemberAccess)):
+                root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
+            if not isinstance(root, P.Identifier) or not self._restricted_name(refs.get(id(root))):
+                return      # declared nowhere, or a LITERALLY's: check_uses
+            kind = ("name" if isinstance(e, P.Identifier) else
+                    "call" if isinstance(e, P.Call) else "member")
+            faults.append((kind, e, ctx))
+
+    def _restricted_location(self, d, ctx: str, refs: dict, faults: list) -> None:
+        """The faults of what a dot takes the location of, in ``ctx``: its
+        subscripts', and, in an AT, a built-in's but MEMORY's (V3.1: ERROR
+        211)."""
+        d = unwrap_paren(d)
+        if isinstance(d, P.Identifier):
+            r = refs.get(id(d))
+            name = _key(d.name)
+            if ctx == "at" and r is not None and r.decl is None and name in _BUILTINS \
+                    and name != "MEMORY":
+                faults.append(("at-builtin", d, ctx))
+        elif isinstance(d, P.Call):
+            self._restricted_location(d.callee, ctx, refs, faults)
+            for a in d.args:
+                if faults and faults[-1][0] not in self._READ_PAST:
+                    return
+                self._restricted(a, "subscript", "top", refs, faults)
+        elif isinstance(d, P.MemberAccess):
+            self._restricted_location(d.base, ctx, refs, faults)
+
+    @staticmethod
+    def _restricted_name(r: _Ref | None) -> bool:
+        """Whether the name ``r`` is of is one a restricted expression
+        does not take: declared, but not a LITERALLY, or a built-in."""
+        if r is None:
+            return False
+        if r.decl is None:
+            return _key(getattr(r.node, r.attr)) in _BUILTINS
+        return r.decl.kind != "lit"
+
+    @staticmethod
+    def _restricted_range(expr, where: str, faults: list) -> None:
+        """A constant of a constant list is a byte, and so is a value of a
+        DATA or INITIAL list that fills a BYTE: V3.1 computes it as it
+        computes a constant, a number below 256 a BYTE and the rest an
+        ADDRESS, BYTE arithmetic in eight bits (`-1', `1 - 2' are 0FFH), and
+        rejects what is more than 255 (ERROR 210): `.(300)', `.(-256)',
+        `.(299 + 1)', `.(0ffffh)', `declare b byte data (300)'; uplm80 kept
+        the low byte."""
+        value = _v31_constant(expr)
+        if value is not None and value[0] > 0xFF:
+            faults.append(("range", expr, where))
+
+    def _restricted_error(self, faults: list, where: str, expr, place: tuple,
+                          refs: dict) -> None:
+        """Refuse the restricted expression ``expr`` for its first fault,
+        with the errors V3.1 gives for it: those of each fault it reads, up
+        to the first it does not read past; #210 for a location that fills
+        a BYTE; and in a constant list, where a value that starts with a
+        name or a location is taken for a word, #209 for the second byte
+        after the first value or past the list's end, #210 for a location
+        first, and #172 for a built-in's call first.  ``place``: the
+        value's index in its list, how many the list has, and whether it
+        fills a BYTE."""
+        index, count, byte = place
+        numbers: set[int] = set()
+        for kind, node, ctx in faults:
+            numbers.update(self._RESTRICTED[kind][self._CONTEXTS.index(ctx)])
+            if where == "consts" and ctx == "subscript" and kind in ("paren", "call", "constants"):
+                numbers.add(32)
+            if kind not in self._READ_PAST:
+                break
+        lead = _lead(expr)
+        if where == "list" and byte and isinstance(lead, P.LocationOf):
+            numbers.add(210)
+        if where == "consts":
+            if isinstance(lead, P.LocationOf) and index == 0:
+                numbers.add(210)
+            if isinstance(lead, (P.Identifier, P.Call, P.MemberAccess, P.LocationOf)) and (
+                    index > 0 or (count > 1 and not numbers & {32, 152})):
+                numbers.add(209)
+            kind, node, _ = faults[0]
+            if index == 0 and kind == "call":
+                r = refs.get(id(unwrap_paren(node.callee)))
+                if r is not None and r.decl is None:
+                    numbers.add(172)
+        kind, node, ctx = faults[0]
+        self.intel(node, self._restricted_text(kind, node, ctx, where, refs),
+                   *sorted(numbers, key=self._V31_ORDER.index))
+
+    def _restricted_text(self, kind: str, node, ctx: str, where: str, refs: dict) -> str:  # pylint: disable=too-many-arguments,too-many-return-statements
+        """What the message says of the fault ``kind`` at ``node``, in
+        ``ctx``, of a value in ``where``."""
+        what = expr_text(node)
+        subject, rule = self._RULES[where]
+        if kind in ("name", "call", "member"):
+            root = node
+            while isinstance(root, (P.Call, P.MemberAccess)):
+                root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
+            text = ident_text(root.name)
+            if kind == "member":
+                return f"{what}: {what} is a member of structure {text}, and {subject} {rule}"
+            return f"{what}: {text} is {self._name_kind(refs.get(id(root)))}, and {subject} {rule}"
+        if ctx == "subscript":
+            subject = f"the subscript of a location in {subject}"
+        if kind in ("operator", "not"):
+            return f"{what}: of the operators, {subject} takes + and - only"
+        if kind == "paren":
+            return f"{what}: {subject} has nothing in parentheses"
+        if kind == "negation":
+            return f"{what}: in {subject} a minus sign goes before a number only"
+        if kind in ("string", "string-first"):
+            if ctx in ("at", "subscript"):
+                return f"{what}: {subject} has no string in it"
+            return (f"{what}: a string in {subject} is a value of its own, not added to or "
+                    "subtracted from")
+        if kind == "location":
+            if ctx == "subscript":
+                return f"{what}: {subject} is numbers only"
+            if where == "consts":
+                return f"{what}: {subject} {rule}, and a location is none"
+            return (f"{what}: {subject} is a location plus or minus constants, the location "
+                    "first, or constants alone")
+        if kind == "constant-location":
+            return f"{what}: {subject} {rule}, and {what} is a location"
+        if kind in ("constants", "text"):
+            return f"{what}: {subject} does not take the location of constants"
+        if kind == "at-builtin":
+            text = ident_text(node.name)
+            return (f".{text}: {text} is a built-in, and the location in an AT address is a "
+                    "variable's, or MEMORY's")
+        if kind == "byte-location":
+            return f"{what}: a location is an address, and this value fills a BYTE"
+        value = f"{_v31_constant(node)[0]:X}H"
+        value = "0" + value if value[0] in "ABCDEF" else value
+        if where == "consts":
+            return f"{what}: {subject} holds bytes, and {what} is {value}, more than 0FFH"
+        return f"{what}: this value fills a BYTE, and {what} is {value}, more than 0FFH"
+
+    @staticmethod
+    def _name_kind(r: _Ref | None) -> str:
+        """What the name ``r`` is of is, in a message."""
+        d = r.decl if r is not None else None
+        if d is None:
+            return "a built-in"
+        if d.kind == "var":
+            return "an array" if d.dim is not None else "a variable"
+        return {"param": "a parameter", "proc": "a procedure", "label": "a label"}.get(
+            d.kind, "a name")
 
     @staticmethod
     def _check_builtin_use(r: _Ref, text: str) -> None:
@@ -1295,6 +1543,85 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
 
 
+def _has_statements(p: P.ProcDecl) -> bool:
+    """Whether the procedure ``p`` has a statement of its own."""
+    return any(not isinstance(it, (P.DeclareStmt, P.ProcDecl)) and not is_end_of_block(it)
+               for it in p.body.items)
+
+
+def _lead(expr):
+    """What a restricted expression starts with: the left operand of its
+    sums and differences, all the way down."""
+    while isinstance(expr, P.BinaryOp):
+        expr = expr.left
+    return expr
+
+
+def _byte_values(item) -> set[int]:
+    """The values of the DATA or INITIAL list of ``item`` that fill a
+    BYTE, by id.  Each value fills the next of the scalars declared, in
+    order, and past them one of the declaration's own type, as
+    codegen._emit_value_list lays them out: of a BYTE or an untyped DATA
+    every value, of an ADDRESS none, of a STRUCTURE those that fill its
+    BYTE members, a string one member to a character, or to two of an
+    ADDRESS."""
+    attrs = decl_attrs(item)
+    values = attrs.data_values or attrs.initial_values or []
+    members = decl_item_struct_members(item)
+    if members is None:
+        dtype, _ = decl_item_type(item)
+        return {id(v) for v in values} if dtype in (None, DataType.BYTE) else set()
+    one = []
+    for m in members:
+        width = 1 if struct_member_type(m) == DataType.BYTE else 2
+        one.extend([width] * ((struct_member_dim(m) or 1) * len(struct_member_names(m))))
+    _, dim = decl_item_type(item)
+    names = item.names
+    count = 1 if isinstance(names, P.DeclName) else len(names.names or [])
+    widths = one * max(dim or 1, 1) * count
+    out, slot = set(), 0
+    for v in values:
+        inner = unwrap_paren(v)
+        if isinstance(inner, P.StringLiteral):
+            used = 0
+            while used < max(len(string_value(inner)), 1):
+                used += widths[slot] if slot < len(widths) else 1
+                slot += 1
+            continue
+        if (widths[slot] if slot < len(widths) else 1) == 1:
+            out.add(id(v))
+        slot += 1
+    return out
+
+
+def _v31_constant(expr) -> tuple[int, bool] | None:
+    """The value of ``expr``, numbers added and subtracted, as Intel's
+    PL/M-80 V3.1 computes it in a restricted expression, and whether it is
+    a BYTE: a number below 256 is a BYTE, and BYTE arithmetic is in eight
+    bits, `-1' 0FFH, `-1 - 1' 0FEH; ADDRESS arithmetic in sixteen, `0ffffh +
+    1' 0.  None for anything else."""
+    if isinstance(expr, P.NumberLiteral):
+        value = parse_plm_number(expr.value.text)
+        return value & 0xFFFF, value < 0x100
+    if isinstance(expr, P.StringLiteral):
+        text = string_value(expr)
+        return (ord(text) & 0xFF, True) if len(text) == 1 else None
+    if isinstance(expr, P.UnaryOp) and unop_kind(expr) == UnaryOpKind.NEG:
+        inner = _v31_constant(expr.operand)
+        if inner is None:
+            return None
+        value, byte = inner
+        return -value & (0xFF if byte else 0xFFFF), byte
+    if isinstance(expr, P.BinaryOp) and binop_kind(expr) in (BinaryOpKind.ADD, BinaryOpKind.SUB):
+        left, right = _v31_constant(expr.left), _v31_constant(expr.right)
+        if left is None or right is None:
+            return None
+        byte = left[1] and right[1]
+        value = left[0] + right[0] if binop_kind(expr) == BinaryOpKind.ADD else left[0] - right[0]
+        return value & (0xFF if byte else 0xFFFF), byte
+    return None
+
+
 def _has_parentheses(expr) -> bool:
     """Whether ``expr`` has anything in parentheses: a call, a subscript,
     `f()', `( )', `.(list)'."""
@@ -1378,6 +1705,7 @@ def check_names(modules: list, multi: bool = False) -> list[tuple]:
     r.bind()
     if multi:
         r.check_private()
+    r.check_restricted()
     r.check_uses()
     r.check_forms()
     return r.intel_warnings
