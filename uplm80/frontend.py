@@ -90,12 +90,20 @@ def _literally_at(e: Exception, src: str, substitutions) -> str:
     if line > len(lines):
         return ""
     offset = sum(len(x) + 1 for x in lines[:line - 1]) + column - 1
-    for at, name, text in substitutions:
-        if at == offset:
-            return (f"; that is the text of {name}, declared LITERALLY '{text}', which "
-                    f"PL/M-80 puts in place of {name} wherever it occurs in the LITERALLY's "
-                    "scope (Programming Manual 9800268B, 6.4)")
-    return ""
+    # A nested LITERALLY's text begins where the one whose text names it
+    # does, and comes after it: the last is the text the token is.
+    found = [(name, text) for at, name, text in substitutions if at == offset]
+    if not found:
+        return ""
+    name, text = found[-1]
+    where = "(Programming Manual 9800268B, 6.4)"
+    if len(found) == 1:
+        return (f"; that is the text of {name}, declared LITERALLY '{text}', which PL/M-80 "
+                f"puts in place of {name} wherever it occurs in the LITERALLY's scope {where}")
+    outer = "".join(f", in the text of {n}, declared LITERALLY '{t}'" for n, t in found[-2::-1])
+    return (f"; that is the text of {name}, declared LITERALLY '{text}'{outer}, and PL/M-80 "
+            f"puts a LITERALLY's text in place of its name wherever it occurs in the "
+            f"LITERALLY's scope {where}")
 
 
 def _syntax_error(e: Exception, line_map, filename: str, why: str = "") -> ParserError:

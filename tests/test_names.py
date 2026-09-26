@@ -1162,6 +1162,29 @@ end t;
             "6.4)") in err, err
 
 
+def test_the_note_names_the_literally_whose_text_the_token_is():
+    """With `nn literally '5', n literally 'nn'', an inner `declare n
+    byte' is `declare 5 byte' by way of NN; the note said the 5 was the
+    text of N, declared LITERALLY 'nn'.  It is NN's, in N's text.  Intel's
+    PL/M-80 V3.1: ERROR #48, ILLEGAL DECLARATION STATEMENT SYNTAX, near
+    NN."""
+    err = _compile_error(PRELUDE + """declare nn literally '5', n literally 'nn';
+declare w address;
+p: procedure;
+  declare n byte;
+  n = 3;
+  w = n;
+end p;
+w = n;
+end t;
+""")
+    assert ("T.PLM:8:11: error: unexpected token 'NUMBER' '5'; expected one of: IDENT, LPAREN; "
+            "that is the text of NN, declared LITERALLY '5', in the text of N, declared "
+            "LITERALLY 'nn', and PL/M-80 puts a LITERALLY's text in place of its name "
+            "wherever it occurs in the LITERALLY's scope (Programming Manual 9800268B, "
+            "6.4)") in err, err
+
+
 @pytest.mark.parametrize("opt", LEVELS)
 def test_a_literally_whose_text_is_a_name_declares_that_name_again(opt):
     """With `m literally 'w'', q's `declare m byte' declares a W of q's

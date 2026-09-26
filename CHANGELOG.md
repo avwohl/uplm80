@@ -191,6 +191,11 @@ any.
       of N wherever it occurs in the LITERALLY's scope (Programming Manual
       9800268B, 6.4)
 
+  Where the text is a nested LITERALLY's, the note names that one, and
+  the LITERALLY whose text names it: with `nn literally '5', n literally
+  'nn'`, "that is the text of NN, declared LITERALLY '5', in the text of
+  N, declared LITERALLY 'nn', ...". The syntax error is where it was.
+
 - A static parameter is no longer named a second time by an EQU
   (`?@proc$name equ @proc$name`). upeepz80 before 0.2.6 dropped the store
   of an argument at a procedure's entry when nothing else named the
