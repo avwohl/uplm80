@@ -785,6 +785,27 @@ call run;
 """, [0x1235, 0x34, 0x34, 1, 0x1269])
 
 
+# A multiple assignment whose value is an embedded assignment of one of its
+# targets, not the last.  Intel's PL/M-80 V3.1 takes that target's value for
+# an address (README, Known differences), and tests/test_intel_oracle.py
+# checks that its build of this program still does.
+EMBEDDED_TARGET = """
+declare (w2, w3, ew) address, eb byte;
+w2 = 0fffeh; w3 = 0cfh;
+w2, w3 = (ew := w2); call ph(w2); call ph(w3); call ph(ew);
+w2 = 0fffeh; w3 = 0cfh;
+w2, w3 = (eb := w2); call ph(w2); call ph(w3); call ph(eb);
+"""
+
+
+def test_a_multiple_assignment_of_an_embedded_assignment_of_a_target():
+    """`w2, w3 = (ew := w2)' gives w2, w3 and ew all of w2, the embedded
+    assignment's right half (4.6.3), and `(eb := w2)' eb its low byte;
+    V3.1 gives w3 the word 34H bytes on from w2's value (0.4.3's release
+    check, seed 80353)."""
+    _check(EMBEDDED_TARGET, [0xFFFE] * 5 + [0xFE])
+
+
 def test_size_of_a_variable_whose_value_is_known():
     """SIZE's operand names a variable; -O3 propagated `b0 = 5' into it,
     and SIZE(5) does not compile."""

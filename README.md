@@ -571,10 +571,13 @@ runs it with the rest where Intel's binaries are found (building
 building nothing; the oracle's own pieces that need no tools - the source
 normalisation, the halt patch, the skip - are checked either way.  It
 checks three generated programs and one of `tests/`, that a known
-difference is seen and a V3.1 rejection is, each program of a release's
-tests whose output the release transcribed from Intel's build, and, for
-each program `tests/test_names.py` expects uplm80 to reject or warn of as
-V3.1 rejects it, that V3.1 does, with the error uplm80's message names.
+difference is seen and a V3.1 rejection is, that V3.1's builds of the
+programs of the two V3.1 bugs 0.4.3's checks found print what they did
+(and, needing no tools, that the table below has them), each program of
+a release's tests whose output the release transcribed from Intel's
+build, and, for each program `tests/test_names.py` expects uplm80 to
+reject or warn of as V3.1 rejects it, that V3.1 does, with the error
+uplm80's message names.
 
 Intel's binaries are not part of this repository.  The oracle finds them
 through `--tools DIR` or `$PLM80_TOOLS`, or on DRI's MP/M II work disk at
@@ -645,6 +648,7 @@ result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
 | `neg-widened` | `b = 0E7H; w = 0FFFEH; v = (b - w) + (-b);` | `0002` | `0102H` | V3.1 negates `b` in 16 bits when `b - w` has already widened it (the manual: `-b` is a BYTE, 19H) |
 | | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` (b1-b4 BYTE, w1-w4 ADDRESS), as a program's first statement or later, is coded `INX H; INX SP; MOV M,A`, and a later CALL overwrites `b1` (the random campaign's seed 233).  The decrement form is the same: `MOV A,L; DCX SP` (`DCX PSW`) where it means `DCR A`, in `DO CASE ((-(LAST(sa.z))) / ROL(0FFFFH, 9)) MOD 5;` (seed 20226), and `INX SP` again in `DO CASE (ROR((07H AND 08001H), 1)) AND 1;` (0.4.3's seed 50265) |
 | | `b = 0ECH; w = (ew := b) + b;` (ew, w ADDRESS) | `01D8H` | `00D8H` | V3.1 widens b to store it in ew and adds that 16-bit copy to itself, `SHLD EW; MOV D,H; MOV E,L; DAD D` (0.4.3's campaign, seed 50252); the manual (4.6.3): the embedded assignment is its right half, a BYTE, and BYTE + BYTE is a BYTE |
+| | `w2 = 0FFFEH; w2, w3 = (ew := w2);` (w2, w3, ew ADDRESS) | w3 `0000` | w3 `0FFFEH` | Where a multiple assignment's value is an embedded assignment of one of its targets but the last, V3.1 takes that target's value for an address, `LHLD W2; SHLD EW; MOV D,H; MOV E,L; XCHG` and 52 `INX H` (54 in another program, 9 `DCX H` in a third): it copies the word there, at 0032H, onto itself and into each target after w2, and does not store w2.  `w2, w3 = (eb := w2);`, eb a BYTE, stores 0032H at 0032H and in w3 (0.4.3's release check, seed 80353).  `w3, w2 = (ew := w2);` is right; the manual: the embedded assignment is w2 (4.6.3), which each target gets |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
 | | `rw = ((08B1FH - b3) XOR (-((b4 >= ms(3)) AND 0))) + 0;` (b3 = 20H, b4 = 0, `ms DATA('x=1; y=2$')`) | `0` | `8AFFH` | V3.1's count of what it has on the stack goes below zero (its listing counts 0, 255, 254, ...) and it pops what it never pushed, a run of `POP PSW` (seed 20090); 8AFFH is the manual's value |
 

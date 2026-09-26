@@ -24,7 +24,7 @@ import pytest
 from tests.plm_difftest import Bin, Num, Var
 from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
-from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, QUALIFIED_SIZES
+from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
 from tests.test_names import V31_ALLOWS, V31_DECLS, V31_REJECTS, V31_WARNS
 
@@ -49,6 +49,20 @@ RELEASE_PROGRAMS = {
     "end-labels": END_LABELS,                    # 0.4.2, out: end p;
     "byte-shifts": BYTE_SHIFTS,                  # 0.4.3, shl(b, 4) of a BYTE
     "v31-allows": V31_ALLOWS,                    # 0.4.3, size(ab(b + 1)), forward REENTRANT
+}
+# V3.1's bugs the README's Known differences has and the generator does not
+# leave out: a program, after _PRELUDE; how the README writes it; what
+# V3.1's build prints; and what uplm80's prints at every level, the
+# manual's value.
+V31_BUGS = {
+    # 0.4.3's campaign, seed 50252: V3.1 adds the 16-bit copy of b in ew.
+    "embedded-byte-sum": ("""
+declare b byte, (ew, w) address;
+b = 0ech; w = (ew := b) + b; call ph(w);
+""", "`b = 0ECH; w = (ew := b) + b;`", "01D8 ", "00D8 "),
+    # 0.4.3's release check, seed 80353: V3.1 takes w2's value for an address.
+    "embedded-target": (EMBEDDED_TARGET, "`w2 = 0FFFEH; w2, w3 = (ew := w2);`",
+                        "FFFE 0000 FFFE FFFE 0032 00FE ", "FFFE FFFE FFFE FFFE FFFE 00FE "),
 }
 
 
@@ -109,6 +123,17 @@ end t;
     assert res.verdict == "differs"
     assert res.intel_out == "N"            # 40H + 0EH
     assert res.levels[0]["out"] == "@"
+
+
+@pytest.mark.parametrize("name", sorted(V31_BUGS))
+def test_a_v31_bug_the_readme_has_is_seen(tools, name):
+    """V3.1's build of each program prints what it did, and uplm80's the
+    manual's value at every level."""
+    body, _, intel, ours = V31_BUGS[name]
+    res = oracle.check_text(tools, _PRELUDE + body + "\nend t;\n", name)
+    assert res.verdict == "differs", oracle.format_result(res)
+    assert res.intel_out == intel, oracle.format_result(res)
+    assert all(r.get("out") == ours for r in res.levels.values()), oracle.format_result(res)
 
 
 def test_intel_rejects_what_v31_does_not_take(tools):
@@ -230,6 +255,17 @@ def test_zero_dividend_leaves_out_a_dividend_that_folds_to_0():
     assert not zero_dividend(Num(8), Var("b1"))
     avoid = KNOWN | {"zero-dividend"}
     assert "(high(144) / (7 = last(ms)))" not in generate(115, n_stmts=20, avoid=avoid).render()
+
+
+def test_the_readme_has_each_v31_bug():
+    """Each V3.1 bug the tests know is a row of the README's Known
+    differences with no `--avoid' name."""
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+        text = f.read()
+    known = text.split("### Known differences from Intel's PL/M-80 V3.1")[1].split("\n## ")[0]
+    rows = [line for line in known.splitlines() if line.startswith("| | ")]
+    for name, (_, spelling, _, _) in V31_BUGS.items():
+        assert any(row.startswith(f"| | {spelling} ") for row in rows), (name, spelling)
 
 
 def test_generator_is_deterministic_and_reducible():
