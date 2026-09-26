@@ -144,6 +144,27 @@ Homuth-Rosemann ([@Ho-Ro](https://github.com/Ho-Ro), issue #5).
 
 For more on CP/M BDOS usage, see [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md).
 
+The compiler holds a program to these rules of the Programming Manual
+(9800268B), as Intel's PL/M-80 V3.1 does, and says what it found and
+where:
+
+- Every name is declared, the built-ins aside (6.1); in a multi-file
+  compile a module may name another's PUBLIC name without declaring it
+  EXTERNAL.
+- A declaration hides the built-in of its name (9.2): a procedure DOUBLE
+  or a variable OUTPUT, MEMORY or STACKPTR of the program's is the
+  program's, and the compiler never takes it for the built-in.
+- A LITERALLY's text takes its name's place throughout its scope (6.4), a
+  declaration of the name in an inner block included: after `DECLARE N
+  LITERALLY '5'`, an inner `DECLARE N BYTE` is `DECLARE 5 BYTE`, an error.
+- `x()`, empty parentheses after a variable, is an error; `f()` of a
+  procedure is taken for `f`.
+- The address of a label, `.label`, may be given in a DATA or an INITIAL
+  list, not in an expression (4.1.3).
+- An INTERRUPT procedure is declared at the outer level of its module and
+  has no parameters (8.1.6).
+- A direct call passes as many arguments as the procedure has parameters.
+
 ## Conditional Compilation
 
 PL/M-80 v4.0 added conditional compilation. The directives are **control lines** — a leading `$` at the left margin (column 1), exactly like `$INCLUDE` and `$TITLE` — so the same source can target different configurations (e.g., CP/M 2.2 vs CP/M 3, single-user vs MP/M). No enabling directive is required.
@@ -230,7 +251,8 @@ PL/M-80 compiled.  (Up to 0.3.x it did not: see CHANGELOG.md, 0.4.0.)
 - `MON1(f, a)` and `MON2(f, a)` with a constant `f` are compiled as the
   BDOS call itself, `ld de,a / ld c,f / call 5` (`call ??BDOS` under
   `-m mpm`): the registers PL/M-80 sets for `mon1 equ 5`.
-- An INTERRUPT procedure has no parameters (8.1.6).
+- An INTERRUPT procedure has no parameters, and is at the outer level of
+  its module (8.1.6).
 
 **One exception.**  A procedure with one parameter that nothing outside the
 compile can reach - not PUBLIC, EXTERNAL or REENTRANT, and its address
