@@ -65,20 +65,27 @@ python3.14 tools/verify_dri.py        # XDOS, BNKXDOS, RESBDOS, TMP, RDT, DDT id
 * 0.4.1 (`fix/0.4.1`, CHANGELOG `## 0.4.1 — unreleased`) settles the Known
   issues 0.3.7 listed and 0.4.0 carried, each against Intel's PL/M-80 V3.1's
   listing, diagnostics and linked build: names declared nowhere, empty
-  parentheses, `.label`, nested INTERRUPT procedures and built-in names are
-  checked as V3.1 checks them; a counted loop over a module-level index sees
-  pointers and overruns, of a structure's members too; PLUS/MINUS/SCL/SCR after
-  `+ 4`; a REENTRANT procedure's factored parameter.  Its own Known issues list
-  what V3.1 still rejects and uplm80 compiles (`f()` of a procedure, a subscript
-  on a scalar, an array without a subscript, INITIAL in a procedure, a
-  procedure with no statements).  Left for the release: bump the version,
-  rerun the Verified checks on the release commit, merge, tag, push.
+  parentheses, `.label`, nested INTERRUPT procedures, undeclared parameters,
+  a LITERALLY used before its declaration, a dimension that is not a number
+  and built-in names (in a multi-file compile too) are checked as V3.1
+  checks them; a counted loop over a module-level or static index sees
+  pointers and overruns, run on or back, of a structure's members too;
+  PLUS/MINUS/SCL/SCR after `+ 4`; a REENTRANT procedure's factored parameter.
+  Its own Known issues list what V3.1 still rejects and uplm80 compiles (`f()`
+  of a procedure, a subscript on a scalar, an array without a subscript,
+  INITIAL in a procedure, a procedure with no statements, a forward call),
+  and a counted loop over a local in `??AUTO`, which a store from another
+  frame or the module's variables does not end (counting none would cost ED,
+  PIP and 80un 17 to 20 bytes each).  Left for the release: bump the
+  version, rerun the Verified checks on the release commit, merge, tag, push.
 * Argument evaluation order differs from Intel V3.1 where the last argument
   changes a variable passed next-to-last; the language leaves it undefined
   (9800268B 4.5.1), so it is documented, not changed.
 * The workaround for um80 0.3.50's operator words (names.fix_symbols) is
-  harmless and can go now that 0.4.0 requires um80 0.3.51; 0.4.1 drops the
-  other, the `?` EQU for upeepz80 0.2.5's dead-store rule.
+  harmless and can go once uplm80 requires um80 0.3.51 or later.  Nothing
+  requires it yet: pyproject.toml names only `upeepz80>=0.2.6`, and um80 is
+  installed on its own (0.4.0 and 0.4.1 are checked with 0.3.51 and 0.3.52).
+  0.4.1 drops the other, the `?` EQU for upeepz80 0.2.5's dead-store rule.
 
 ### um80_and_friends (0.3.52)
 

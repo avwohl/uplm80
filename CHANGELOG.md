@@ -377,9 +377,11 @@ And one that V3.1 compiles to other code (0.4.0 the same):
 
 ### Verified
 
-On 84bea83, with upeepz80 0.2.6 and um80 0.3.51.
+On 31444b1, with upeepz80 0.2.6 and um80 0.3.52 (84bea83 was checked
+with um80 0.3.51).
 
-- The suite: 924 tests pass. pylint rates the package 9.73.
+- The suite: 1038 tests pass, and with upeepz80 0.2.7 too. pylint rates
+  the package 9.73.
 - `tests/run_tests.sh`: all 22 programs pass.
 - `scripts/difftest.py --seeds 300`: every program prints what the model
   says at `-O0` to `-O3`. `scripts/abifuzz.py --seeds 300`: every program
@@ -412,7 +414,16 @@ On 84bea83, with upeepz80 0.2.6 and um80 0.3.51.
   member - constant or not, inside its variable or past its end - and 300
   with those variables local to the procedure, print at `-O0` to `-O3`
   what each prints compiled by Intel's PL/M-80 V3.1; c71574d's `-O2`
-  build of 11 of the 600 printed something else.
+  build of 11 of the 600 printed something else. 200 more such programs
+  print what the generator's model of the layout says.
+- Each program of the new tests that V3.1 accepts prints, compiled by it,
+  what uplm80's build prints at `-O0` to `-O3`: the counted loops whose
+  store runs back to the index, at module level and to a static local,
+  and a LITERALLY used after its declaration beside a variable declared
+  after the procedure that names it. V3.1 refuses each program the new
+  errors refuse, with the errors named under Incompatible. The modules
+  of the multi-file test print, compiled together, what they print
+  compiled one at a time and linked.
 - ogdenpm/intel80tools' 469 PL/M files, with the `.ipx` files
   `scripts/genipx.py` makes from the packs' `.pex`, at `-O2`: 176
   compile, 144 to 0.4.0's assembly and 32 to 0.4.0's less its EQUs;
