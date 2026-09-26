@@ -5,6 +5,14 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 
 ## 0.4.3 — unreleased
 
+SHL and SHR of a BYTE are a BYTE, as the manual and Intel's PL/M-80 V3.1
+make them, with a warning where what a program written for uplm80
+computes changes; 80un's sources are fixed for it.  The errors V3.1 gives
+that 0.4.2 did not, its Known issues, are given, but for two forms
+uplm80's own tests exist to test, which stay, with a warning.  Messages
+name the source's line after a LITERALLY over several lines, and its
+column after `out:end p;`.
+
 ### Incompatible: SHL and SHR of a BYTE are a BYTE
 
 **SHL and SHR of a BYTE are a BYTE**, shifted in eight bits, as the manual
@@ -50,19 +58,22 @@ it, the tests it passed and the case of a DO CASE on it included; a typed
 procedure's is what its RETURNs give.  That is followed for a scalar whose
 address is never taken, nor AT, BASED, PUBLIC or EXTERNAL, across calls of
 procedures that do not assign it.  There is no warning for a SHR, nor for
-BYTE arithmetic around a shift that loses nothing (`shr(z, 4) - 1` above).
-The warnings, of the programs checked:
+BYTE arithmetic around a shift that loses nothing (`shr(z, 4) - 1` above):
+of the programs checked, only CP/M 2.0's STAT in `sample_code` has such
+arithmetic, `.devr(shl(iobyte and 11b, 2) + j)`, whose j keeps the sum
+below 256.  The warnings, of the programs checked:
 
 - 80un's sources before the fix: the 29 places the fix changed, and no
   other; its sources after it: none.  `tests/bug_80un.plm`, 80un's old
   single-file source, which 80un keeps as `src/plm/archive/80un.plm`: 20,
-  each a place 80un's fix changed.
+  each of a kind 80un's fix changed.
 - MP/M II, DRI's tree and mpm2's overrides: 7, in ERA, REN, SET (2), SHOW
-  (DRI's and mpm2's) and STAT, each `shl(dcnt, 5) + .buff` of a directory
-  code BDOS returns, 0 to 3 or 0FFH, which the program has tested against
-  0FFH.  The compiler cannot know it is below 8, and the programs are
+  (DRI's and mpm2's) and STAT, each `shl(dcnt, 5) + .tbuff` or the like,
+  of a directory code BDOS returns, 0 to 3 or 0FFH, which the program has
+  tested against 0FFH.  The compiler cannot know it is below 8, and the programs are
   right as V3.1 compiles them.
-- `sample_code` and the other programs of `tests/`: none.
+- `sample_code`, and the programs of `tests/` but those that test the
+  warning and the generators' (Verified): none.
 
 Of the 87 compiles of MP/M II's and 80un's PL/M, 24 of MP/M II's and 12
 of 80un's are smaller, by 619 and 209 bytes in all at `-O2`.
@@ -145,19 +156,22 @@ takes to print what uplm80's build prints.
   null statement between the labels on an END and the END, and where no
   blank follows the colon for its `;` to take the place of, it put one in,
   and a message about what followed on the line gave a column one too far
-  for each.  A second such label on a line was not taken for the end of
-  its block either, as a DO CASE's last `y:end;` is not one of its cases.
+  for each.  A second such label on a line was not marked the end of its
+  block either: `do case k; ... x:end; y:end;` counted `y:` among its
+  cases.
 - **A LITERALLY whose text runs over several lines no longer moves the
   lines after its use.**  The macro pass put the text in with its line
   ends, so every message about a later line named a line too far on, by
   the text's line ends at each use: MP/M II's ERA, REN and SET use
   `PROCES.LIT`'s PROCESS$DESCRIPTOR once, whose text, with the texts it
-  names, has 16 line ends, and were reported 16 lines on.  The text goes in on one line, as a line end in it is a blank;
-  the 87 MP/M II and 80un compiles are unchanged.
+  names, has 16 line ends, and were reported 16 lines on.  The text goes
+  in on one line, as a line end in it is a blank; the 87 MP/M II and 80un
+  compiles are unchanged.
 - In the oracle, `scripts/intel_oracle.py` (0.4.2's Known issues):
   `--avoid zero-dividend` leaves out a dividend that folds to 0 divided by
   what folds to 0 too, `(8 / 0FF00H) / (0F82AH <= 1)`, which V3.1 folds to
-  0 and uplm80 divides (the 0.4.2 release check's seed 20275), as well as
+  0 and uplm80 divides (the 0.4.2 release check's seed 20275), and a
+  product with 0, `((k0 * 0) * x) / y` (0.4.3's seed 50094), as well as
   `0 / x`; and where a label on the module's END is one a procedure's GOTO
   reaches, `fin: end t;`, the HLT made a warm boot is the one after the
   `LXI SP` V3.1 puts at the END, and Intel's build no longer runs on to
@@ -210,6 +224,55 @@ And this V3.1 compiles to other code (0.4.2 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+
+### Verified
+
+On 56fad40, with upeepz80 0.2.7 and um80 0.3.52.
+
+- The suite: 1458 tests pass.  Without Intel's binaries the oracle's 58
+  tests that need them skip, and its 8 others pass.  pylint rates the
+  package 9.75, with no message 0.4.2 did not have.
+- `tests/run_tests.sh`: all 22 programs pass.
+- `scripts/difftest.py`, `scripts/abifuzz.py` and `scripts/namestest.py`,
+  200 seeds each (40000-40199, 41000-41199, 42000-42199; and namestest's
+  `--modules`, 40): every program prints what the model, its `-O0` build
+  or its scopes say.
+- `scripts/intel_oracle.py --random 300` (seeds 50001-50300), leaving out
+  `shift9`, `wide-limit`, `sub-zero`, `zero-dividend` and `neg-widened` -
+  not `shl-byte`: 298 programs print at `-O0` to `-O3` what Intel's
+  PL/M-80 V3.1 build prints.  The two others are V3.1's bugs (README,
+  Known differences): seed 50265 its `INX SP` for `INR A`, and seed 50252
+  a new one, `w = (ew := b) + b` of a BYTE b and an ADDRESS ew, which V3.1
+  adds in 16 bits, 01D8H for b = 0ECH, where the embedded assignment is a
+  BYTE (4.6.3) and the sum 00D8H.  The first run had a third, seed 50094,
+  a product with 0 divided by 0, which `zero-dividend` now leaves out.
+- `scripts/intel_oracle.py --corpus --normalize`: of the 67 programs of
+  `tests/` and `sample_code/`, 38 print what V3.1's build prints, V3.1
+  rejects 28, and `tests/test_move_builtin.plm` differs where V3.1's MOVE
+  of 0 bytes moves 65536, as with 0.4.2.
+- The 87 compiles of MP/M II's and 80un's PL/M (DRI's tree and mpm2's
+  overrides, each in the mode `tools/build.py` uses; 80un's files, from its
+  fix/byte-shifts branch, one at a time and its two programs), against
+  0.4.2: the assembly of those that shift a BYTE changes, to the shift in
+  A, and each is smaller - at `-O0` 33 (24 of MP/M II's, 625 bytes in
+  all; 9 of 80un's, 179), at `-O2` 36 (24, 619; 12, 209), at `-O3` 34 (24,
+  609; 10, 202).  The rest compile to 0.4.2's assembly, and the ten that
+  stop, stop with 0.4.2's errors.  The code at `-O2` is 164,354 bytes, the
+  data 45,088.  No new error; the new warnings are the SHL warnings above,
+  7 of MP/M II's and 20 of 80un's old source, and none of the new errors'
+  warnings.
+- 80un's two programs, built from fix/byte-shifts at `-O0`, `-O2` and
+  `-O3`, extract the 136 files of the 23 archives and compressed files of
+  80un's tests, and detokenize its five BASIC files, byte for byte as
+  0.4.2's build of 80un's own sources does (cpmemu, binary mode); what
+  they print differs only in the size cpmemu says it loaded.
+- The warnings of `tests/`' programs, the pytest's included, besides those
+  above: the SHL of a BYTE warning in the programs that test it
+  (`tests/test_shl_of_a_byte.py`, `tests/test_expression_types.py`'s
+  byte shifts, `shl(b, 9)` of `tests/test_intel_oracle.py`) and in the
+  generators' programs, which shift a BYTE by a computed count; the
+  warning of `x(1)` in `tests/test_optimizer_soundness.py` and of
+  `s2.m(4)` in `tests/test_calls_and_loops.py`.
 
 ## 0.4.2 — 2026-09-26
 
