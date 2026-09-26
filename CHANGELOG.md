@@ -172,6 +172,16 @@ any.
   They test the least significant bit (5.1.2): 128, 10, 2 and 256 are
   false. The expected output is now what the program prints compiled by
   Intel's PL/M-80 V3.1, and by uplm80; all 22 programs pass.
+- `scripts/genipx.py`, which makes the `.ipx` includes of an intel80tools
+  pack from its `.pex`, put in each module's include another module's
+  BASED variable whose base no module makes PUBLIC - lib_2.1's `declare
+  arg based argChain ARG$T;` and `declare module based module$p
+  MODULE$T;` - and nothing declared the base. With a name declared
+  nowhere now an error, lib_2.1's ISIS1.PLM and ISIS2.PLM stopped at
+  ARGCHAIN, as Intel's PL/M-80 V3.1 would (ERROR #54, UNDECLARED BASE).
+  Such a variable is left out, as only its own module can use it; both
+  compile to 0.4.0's assembly less its EQUs, and `scripts/
+  test_intel80tools.sh` still compiles 12 of link_3.0's 15 modules.
 
 ### Changed
 

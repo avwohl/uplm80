@@ -165,6 +165,12 @@ def gen_ipx(module: str, header, files, owner) -> str:
         if fname == module:
             continue
         for name, rest in syms:
+            if ".." in rest and not _is_literal(rest) and \
+                    owner.get(rest.split("..", 1)[1].strip()) is None:
+                # Based on a pointer no module makes PUBLIC (lib.plm's
+                # `arg "ARG$T"..argChain'): no other module can use it, and
+                # its base would be declared nowhere here.
+                continue
             emit(name, f"declare {name} literally {rest};" if _is_literal(rest)
                  else _render_typed(name, rest))
     for name, rest in header:                       # based templates (external base)
