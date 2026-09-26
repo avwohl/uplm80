@@ -483,6 +483,27 @@ call run;
 """, [3, 0x15])
 
 
+@pytest.mark.parametrize("where", ["module", "local"])
+def test_a_member_of_an_unsubscripted_array_of_structures_runs_on(where):
+    """`s2.m(4)' of an `s2 (2) structure (m(2) byte)' is s2(0).m(4) to
+    uplm80 - Intel's PL/M-80 V3.1 rejects it, ERROR #133 (CHANGELOG, Known
+    issues) - which is the i declared after s2.  For a procedure's local
+    local_storage took the reference to reach no further than s2, and the
+    loop over i was counted: n was 11, not 3."""
+    decls = "declare s2 (2) structure (m(2) byte);\ndeclare i byte;\n"
+    _check(("" if where == "local" else decls) + """declare n byte;
+run: procedure;
+""" + (decls if where == "local" else "") + """  n = 0;
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then s2.m(4) = 20;
+  end;
+  call ph(n); call ph(i);
+end run;
+call run;
+""", [3, 0x15])
+
+
 def test_a_reentrant_procedures_parameter_factored_with_its_locals():
     """`DECLARE (TOP, C) BYTE' names a REENTRANT procedure's parameter with
     a local. The parameter was declared a second time, as a local in the

@@ -151,9 +151,13 @@ any.
   counted either when a variable laid out before it - the module's and the
   procedures' static ones, in the source's order - has its address taken,
   or is subscripted, itself or a member of it, past the end of what is
-  subscripted or by what is not a constant. DRI's compiler never counts a
-  loop, and the programs in `tests/test_calls_and_loops.py` print, at
-  `-O0` to `-O3`, what they print compiled by Intel's PL/M-80 V3.1. Of
+  subscripted or by what is not a constant. So is a procedure's local
+  after `s2.m(4) = 20` of a local `s2 (2) structure (m(2) byte)`, which
+  PL/M-80 does not allow and uplm80 compiles as `s2(0).m(4)` (Known
+  issues): the overrun was taken to reach no further than `s2`. DRI's
+  compiler never counts a loop, and the programs in
+  `tests/test_calls_and_loops.py` that V3.1 accepts print, at `-O0` to
+  `-O3`, what they print compiled by Intel's PL/M-80 V3.1. Of
   the 87 MP/M II and 80un compiles, one loop changes, `DO jtab = 0 TO
   itab` in MSPL.PLM's LIST$BUF (DRI's and mpm2's), since `.pcb` is taken
   and PCB is declared before JTAB: 7 bytes more at `-O1` to `-O3` and 8

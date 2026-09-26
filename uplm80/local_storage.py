@@ -255,6 +255,10 @@ def _path_prefix(local: Local, path: list) -> tuple[Optional[tuple], bool, bool]
     rest = list(path)
     prefix: tuple = (local.name,)
     if local.dim is not None:
+        if rest and rest[0][0] == "mem":
+            # `s2.m(1)' of an array of structures, which PL/M-80 does not
+            # allow, is compiled as s2(0).m(1).
+            rest.insert(0, ("idx", [0]))
         if not rest or rest[0][0] != "idx":
             return None, False, False
         k, reach = _subscript(rest.pop(0), local.dim)
