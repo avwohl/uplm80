@@ -3,6 +3,33 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.4.2 — unreleased
+
+uplm80 checked against Intel's own PL/M-80 V3.1 as a matter of course:
+`scripts/intel_oracle.py` builds a program with both compilers and
+compares what the builds print, and the suite runs it where Intel's
+binaries are found.
+
+### Added
+
+- **`scripts/intel_oracle.py`, a differential test with Intel's PL/M-80
+  V3.1 as the oracle** (README, Testing against Intel's PL/M-80). It
+  builds a program the way DRI's `P.SUB` built its CP/M programs - PLM80,
+  LINK with `X0100` and `PLM80.LIB`, LOCATE, OBJCPM - and with uplm80 at
+  `-O0` to `-O3`, runs every build under cpmemu, and says whether each
+  level prints what Intel's build prints; `--random N` checks programs of
+  `tests/plm_intel.py`, a generator of programs in the dialect both
+  compilers share, `--corpus` the programs of `tests/` and `sample_code/`,
+  and `--reduce` cuts a difference down to the lines it needs. Intel's
+  binaries are not in the repository: the oracle finds them on DRI's MP/M
+  II work disk, or through `$PLM80_TOOLS`, and runs them on
+  `tools/isis`, a small ISIS-II emulator on cpmemu's qkz80 core (`make -C
+  tools/isis`), or on romwbw_emu's `tools/romwbw-plm80`.
+- `tests/test_intel_oracle.py`, in the suite: generated programs, a
+  program of `tests/`, and the programs of this release's tests whose
+  output is transcribed from Intel's build, each built by both compilers.
+  Without Intel's binaries - as on CI - it skips, building nothing.
+
 ## 0.4.1 — 2026-09-26
 
 The Known issues 0.3.7 listed, and 0.4.0 carried, each settled by the
