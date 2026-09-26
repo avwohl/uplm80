@@ -235,6 +235,19 @@ class Compiler:
 
         return True
 
+    def _optimize_modules(self, modules: list, filenames: list[str]) -> list:
+        """Phase 3, AST optimization, of each module of a multi-file compile."""
+        if self.opt_level == 0:
+            return modules
+        out = []
+        for ast, filename in zip(modules, filenames):
+            if self.debug:
+                print(f"[DEBUG] Phase 3: AST Optimization for {filename}", file=sys.stderr)
+            ast = ASTOptimizer(self.opt_level).optimize(ast)
+            ast.uplm80_file = filename  # a new Module; see names._file_name
+            out.append(ast)
+        return out
+
     def compile_files(self, input_paths: list[Path], output_path: Path | None = None) -> bool:
         """
         Compile multiple PL/M-80 source files together.
@@ -281,16 +294,7 @@ class Compiler:
 
             # The names of every module, before any of them is optimized.
             check_names(modules, multi=True)
-
-            # Phase 3: AST Optimization
-            if self.opt_level > 0:
-                for i, (ast, filename) in enumerate(zip(modules, filenames)):
-                    if self.debug:
-                        print(f"[DEBUG] Phase 3: AST Optimization for {filename}", file=sys.stderr)
-                    optimizer = ASTOptimizer(self.opt_level)
-                    ast = optimizer.optimize(ast)
-                    ast.uplm80_file = filename  # a new Module; see names._file_name
-                    modules[i] = ast
+            modules = self._optimize_modules(modules, filenames)
 
             # Phase 4: Code Generation with unified call graph
             if self.debug:

@@ -258,7 +258,7 @@ def _retext(tok, text: str):
     return type(tok)(text, tok.name, tok.kind)
 
 
-class _Resolver:
+class _Resolver:  # pylint: disable=too-many-instance-attributes
     """The declarations of one compilation and what each name is bound to."""
 
     def __init__(self) -> None:
@@ -343,7 +343,24 @@ class _Resolver:
                 self.refs.append(_Ref(inner, n, "index"))
             for f in ("condition", "start", "bound", "step", "selector", "items"):
                 self._visit(getattr(n, f, None), inner)
-        elif isinstance(n, (P.Identifier, P.DottedIdent)):
+        elif self._visit_use(n, block):
+            pass
+        elif isinstance(n, (P.MemberAccess, P.DottedMember)):
+            self._visit(n.base, block)      # a member's name is not in scope
+        elif isinstance(n, (P.StructMember, P.StructMemberUntyped, P.EndLabel)):
+            pass
+        else:
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields and not hasattr(n, "file_id"):
+                for f in fields:
+                    if f != "pos":
+                        self._visit(getattr(n, f), block)
+
+    def _visit_use(self, n, block: _Block) -> bool:
+        """Visit ``n`` if it is a use of a name, or where a use says more
+        than the name: after a dot, before empty parentheses, in an AT or
+        in a DATA or INITIAL list.  Whether it was."""
+        if isinstance(n, (P.Identifier, P.DottedIdent)):
             self._ref(block, n)
         elif isinstance(n, P.CallNoArgs) and isinstance(unwrap_paren(n.callee), P.Identifier):
             self._ref(block, unwrap_paren(n.callee), empty=True)
@@ -362,16 +379,9 @@ class _Resolver:
                 self._lists += inside
                 self._visit(getattr(n, f), block)
                 self._lists -= inside
-        elif isinstance(n, (P.MemberAccess, P.DottedMember)):
-            self._visit(n.base, block)      # a member's name is not in scope
-        elif isinstance(n, (P.StructMember, P.StructMemberUntyped, P.EndLabel)):
-            pass
         else:
-            fields = getattr(n, "__dataclass_fields__", None)
-            if fields and not hasattr(n, "file_id"):
-                for f in fields:
-                    if f != "pos":
-                        self._visit(getattr(n, f), block)
+            return False
+        return True
 
     def _ref(self, block: _Block, node, **kw) -> None:
         """A use of the name ``node`` spells, in ``block``."""
