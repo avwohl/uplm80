@@ -309,10 +309,11 @@ def neg_widened(e: Expr, env: dict) -> bool:
 
 def zero_dividend(left: Expr, right: Expr, extents=None, lits=None) -> bool:
     """Whether ``left / right`` divides a dividend that folds to 0 by what
-    may be 0.  V3.1 folds such a quotient to 0 - `0 / x', `(8 / 0FF00H) /
-    (0F82AH <= 1)' (seed 20275 of the 0.4.2 release check), `(b * 0) / x'
-    (seed 50094 of 0.4.3's) - where uplm80 divides, and 0 / 0 is 0FFFFH
-    (4.2.3: undefined).  By a constant other than 0 both give 0."""
+    may be 0.  V3.1 folds such a quotient to 0 - `0 / x', `256 * 256 / x'
+    (seed 96044 of 0.4.3's release check), `(8 / 0FF00H) / (0F82AH <= 1)'
+    (seed 20275 of 0.4.2's), `(b * 0) / x' (seed 50094 of 0.4.3's) - where
+    uplm80 divides, and 0 / 0 is 0FFFFH (4.2.3: undefined).  By a constant
+    other than 0 both give 0."""
     if not _folds_to_zero(left, extents, lits):
         return False
     divisor = const_value(right, extents, lits)
@@ -320,10 +321,12 @@ def zero_dividend(left: Expr, right: Expr, extents=None, lits=None) -> bool:
 
 
 def _folds_to_zero(e: Expr, extents=None, lits=None) -> bool:
-    """A constant 0, or a product with one, `(k * 0) * x'."""
-    if isinstance(e, Bin) and e.op == "*":
-        return any(_folds_to_zero(x, extents, lits) for x in (e.left, e.right))
-    return const_value(e, extents, lits) == 0
+    """A constant 0 - `256 * 256' too - or a product with one, `(k * 0) *
+    x'."""
+    if const_value(e, extents, lits) == 0:
+        return True
+    return isinstance(e, Bin) and e.op == "*" \
+        and any(_folds_to_zero(x, extents, lits) for x in (e.left, e.right))
 
 
 def folds_to_address_zero(e: Expr, env: dict, extents=None, lits=None) -> bool:

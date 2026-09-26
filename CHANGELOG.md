@@ -178,7 +178,9 @@ takes to print what uplm80's build prints.
   what folds to 0 too, `(8 / 0FF00H) / (0F82AH <= 1)`, which V3.1 folds to
   0 and uplm80 divides (the 0.4.2 release check's seed 20275), and a
   product with 0, `((k0 * 0) * x) / y` (0.4.3's seed 50094), as well as
-  `0 / x`; and where a label on the module's END is one a procedure's GOTO
+  `0 / x` and a constant that overflows to 0, `256 * 256 / x` (the
+  release check's seed 96044, which V3.1 prints 0000 and uplm80 0FFFFH);
+  and where a label on the module's END is one a procedure's GOTO
   reaches, `fin: end t;`, the HLT made a warm boot is the one after the
   `LXI SP` V3.1 puts at the END, and Intel's build no longer runs on to
   `timeout`.

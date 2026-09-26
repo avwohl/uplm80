@@ -257,6 +257,23 @@ def test_zero_dividend_leaves_out_a_dividend_that_folds_to_0():
     assert "(high(144) / (7 = last(ms)))" not in generate(115, n_stmts=20, avoid=avoid).render()
 
 
+def test_zero_dividend_leaves_out_a_product_that_overflows_to_0():
+    """A constant product that overflows to 0 is a zero dividend too,
+    `256 * 256 / b1'.  Seed 96044 of 0.4.3's release check divides
+    `('N' * 08000H)' by `HIGH(AB(0))', which is 0: V3.1 prints 0000 and
+    uplm80 0FFFFH.  0.4.2's generator left it out; 56fad40 looked only at
+    whether a factor folds to 0, and `--avoid zero-dividend' let it
+    through."""
+    assert zero_dividend(Bin("*", Num(256), Num(256)), Var("b1"))
+    assert zero_dividend(Bin("*", Num(0x4E, "str"), Num(0x8000)), Var("b1"))
+    assert zero_dividend(Bin("*", Bin("*", Num(256), Num(256)), Var("b1")), Var("w1"))
+    assert not zero_dividend(Bin("*", Num(256), Num(256)), Num(3))
+    assert not zero_dividend(Bin("*", Num(255), Num(257)), Var("b1"))
+    text = generate(96044, avoid=KNOWN).render()
+    assert "(('N' * 08000h) / high(ab(0)))" not in text
+    assert "(('N' * 08000h) / (high(ab(0)) or 1))" in text
+
+
 def test_the_readme_has_each_v31_bug():
     """Each V3.1 bug the tests know is a row of the README's Known
     differences with no `--avoid' name."""
