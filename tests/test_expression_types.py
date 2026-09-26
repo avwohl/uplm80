@@ -719,6 +719,52 @@ call run;
 """, [1, 0xFF, 6, 3, 1, 0xFF, 8, 0xF8, 0xFF, 0xFE])
 
 
+def test_plus_minus_scl_and_scr_after_four_read_its_carry():
+    """PLUS, MINUS, SCL and SCR read the carry of the operation before them
+    (12.2, 12.3).  An ADDRESS plus or minus 1 to 4 was `inc hl' or `dec
+    hl', which set none, so they read whatever an earlier instruction left:
+    `(w + 4) PLUS z' with w = 0FFFEH gave 2.  Intel's PL/M-80 V3.1 steps an
+    ADDRESS by 1 to 3 with INX and DCX, which leave the carry alone too, but
+    adds or subtracts 4 and more with DAD, or SUB and SBB, which set it; so
+    does uplm80 now where the carry is read, and the program compiled by
+    V3.1 prints what is expected here.  (After 1 to 3 the carry is stale in
+    both compilers' code; the manual says not to rely on it, 12.1.)  A BYTE
+    plus or minus a constant is `add' or `sub', which set it."""
+    _check("""
+declare (w, z, r) address, (b, c) byte;
+run: procedure;
+  z = 0;
+  w = 0fffeh; r = (w + 4) plus z; call ph(r);
+  w = 0; r = (w + 4) plus z; call ph(r);
+  w = 2; r = (w - 4) minus z; call ph(r);
+  w = 6; r = (w - 4) minus z; call ph(r);
+  w = 0fffch; r = scl(w + 4, 1); call ph(r);
+  w = 0; r = scl(w + 4, 1); call ph(r);
+  w = 2; r = scr(w - 4, 1); call ph(r);
+  w = 6; r = scr(w - 4, 1); call ph(r);
+  w = 0fffeh; r = z plus (w + 4); call ph(r);
+  b = 0feh; c = (b + 3) plus 0; call ph(c);
+  b = 2; c = (b - 3) minus 0; call ph(c);
+end run;
+call run;
+""", [3, 4, 0xFFFD, 2, 1, 8, 0xFFFF, 1, 3, 2, 0xFE])
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_one_to_three_is_still_inc_hl_where_the_carry_is_read(opt):
+    """As Intel's INX: `(w + 3) PLUS z' is three `inc hl', `(w + 4) PLUS z'
+    an `add hl,de', and `w + 4' where nothing reads the carry four `inc
+    hl' still."""
+    def body(expr):
+        return _asm(f"t: do;\ndeclare (w, z, r) address;\nr = {expr};\nend t;\n", opt)
+    assert body("(w + 3) plus z").count("inc\thl") == 3
+    four = body("(w + 4) plus z")
+    assert "inc\thl" not in four and "add\thl,de" in four, four
+    assert body("(w - 3) minus z").count("dec\thl") == 3
+    assert "dec\thl" not in body("(w - 4) minus z")
+    assert body("w + 4").count("inc\thl") == 4
+
+
 def test_an_embedded_assignment_through_a_pointer_keeps_its_value():
     """`(x := w)' with x a BASED BYTE is w, all of it; the store loads the
     pointer into HL, where the value was, and nothing kept it."""

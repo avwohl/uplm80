@@ -6508,10 +6508,14 @@ class CodeGenerator:
 
     def _gen_binary(self, expr) -> DataType:
         """Generate code for a typed binary expression."""
+        carry_out = getattr(unwrap_paren(expr), "uplm80_carry_out", False)
         expr = self._without_redundant_double(self._narrowed_comparison(expr))
         op = binop_kind(expr)
         left = unwrap_paren(expr.left)
         right = unwrap_paren(expr.right)
+        if op in (BinaryOpKind.PLUS, BinaryOpKind.MINUS):
+            self._carry_read(left)
+            self._carry_read(right)
 
         # Special case: SHL(DOUBLE(hi), 8) OR lo -> combine two bytes into address
         if op == BinaryOpKind.OR:
@@ -6598,13 +6602,18 @@ class CodeGenerator:
             self._emit("sbc", "a,0")
             return DataType.BYTE
 
+        # An ADDRESS plus or minus 1 to 4 is `inc hl' or `dec hl' that many
+        # times, which set no carry; where a PLUS, MINUS, SCL or SCR reads
+        # the carry, only 1 to 3 are, as in Intel's PL/M-80 V3.1, which
+        # uses INX and DCX for those and DAD, or SUB and SBB, from 4 on.
+        steps = 3 if carry_out else 4
         if (
             op == BinaryOpKind.ADD
             and isinstance(right, P.NumberLiteral)
             and left_type == DataType.ADDRESS
         ):
             const_val = number_value(right)
-            if 1 <= const_val <= 4:
+            if 1 <= const_val <= steps:
                 self._gen_expr(left)
                 for _ in range(const_val):
                     self._emit("inc", "hl")
@@ -6620,7 +6629,7 @@ class CodeGenerator:
             and left_type == DataType.ADDRESS
         ):
             const_val = number_value(right)
-            if 1 <= const_val <= 4:
+            if 1 <= const_val <= steps:
                 self._gen_expr(left)
                 for _ in range(const_val):
                     self._emit("dec", "hl")
@@ -6809,6 +6818,18 @@ class CodeGenerator:
             self.regs.release_reg('de', self._emit)
 
         return DataType.ADDRESS
+
+    @staticmethod
+    def _carry_read(expr) -> None:
+        """Note that a PLUS, MINUS, SCL or SCR reads the carry that
+        computing ``expr`` leaves (12.2, 12.3): an ADDRESS plus or minus a
+        constant is then `inc hl' or `dec hl' only up to 3 (_gen_binary).
+        Intel's PL/M-80 V3.1 leaves the carry as it was after INX and DCX,
+        for 1 to 3, and so does uplm80; the manual warns that it is not
+        to be relied on (12.1)."""
+        expr = unwrap_paren(expr)
+        if isinstance(expr, P.BinaryOp):
+            expr.uplm80_carry_out = True
 
     def _gen_comparison(self, op: BinaryOpKind) -> DataType:
         """Generate code for comparison. HL=left, DE=right. Result in A (0 or 0FFH)."""
@@ -8033,6 +8054,8 @@ class CodeGenerator:
         """
         wide = (name in ("SCL", "SCR")
                 and self._get_expr_type(args[0]) == DataType.ADDRESS)
+        if name in ("SCL", "SCR"):
+            self._carry_read(args[0])
         ops = {
             "ROL": [("rlca", "")], "ROR": [("rrca", "")],
             "SCL": [("rl", "l"), ("rl", "h")] if wide else [("rla", "")],

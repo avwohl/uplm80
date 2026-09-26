@@ -30,6 +30,35 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **PLUS, MINUS, SCL and SCR after `+ 4` or `- 4` of an ADDRESS read the
+  carry that the addition or subtraction sets**, as in Intel's PL/M-80
+  V3.1. uplm80 stepped an ADDRESS by 1 to 4 with `inc hl` and `dec hl`,
+  which set no carry, so `(w + 4) PLUS z` with w = 0FFFEH gave 2, not 3
+  (Known issues, 0.3.7). V3.1 steps it by 1 to 3 with INX and DCX, which
+  leave the carry as it was, and from 4 on adds with DAD or subtracts
+  with SUB and SBB:
+
+      R = (W - 1) MINUS Z;   LHLD W / DCX H / XCHG / LHLD Z / CALL @P0074
+      R = (W + 3) MINUS Z;   LHLD W / INX H / INX H / INX H / XCHG / ...
+      R = (W + 4) PLUS Z;    LXI D,4H / LHLD W / DAD D / LXI D,Z / CALL @P0010
+      R = (W - 4) PLUS Z;    MVI A,4H / LXI D,W / CALL @P0101
+      D = (B + 1) PLUS C;    LDA B / INR A / ... / ADC M
+      D = (B + 3) PLUS C;    LDA B / ADI 3H / ... / ADC M
+
+  (@P0074 is `MOV A,E / SBB L / MOV L,A / MOV A,D / SBB H`, @P0010 `LDAX D
+  / ADC L ...`, @P0101 `... SUB L ... SBB H`.) So after `+ 1` to `+ 3` or
+  `- 1` to `- 3` of an ADDRESS, and `+ 1`, `+ 2`, `- 1` or `- 2` of a
+  BYTE, V3.1's PLUS, MINUS, SCL and SCR read a stale carry too; `(w - 1)
+  MINUS z` with w = z = 0 is 0FFFFH or 0FFFEH as the carry happens to
+  be, in either compiler, and the manual warns that the flags are not to
+  be relied on (12.1). uplm80 now does what V3.1 does for an ADDRESS:
+  where a PLUS, MINUS, SCL or SCR reads the carry, `+ 4` and `- 4` are an
+  addition or a subtraction that sets it, and 1 to 3 are still `inc hl`
+  and `dec hl`; elsewhere 4 is still four `inc hl`. A BYTE plus or minus
+  a constant was `add a,n` or `sub n` already, which set it. The program
+  in `tests/test_expression_types.py` prints what V3.1's code prints at
+  `-O0` to `-O3`. None of the 87 MP/M II and 80un compiles has such an
+  expression.
 - **A procedure or a variable named like a built-in is the program's,** as
   a declaration hides the built-in of its name (9.2), and as Intel's
   PL/M-80 V3.1 compiles it. The optimizer wrote an ADDRESS constant below
@@ -1267,12 +1296,6 @@ Each fix has a regression test that fails without it.
 
 ### Known issues
 
-- **PLUS, MINUS, SCL and SCR after `+ 1` to `+ 4` or `- 1` to `- 4` of an
-  ADDRESS** take a stale carry: those are `inc hl` and `dec hl`, which set
-  none, so `(w - 1) MINUS z` with w = z = 0 gives 0FFFFH, not 0FFFEH. DRI's
-  PL/M-80 increments with INX and INR too (PIP.PLM declares a variable
-  `ONE = 1` so that `DEC(C1 + ONE)` gets an ADD and its carry), and the
-  manual (12.1) warns that the flags cannot be relied on.
 - **A counted loop trusts that a pointer made from `.x` reaches only `x`, for
   a module-level `x`.** A BYTE `DO i = 0 TO n` whose body does not name `i`
   counts its passes in B. It is not used when anything can reach `i` another
