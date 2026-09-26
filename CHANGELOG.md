@@ -38,15 +38,27 @@ any.
   `MSBRS.PLM` and `MSRSP.PLM` include after declaring what it uses, and
   eight of 80un's modules compiled alone, which name each other's
   procedures (80un compiles them together).
-- **`x()`, empty parentheses after a variable, is an error.** PL/M-80 has
+- **Empty parentheses after a variable, `x()`, after a structure member,
+  `s.m()`, and after a subscript, `a(1)()`, are an error.** PL/M-80 has
   no empty subscript or argument list. `y = x() + 1` with x a BYTE compiled
   to a CALL through x's value (0.3.6: `call X`), and so did an array, a
   BASED variable, a structure, a parameter and `CALL w()` of an ADDRESS
-  (Known issues, 0.3.7). Intel's PL/M-80 V3.1 rejects each, ERROR #127,
-  INVALID SUBSCRIPT ON NON-ARRAY, and #102, MISSING PRIMARY OPERAND.
+  (Known issues, 0.3.7); `y = s.m()` compiled to `ld a,(S) / ld l,a / ld
+  h,0 / call ??jphl`, a call through the member's value, and so did `w =
+  s.a()`, `y = sa(1).m()`, `CALL s.a()`, `y = a(1)()` and `y = q(1)()`
+  (0.4.0 the same). Intel's PL/M-80 V3.1 rejects each: ERROR #127,
+  INVALID SUBSCRIPT ON NON-ARRAY, and #102, MISSING PRIMARY OPERAND, in
+  an expression after a scalar, a parameter or a BASED variable, and after
+  a structure with #135, ILLEGAL REFERENCE TO AN UNQUALIFIED STRUCTURE;
+  #102 alone after an array or an array member, and in `CALL w()` and
+  `CALL s.a()`; #127 and #32, INVALID SYNTAX, after a scalar member in an
+  expression; and #32 after a subscript (with #118 in `CALL a(1)()`, and
+  #135 in `sa(1)()`).
 
       X(): X is a variable, and PL/M-80 has neither an empty subscript nor
       an empty argument list
+      SA(1).M(): SA(1).M is a structure member, and PL/M-80 has neither an
+      empty subscript nor an empty argument list
 
   A procedure's `f()` is still taken for `f`, as uplm80 always has; V3.1
   rejects that too (#102).
@@ -199,9 +211,10 @@ any.
 
 - `tests/test_names.py`: each new error, at every level and where it is
   placed - a name declared nowhere, empty parentheses after each kind of
-  variable, the address of a label in an expression, an INTERRUPT
-  procedure in a procedure and in a DO block, a LITERALLY's name declared
-  again - and every built-in compiling undeclared.
+  variable, after a member and after a subscript, the address of a label
+  in an expression, an INTERRUPT procedure in a procedure and in a DO
+  block, a LITERALLY's name declared again - and every built-in compiling
+  undeclared.
 - `tests/test_expression_types.py`: a procedure named like each built-in
   that is one, and a variable named like each that can be one; PLUS,
   MINUS, SCL and SCR after `+ 4` and `- 4`, and 1 to 3 still `inc hl`.

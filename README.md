@@ -157,7 +157,8 @@ where:
 - A LITERALLY's text takes its name's place throughout its scope (6.4), a
   declaration of the name in an inner block included: after `DECLARE N
   LITERALLY '5'`, an inner `DECLARE N BYTE` is `DECLARE 5 BYTE`, an error.
-- `x()`, empty parentheses after a variable, is an error; `f()` of a
+- Empty parentheses are an error after a variable, `x()`, after a
+  structure member, `s.m()`, and after a subscript, `a(1)()`; `f()` of a
   procedure is taken for `f`.
 - The address of a label, `.label`, may be given in a DATA or an INITIAL
   list, not in an expression (4.1.3).

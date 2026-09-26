@@ -1059,6 +1059,41 @@ q: procedure (v) byte; declare v byte; return v + f(); end q;
             "and PL/M-80 has neither an empty subscript nor an empty argument list") in err, err
 
 
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("stmt, text, kind", [
+    ("y = s.m();", "S.M", "a structure member"),
+    ("w = s.a();", "S.A", "a structure member"),
+    ("y = s.n();", "S.N", "a structure member"),
+    ("y = sa(1).m();", "SA(1).M", "a structure member"),
+    ("y = sa(k).m() + 1;", "SA(K).M", "a structure member"),
+    ("call s.a();", "S.A", "a structure member"),
+    ("y = s.n(1)();", "S.N(1)", "a subscripted variable"),
+    ("y = a(1)();", "A(1)", "a subscripted variable"),
+    ("call a(1)();", "A(1)", "a subscripted variable"),
+    ("y = sa(k + 1)();", "SA(...)", "a subscripted variable"),
+    ("y = q(1)();", "Q(1)", "a call"),
+])
+def test_empty_parentheses_after_a_member_or_a_subscript_are_an_error(opt, stmt, text, kind):
+    """Empty parentheses after a structure member, or after a subscript,
+    are no more a subscript or an argument list than after a variable;
+    what they follow is never a procedure's name.  `y = s.m()' compiled to
+    `ld a,(S) / ld l,a / ld h,0 / call ??jphl', a call through the
+    member's value, and so did the others.  Intel's PL/M-80 V3.1 rejects
+    each: ERROR #127, INVALID SUBSCRIPT ON NON-ARRAY, and #32 for `s.m()',
+    `s.a()' and `sa(1).m()'; #102, MISSING PRIMARY OPERAND, for `s.n()',
+    an array member, and `call s.a()'; #32, INVALID SYNTAX, after a
+    subscript, with #118 in a CALL and #135 after a structure element."""
+    src = PRELUDE + """declare (x, y, k) byte, (w, p) address, a (3) byte;
+declare s structure (m byte, a address, n (2) byte), sa (3) structure (m byte);
+f: procedure byte; return 3; end f;
+q: procedure (v) byte; declare v byte; return v + f(); end q;
+""" + stmt + "\nend t;\n"
+    err = _compile_error(src, opt)
+    col = re.search(r"\b" + text.split("(")[0].split(".")[0].lower() + r"\b", stmt).start() + 1
+    assert (f"T.PLM:9:{col}: error: {text}(): {text} is {kind}, "
+            "and PL/M-80 has neither an empty subscript nor an empty argument list") in err, err
+
+
 def test_empty_parentheses_after_a_parameter_are_an_error():
     err = _compile_error(PRELUDE + "q: procedure (x) byte; declare x byte; return x(); end q;\n"
                          "call pc(q(1));\nend t;\n")

@@ -245,6 +245,9 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     in_list: bool = False       # in a DATA or INITIAL list
     empty: bool = False         # followed by empty parentheses, `name()'
     in_at: bool = False         # in an AT clause
+    # the member or the subscripted reference it starts that empty
+    # parentheses follow, `s.m()', `a(1)()'
+    after: object = None
 
 
 def _key(tok) -> str:
@@ -364,6 +367,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._ref(block, n)
         elif isinstance(n, P.CallNoArgs) and isinstance(unwrap_paren(n.callee), P.Identifier):
             self._ref(block, unwrap_paren(n.callee), empty=True)
+        elif isinstance(n, P.CallNoArgs):
+            self._empty_after(unwrap_paren(n.callee), block)
         elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Identifier):
             self._ref(block, unwrap_paren(n.operand), dot=True)
         elif isinstance(n, P.AttrAt):
@@ -382,6 +387,24 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         else:
             return False
         return True
+
+    def _empty_after(self, callee, block: _Block) -> None:
+        """``callee()``, ``callee`` a member or a subscripted reference,
+        which is never a procedure's name: visit it, and mark the use of the
+        name it starts from, so that check_uses refuses the parentheses
+        once it knows the name is declared."""
+        start = len(self.refs)
+        self._visit(callee, block)
+        root = callee
+        while isinstance(root, (P.MemberAccess, P.Call)):
+            root = unwrap_paren(root.base if isinstance(root, P.MemberAccess) else root.callee)
+        for r in self.refs[start:]:
+            if r.node is root:
+                r.after = callee
+                return
+        text = _reference_text(callee)
+        raise CodeGenError(f"{text}(): PL/M-80 has neither an empty subscript nor an "
+                           "empty argument list", source_location(callee))
 
     def _ref(self, block: _Block, node, **kw) -> None:
         """A use of the name ``node`` spells, in ``block``."""
@@ -593,13 +616,22 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             if r.goto:
                 continue
             text = ident_text(getattr(r.node, r.attr))
-            if d is None:
+            if d is None and not (_key(getattr(r.node, r.attr)) in _BUILTINS or r.in_at):
                 # Intel's PL/M-80 V3.1: ERROR 105, UNDECLARED IDENTIFIER.
                 # (An AT names its own: _at_address.)
-                if _key(getattr(r.node, r.attr)) in _BUILTINS or r.in_at:
-                    continue
                 raise CodeGenError(f"{text} is not declared (Programming Manual "
                                    "9800268B, 6.1)", source_location(r.node))
+            if r.after is not None:
+                # Intel's PL/M-80 V3.1: ERROR 127, INVALID SUBSCRIPT ON
+                # NON-ARRAY, or 102, MISSING PRIMARY OPERAND, after a member;
+                # 32, INVALID SYNTAX, after a subscript.
+                after = _reference_text(r.after)
+                kind = _after_kind(r.after, d, _key(getattr(r.node, r.attr)))
+                raise CodeGenError(
+                    f"{after}(): {after} is {kind}, and PL/M-80 has neither an empty "
+                    "subscript nor an empty argument list", source_location(r.node))
+            if d is None:
+                continue
             if r.empty and d.kind in self._KIND_WORDS:
                 # Intel's PL/M-80 V3.1: ERROR 127, INVALID SUBSCRIPT ON
                 # NON-ARRAY, and ERROR 102, MISSING PRIMARY OPERAND, for
@@ -819,6 +851,32 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 continue
             for node, attr in d.sites + [(r.node, r.attr) for r in self.refs_of.get(id(d), [])]:
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
+
+
+def _reference_text(expr) -> str:
+    """A member or a subscripted reference as the source spells it, but
+    for a subscript that is neither a name nor a number: ``SA(...).M``."""
+    expr = unwrap_paren(expr)
+    if isinstance(expr, P.Identifier):
+        return ident_text(expr.name)
+    if isinstance(expr, P.NumberLiteral):
+        return ident_text(expr.value)
+    if isinstance(expr, P.MemberAccess):
+        return f"{_reference_text(expr.base)}.{ident_text(expr.member)}"
+    if isinstance(expr, P.Call):
+        args = ", ".join(_reference_text(a) for a in expr.args)
+        return f"{_reference_text(expr.callee)}({args})"
+    return "..."
+
+
+def _after_kind(ref, decl: _Decl | None, name: str) -> str:
+    """What the reference ``ref`` is, which starts from ``name``, declared
+    by ``decl`` or, None, a built-in."""
+    if isinstance(ref, P.MemberAccess):
+        return "a structure member"
+    if decl is None:
+        return "a subscripted variable" if name in ("MEMORY", "OUTPUT") else "a call"
+    return "a call" if decl.kind == "proc" else "a subscripted variable"
 
 
 def check_names(modules: list, multi: bool = False) -> None:
