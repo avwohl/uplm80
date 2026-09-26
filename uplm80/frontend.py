@@ -46,11 +46,13 @@ def parse_source(
     line_map: list[tuple[str, int]] = []
     pre1 = uplm_preprocess(source, filename, defines=defines, include_paths=include_paths,
                            line_map=line_map)
-    src = macro_pass(pre1)
+    substitutions: list[tuple[int, str, str]] = []
+    src = macro_pass(pre1, substitutions)
     try:
         tree = _plm_parser.parse(src, filename=filename)
     except Exception as e:  # ScanError or ParseError
-        raise _syntax_error(e, line_map, filename) from e
+        raise _syntax_error(e, line_map, filename,
+                            _literally_at(e, src, substitutions)) from e
     note_origins(tree, line_map)
     tree.uplm80_file = filename
     return tree
@@ -63,23 +65,56 @@ def _origin(line_map: list[tuple[str, int]], line: int, filename: str) -> tuple[
     return filename, line
 
 
-def _syntax_error(e: Exception, line_map, filename: str) -> ParserError:
-    """A scanner or parser error, placed where its text came from.
-
-    uplox reports a line of the preprocessed text, which past an
-    ``$INCLUDE`` is not a line of the file being compiled.
-    """
+def _error_place(e: Exception) -> tuple[int | None, int | None]:
+    """(line, column) of a uplox scanner or parser error, if it has one."""
     token = getattr(e, "token", None)
     line = getattr(token, "line", None) or getattr(e, "line", None)
     column = getattr(token, "column", None) or getattr(e, "column", None)
+    return line, column
+
+
+def _literally_at(e: Exception, src: str, substitutions) -> str:
+    """Why the parser met what it met, where that is a LITERALLY's text.
+
+    PL/M-80 puts a LITERALLY's text in place of its name wherever the
+    name occurs in the LITERALLY's scope (9800268B, 6.4) - in a
+    declaration of the name in an inner block too, which then declares
+    what the text says (`n literally '5'` makes `declare n byte`
+    `declare 5 byte`).  Intel's PL/M-80 V3.1 does the same: ERROR 48,
+    ILLEGAL DECLARATION STATEMENT SYNTAX.
+    """
+    line, column = _error_place(e)
+    if not line or not column:
+        return ""
+    lines = src.split("\n")
+    if line > len(lines):
+        return ""
+    offset = sum(len(x) + 1 for x in lines[:line - 1]) + column - 1
+    for at, name, text in substitutions:
+        if at == offset:
+            return (f"; that is the text of {name}, declared LITERALLY '{text}', which "
+                    f"PL/M-80 puts in place of {name} throughout the LITERALLY's scope, a "
+                    f"declaration of {name} in an inner block included (Programming Manual "
+                    "9800268B, 6.4)")
+    return ""
+
+
+def _syntax_error(e: Exception, line_map, filename: str, why: str = "") -> ParserError:
+    """A scanner or parser error, placed where its text came from.
+
+    uplox reports a line of the preprocessed text, which past an
+    ``$INCLUDE`` is not a line of the file being compiled.  ``why`` is
+    added to the message.
+    """
+    line, column = _error_place(e)
     message = str(e)
     if not line:
-        return ParserError(message, SourceLocation(1, 1, filename))
+        return ParserError(message + why, SourceLocation(1, 1, filename))
     # The message says where in uplox's terms; the location says it right.
     message = re.sub(r"\s*at line \d+, column \d+", "", message)
     message = re.sub(r"^[^\s:]*:\d+:\d+:\s*", "", message)
     file, orig = _origin(line_map, line, filename)
-    return ParserError(message, SourceLocation(orig, column or 1, file))
+    return ParserError(message + why, SourceLocation(orig, column or 1, file))
 
 
 def note_origins(tree, line_map: list[tuple[str, int]]) -> None:

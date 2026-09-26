@@ -418,7 +418,19 @@ _PLM_KEYWORDS_LOWER = frozenset(
 )
 
 
-def macro_pass(source: str) -> str:
+class _Out(list):
+    """The macro pass's output pieces, and how long they are together."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.length = 0
+
+    def append(self, text: str) -> None:  # type: ignore[override]
+        super().append(text)
+        self.length += len(text)
+
+
+def macro_pass(source: str, substitutions: list | None = None) -> str:
     """Case-fold and apply block-scoped LITERALLY substitution.
 
     Tokenises the source with a small PL/M-aware scanner (the bare
@@ -432,6 +444,11 @@ def macro_pass(source: str) -> str:
     ``process$descriptor`` → ``process$header, …, bdos$save`` where
     those are themselves macros) expand fully without an outer fixed-
     point loop.
+
+    ``substitutions``, if given, gets (offset, name, text) for each
+    substitution: where in the output the LITERALLY ``name``'s ``text``
+    begins.  A nested macro's comes after its outer one's, at the same
+    offset when it begins the outer one's text.
     """
     # PL/M source files end at the first Ctrl-Z (0x1A) — that's the
     # CP/M end-of-file marker, and any bytes after it are garbage
@@ -440,7 +457,7 @@ def macro_pass(source: str) -> str:
     if eof >= 0:
         source = source[:eof]
     tokens = _tokenize_for_macros(source)
-    out: list[str] = []
+    out = _Out()
     scope: list[dict[str, str]] = [{}]  # outermost frame
     aliases: list[set[str]] = [{"LITERALLY"}]  # words that act as KW LITERALLY
 
@@ -552,6 +569,8 @@ def macro_pass(source: str) -> str:
         # machinery, so nested macros expand to the bottom.
         body = lookup(text)
         if body is not None:
+            if substitutions is not None:
+                substitutions.append((out.length, text, body))
             # The whole body, in an INITIAL or DATA list as anywhere else.
             # It used to be cut at its first top-level comma there, to match
             # an earlier uplm80 that parsed a macro body as one expression.

@@ -30,6 +30,22 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **A LITERALLY's name declared again in an inner block** is PL/M-80's
+  rule, not a defect (Known issues, 0.3.7): a LITERALLY's text is
+  "substituted for each occurrence of the identifier in subsequent text"
+  (6.4), throughout its scope, so after `declare n literally '5'` a
+  procedure's `declare n byte` is `declare 5 byte`. Intel's PL/M-80 V3.1
+  does the same, ERROR #48, ILLEGAL DECLARATION STATEMENT SYNTAX; with
+  `m literally 'w'` an inner `declare m byte` declares a W of that block's
+  own in both compilers, and MP/M II's MPMLDR needs `mon1 literally
+  'ldmon1'` to make its `mon1: procedure external` LDMON1. The syntax
+  error now says where the text came from:
+
+      unexpected token 'NUMBER' '5'; expected one of: IDENT, LPAREN; that
+      is the text of N, declared LITERALLY '5', which PL/M-80 puts in place
+      of N throughout the LITERALLY's scope, a declaration of N in an inner
+      block included (Programming Manual 9800268B, 6.4)
+
 - **A name declared nowhere is an error**, as it is to Intel's PL/M-80
   V3.1 (ERROR #105, UNDECLARED IDENTIFIER). `y = nosuch + 1` compiled to
   `ld hl,(NOSUCH)`, and only um80 reported it, as an undefined symbol, or
@@ -1252,11 +1268,6 @@ Each fix has a regression test that fails without it.
   possibly another procedure's) only where that variable is static. In
   `??AUTO` it reaches another frame, or nothing (0.3.6 the same). Keeping all
   of that in DRI's order would make every local static.
-- **A LITERALLY's name declared again in an inner block** is a syntax error:
-  the macro pass puts the LITERALLY's text in place of the name there too
-  (`declare n literally '5'` and, in a procedure, `declare n byte` reads
-  `declare 5 byte`), as it must for DRI's `mon1: procedure` with `mon1
-  literally 'ldmon1'`.
 - **A procedure named DOUBLE** is taken for the built-in where code generation
   folds constants: `double(30h)` is 30H however the procedure is written.
 - **`STACKPTR` read inside an expression can see a temporary the compiler

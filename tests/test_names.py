@@ -10,10 +10,13 @@ in one assembler name, or a GOTO reach the wrong one of two labels
 """
 
 import os
+import re
 import subprocess
 import tempfile
 
 import pytest
+
+from uplm80.compiler import Compiler
 
 from ._toolchain import compile_cmd, compiler_env, run_asm, run_plm, tools_missing
 
@@ -1098,3 +1101,58 @@ call move(1, .x, .y); call time(1); output(3) = 1;
 end t;
 """)
     assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_literallys_name_declared_again_in_an_inner_block(opt):
+    """A LITERALLY's text is "substituted for each occurrence of the
+    identifier in subsequent text" (6.4), in its scope, and that takes in
+    a declaration of the name in an inner block: `n literally '5'' makes a
+    procedure's `declare n byte' `declare 5 byte'.  Intel's PL/M-80 V3.1
+    does the same, ERROR #48, ILLEGAL DECLARATION STATEMENT SYNTAX, and so
+    does uplm80, which now says where the 5 came from."""
+    err = _compile_error(PRELUDE + """declare n literally '5';
+declare w address;
+p: procedure;
+  declare n byte;
+  n = 3;
+  w = n;
+end p;
+w = n;
+end t;
+""", opt)
+    assert ("T.PLM:8:11: error: unexpected token 'NUMBER' '5'; expected one of: IDENT, LPAREN; "
+            "that is the text of N, declared LITERALLY '5', which PL/M-80 puts in place of N "
+            "throughout the LITERALLY's scope, a declaration of N in an inner block included "
+            "(Programming Manual 9800268B, 6.4)") in err, err
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_literally_whose_text_is_a_name_declares_that_name_again(opt):
+    """With `m literally 'w'', q's `declare m byte' declares a W of q's
+    own, which q's `m = 7' sets, and p's `m = 9' still sets the module's W.
+    As MP/M II's MPMLDR needs `mon1 literally 'ldmon1'' to make its `mon1:
+    procedure external' LDMON1.  The program compiled by Intel's PL/M-80
+    V3.1 prints 79 too."""
+    assert run_plm(PRELUDE + """declare w address;
+p: procedure;
+  declare m literally 'w';
+  q: procedure;
+    declare m byte;
+    m = 7;
+    call pc('0' + m);
+  end q;
+  m = 9;
+  call q;
+  call pc('0' + low(m));
+end p;
+call p;
+end t;
+""", opt) == "79"
+    asm = Compiler(opt_level=opt).compile(
+        "t: do;\ndeclare mon1 literally 'ldmon1';\n"
+        "mon1: procedure (f, a) external; declare f byte, a address; end mon1;\n"
+        "declare b byte;\ncall mon1(b, 65);\nend t;\n", "<t>")
+    assert asm is not None
+    assert re.search(r"^\s*extrn\s+LDMON1\s*$", asm, re.I | re.M), asm
+    assert re.search(r"^\s*call\s+LDMON1\s*$", asm, re.I | re.M), asm
