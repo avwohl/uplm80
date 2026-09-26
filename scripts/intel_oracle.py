@@ -129,7 +129,10 @@ class Tools:
         t.isis = _executable(isis) or _executable(os.environ.get("ISIS_EMU"))
         if t.isis is None:
             own = os.path.join(ISIS_DIR, "isis")
-            if not _executable(own) and build_isis and route != "romwbw":
+            # Built only where there is something to run on it: without
+            # Intel's binaries the oracle checks nothing, and the suite
+            # skips at once.
+            if not _executable(own) and build_isis and route != "romwbw" and t.intel_dir:
                 _try_build_isis()
             t.isis = _executable(own)
         for cand in (os.environ.get("ROMWBW_PLM80"), os.path.expanduser(DEFAULT_ROMWBW_PLM80)):

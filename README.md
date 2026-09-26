@@ -543,6 +543,15 @@ python3.14 scripts/intel_oracle.py --random 50 --first 1000 --reduce --keep out/
 python3.14 -m pytest tests/test_intel_oracle.py
 ```
 
+`tests/test_intel_oracle.py` is part of the suite: `python3.14 -m pytest`
+runs it with the rest where Intel's binaries are found (building
+`tools/isis` first if it can), and skips it where they are not, as on CI,
+building nothing; the oracle's own pieces that need no tools - the source
+normalisation, the halt patch, the skip - are checked either way.  It
+checks three generated programs and one of `tests/`, that a known
+difference is seen and a V3.1 rejection is, and each program of a
+release's tests whose output the release transcribed from Intel's build.
+
 Intel's binaries are not part of this repository.  The oracle finds them
 through `--tools DIR` or `$PLM80_TOOLS`, or on DRI's MP/M II work disk at
 `~/src/mpm2/mpm2_external/mpm2src/PLM_WORK` (`PLM80`, `PLM80.OV0`-`OV4`,
@@ -609,8 +618,27 @@ was one of these, and none depended on the optimization level.
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
-after a statement (26), `NOT NOT x` and `f()` (102), and a `CALL` of a typed
-procedure (129).
+after a statement (26), `NOT NOT x` (102), and a `CALL` of a typed
+procedure (129); and what the CHANGELOG lists under 0.4.1's Known issues:
+`f()` and `CALL g()` of a procedure and `carry()` of a built-in (102, 153),
+a subscript on a scalar (127), an array without a subscript (133, 134),
+`INITIAL` in a procedure (73), a procedure with no statements (174), a
+call of a procedure its block declares after the call (169), a zero
+dimension (57) and the address of a built-in.  uplm80 0.4.1 rejects, as
+V3.1 does, a name declared nowhere, empty parentheses after a variable,
+`.label` in an expression, an `INTERRUPT` procedure below module level, a
+parameter no `DECLARE` declares, and a `LITERALLY` used before its
+declaration.
+
+The other way round, V3.1 compiles a label on an `END` statement, `out:
+end p;` (A.4.4.1), which uplm80 0.4.1 does not.  And two kinds of program
+compile to other code in each (0.4.1, Known issues): a store through a
+pointer or an overrun in or from `??AUTO` reaches what uplm80's layout puts
+there, not what DRI's does; and a counted loop over the last module-level
+variable does not see a store through MEMORY that reaches it,
+`p = .memory - 1` with a BASED `b`, or `memory(0FFFFH) = 20` (V3.1's build
+prints `0003 0015`, uplm80's `000B 0014`).  Neither is in the generator's
+dialect.
 
 ## Project Structure
 

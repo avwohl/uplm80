@@ -4,13 +4,15 @@ A few programs of tests/plm_intel.py's generator, and one of the corpus,
 built with both compilers and run: every -O level must print what Intel's
 build prints.  The generator leaves out the differences already known and
 documented (README, Testing against Intel's PL/M-80), so what fails here is
-new.  Skipped unless Intel's binaries are found ($PLM80_TOOLS, or DRI's
-work disk at ~/src/mpm2/mpm2_external/mpm2src/PLM_WORK), with
-tools/isis/isis (built here if make and a C++ compiler can) or romwbw_emu's
-tools/romwbw-plm80 to run them, and um80, ul80 and cpmemu.
+new.
 
-The oracle's own pieces that need no tools - the source normalisation, the
-halt patch - are checked always.
+Part of the suite, and skipped - at once, building nothing - unless
+Intel's binaries are found ($PLM80_TOOLS, or DRI's work disk at
+~/src/mpm2/mpm2_external/mpm2src/PLM_WORK), with tools/isis/isis (built
+here, when they are, if make and a C++ compiler can) or romwbw_emu's
+tools/romwbw-plm80 to run them, and um80, ul80 and cpmemu.  The oracle's
+own pieces that need no tools - the source normalisation, the halt patch,
+the skip itself - are checked always.
 """
 
 import importlib.util
@@ -107,6 +109,23 @@ def test_prepare_drops_an_origin_line_and_reads_includes(tmp_path):
         "0100H: /* origin */\nt: do;\n$include (:F1:DEFS.LIT)\nend t;\n\x1a")
     assert oracle.prepare_source(str(tmp_path / "main.plm")) == \
         "t: do;\ndeclare k literally '3';\nend t;\n"
+
+
+def test_without_intels_binaries_the_oracle_checks_nothing(monkeypatch, tmp_path, capsys):
+    """Where Intel's binaries are not found - as on CI - the oracle says so,
+    builds no ISIS emulator, and exits 0 (2 with --strict); the tests that
+    need them skip."""
+    monkeypatch.delenv("PLM80_TOOLS", raising=False)
+    monkeypatch.setattr(oracle, "DEFAULT_TOOLS", str(tmp_path / "none"))
+    built = []
+    monkeypatch.setattr(oracle, "_try_build_isis", lambda: built.append(True))
+    monkeypatch.setattr(oracle, "ISIS_DIR", str(tmp_path))       # no isis there
+    t = oracle.Tools.find()
+    assert t.missing().startswith("Intel's PL/M-80 V3.1 not found")
+    assert not built
+    assert oracle.main(["--random", "1"]) == 0
+    assert oracle.main(["--random", "1", "--strict"]) == 2
+    assert "intel_oracle: skipped - Intel's PL/M-80 V3.1 not found" in capsys.readouterr().err
 
 
 def _omf(rtype: int, body: bytes) -> bytes:
