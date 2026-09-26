@@ -41,7 +41,7 @@ names the statement.  :func:`generate` returns a :class:`Program`, whose
 told to - the reducer in scripts/intel_oracle.py drops chunks while the
 difference persists.
 
-Features ``avoid`` can leave out - the first seven are differences from V3.1
+Features ``avoid`` can leave out - the first six are differences from V3.1
 the README lists:
 * shl-byte: SHL or SHR of a BYTE, which uplm80 shifts in 16 bits
   (uplm80/plm_types.py);
@@ -55,10 +55,9 @@ the README lists:
   even when the divisor is 0, where uplm80 divides (0FFFFH);
 * neg-widened: `-b' or `0 - b' of a BYTE the expression also uses
   elsewhere, which V3.1 may negate in 16 bits;
-* qualsize: LENGTH, LAST and SIZE of a structure member, which uplm80
-  refuses;
-* carry, div0, strings, based, struct, move, case, while, loops, procs,
-  reentrant, embedded, nested, str2.
+* qualsize (LENGTH, LAST and SIZE of a structure member, which uplm80
+  refused before 0.4.2), carry, div0, strings, based, struct, move, case,
+  while, loops, procs, reentrant, embedded, nested, str2.
 """
 
 from __future__ import annotations

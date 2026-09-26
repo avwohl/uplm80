@@ -10,6 +10,27 @@ uplm80 checked against Intel's own PL/M-80 V3.1 as a matter of course:
 compares what the builds print, and the suite runs it where Intel's
 binaries are found.
 
+### Fixed
+
+- **LENGTH, LAST and SIZE of a qualified reference**, as the manual
+  allows them (11.1.2): of a structure's member, `LENGTH(st.z)`; of a
+  member of an element of an array of structures, `LAST(sa(i).w)`, or of
+  the array, `LENGTH(sa.z)` (partially qualified); and SIZE of an
+  element, `SIZE(sa(2))`, `SIZE(ab(2))`, `SIZE(st.z(1))`. uplm80 took
+  only a variable's name and stopped at each: "LENGTH() needs an array
+  whose extent is known", "SIZE() needs a declared variable" (0.4.1 the
+  same). The subscripts are not evaluated, and a LENGTH or LAST that fits
+  is a BYTE, as of an array. Intel's PL/M-80 V3.1 compiles the program
+  in `tests/test_expression_types.py` - members of structures at module
+  level, in a procedure and in a REENTRANT one, and of BASED ones - to
+  print what uplm80's build prints at `-O0` to `-O3`. LENGTH or LAST of
+  what is not an array - an element, a scalar member, a structure - is
+  still an error, as it is to V3.1 (ERROR #125, ILLEGAL ARGUMENT FOR
+  BUILT-IN PROCEDURE, and #157, INVALID ARGUMENT, ARRAY REQUIRED FOR
+  LENGTH OR LAST), and so is SIZE of a subscripted scalar (#127) or of a
+  member no structure has (#112). The oracle's generator no longer leaves
+  them out (README, Known differences).
+
 ### Added
 
 - **`scripts/intel_oracle.py`, a differential test with Intel's PL/M-80

@@ -602,7 +602,9 @@ that printed it, which the source carries as `/* S1F */`.
 The generator can leave out those with a name (`--avoid NAME,...`), and the
 pytest does.  In the first campaign - 1,200 generated programs and the 67
 programs of `tests/` and `sample_code/`, at `-O0` to `-O3` - every difference
-was one of these, and none depended on the optimization level.
+was one of these, and none depended on the optimization level; one more,
+LENGTH, LAST and SIZE of a qualified reference, which uplm80 rejected, it
+takes since 0.4.2 (`qualsize` no longer leaves them out).
 
 | `--avoid` | Program | Intel V3.1 | uplm80 | |
 |---|---|---|---|---|
@@ -611,7 +613,6 @@ was one of these, and none depended on the optimization level.
 | `wide-limit` | `DO i = 250 TO 300;` (i BYTE) | 6 times | never | V3.1 compares the BYTE index with the 16-bit limit; the manual (5.1.4) converts the limit to the index's type |
 | `sub-zero` | `w = (b - DOUBLE(0)) + 0F0H;` (b = 0F0H) | `00E0H` | `01E0H` | V3.1 drops `- 0` and with it the ADDRESS type (also `b - (c * 0)`); the manual (4.2.1): ADDRESS |
 | `zero-dividend` | `z = 0; w = 0 / z;` | `0` | `0FFFFH` | V3.1 folds `0 / x` to 0; uplm80 divides, and a division by 0 gives what Intel's own divide routine gives (4.2.3: undefined) |
-| `qualsize` | `LENGTH(st.z)`, `SIZE(sa(2))`, `LAST(sa.z)` | 4, ... | rejected | uplm80 does not take a qualified reference in LENGTH, LAST or SIZE (11.1.2) |
 | `neg-widened` | `b = 0E7H; w = 0FFFEH; v = (b - w) + (-b);` | `0002` | `0102H` | V3.1 negates `b` in 16 bits when `b - w` has already widened it (the manual: `-b` is a BYTE, 19H) |
 | | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` as a program's first statement (b1-b4 BYTE, w1-w4 ADDRESS) is coded `INX H; INX SP; MOV M,A`, and the next CALL overwrites `b1` |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |

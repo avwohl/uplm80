@@ -22,6 +22,7 @@ import sys
 import pytest
 
 from tests.plm_intel import generate
+from tests.test_expression_types import _PRELUDE, QUALIFIED_SIZES
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -33,8 +34,14 @@ _spec.loader.exec_module(oracle)
 # The differences the README lists; each is a generator feature it can
 # leave out.
 KNOWN = frozenset({"shl-byte", "shift9", "wide-limit", "sub-zero", "zero-dividend",
-                   "neg-widened", "qualsize"})
+                   "neg-widened"})
 SEEDS = [3, 8, 10]
+# The programs of a release's tests whose expected output is what Intel's
+# build prints, transcribed there: each body follows tests/
+# test_expression_types.py's _PRELUDE.
+RELEASE_PROGRAMS = {
+    "qualified-sizes": QUALIFIED_SIZES,          # 0.4.2, LENGTH(st.z), SIZE(sa(2))
+}
 
 
 @pytest.fixture(scope="module")
@@ -50,6 +57,13 @@ def tools():
 def test_generated_program_prints_what_intels_build_prints(tools, seed):
     text = generate(seed, n_stmts=20, avoid=KNOWN).render()
     res = oracle.check_text(tools, text, f"seed{seed}")
+    assert res.verdict == "same", oracle.format_result(res)
+
+
+@pytest.mark.parametrize("name", sorted(RELEASE_PROGRAMS))
+def test_a_release_program_prints_what_intels_build_prints(tools, name):
+    text = _PRELUDE + RELEASE_PROGRAMS[name] + "\nend t;\n"
+    res = oracle.check_text(tools, text, name)
     assert res.verdict == "same", oracle.format_result(res)
 
 

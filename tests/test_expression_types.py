@@ -818,6 +818,90 @@ call run;
 """, [0, 0x10, 1, 0x2D])
 
 
+# LENGTH, LAST and SIZE of a qualified reference (11.1.2): a structure's
+# member, `st.z'; a member of an element of an array of structures,
+# `sa(1).z', or of the array, `sa.z' (partially qualified); an element,
+# `sa(2)', `ab(2)', `sa(1).z(1)'; in a procedure, a REENTRANT one, and of
+# BASED structures. The subscripts are not evaluated. Intel's PL/M-80 V3.1
+# compiles the program to print what is expected (tests/test_intel_oracle.py
+# checks it again where Intel's tools are).
+QUALIFIED_SIZES = """
+declare st structure (x byte, y address, z(4) byte);
+declare sa(3) structure (x byte, y address, z(2) byte, w(5) address);
+declare ab(6) byte, aw(7) address, (i, n) byte, (p, w) address;
+declare bs based p structure (k(9) byte, q address);
+declare ba based p (4) structure (k(3) address, m byte);
+lp: procedure (a) address;
+  declare a byte;
+  declare ls structure (u(3) byte, v(6) address);
+  declare la(2) structure (u(7) byte);
+  n = 0;
+  do i = 0 to last(ls.v);
+    ls.v(i) = i; n = n + 1;
+  end;
+  call ph(n);
+  call ph(length(la.u) + size(la(1).u) + size(ls.v(2)));
+  return size(ls) + size(la) + a;
+end lp;
+rp: procedure (d) address reentrant;
+  declare d byte;
+  declare rs structure (u(3) byte, v(6) address);
+  if d = 0 then return size(rs.v) + last(rs.u);
+  return rp(d - 1) + length(rs.v);
+end rp;
+i = 1;
+call ph(length(st.z)); call ph(last(st.z)); call ph(size(st.z));
+call ph(size(st.x)); call ph(size(st.y)); call ph(size(st));
+call ph(length(sa.z)); call ph(last(sa.z)); call ph(size(sa.z));
+call ph(length(sa(1).z)); call ph(last(sa(i).w)); call ph(size(sa(2).w));
+call ph(size(sa(1))); call ph(size(sa(i))); call ph(size(sa));
+call ph(size(ab(2))); call ph(size(aw(i))); call ph(size(sa(1).y)); call ph(size(sa.y));
+call ph(size(sa(1).z(1))); call ph(size(sa.w)); call ph(length(sa.w)); call ph(size(st.z(1)));
+do i = 0 to last(ab); ab(i) = i + 30h; end;
+n = 0;
+do i = 0 to last(st.z);
+  st.z(i) = i; n = n + 1;
+end;
+call ph(n);
+call ph(length(st.z) + 0ffh); call ph(last(sa.w) + 0feh);
+call ph(ab(last(st.z)));
+ab(last(sa.z)) = 7; call ph(ab(1));
+call ph(size(bs.k) + size(bs) + length(ba.k) + size(ba(2).k) + size(ba(1)) + size(ba)
+  + size(ba.k(1)));
+call ph(lp(1));
+call ph(rp(3));
+w = size(sa(i).w) * 3; call ph(w);
+"""
+QUALIFIED_SIZES_PRINT = [4, 3, 4, 1, 2, 7, 2, 1, 2, 2, 4, 10, 15, 15, 45, 1, 2, 2, 2,
+                         1, 10, 5, 1, 4, 3, 2, 0x33, 7, 0x42, 6, 0x10, 0x1E, 0x20, 0x1E]
+
+
+def test_length_last_and_size_of_a_qualified_reference():
+    """uplm80 took only a variable's name: `LENGTH(st.z)' was "LENGTH()
+    needs an array whose extent is known", and `SIZE(sa(2))' "SIZE() needs
+    a declared variable" (0.4.1 the same)."""
+    _check(QUALIFIED_SIZES, QUALIFIED_SIZES_PRINT)
+
+
+@pytest.mark.parametrize("expr", [
+    "length(sa(1))", "length(st.x)", "length(ab(1))", "length(st)", "last(i)",
+    "length(sa(1).z(1))", "size(i(1))", "size(st.nosuch)", "size(sa(1).x(1))",
+    "length(sa.q)"])
+def test_length_last_and_size_of_what_is_not_an_array_or_a_variable(expr):
+    """What V3.1 rejects - LENGTH of an element or a scalar (ERROR #125,
+    #157), a subscript on a scalar (#127), a member no structure has
+    (#112) - uplm80 rejects too."""
+    src = _PRELUDE + (
+        "declare st structure (x byte, y address, z(4) byte);\n"
+        "declare sa(3) structure (x byte, y address, z(2) byte, w(5) address);\n"
+        "declare ab(6) byte, i byte, w address;\n"
+        f"w = {expr};\nend t;\n")
+    compiler = Compiler(opt_level=2)
+    assert compiler.compile(src, "<test>") is None
+    errors = [str(e) for e in compiler.errors.errors]
+    assert any("needs an array" in e or "SIZE() needs" in e for e in errors), errors
+
+
 # ---- a name the program declares hides the built-in ------------------------
 
 def test_a_procedure_named_like_a_built_in_is_the_programs():

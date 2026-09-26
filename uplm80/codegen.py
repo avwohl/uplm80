@@ -5467,11 +5467,9 @@ class CodeGenerator:
                     if extent:
                         return extent if name == "LENGTH" else extent - 1
                 elif name == "SIZE":
-                    arg = unwrap_paren(e.args[0])
-                    if isinstance(arg, P.Identifier):
-                        var = self._lookup_scoped(ident_text(arg.name))
-                        if var is not None:
-                            return var.size
+                    ref = self._sized_ref(e.args[0])
+                    if ref is not None:
+                        return ref[1]
         return None
 
     def _byte_var_operand(self, var) -> str | None:
@@ -5705,13 +5703,70 @@ class CodeGenerator:
         return None
 
     def _array_extent(self, arg) -> int | None:
-        """The declared extent of the array ``arg`` names, if known."""
+        """The declared extent of the array ``arg`` names, if known: an
+        array, or an array member of a structure (11.1.2)."""
+        ref = self._sized_ref(arg)
+        return None if ref is None else ref[0]
+
+    def _sized_ref(self, arg) -> tuple[int | None, int] | None:
+        """(extent, size) of what ``arg``, the operand of LENGTH, LAST or
+        SIZE, names (11.1.2); None when it names nothing of a known size.
+
+        The operand is a reference, not a value, and is not evaluated: a
+        variable, ``a''; an element of an array, ``a(i)''; a member of a
+        structure, ``s.m'', of an element of an array of structures,
+        ``sa(i).m'', or of any of them, ``sa.m'' (partially qualified);
+        or an element of an array member, ``s.m(i)''.  The extent is the
+        number of elements of what is an array, else None; the size is in
+        bytes.
+        """
         arg = unwrap_paren(arg)
         if isinstance(arg, P.Identifier):
             sym = self._lookup_scoped(ident_text(arg.name))
-            if sym and sym.dimension:
-                return sym.dimension
+            if sym is None:
+                return None
+            return sym.dimension or None, sym.size
+        if isinstance(arg, P.MemberAccess):
+            member = self._struct_member(arg)
+            if member is None:
+                return None
+            width = 2 if member.data_type == DataType.ADDRESS else 1
+            return member.dimension or None, width * (member.dimension or 1)
+        if isinstance(arg, P.Call) and len(arg.args) == 1:
+            callee = unwrap_paren(arg.callee)
+            if isinstance(callee, P.MemberAccess):
+                member = self._struct_member(callee)
+                if member is None or not member.dimension:
+                    return None
+                return None, 2 if member.data_type == DataType.ADDRESS else 1
+            if isinstance(callee, P.Identifier):
+                sym = self._lookup_scoped(ident_text(callee.name))
+                if sym is None or not sym.dimension or sym.kind not in (
+                        SymbolKind.VARIABLE, SymbolKind.PARAMETER):
+                    return None
+                return None, sym.size // sym.dimension
         return None
+
+    def _struct_member(self, expr):
+        """The declared member ``expr``, a MemberAccess, names: of a
+        structure, ``s.m'', of an element of an array of structures,
+        ``sa(i).m'', or of the array, ``sa.m''; None when it names none."""
+        base = unwrap_paren(expr.base)
+        if isinstance(base, P.Call) and len(base.args) == 1:
+            base = unwrap_paren(base.callee)
+            if not isinstance(base, P.Identifier):
+                return None
+            sym = self._lookup_scoped(ident_text(base.name))
+            if sym is None or not sym.dimension:
+                return None
+        elif isinstance(base, P.Identifier):
+            sym = self._lookup_scoped(ident_text(base.name))
+        else:
+            return None
+        if sym is None or not sym.struct_members:
+            return None
+        name = ident_text(expr.member)
+        return next((m for m in sym.struct_members if m.name == name), None)
 
     def _is_simple_address_expr(self, expr) -> bool:
         """Check if expression is simple enough to load directly into DE."""
@@ -7995,15 +8050,13 @@ class CodeGenerator:
             return DataType.ADDRESS
 
         if name == "SIZE":
-            if args:
-                arg0 = unwrap_paren(args[0])
-                if isinstance(arg0, P.Identifier):
-                    sym = self._lookup_scoped(ident_text(arg0.name))
-                    if sym:
-                        self._emit("ld", f"hl,{sym.size}")
-                        return DataType.ADDRESS
-            raise CodeGenError(
-                "SIZE() needs a declared variable")
+            ref = self._sized_ref(args[0]) if len(args) == 1 else None
+            if ref is None:
+                raise CodeGenError(
+                    "SIZE() needs a variable, an element of an array or a "
+                    "structure member")
+            self._emit("ld", f"hl,{ref[1]}")
+            return DataType.ADDRESS
 
         if name == "MEMORY":
             self.needs_end_symbol = True

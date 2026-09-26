@@ -78,4 +78,4 @@ def test_an_assignment_is_placed_at_its_target():
     placed at column 6 here (and, before, nowhere)."""
     r = _compile({"sz.plm": "t: do;\ndeclare x address;\n\n   x = size(3);\nend t;\n"}, "sz.plm")
     assert r.returncode != 0
-    assert "sz.plm:4:4: error: SIZE() needs a declared variable" in r.stderr, r.stderr
+    assert "sz.plm:4:4: error: SIZE() needs a variable" in r.stderr, r.stderr
