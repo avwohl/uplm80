@@ -151,6 +151,9 @@ where:
 - Every name is declared, the built-ins aside (6.1); in a multi-file
   compile a module may name another's PUBLIC name without declaring it
   EXTERNAL.
+- Each parameter is declared once, by a DECLARE of its procedure, as a
+  BYTE or an ADDRESS scalar, not BASED and with no other attribute
+  (8.1.1).
 - A declaration hides the built-in of its name (9.2): a procedure DOUBLE
   or a variable OUTPUT, MEMORY or STACKPTR of the program's is the
   program's, and the compiler never takes it for the built-in.

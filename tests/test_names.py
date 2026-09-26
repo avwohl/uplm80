@@ -1138,6 +1138,96 @@ end t;
     assert r.returncode == 0, r.stderr
 
 
+_UNDECLARED_PARAMETER = ("and no DECLARE of the procedure declares it; a parameter is declared "
+                         "a BYTE or an ADDRESS scalar, not BASED, by a DECLARE of its "
+                         "procedure (Programming Manual 9800268B, 8.1.1)")
+_PARAMETER_FORM = ("and a parameter is declared a BYTE or an ADDRESS scalar, not BASED and "
+                   "with no other attribute (Programming Manual 9800268B, 8.1.1)")
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("proc, name", [
+    ("p: procedure (a);\n  y = a;\nend p;", "A"),
+    ("p: procedure (a, b);\n  declare a byte;\n  y = a + b;\nend p;", "B"),
+    ("p: procedure (a);\n  y = 1;\nend p;", "A"),
+    ("p: procedure (a) external;\nend p;", "A"),
+    ("p: procedure (a) reentrant;\n  y = 1;\nend p;", "A"),
+    ("p: procedure (a);\n  do;\n    declare a byte;\n    y = a;\n  end;\nend p;", "A"),
+])
+def test_a_parameter_no_declare_declares_is_an_error(opt, proc, name):
+    """"Each formal parameter must be declared as a non-based scalar
+    variable in a DECLARE statement preceding the first executable
+    statement in the procedure body" (8.1.1).  A parameter only the
+    PROCEDURE statement names was an ADDRESS, and `y = a + b' compiled to
+    `ld (??AUTO+0),hl / ld a,l / ld (Y),a' (0.4.0 the same); a DO block's
+    DECLARE of the name declares a variable of the block.  Intel's PL/M-80
+    V3.1 rejects each: ERROR #25, UNDECLARED PARAMETER, and #105,
+    UNDECLARED IDENTIFIER, at a use of it."""
+    src = PRELUDE + "declare y byte;\n" + proc + "\nend t;\n"
+    err = _compile_error(src, opt)
+    col = proc.split("\n")[0].index(name.lower()) + 1
+    assert (f"T.PLM:6:{col}: error: {name} is a parameter of P, "
+            + _UNDECLARED_PARAMETER) in err, err
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("decl", [
+    "a (3) byte",
+    "a based w byte",
+    "a label",
+    "a structure (m byte)",
+    "a byte public",
+    "a byte initial (3)",
+    "a byte at (.y)",
+    "a byte data (1)",
+    "a address external",
+])
+def test_a_parameter_declared_as_anything_but_a_scalar_is_an_error(opt, decl):
+    """A parameter declared an array, BASED, a LABEL or a structure, or
+    with PUBLIC, EXTERNAL, INITIAL, DATA or AT, compiled as one (0.4.0 the
+    same).  Intel's PL/M-80 V3.1 rejects each: ERROR #76, CONFLICTING
+    ATTRIBUTE WITH PARAMETER, #77, INVALID PARAMETER DECLARATION, BASE
+    ILLEGAL, and #79, ILLEGAL PARAMETER TYPE, NOT BYTE OR ADDRESS."""
+    src = (PRELUDE + "declare y byte, w address;\np: procedure (a);\n  declare " + decl
+           + ";\n  y = 1;\nend p;\ncall p(1);\nend t;\n")
+    err = _compile_error(src, opt)
+    assert "T.PLM:7:11: error: A is a parameter of P, " + _PARAMETER_FORM in err, err
+
+
+def test_a_parameter_declared_twice_is_an_error():
+    """Intel's PL/M-80 V3.1: ERROR #78, DUPLICATE DECLARATION."""
+    err = _compile_error(PRELUDE + """declare y byte;
+q: procedure (a) byte;
+  declare a byte;
+  declare a byte;
+  return a;
+end q;
+y = q(1);
+end t;
+""")
+    assert "T.PLM:8:11: error: A is declared twice in the same block" in err, err
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_parameters_declared_with_locals_and_on_their_own(opt):
+    """Every parameter declared once, as PL/M-80 asks, in any order, with
+    locals in one factored declaration or on its own."""
+    assert run_plm(PRELUDE + """declare y byte;
+p: procedure (a, b, c) byte;
+  declare (x, b) byte, c address;
+  declare a byte;
+  x = a + b;
+  return x + low(c);
+end p;
+e: procedure (a) byte external;
+  declare a byte;
+end e;
+y = p(20h, 21h, 0ffh);
+call pc(y);
+end t;
+""", opt) == "@"
+
+
 @pytest.mark.parametrize("opt", LEVELS)
 def test_a_literallys_name_declared_again_in_an_inner_block(opt):
     """A LITERALLY's text is "substituted for each occurrence of the

@@ -435,6 +435,14 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._declare(body, _key(n.name), "param", (n, "name"),
                           storage=not (attrs.is_reentrant or attrs.is_external))
         self._visit(p.body.items, body)
+        for n in (params.names or []) if params is not None else []:
+            if len(body.decls[_key(n.name)].sites) < 2:
+                # Intel's PL/M-80 V3.1: ERROR 25, UNDECLARED PARAMETER.
+                raise CodeGenError(
+                    f"{ident_text(n.name)} is a parameter of {d.orig}, and no DECLARE of "
+                    "the procedure declares it; a parameter is declared a BYTE or an "
+                    "ADDRESS scalar, not BASED, by a DECLARE of its procedure "
+                    "(Programming Manual 9800268B, 8.1.1)", source_location(n))
 
     def _decl_item(self, item: P.DeclItem, block: _Block) -> None:
         attrs = decl_attrs(item)
@@ -450,7 +458,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             name = _key(node.name)
             old = block.decls.get(name)
             if old is not None and old.kind == "param":
-                old.sites.append((node, "name"))
+                self._declare_param(old, item, node)
                 continue
             kind = "label" if dtype == DataType.LABEL else "var"
             self._declare(block, name, kind, (node, "name"), public=attrs.is_public,
@@ -458,6 +466,31 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         if item.based is not None:
             self._visit(item.based.base, block)
         self._visit([item.array_size, item.tail], block)
+
+    @staticmethod
+    def _declare_param(d: _Decl, item: P.DeclItem, node) -> None:
+        """``node`` of ``item`` declares ``d``, a parameter of the procedure
+        whose block it is: once, as a BYTE or an ADDRESS scalar, not BASED
+        and with no other attribute (8.1.1)."""
+        if len(d.sites) > 1:
+            # Intel's PL/M-80 V3.1: ERROR 78, DUPLICATE DECLARATION.
+            raise CodeGenError(f"{ident_text(node.name)} is declared twice in the same block",
+                               source_location(node))
+        attrs = decl_attrs(item)
+        dtype, dim = decl_item_type(item)
+        plain = not (attrs.is_public or attrs.is_external) and all(
+            v is None for v in (attrs.at_location, attrs.initial_values, attrs.data_values))
+        if (dtype not in (DataType.BYTE, DataType.ADDRESS) or dim is not None
+                or item.based is not None or not plain):
+            # Intel's PL/M-80 V3.1: ERROR 76, CONFLICTING ATTRIBUTE WITH
+            # PARAMETER; 77, INVALID PARAMETER DECLARATION, BASE ILLEGAL;
+            # 79, ILLEGAL PARAMETER TYPE, NOT BYTE OR ADDRESS.
+            raise CodeGenError(
+                f"{ident_text(node.name)} is a parameter of {d.block.proc.orig}, and a "
+                "parameter is declared a BYTE or an ADDRESS scalar, not BASED and with "
+                "no other attribute (Programming Manual 9800268B, 8.1.1)",
+                source_location(node))
+        d.sites.append((node, "name"))
 
     def _label(self, s: P.LabeledStmt, block: _Block) -> None:
         name = _key(s.label)

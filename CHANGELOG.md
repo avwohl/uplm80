@@ -39,6 +39,34 @@ any.
   `MSBRS.PLM` and `MSRSP.PLM` include after declaring what it uses, and
   eight of 80un's modules compiled alone, which name each other's
   procedures (80un compiles them together).
+- **A parameter that no DECLARE of its procedure declares, or that one
+  declares as anything but a BYTE or an ADDRESS scalar, is an error**:
+  "Each formal parameter must be declared as a non-based scalar variable
+  in a DECLARE statement preceding the first executable statement in the
+  procedure body" (8.1.1). A parameter that only the PROCEDURE statement
+  names was an ADDRESS: `p: procedure (a, b); declare a byte; y = a + b;
+  end p;` stored b with `ld (??AUTO+1),de` and added it as one, and with
+  `a` declared only in a DO block of the procedure, that block's `y = a`
+  read the block's own variable, which nothing set. A parameter declared
+  an array, BASED, a LABEL or a structure, or with PUBLIC, EXTERNAL,
+  INITIAL, DATA or AT, was compiled as declared, and a second declaration
+  of one was taken without a word (0.4.0 the same). Intel's PL/M-80 V3.1
+  rejects each: ERROR #25, UNDECLARED PARAMETER (and #105, UNDECLARED
+  IDENTIFIER, at a use of it); #76, CONFLICTING ATTRIBUTE WITH
+  PARAMETER; #77, INVALID PARAMETER DECLARATION, BASE ILLEGAL; #79,
+  ILLEGAL PARAMETER TYPE, NOT BYTE OR ADDRESS; and #78, DUPLICATE
+  DECLARATION. An EXTERNAL or a REENTRANT procedure's parameters are
+  declared too, as V3.1 asks.
+
+      B is a parameter of P, and no DECLARE of the procedure declares it; a
+      parameter is declared a BYTE or an ADDRESS scalar, not BASED, by a
+      DECLARE of its procedure (Programming Manual 9800268B, 8.1.1)
+      A is a parameter of P, and a parameter is declared a BYTE or an
+      ADDRESS scalar, not BASED and with no other attribute (Programming
+      Manual 9800268B, 8.1.1)
+
+  None of the 87 MP/M II and 80un compiles, `sample_code`, the test
+  programs and intel80tools' 469 PL/M files has one.
 - **Empty parentheses after a variable, `x()`, after a structure member,
   `s.m()`, and after a subscript, `a(1)()`, are an error.** PL/M-80 has
   no empty subscript or argument list. `y = x() + 1` with x a BYTE compiled
@@ -237,7 +265,8 @@ any.
 ### Added
 
 - `tests/test_names.py`: each new error, at every level and where it is
-  placed - a name declared nowhere, empty parentheses after each kind of
+  placed - a name declared nowhere, a parameter declared nowhere, twice or
+  as anything but a scalar, empty parentheses after each kind of
   variable, after a member and after a subscript, the address of a label
   in an expression, an INTERRUPT procedure in a procedure and in a DO
   block, a LITERALLY's name declared again - and every built-in compiling
