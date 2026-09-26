@@ -30,6 +30,25 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **A counted loop over a module-level index ends where a pointer or an
+  overrun sets the index.** A BYTE `DO i = 0 TO n` whose body does not
+  name `i` counts its passes in B, which is right only if nothing else can
+  reach `i` while it runs. For a procedure's local that took in a pointer
+  run on from a local declared before it and an overrun of an array
+  declared before it; for a module-level `i` it did not, so with `p = .a +
+  1` (`a` declared just before `i`) a store through `p` in the body did not
+  end the loop (Known issues, 0.3.7), and neither did `buf(k) = 30` with
+  `k` past the end of a `buf` declared before `i`, or with `p = .a2 + 1`
+  after `declare (a2, i2) byte`. Now a module-level index is not counted
+  either when a variable laid out before it - the module's and the
+  procedures' static ones, in the source's order - has its address taken,
+  or is subscripted past its end or by what is not a constant. DRI's compiler never counts a loop, and the program in
+  `tests/test_calls_and_loops.py` prints, at `-O0` to `-O3`, what it prints
+  compiled by Intel's PL/M-80 V3.1. Of the 87 MP/M II and 80un compiles,
+  one loop changes, `DO jtab = 0 TO itab` in MSPL.PLM's LIST$BUF (DRI's and
+  mpm2's), since `.pcb` is taken and PCB is declared before JTAB: 7 bytes
+  more at `-O1` to `-O3` and 8 at `-O0`, in each of the two, and nothing
+  else; ED's, PIP's and 80un's counted loops are over locals.
 - **PLUS, MINUS, SCL and SCR after `+ 4` or `- 4` of an ADDRESS read the
   carry that the addition or subtraction sets**, as in Intel's PL/M-80
   V3.1. uplm80 stepped an ADDRESS by 1 to 4 with `inc hl` and `dec hl`,
@@ -1296,14 +1315,6 @@ Each fix has a regression test that fails without it.
 
 ### Known issues
 
-- **A counted loop trusts that a pointer made from `.x` reaches only `x`, for
-  a module-level `x`.** A BYTE `DO i = 0 TO n` whose body does not name `i`
-  counts its passes in B. It is not used when anything can reach `i` another
-  way: a procedure that names it, `.i` anywhere, `i` AT or BASED, and, for a
-  procedure's local, an overrun of an array or a pointer from a local declared
-  before it. For a module-level `i`, a pointer computed from the address of
-  the variable declared before it still can reach it, and a store through that
-  pointer does not end the loop. DRI's compiler never counts a loop.
 - **An overrun or a pointer that runs backwards from a local, past a
   procedure's last local, or past a module-level variable** reaches what DRI's
   layout has there (the variable the text declares before or after it,

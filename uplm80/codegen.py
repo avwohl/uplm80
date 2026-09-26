@@ -1235,8 +1235,11 @@ class CodeGenerator:
     def _survey_aliases(self, modules) -> None:
         """Record the names a store can reach without naming them: a name
         whose address is taken anywhere (``.x``, ``.x(i)``, ``.x.m``), and one
-        placed AT something (see :meth:`_only_the_loop_sees`)."""
+        placed AT something (see :meth:`_only_the_loop_sees`); and, for
+        each name subscripted anywhere, its largest constant subscript, or
+        None where a subscript is not a constant (:meth:`_module_reach`)."""
         self._aliased = set()
+        self._subscripted: dict[str, int | None] = {}
         stack: list = list(modules)
         while stack:
             n = stack.pop()
@@ -1248,12 +1251,104 @@ class CodeGenerator:
                     self._aliased.add(ident_text(base.name))
             elif isinstance(n, P.DeclItem) and decl_attrs(n).at_location is not None:
                 self._aliased.update(decl_item_names(n))
+            elif isinstance(n, P.Call) and n.args:
+                self._note_subscript(n)
             if isinstance(n, (list, tuple)):
                 stack.extend(n)
                 continue
             fields = getattr(n, "__dataclass_fields__", None)
             if fields:
                 stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+
+    def _note_subscript(self, call) -> None:
+        """Note ``call``, a subscript or a call, for _survey_aliases: a
+        variable's largest constant subscript, and None for one that is
+        not a constant.  A member's subscript (``s.m(i)``) counts, for
+        ``s``, only where it is not a constant."""
+        base = unwrap_paren(call.callee)
+        member = False
+        while isinstance(base, P.MemberAccess):
+            base, member = unwrap_paren(base.base), True
+        if not isinstance(base, P.Identifier):
+            return
+        name = ident_text(base.name)
+        values = [eval_typed(a) for a in call.args]
+        if any(v is None for v in values):
+            self._subscripted[name] = None
+            return
+        if member or (name in self._subscripted and self._subscripted[name] is None):
+            return
+        top = max(v[0] for v in values)     # type: ignore[index]
+        self._subscripted[name] = max(top, self._subscripted.get(name) or 0)
+
+    def _survey_layout(self, modules) -> None:
+        """Where each module-level variable is in the layout, and where the
+        first variable is from which a pointer or an overrun can run on
+        into the variables after it (:meth:`_module_reach`).
+
+        Variables are laid out in the order the source declares them, a
+        procedure's static ones among the module's (_number_declarations).
+        A variable is such a start if its address is taken (_aliased) or it
+        is subscripted past its end or by what is not a constant, which
+        makes it and everything after it reachable without a name, as for a
+        procedure's locals (local_storage).  Names are matched whatever
+        block declares them, which can only find more starts.  A BASED
+        variable has no place of its own, and DATA is with the code.
+        """
+        self._module_seq: dict[str, tuple[int, int]] = {}
+        starts: list[tuple[int, int]] = []
+
+        def starts_here(item, name: str) -> bool:
+            if item.based is not None or decl_attrs(item).data_values:
+                return False
+            if name in self._aliased:
+                return True
+            if name not in self._subscripted:
+                return False
+            _, dim = _view_decl_item_type(item)
+            top = self._subscripted[name]
+            return top is None or top >= (dim if dim and dim > 0 else 1)
+
+        def walk(n, top: bool) -> None:
+            if isinstance(n, (list, tuple)):
+                for x in n:
+                    walk(x, top)
+                return
+            if isinstance(n, P.DeclItem):
+                # The names of a factored declaration are contiguous, in
+                # their order (6.2.4).
+                seq = self._decl_seq.get(id(n), 0)
+                for i, name in enumerate(decl_item_names(n)):
+                    if top:
+                        self._module_seq.setdefault(name, (seq, i))
+                    if starts_here(n, name):
+                        starts.append((seq, i))
+                return
+            if isinstance(n, P.ProcDecl):
+                walk(proc_body_items(n), False)
+                return
+            fields = getattr(n, "__dataclass_fields__", None)
+            if fields and not isinstance(n, P.DeclItemBasedGroup):
+                inner = top and not isinstance(
+                    n, (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock))
+                for f in fields:
+                    if f != "pos":
+                        walk(getattr(n, f, None), inner)
+
+        for m in modules:
+            shape = module_shape(m)
+            walk(list(shape.decls), True)
+            walk(list(shape.stmts), False)
+        self._first_reach = min(starts) if starts else None
+
+    def _module_reach(self, name: str) -> bool:
+        """Whether the module-level variable ``name`` can be read or written
+        without its name: through a pointer run on from a variable laid out
+        before it whose address is taken, or an overrun of one laid out
+        before it (_survey_layout).  DRI's PL/M-80 lays variables out in the
+        source's order too, and never counts a loop."""
+        seq = self._module_seq.get(name)
+        return seq is None or (self._first_reach is not None and self._first_reach < seq)
 
     def _only_the_loop_sees(self, name: str, body_stmts, after_return: bool) -> bool:
         """Whether nothing but the loop's own code can read or write `name'
@@ -1290,7 +1385,10 @@ class CodeGenerator:
     def _reached_unnamed(self, owner: str | None, name: str) -> bool:
         """Whether local ``name`` of ``owner`` can be read or written without
         its name: through a pointer run on from a local declared before it,
-        or an overrun of an array declared before it (see local_storage)."""
+        or an overrun of an array declared before it (see local_storage);
+        for a module-level variable (``owner`` None), :meth:`_module_reach`."""
+        if owner is None:
+            return self._module_reach(name)
         storage = getattr(self, "local_storage", None)
         return storage is not None and (owner, name) in storage.reachable
 
@@ -2088,6 +2186,7 @@ class CodeGenerator:
         self.literal_macros = _ScopedLiterals(self.symbols)
         self._survey_aliases([module])
         self._number_declarations([module])
+        self._survey_layout([module])
 
         shape = module_shape(module)
         self._module_decl_items = [d for d in shape.decls if isinstance(d, P.DeclItem)]
@@ -2306,6 +2405,7 @@ class CodeGenerator:
         self.literal_macros = _ScopedLiterals(self.symbols)
         self._survey_aliases(modules)
         self._number_declarations(modules)
+        self._survey_layout(modules)
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]

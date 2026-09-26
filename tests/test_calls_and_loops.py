@@ -407,6 +407,48 @@ call run;
 """, [7, 0xC8, 3, 0x1002, 8, 2, 0xABCD, 1, 0x1234, 0x24, 0x2C, 0x279, 10])
 
 
+def test_a_counted_loop_ends_where_a_pointer_or_an_overrun_sets_its_index():
+    """A BYTE `DO i = 0 TO n' whose body does not name i counted its passes
+    in B when i was a module-level variable no procedure named and no `.i'
+    reached - but a pointer made from the address of the variable declared
+    before i reaches i as well (`p = .a + 1'), and so does an array
+    declared before it, subscripted past its end (`buf(2)' of a `buf (2)
+    byte'), and a store through either did not end the loop: n was 11, not
+    3 and 4.  So does a pointer from the name before it in a factored
+    declaration, `(a2, i2)'.  A procedure's local was not counted in that
+    case already.
+    DRI's PL/M-80 never counts a loop, and the program compiled by Intel's
+    PL/M-80 V3.1 prints what is expected here."""
+    _check("""
+declare a byte, i byte, n byte;
+declare p address, x based p byte;
+declare buf (2) byte, j byte, k byte;
+declare (a2, i2) byte;
+run: procedure;
+  n = 0;
+  p = .a + 1;
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then x = 20;
+  end;
+  call ph(n); call ph(i);
+  n = 0; k = 2;
+  do j = 0 to 10;
+    n = n + 1;
+    if n = 4 then buf(k) = 30;
+  end;
+  call ph(n); call ph(j);
+  n = 0; p = .a2 + 1;
+  do i2 = 0 to 10;
+    n = n + 1;
+    if n = 5 then x = 40;
+  end;
+  call ph(n); call ph(i2);
+end run;
+call run;
+""", [3, 0x15, 4, 0x1F, 5, 0x29])
+
+
 def test_a_reentrant_procedures_parameter_factored_with_its_locals():
     """`DECLARE (TOP, C) BYTE' names a REENTRANT procedure's parameter with
     a local. The parameter was declared a second time, as a local in the
