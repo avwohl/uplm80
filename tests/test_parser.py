@@ -15,6 +15,7 @@ from uplm80._plm_parser import (
     CallNoArgs,
     CallStmt,
     DeclItem,
+    DoCaseBlock,
     DoIterBlock,
     DoWhileBlock,
     Identifier,
@@ -424,6 +425,21 @@ class TestLabelsOnEnd:
         assert text == "X = 1; OUT:;END; Y = 6;"
         assert ends == {(1, 12)}
         assert subs == [(0, "K", "5"), (14, "M", "6")]
+
+    def test_two_colons_against_the_end_on_one_line(self) -> None:
+        """Each `;' put in moves what follows it on the line on one: the
+        second was looked for, to be marked the end of its block, where
+        it had been before the first went in."""
+        put_in: dict[int, list[int]] = {}
+        text, ends = label_the_ends("DO; X:END; DO; Y:END;", None, put_in)
+        assert text == "DO; X:;END; DO; Y:;END;"
+        assert ends == {(1, 7), (1, 19)}
+        assert put_in == {1: [7, 19]}
+        m = parse("T: DO;\nDECLARE K BYTE;\nDO CASE K; K = 1; DO; K = 2; X:END; Y:END;\nEND T;\n")
+        case = V.module_shape(m).stmts[0]
+        assert isinstance(case, DoCaseBlock)
+        assert V.is_end_of_block(case.items[-1])
+        assert sum(1 for it in case.items if not V.is_end_of_block(it)) == 2
 
     def test_strings_and_comments_are_left_alone(self) -> None:
         src = "C = 'A: END'; /* B: END */ D: /* here */ END;"

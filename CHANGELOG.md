@@ -69,6 +69,13 @@ of 80un's are smaller, by 619 and 209 bytes in all at `-O2`.
 
 ### Fixed
 
+- **The columns after a label's colon against END**, `out:end p; b =
+  zz;`, are the source's (0.4.2's Known issues).  The front end puts a
+  null statement between the labels on an END and the END, and where no
+  blank follows the colon for its `;` to take the place of, it put one in,
+  and a message about what followed on the line gave a column one too far
+  for each.  A second such label on a line was not taken for the end of
+  its block either, as a DO CASE's last `y:end;` is not one of its cases.
 - **A LITERALLY whose text runs over several lines no longer moves the
   lines after its use.**  The macro pass put the text in with its line
   ends, so every message about a later line named a line too far on, by
@@ -136,10 +143,6 @@ And this V3.1 compiles to other code (0.4.2 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
-
-Also: where a label's colon is followed at once by END, `out:end p;`,
-a message about what follows on that line gives a column one too far,
-for the null statement put before the END.
 
 In the oracle, `scripts/intel_oracle.py`:
 

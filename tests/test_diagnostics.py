@@ -89,3 +89,21 @@ def test_a_literally_over_two_lines_does_not_move_the_lines_after_it():
                            "if b = 300 then b = 1;\nend t;\n"}, "m.plm")
     assert r.returncode == 0, r.stderr
     assert "m.plm:5:8: warning: comparison BYTE = 300 is always false" in r.stderr, r.stderr
+
+
+def test_after_a_colon_against_an_end_the_columns_are_the_sources():
+    """A label's colon against END, `out:end p;': the null statement put in
+    before the END (frontend.label_the_ends) moved every column after it on
+    the line on one, in every message (0.4.2's Known issues)."""
+    r = _compile({"c.plm": "t: do;\ndeclare b byte;\np: procedure;\nout:end p; b = zz;\nend t;\n"},
+                 "c.plm")
+    assert "c.plm:4:16: error: ZZ is not declared" in r.stderr, r.stderr
+    r = _compile({"c.plm": "t: do;\ndeclare b byte;\np: procedure;\n"
+                           "  do; x:end; do; y:end; b = zz;\nend p;\nend t;\n"}, "c.plm")
+    assert "c.plm:4:29: error: ZZ is not declared" in r.stderr, r.stderr
+    r = _compile({"c.plm": "t: do;\ndeclare b byte;\np: procedure;\n  b = 1;\n"
+                           "out:end p; if b = 300 then b = 2;\nend t;\n"}, "c.plm")
+    assert "c.plm:5:19: warning: comparison BYTE = 300 is always false" in r.stderr, r.stderr
+    r = _compile({"c.plm": "t: do;\ndeclare b byte;\np: procedure;\n  b = 1;\n"
+                           "out:end p; b = = 2;\nend t;\n"}, "c.plm")
+    assert "c.plm:5:16: error: unexpected token 'EQ'" in r.stderr, r.stderr

@@ -49,20 +49,22 @@ def parse_source(
                            line_map=line_map)
     substitutions: list[tuple[int, str, str]] = []
     src = macro_pass(pre1, substitutions)
-    src, ends = label_the_ends(src, substitutions)
+    put_in: dict[int, list[int]] = {}
+    src, ends = label_the_ends(src, substitutions, put_in)
     try:
         tree = _plm_parser.parse(src, filename=filename)
     except Exception as e:  # ScanError or ParseError
         raise _syntax_error(e, line_map, filename,
-                            _literally_at(e, src, substitutions)) from e
+                            _literally_at(e, src, substitutions), put_in) from e
     if ends:
         _mark_ends(tree, ends)
-    note_origins(tree, line_map)
+    note_origins(tree, line_map, put_in)
     tree.uplm80_file = filename
     return tree
 
 
-def label_the_ends(src: str, substitutions: list | None = None
+def label_the_ends(src: str, substitutions: list | None = None,
+                   put_in: dict[int, list[int]] | None = None
                    ) -> tuple[str, set[tuple[int, int]]]:
     """``src`` with a null statement between the labels on an END
     statement and the END, and the (line, column) of each null
@@ -79,28 +81,37 @@ def label_the_ends(src: str, substitutions: list | None = None
 
     The `;' takes the place of a blank after the last label's colon where
     there is one, so the columns of the line are the source's; else it is
-    put in, and ``substitutions``' offsets after it move on.
+    put in, and ``substitutions``' offsets after it move on, and
+    ``put_in`` gets, by line, the column each such `;' has in the text
+    returned (:func:`source_column`).
     """
     toks = [t for t in _tokenize_for_macros(src) if t.kind not in ("WS", "COMMENT")]
     starts = [0]
     for line in src.split("\n"):
         starts.append(starts[-1] + len(line) + 1)
-    places: list[int] = []
-    ends: set[tuple[int, int]] = set()
+    places: list[tuple[int, int, int]] = []     # offset, line, column after the colon
     for i, tok in enumerate(toks):
         if (tok.kind == "IDENT" and tok.text == "END" and i >= 2
                 and toks[i - 1].text == ":" and toks[i - 2].kind == "IDENT"):
             colon = toks[i - 1]
-            places.append(starts[colon.line - 1] + colon.col)
-            ends.add((colon.line, colon.col + 1))
-    for at in reversed(places):
-        if src[at] in " \t":
-            src = src[:at] + ";" + src[at + 1:]
-            continue
-        src = src[:at] + ";" + src[at:]
-        if substitutions is not None:
+            places.append((starts[colon.line - 1] + colon.col, colon.line, colon.col + 1))
+    blank = [src[at] in " \t" for at, _, _ in places]
+    for (at, _, _), fill in reversed(list(zip(places, blank))):
+        src = src[:at] + ";" + src[at + (1 if fill else 0):]
+        if not fill and substitutions is not None:
             substitutions[:] = [(o + 1 if o >= at else o, name, text)
                                 for o, name, text in substitutions]
+    # Where each `;' is in the text returned: each put in before it on its
+    # line has moved it on one.
+    ends: set[tuple[int, int]] = set()
+    moved: dict[int, int] = {}
+    for (_, line, column), fill in zip(places, blank):
+        column += moved.get(line, 0)
+        ends.add((line, column))
+        if not fill:
+            moved[line] = moved.get(line, 0) + 1
+            if put_in is not None:
+                put_in.setdefault(line, []).append(column)
     return src, ends
 
 
@@ -174,7 +185,16 @@ def _literally_at(e: Exception, src: str, substitutions) -> str:
             f"LITERALLY's scope {where}")
 
 
-def _syntax_error(e: Exception, line_map, filename: str, why: str = "") -> ParserError:
+def source_column(put_in: dict[int, list[int]] | None, line: int, column: int) -> int:
+    """The source's column for ``column`` of line ``line`` of the text the
+    parser saw, which has the `;'s ``put_in`` says (label_the_ends): each
+    before it moved it on one.  A `;' put in is at the column of what
+    followed the colon."""
+    return column - sum(1 for c in (put_in or {}).get(line, ()) if c < column)
+
+
+def _syntax_error(e: Exception, line_map, filename: str, why: str = "",
+                  put_in: dict[int, list[int]] | None = None) -> ParserError:
     """A scanner or parser error, placed where its text came from.
 
     uplox reports a line of the preprocessed text, which past an
@@ -189,12 +209,14 @@ def _syntax_error(e: Exception, line_map, filename: str, why: str = "") -> Parse
     message = re.sub(r"\s*at line \d+, column \d+", "", message)
     message = re.sub(r"^[^\s:]*:\d+:\d+:\s*", "", message)
     file, orig = _origin(line_map, line, filename)
-    return ParserError(message + why, SourceLocation(orig, column or 1, file))
+    return ParserError(message + why, SourceLocation(
+        orig, source_column(put_in, line, column or 1), file))
 
 
-def note_origins(tree, line_map: list[tuple[str, int]]) -> None:
-    """Give every node position of ``tree`` the (file, line) it came from,
-    as ``pos.origin``.
+def note_origins(tree, line_map: list[tuple[str, int]],
+                 put_in: dict[int, list[int]] | None = None) -> None:
+    """Give every node position of ``tree`` the (file, line, column) it
+    came from, as ``pos.origin`` (``put_in``: see source_column).
 
     The optimizer carries a node's position over to what it rewrites the
     node into, so what code generation reports on still knows its origin.
@@ -220,7 +242,8 @@ def note_origins(tree, line_map: list[tuple[str, int]]) -> None:
             if first is not None and first.start_line:
                 pos.start_line, pos.start_column = first.start_line, first.start_column
         if pos is not None and getattr(pos, "start_line", 0):
-            pos.origin = _origin(line_map, pos.start_line, "")
+            pos.origin = _origin(line_map, pos.start_line, "") + (
+                source_column(put_in, pos.start_line, pos.start_column),)
         stack.extend(getattr(n, f, None) for f in fields if f != "pos")
 
 
@@ -232,5 +255,5 @@ def source_location(node) -> SourceLocation | None:
         return None
     origin = getattr(pos, "origin", None)
     if origin is not None:
-        return SourceLocation(origin[1], pos.start_column, origin[0])
+        return SourceLocation(origin[1], origin[2], origin[0])
     return SourceLocation(line, pos.start_column)
