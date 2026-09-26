@@ -12,8 +12,13 @@ and the code it generates, linked with DRI's `X0100` and run. Four of
 them were code the compiler got wrong, four were programs it should
 have refused; one is PL/M-80's own rule, one a test's wrong
 expectation, and the others were fixed by 0.4.0, upeepz80 0.2.6 and
-um80 0.3.51. What V3.1 rejects and uplm80 still compiles is listed under
-Known issues.
+um80 0.3.51. Checking them against V3.1 found three more kinds of
+program to refuse - a parameter no DECLARE declares, a LITERALLY used
+before its declaration, a dimension that is not a number - and two more
+cases of two of the four: a store that runs back to a counted loop's
+index, and a built-in's name another module of a multi-file compile
+makes PUBLIC. What V3.1 rejects and uplm80 still compiles is listed
+under Known issues.
 
 ### Incompatible: errors Intel's PL/M-80 gives
 
@@ -348,6 +353,10 @@ the same):
   INITIALIZATION, NOT AT MODULE LEVEL).
 - A procedure with no statements, `g: procedure; end g;`, which returns
   (#174, INVALID NULL PROCEDURE).
+- A call of a procedure that its block declares after the call, `p:
+  procedure; call q; end p; q: procedure; ... end q;`, and `y = f + 1`
+  of a typed procedure `f` declared after it (#169, ILLEGAL FORWARD
+  CALL).
 
 And one that V3.1 compiles to other code (0.4.0 the same):
 
