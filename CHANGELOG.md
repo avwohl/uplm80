@@ -21,6 +21,12 @@ code it generates, linked with DRI's `X0100` and run.
   c;`, `c` BASED on `pp`, still keeps `ld (@PQ$@B),a` and returns `B` at
   `-O1` to `-O3`. Over the 87 compiles of MP/M II and 80un, the assembly at
   `-O1`, `-O2` and `-O3` is 0.4.0's less its 25 such EQUs, line for line.
+- The CHANGELOG's Known issues of 0.3.7 no longer list what 0.4.0 fixed:
+  a CALL through an address passes any number of arguments to any
+  procedure. um80 0.3.51 needs none of uplm80's renames and rewrites of
+  names spelled like an operator (`@EQ`, `2+TYPE`, `jp 0+P`), which are
+  kept, and cost nothing, for older um80 releases (README, Names in the
+  Output).
 
 ### Fixed
 
@@ -1192,8 +1198,6 @@ Each fix has a regression test that fails without it.
   literally 'ldmon1'`.
 - **A procedure named DOUBLE** is taken for the built-in where code generation
   folds constants: `double(30h)` is 30H however the procedure is written.
-- A CALL through an address passes more than one argument only to a PUBLIC or
-  REENTRANT procedure (a warning says so).
 - **A name that is declared nowhere is not an error.** `y = nosuch + 1`
   compiles to `ld hl,(NOSUCH)`, and only um80 reports it, as an undefined
   symbol (0.3.6 the same).
@@ -1232,7 +1236,9 @@ Each fix has a regression test that fails without it.
   when they end a longer symbol), and `EQ`, `SHL`, `NUL` and the like on
   their own as operators, without an error: `ld hl,TYPE+2` loads 0, `call
   EQ` calls 0FFFFH. uplm80 renames or rewrites what it emits so as not to
-  meet it; an assembly module written by hand can.
+  meet it; an assembly module written by hand can. um80 0.3.51 reads all of
+  these as M80 does, as the symbols, and so does `jp P`; uplm80 keeps the
+  renames and rewrites (`names.fix_symbols`, `data_name`) for older um80s.
 - **With `um80 -t` (PUBLIC and EXTERNAL names cut to six characters, as
   MACRO-80 does), ul80 links two PUBLIC names that agree in their first six
   characters as one** - PRINTCHAR and PRINTCRLF are both PRINTC - reporting

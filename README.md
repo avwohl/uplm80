@@ -283,8 +283,11 @@ local or a parameter of the procedure around it - one is renamed `NAME?2`
 (no PL/M-80 identifier has a `?`): a LITERALLY before a label, a label
 before a procedure, a procedure before a variable.  A name the assembler
 reads as a register or an operator (`A`, `HL`, `EQ`, `NUL`, ...) is
-`@NAME`.  `uplm80/names.py` binds every name to the declaration PL/M-80
-means and checks every GOTO against the Programming Manual (9.3): out of a
+`@NAME`, and an offset from a name that ends in the letters of an operator
+is written first (`2+TYPE`, not `TYPE+2`); um80 0.3.51 reads the operator
+names and `TYPE+2` as M80 does, and needs neither, but older um80 releases
+do.  `uplm80/names.py` binds every name to the declaration PL/M-80 means
+and checks every GOTO against the Programming Manual (9.3): out of a
 procedure only to a label at the outer level of the main program module.
 
 ## Runtime Modes

@@ -34,7 +34,11 @@ rules of 9.3, tells code generation the label each one jumps to, and
 rejects a name declared twice in one block.
 
 :func:`data_name` and :func:`fix_symbols` keep names away from what um80
-reads as a register, a condition or an operator.
+reads as a register, a condition or an operator.  um80 0.3.51 reads a name
+spelled like an operator or a condition, and one ending in an operator's
+letters before a + or a -, as the symbol, as M80 does; the renames and
+rewrites for those are kept for older um80 releases, and cost nothing.  A
+register name is still not a symbol to it in Z80 code.
 """
 
 from __future__ import annotations
@@ -59,8 +63,8 @@ from .frontend import source_location
 
 # Names um80 reads as something other than a symbol.  A register, as an
 # operand (`ld hl,A' is "Register 'A' used as value", `ld a,(IX)' is
-# `ld a,(ix+0)'), and an operator of its expressions: `call EQ' calls 0FFFFH
-# and `ld hl,SHL' loads 0, without a word.
+# `ld a,(ix+0)'), and, before 0.3.51, an operator of its expressions: `call
+# EQ' called 0FFFFH and `ld hl,SHL' loaded 0, without a word.
 REGISTER_NAMES = frozenset(
     {"A", "B", "C", "D", "E", "H", "L", "M", "SP", "PSW",
      "AF", "BC", "DE", "HL", "IX", "IY", "I", "R"})
@@ -75,23 +79,25 @@ def data_name(name: str) -> str:
     return name
 
 
-# As the target of a jump, a condition: `jp P' wants an address after the
-# P.  A procedure is jumped to as well as called (the peephole turns
-# `call p / ret' into `jp P'), and a label is.  `call P' and `ld hl,P' are
-# the symbol, so such a name is not renamed; the jump is written `jp 0+P'
-# (fix_symbols).
+# As the target of a jump, a condition, before um80 0.3.51: `jp P' wanted an
+# address after the P (and M80 3.44 takes `JP P' to a P defined further
+# down for one byte in its first pass).  A procedure is jumped to as well as
+# called (the peephole turns `call p / ret' into `jp P'), and a label is.
+# `call P' and `ld hl,P' are the symbol, so such a name is not renamed; the
+# jump is written `jp 0+P' (fix_symbols).
 _JUMP_TO_CONDITION = re.compile(
     r"^(\s*(?:[\w?@$.]+:)?\s*(?:jp|jr)\s+)(Z|NZ|NC|PO|PE|P)(\s*(?:;.*)?)$",
     re.IGNORECASE | re.MULTILINE)
 
 
 # And a symbol followed by a + or a - where the letters it ends in are one of
-# um80's word operators: it takes the + for the sign of that operator's
-# operand, so `ld hl,TYPE+2' is TYPE(+2), the type of the expression +2, and
-# `@P$NUL+2', `LIB?EQ+1' and `X1LOW-1' do not parse.  Bare, such a symbol is
-# read as a symbol (but for the operators themselves, which data_name
-# renames), and MP/M II's PIP has a variable TYPE, so they are not renamed;
-# an offset from one is written the other way round, `2+TYPE' (fix_symbols).
+# um80's word operators: um80 before 0.3.51 took the + for the sign of that
+# operator's operand, so `ld hl,TYPE+2' was TYPE(+2), the type of the
+# expression +2, and `@P$NUL+2', `LIB?EQ+1' and `X1LOW-1' did not parse.
+# Bare, such a symbol is read as a symbol (but for the operators themselves,
+# which data_name renames), and MP/M II's PIP has a variable TYPE, so they
+# are not renamed; an offset from one is written the other way round,
+# `2+TYPE' (fix_symbols).
 _UM80_WORDS = frozenset({"MOD", "SHL", "SHR", "AND", "OR", "XOR", "NOT", "EQ", "NE", "LT",
                          "LE", "GT", "GE", "HIGH", "LOW", "NUL", "TYPE"})
 _WORD_THEN_SIGN = re.compile(r"(?:" + "|".join(sorted(_UM80_WORDS)) + r")[+-]", re.IGNORECASE)
