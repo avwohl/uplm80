@@ -242,6 +242,30 @@ any.
   and LOCATE, and run under cpmemu. The expected output is transcribed:
   Intel's binaries are not in this repository.
 
+### Known issues
+
+uplm80 still compiles these, which Intel's PL/M-80 V3.1 rejects (0.4.0
+the same):
+
+- `f()` and `CALL g()` of a procedure, and `carry()` of a built-in,
+  taken for `f`, `g` and `carry` (ERROR #102, MISSING PRIMARY OPERAND, and
+  #153, INVALID NUMBER OF ARGUMENTS IN CALL).
+- A subscript on a scalar, `x(0)` or `x(1)`, the byte at X's address
+  plus the subscript (#127, INVALID SUBSCRIPT ON NON-ARRAY); and `shl(w,
+  3)` where the program declares SHL an ADDRESS, a call through SHL's
+  value (#127, and #114, MULTIPLE SUBSCRIPTS ILLEGAL).
+- An array, or an array member, without a subscript anywhere but in a
+  location reference or LENGTH, LAST and SIZE (3.6.2): `a = 3` and `x =
+  a` are `a(0)`, `s.m = 4` is `s.m(0)`, `s2.m(1)` of an array of
+  structures is `s2(0).m(1)`, and `size(a)`, SIZE an array of the
+  program's, is `size(a(0))` (#133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+  ARRAY, and #134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY).
+- INITIAL in a procedure's declaration, which initializes the variable
+  once, when the program is loaded (#73, INVALID ATTRIBUTE OR
+  INITIALIZATION, NOT AT MODULE LEVEL).
+- A procedure with no statements, `g: procedure; end g;`, which returns
+  (#174, INVALID NULL PROCEDURE).
+
 ### Verified
 
 On 1b210ad, with upeepz80 0.2.6 and um80 0.3.51.
