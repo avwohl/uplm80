@@ -1587,6 +1587,17 @@ def test_a_declared_memory_or_size_in_a_data_list_is_the_programs(name):
     _check(body, expect)
 
 
+@pytest.mark.parametrize("name", ["stackptr", "shl", "double"])
+def test_the_location_of_a_built_in_in_a_list_is_uplm80s_own_refusal(name):
+    """Intel's PL/M-80 V3.1 takes `data (.stackptr)' for an address of its
+    own (tests/test_intel_oracle.py), and uplm80, which has none to give,
+    refuses it, as it did; the message said V3.1 rejects it (#123), which
+    V3.1 does in an expression only."""
+    err = _compile_error(PRELUDE + f"declare d address data (.{name});\nend t;\n", 0)
+    assert f"uplm80 has none to give {name.upper()} in a DATA or INITIAL list" in err, err
+    assert "rejects" not in err, err
+
+
 
 def test_an_untyped_data_string_is_an_array():
     """uplm80 takes `declare hx data ('0123')', which V3.1 does not (ERROR

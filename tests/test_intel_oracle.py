@@ -107,6 +107,15 @@ def test_v31_rejects_what_uplm80_rejects_or_warns_of(tools, name):
     assert ("uplm80 rejects it too" in res.detail) == (name in V31_REJECTS), res.detail
 
 
+@pytest.mark.parametrize("name", ["stackptr", "shl", "double"])
+def test_v31_takes_the_location_of_a_built_in_in_a_list(tools, name):
+    """0.4.3's Known issues: V3.1 takes `data (.stackptr)' for an address
+    of its own, which uplm80 has none to give, and refuses."""
+    text = _PRELUDE + f"declare d address data (.{name});\ncall ph(d);\nend t;\n"
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "uplm80-rejects", oracle.format_result(res)
+
+
 def test_corpus_program_prints_what_intels_build_prints(tools):
     path = os.path.join(ROOT, "tests", "test_based_proc.plm")
     res = oracle.check_text(tools, oracle.prepare_source(path), "test_based_proc")

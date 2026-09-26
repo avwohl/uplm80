@@ -1074,6 +1074,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         OPERAND (and 153, INVALID NUMBER OF ARGUMENTS IN CALL)."""
         if r.in_at:
             return
+        if r.dot and _key(getattr(r.node, r.attr)) != "MEMORY" and r.in_list:
+            # Intel's PL/M-80 V3.1 takes it there, for an address of its own
+            # (057CH, 0103H in the programs checked), which uplm80 has no
+            # counterpart of (0.4.3's Known issues).
+            raise CodeGenError(
+                f".{text}: {text} is a built-in, and of the built-ins only MEMORY has an "
+                f"address; uplm80 has none to give {text} in a DATA or INITIAL list, where "
+                f"Intel's PL/M-80 V3.1 takes .{text} for an address of its own",
+                source_location(r.node))
         if r.dot and _key(getattr(r.node, r.attr)) != "MEMORY":
             raise CodeGenError(
                 f".{text}: {text} is a built-in, and of the built-ins only MEMORY has an "
