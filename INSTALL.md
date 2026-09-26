@@ -208,22 +208,21 @@ Hello, World!
 The typical workflow for compiling PL/M-80 programs:
 
 ```bash
-# 1. Compile PL/M to assembly
+# 1. Compile PL/M to assembly.  At -O1 and up (-O2 is the default) the
+#    compiler optimizes the assembly itself, with upeepz80's peephole
+#    optimizer, before it writes it: there is no separate pass to run.
 uplm80 input.plm -o output.mac
 
-# 2. (Optional) Run post-assembly optimizer
-python -m uplm80.postopt output.mac -o output_opt.mac
-
-# 3. Assemble to relocatable object
+# 2. Assemble to relocatable object
 um80 output.mac
 
-# 4. Link, with the BDOS interface (see Runtime Library) if the program
+# 3. Link, with the BDOS interface (see Runtime Library) if the program
 #    uses any name it defines: MON2A, MON3, BOOT, a system variable such
 #    as FCB, TBUFF, BUFF, BDISK or MAXB, or MON1 or MON2 other than called
 #    with a constant function number (that call is the BDOS call itself)
 ul80 -o program.com output.rel x0100.rel
 
-# 5. Run the program
+# 4. Run the program
 cpmemu program.com
 ```
 
