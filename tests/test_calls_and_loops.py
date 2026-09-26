@@ -603,6 +603,70 @@ def test_memory_run_on_from_its_start_leaves_a_loop_counted():
     assert "djnz" in asm[asm.index("RUN:"):]
 
 
+# Labels on END statements (9800268B, A.4.4.1), and a GOTO to each: on to
+# the next step of an iterative DO and the next test of a DO WHILE, out of
+# a DO CASE, a DO and a procedure.  Follows _PRELUDE; Intel's PL/M-80 V3.1
+# compiles it to print what is expected (tests/test_intel_oracle.py).
+END_LABELS = """
+declare (i, n, k, r) byte;
+p: procedure (x) byte;
+  declare x byte;
+  r = 1;
+  if x > 3 then goto out;
+  n = n + 10;
+  r = 2;
+  return r;
+out: end p;
+q: procedure;
+  if n > 100 then goto done;
+  n = n + 1;
+done: finish:end q;
+n = 0;
+do i = 1 to 5;
+  if i = 3 then goto next;
+  n = n + 1;
+next: end;
+call ph(n); call ph(i);
+n = 0;
+do k = 0 to 2;
+  do case k;
+    n = n + 1;
+    goto cend;
+    n = n + 4;
+  cend: end;
+  n = n + 16;
+end;
+call ph(n);
+n = 0; i = 0;
+do while i < 4;
+  i = i + 1;
+  if i = 2 then goto wend;
+  n = n + 1;
+wend: /* the end */ end;
+call ph(n); call ph(i);
+n = 0;
+k = p(2); call ph(r); call ph(n); k = p(9); call ph(r); call ph(n);
+n = 200; call q; call ph(n); n = 5; call q; call ph(n);
+blk: do;
+  n = 1;
+  goto bend;
+  n = 2;
+bend: end blk;
+call ph(n);
+"""
+
+
+def test_a_label_on_an_end_statement():
+    """`out: end p;' was a syntax error: the grammar took a label only on a
+    statement a block holds (0.4.1 the same).  A GOTO to it goes on to the
+    loop's next step or test, out of a DO CASE (not a case of it: the jump
+    table is the three cases'), a DO or a procedure."""
+    _check(END_LABELS, [4, 6, 0x35, 3, 4, 2, 10, 1, 10, 0xC8, 6, 1])
+    for opt in (0, 2):
+        asm = _asm(_PRELUDE + END_LABELS + "\nend t;\n", opt)
+        assert len(re.findall(r"^\?\?CASE\d+:", asm, re.M)) == 3, asm
+
+
 @pytest.mark.parametrize("where", ["module", "local"])
 def test_a_member_of_an_unsubscripted_array_of_structures_runs_on(where):
     """`s2.m(4)' of an `s2 (2) structure (m(2) byte)' is s2(0).m(4) to

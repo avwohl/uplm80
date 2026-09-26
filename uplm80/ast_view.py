@@ -618,6 +618,17 @@ def make_identifier(name: str, pos=None) -> P.Identifier:
 # value to ADDRESS or writes an ADDRESS constant below 256 (plm_types): no
 # PL/M-80 identifier has a `?', so no declaration of the program's can hide
 # it, as one of DOUBLE hides the built-in (9.2).
+# The attribute that marks, on its position, a labelled null statement the
+# front end put in for a label on an END statement (frontend.label_the_ends):
+# it is where the block ends, and a DO CASE does not count it as a case.
+END_OF_BLOCK = "uplm80_end_of_block"
+
+
+def is_end_of_block(stmt) -> bool:
+    """Whether ``stmt`` is the labels of an END statement (END_OF_BLOCK)."""
+    return isinstance(stmt, P.LabeledStmt) and bool(getattr(stmt.pos, END_OF_BLOCK, False))
+
+
 DOUBLE_MARK = "??DOUBLE"
 
 

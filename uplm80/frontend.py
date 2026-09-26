@@ -31,8 +31,9 @@ import re
 from . import _plm_parser
 from . import _plm_parser as P
 from ._plm_parser import Module
+from .ast_view import END_OF_BLOCK
 from .errors import ParserError, SourceLocation
-from .preprocess import macro_pass, preprocess as uplm_preprocess
+from .preprocess import _tokenize_for_macros, macro_pass, preprocess as uplm_preprocess
 
 
 def parse_source(
@@ -48,14 +49,85 @@ def parse_source(
                            line_map=line_map)
     substitutions: list[tuple[int, str, str]] = []
     src = macro_pass(pre1, substitutions)
+    src, ends = label_the_ends(src, substitutions)
     try:
         tree = _plm_parser.parse(src, filename=filename)
     except Exception as e:  # ScanError or ParseError
         raise _syntax_error(e, line_map, filename,
                             _literally_at(e, src, substitutions)) from e
+    if ends:
+        _mark_ends(tree, ends)
     note_origins(tree, line_map)
     tree.uplm80_file = filename
     return tree
+
+
+def label_the_ends(src: str, substitutions: list | None = None
+                   ) -> tuple[str, set[tuple[int, int]]]:
+    """``src`` with a null statement between the labels on an END
+    statement and the END, and the (line, column) of each null
+    statement's `;'.
+
+    A label may prefix any statement, END included (9800268B, A.4.4.1),
+    `out: end p;'; the grammar takes labels only on the statements a
+    block holds.  A GOTO to such a label goes to the end of the block -
+    to the next test of a DO WHILE or the next step of an iterative DO,
+    out of a DO or a DO CASE, out of a procedure as a RETURN does - which
+    is where a labelled null statement just before the END goes, and
+    Intel's PL/M-80 V3.1 compiles it so.  A DO CASE does not count it
+    among its cases (:data:`ast_view.END_OF_BLOCK`).
+
+    The `;' takes the place of a blank after the last label's colon where
+    there is one, so the columns of the line are the source's; else it is
+    put in, and ``substitutions``' offsets after it move on.
+    """
+    toks = [t for t in _tokenize_for_macros(src) if t.kind not in ("WS", "COMMENT")]
+    starts = [0]
+    for line in src.split("\n"):
+        starts.append(starts[-1] + len(line) + 1)
+    places: list[int] = []
+    ends: set[tuple[int, int]] = set()
+    for i, tok in enumerate(toks):
+        if (tok.kind == "IDENT" and tok.text == "END" and i >= 2
+                and toks[i - 1].text == ":" and toks[i - 2].kind == "IDENT"):
+            colon = toks[i - 1]
+            places.append(starts[colon.line - 1] + colon.col)
+            ends.add((colon.line, colon.col + 1))
+    for at in reversed(places):
+        if src[at] in " \t":
+            src = src[:at] + ";" + src[at + 1:]
+            continue
+        src = src[:at] + ";" + src[at:]
+        if substitutions is not None:
+            substitutions[:] = [(o + 1 if o >= at else o, name, text)
+                                for o, name, text in substitutions]
+    return src, ends
+
+
+def _mark_ends(tree, ends: set[tuple[int, int]]) -> None:
+    """Mark the labelled null statements :func:`label_the_ends` put in,
+    each label of one too, with :data:`ast_view.END_OF_BLOCK` on their
+    positions (which the optimizer carries over to what it rewrites)."""
+    stack: list = [tree]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (list, tuple)):
+            stack.extend(n)
+            continue
+        if isinstance(n, P.LabeledStmt):
+            chain = [n]
+            inner = n.stmt
+            while isinstance(inner, P.LabeledStmt):
+                chain.append(inner)
+                inner = inner.stmt
+            if isinstance(inner, P.NullStmt) and \
+                    (inner.pos.start_line, inner.pos.start_column) in ends:
+                for x in chain + [inner]:
+                    setattr(x.pos, END_OF_BLOCK, True)
+                continue
+        fields = getattr(n, "__dataclass_fields__", None)
+        if fields:
+            stack.extend(getattr(n, f, None) for f in fields if f != "pos")
 
 
 def _origin(line_map: list[tuple[str, int]], line: int, filename: str) -> tuple[str, int]:

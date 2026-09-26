@@ -24,6 +24,7 @@ from .ast_view import (
     proc_local_decls_stmts,
     block_items_split,
     iter_block_proc_decls,
+    is_end_of_block,
     proc_end_label,
     iter_declare_items,
     decl_item_names,
@@ -5527,6 +5528,11 @@ class CodeGenerator:
         end_label = self._new_label("CASEND")
 
         cases = list(stmt.items)
+        # The labels of the END statement are not a case: they are where
+        # the block ends (frontend.label_the_ends).
+        end_labels = []
+        while cases and is_end_of_block(cases[-1]):
+            end_labels.insert(0, cases.pop())
         # Create labels for each case
         case_labels = [self._new_label(f"CASE{i}") for i in range(len(cases))]
 
@@ -5577,6 +5583,8 @@ class CodeGenerator:
                 self._emit("jp", end_label)
 
         self._emit_label(end_label)
+        for labels in end_labels:
+            self._gen_stmt(labels)
 
     def _stmt_transfers_control(self, stmt) -> bool:
         """Check if a typed statement unconditionally transfers control."""

@@ -47,6 +47,17 @@ binaries are found.
   build of each prints. The 87 MP/M II and 80un compiles, MP/M II's ED
   and STAT among them, which take `.memory` and subscript MEMORY by a
   variable, compile to 0.4.1's assembly at `-O0`, `-O2` and `-O3`.
+- **A label on an END statement**, `out: end p;`, as a label may prefix
+  any statement (Programming Manual A.4.4.1); it was a syntax error
+  (Known issues, 0.4.1). The grammar takes a label only on a statement a
+  block holds, so the front end puts a null statement between the labels
+  and the END, in place of the blank after the colon where there is one,
+  and a GOTO to it goes where Intel's PL/M-80 V3.1 goes: on to the next
+  step of an iterative DO and the next test of a DO WHILE, and out of a
+  DO, a DO CASE - whose cases it is not one of - and a procedure. The
+  program in `tests/test_calls_and_loops.py` prints, at `-O0` to `-O3`,
+  what V3.1's build of it prints. No program of MP/M II, 80un,
+  `sample_code` or `tests/` has one; each compiles as before.
 
 ### Added
 
@@ -123,8 +134,6 @@ And these V3.1 compiles to other code (0.4.1 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
-- A label on an END statement, `out: end p;` (Programming Manual A.4.4.1),
-  is a syntax error; V3.1 compiles it.
 - V3.1 rejects a zero dimension, `declare b (0) byte` (ERROR #57), and the
   address of a built-in, `.double`; uplm80 accepts both.
 

@@ -20,13 +20,15 @@ from uplm80._plm_parser import (
     Identifier,
     IfStmt,
     IfStmtElse,
+    LabeledStmt,
     LiterallyDecl,
+    NullStmt,
     NumberLiteral,
     ProcDecl,
     ReturnStmtValue,
     UnaryOp,
 )
-from uplm80.frontend import parse_source as parse
+from uplm80.frontend import label_the_ends, parse_source as parse
 
 
 def _proc_stmts(proc: ProcDecl) -> list:
@@ -403,3 +405,39 @@ class TestStringLiterals:
         )
         assert asm is not None
         assert "5CH" in asm.upper()
+
+
+class TestLabelsOnEnd:
+    """A label on an END statement (9800268B, A.4.4.1) is a labelled null
+    statement before the END, put in where the blank after the colon was;
+    it was a syntax error (0.4.1 the same)."""
+
+    def test_the_columns_stay_the_sources(self) -> None:
+        src = "T: DO;\nP: PROCEDURE;\nOUT: END P;\nL1: L2:  END T;\n"
+        text, ends = label_the_ends(src)
+        assert text == "T: DO;\nP: PROCEDURE;\nOUT:;END P;\nL1: L2:; END T;\n"
+        assert ends == {(3, 5), (4, 8)}
+
+    def test_a_colon_against_the_end(self) -> None:
+        subs = [(0, "K", "5"), (13, "M", "6")]
+        text, ends = label_the_ends("X = 1; OUT:END; Y = 6;", subs)
+        assert text == "X = 1; OUT:;END; Y = 6;"
+        assert ends == {(1, 12)}
+        assert subs == [(0, "K", "5"), (14, "M", "6")]
+
+    def test_strings_and_comments_are_left_alone(self) -> None:
+        src = "C = 'A: END'; /* B: END */ D: /* here */ END;"
+        text, ends = label_the_ends(src)
+        assert text == "C = 'A: END'; /* B: END */ D:;/* here */ END;"
+        assert len(ends) == 1
+
+    def test_the_labels_are_marked_as_the_end_of_the_block(self) -> None:
+        m = parse("T: DO;\nDECLARE I BYTE;\nDO I = 1 TO 3;\nNEXT: END;\nEND T;\n")
+        loop = V.module_shape(m).stmts[0]
+        assert isinstance(loop, DoIterBlock)
+        last = loop.items[-1]
+        assert isinstance(last, LabeledStmt) and V.ident_text(last.label) == "NEXT"
+        assert isinstance(last.stmt, NullStmt)
+        assert V.is_end_of_block(last)
+        m = parse("T: DO;\nDECLARE I BYTE;\nNEXT: ;\nEND T;\n")
+        assert not any(V.is_end_of_block(s) for s in V.module_shape(m).stmts)

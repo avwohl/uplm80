@@ -631,12 +631,12 @@ V3.1 does, a name declared nowhere, empty parentheses after a variable,
 parameter no `DECLARE` declares, and a `LITERALLY` used before its
 declaration.
 
-The other way round, V3.1 compiles a label on an `END` statement, `out:
-end p;` (A.4.4.1), which uplm80 0.4.1 does not.  And a store through a
-pointer or an overrun in or from `??AUTO` reaches what uplm80's layout puts
-there, not what DRI's does (CHANGELOG, Known issues), which the generator
-never writes; a counted loop over the last module-level variable sees a
-store through MEMORY that reaches it since 0.4.2.
+A store through a pointer or an overrun in or from `??AUTO` reaches what
+uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),
+which the generator never writes.  Since 0.4.2 uplm80 compiles a label on
+an `END` statement, `out: end p;` (A.4.4.1), as V3.1 does, and a counted
+loop over the last module-level variable sees a store through MEMORY that
+reaches it.
 
 ## Project Structure
 
