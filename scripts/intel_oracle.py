@@ -364,11 +364,18 @@ def _last_statement_offset(obj: bytes) -> int | None:
 
 def patch_halt(com: bytes, obj: bytes, base: int = 0x100) -> tuple[bytes, str]:
     """``com`` with the main program's final EI; HLT made RST 0; ``base`` is
-    where the module's code segment was located."""
+    where the module's code segment was located.
+
+    The EI; HLT is where the LINES record puts the module's END, or, where
+    a label on the END is one a procedure's GOTO reaches, `fin: end t;',
+    just after the `LXI SP' V3.1 sets SP again with there, as at any such
+    label."""
     off = _last_statement_offset(obj)
     if off is None:
         return com, "no LINES record: final HLT left alone"
     at = base - 0x100 + off
+    if com[at:at + 1] == b"\x31" and com[at + 3:at + 5] == b"\xfb\x76":
+        at += 3                                     # LXI SP,n; EI; HLT
     if com[at:at + 2] != b"\xfb\x76":
         return com, f"no EI; HLT at {at + 0x100:04X}H: left alone"
     return com[:at] + b"\xc7" + com[at + 1:], ""

@@ -21,7 +21,8 @@ import sys
 
 import pytest
 
-from tests.plm_intel import generate
+from tests.plm_difftest import Bin, Num, Var
+from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
@@ -183,6 +184,51 @@ def test_patch_halt_makes_the_last_statements_hlt_a_warm_boot():
     assert patched[6] == 0xC7
     # anything else there is left alone
     assert oracle.patch_halt(bytes(6), obj)[1].startswith("no EI; HLT")
+
+
+def test_a_label_on_the_modules_end_is_where_the_halt_is():
+    """`fin: end t;' where a procedure's GOTO reaches FIN: V3.1 sets SP
+    there again, as at any such label, and its EI; HLT follows the LXI SP
+    the LINES record points at.  The HLT was left alone, and the build ran
+    on past it: `timeout' (0.4.2's Known issues)."""
+    obj = _omf(0x08, bytes([1, 0, 0, 1, 0, 3, 0, 2, 0])) + _omf(0x0E, b"")
+    com = bytes([0x31, 0, 0, 0x31, 0x34, 0x12, 0xFB, 0x76, 0xC9])
+    patched, note = oracle.patch_halt(com, obj)
+    assert note == ""
+    assert patched == bytes([0x31, 0, 0, 0x31, 0x34, 0x12, 0xC7, 0x76, 0xC9])
+
+
+FIN_BY_GOTO = """t: do;
+mon1: procedure (f, a) external; declare f byte, a address; end mon1;
+declare b byte;
+bail: procedure;
+  goto fin;
+end bail;
+b = 0;
+call mon1(2, 41h);
+if b = 0 then call bail;
+call mon1(2, 58h);
+fin: end t;
+"""
+
+
+def test_a_program_that_ends_at_a_label_a_procedure_jumps_to(tools):
+    res = oracle.check_text(tools, FIN_BY_GOTO, "fin", timeout=5)
+    assert res.verdict == "same", oracle.format_result(res)
+    assert res.intel_out == "A"
+
+
+def test_zero_dividend_leaves_out_a_dividend_that_folds_to_0():
+    """`--avoid zero-dividend' left out `0 / x' but not a dividend that
+    folds to 0 by what folds to 0 too, `(8 / 0FF00H) / (0F82AH <= 1)',
+    which V3.1 folds to 0 and uplm80 divides, 0FFFFH (0.4.2's Known
+    issues)."""
+    assert zero_dividend(Bin("/", Num(8), Num(0xFF00)), Bin("<=", Num(0xF82A), Num(1)))
+    assert zero_dividend(Num(0), Var("b1"))
+    assert not zero_dividend(Num(0), Num(3))
+    assert not zero_dividend(Num(8), Var("b1"))
+    avoid = KNOWN | {"zero-dividend"}
+    assert "(high(144) / (7 = last(ms)))" not in generate(115, n_stmts=20, avoid=avoid).render()
 
 
 def test_generator_is_deterministic_and_reducible():

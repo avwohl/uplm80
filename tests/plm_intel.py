@@ -49,8 +49,9 @@ the README lists:
   compares in 16 bits where 5.1.4 makes the limit a BYTE;
 * sub-zero: a BYTE less an ADDRESS that folds to 0, which V3.1 leaves a
   BYTE;
-* zero-dividend: a constant 0 divided by a variable, which V3.1 folds to 0
-  even when the divisor is 0, where uplm80 divides (0FFFFH);
+* zero-dividend: a dividend that folds to 0 divided by what may be 0 - a
+  variable, or what folds to 0 too - which V3.1 folds to 0, where uplm80
+  divides (0FFFFH);
 * neg-widened: `-b' or `0 - b' of a BYTE the expression also uses
   elsewhere, which V3.1 may negate in 16 bits;
 * qualsize (LENGTH, LAST and SIZE of a structure member, which uplm80
@@ -304,6 +305,18 @@ def neg_widened(e: Expr, env: dict) -> bool:
         return False
     uses = [n.name for n in nodes(e) if isinstance(n, Var)]
     return any(uses.count(v) > 1 for v in negated)
+
+
+def zero_dividend(left: Expr, right: Expr, extents=None, lits=None) -> bool:
+    """Whether ``left / right`` divides a dividend that folds to 0 by what
+    may be 0.  V3.1 folds such a quotient to 0 - `0 / x', and `(8 / 0FF00H)
+    / (0F82AH <= 1)' (seed 20275 of the 0.4.2 release check) - where
+    uplm80 divides, and 0 / 0 is 0FFFFH (4.2.3: undefined).  By a constant
+    other than 0 both give 0."""
+    if const_value(left, extents, lits) != 0:
+        return False
+    divisor = const_value(right, extents, lits)
+    return divisor is None or divisor == 0
 
 
 def folds_to_address_zero(e: Expr, env: dict, extents=None, lits=None) -> bool:
@@ -602,8 +615,7 @@ class Generator:  # pylint: disable=too-many-instance-attributes,too-many-public
             if op == "-" and folds_to_address_zero(right, self.types, self.extents, self.lits) \
                     and not self.use("sub-zero"):
                 right = Bin("or", right, Num(1))
-            if op == "/" and const_value(left, self.extents, self.lits) == 0 \
-                    and const_value(right, self.extents, self.lits) is None \
+            if op == "/" and zero_dividend(left, right, self.extents, self.lits) \
                     and not self.use("zero-dividend"):
                 right = Bin("or", right, Num(1))
             return Bin(op, left, right)

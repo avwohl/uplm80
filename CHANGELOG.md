@@ -154,6 +154,14 @@ takes to print what uplm80's build prints.
   `PROCES.LIT`'s PROCESS$DESCRIPTOR once, whose text, with the texts it
   names, has 16 line ends, and were reported 16 lines on.  The text goes in on one line, as a line end in it is a blank;
   the 87 MP/M II and 80un compiles are unchanged.
+- In the oracle, `scripts/intel_oracle.py` (0.4.2's Known issues):
+  `--avoid zero-dividend` leaves out a dividend that folds to 0 divided by
+  what folds to 0 too, `(8 / 0FF00H) / (0F82AH <= 1)`, which V3.1 folds to
+  0 and uplm80 divides (the 0.4.2 release check's seed 20275), as well as
+  `0 / x`; and where a label on the module's END is one a procedure's GOTO
+  reaches, `fin: end t;`, the HLT made a warm boot is the one after the
+  `LXI SP` V3.1 puts at the END, and Intel's build no longer runs on to
+  `timeout`.
 - `UPEEPZ80_MIN`, the upeepz80 the compiler takes at its word, is 0.2.7,
   the floor `pyproject.toml` has required since 0.4.2; it said 0.2.6, and
   `tests/test_upeepz80_version.py` failed.  An upeepz80 numbered below it
@@ -202,16 +210,6 @@ And this V3.1 compiles to other code (0.4.2 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
-
-In the oracle, `scripts/intel_oracle.py`:
-
-- `--avoid zero-dividend` leaves out `0 / x`, but not a dividend that
-  folds to 0, `(8 / 0FF00H) / (0F82AH <= 1)`, which V3.1 folds to 0 and
-  uplm80 divides (seed 20275; 4.2.3: undefined).
-- Intel's build is stopped by a HLT patched in where the LINES record
-  puts the module's END. For `fin: end t;` V3.1 puts an `LXI SP` there,
-  before its `EI; HLT`, and the build runs past the HLT: the verdict is
-  `timeout`, where uplm80's build prints what it should.
 
 ## 0.4.2 — 2026-09-26
 

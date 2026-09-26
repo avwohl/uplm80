@@ -595,7 +595,10 @@ Two things the recipe needs that DRI's own programs did for themselves:
   0103H, where OBJCPM puts a jump to the start in front of it.
 - A PL/M-80 main program ends in `EI; HLT`, which cpmemu runs past.  The
   HLT at the module's last statement (found through the LINES records
-  `DEBUG` writes) becomes `RST 0`, a warm boot, as uplm80's CP/M mode ends.
+  `DEBUG` writes) becomes `RST 0`, a warm boot, as uplm80's CP/M mode ends;
+  where a label on the module's END is one a procedure's GOTO reaches,
+  `fin: end t;`, the `EI; HLT` follows the `LXI SP` V3.1 sets SP again
+  with there.
 
 A module with no statements of its own, entered through a DATA jump that
 Intel's layout puts at 0100H - DRI's CP/M 2.0 `LOAD`, `STAT` and `SUBMIT` -
@@ -638,7 +641,7 @@ result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
 | `shift9` | `b = 7; r = SHL(b, 9);` (r BYTE) | `0EH` | `0` | V3.1 shifts a BYTE by the count mod 8 (0 counts as 8), folded or not; the manual: 0 |
 | `wide-limit` | `DO i = 250 TO 300;` (i BYTE) | 6 times | never | V3.1 compares the BYTE index with the 16-bit limit; the manual (5.1.4) converts the limit to the index's type |
 | `sub-zero` | `w = (b - DOUBLE(0)) + 0F0H;` (b = 0F0H) | `00E0H` | `01E0H` | V3.1 drops `- 0` and with it the ADDRESS type (also `b - (c * 0)`); the manual (4.2.1): ADDRESS |
-| `zero-dividend` | `z = 0; w = 0 / z;` | `0` | `0FFFFH` | V3.1 folds `0 / x` to 0; uplm80 divides, and a division by 0 gives what Intel's own divide routine gives (4.2.3: undefined) |
+| `zero-dividend` | `z = 0; w = 0 / z;` | `0` | `0FFFFH` | V3.1 folds `0 / x` to 0, and a dividend that folds to 0 by what folds to 0 too, `(8 / 0FF00H) / (0F82AH <= 1)`; uplm80 divides, and a division by 0 gives what Intel's own divide routine gives (4.2.3: undefined) |
 | `neg-widened` | `b = 0E7H; w = 0FFFEH; v = (b - w) + (-b);` | `0002` | `0102H` | V3.1 negates `b` in 16 bits when `b - w` has already widened it (the manual: `-b` is a BYTE, 19H) |
 | | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` (b1-b4 BYTE, w1-w4 ADDRESS), as a program's first statement or later, is coded `INX H; INX SP; MOV M,A`, and a later CALL overwrites `b1` (the random campaign's seed 233).  The decrement form is the same: `MOV A,L; DCX SP` (`DCX PSW`) where it means `DCR A`, in `DO CASE ((-(LAST(sa.z))) / ROL(0FFFFH, 9)) MOD 5;` (seed 20226) |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
