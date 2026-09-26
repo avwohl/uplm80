@@ -18,7 +18,7 @@ from . import __version__
 from .frontend import parse_source
 from .codegen import CodeGenerator, Mode
 from .errors import CompilerError, ErrorCollector
-from .names import fix_symbols
+from .names import check_names, fix_symbols
 
 # Import AST optimizer (PL/M-80 specific)
 from .ast_optimizer import ASTOptimizer
@@ -138,6 +138,7 @@ class Compiler:
                 defines=self.defines,
                 include_paths=self.include_paths,
             )
+            check_names([ast])
 
             if self.debug:
                 print(f"[DEBUG] Parsed module: {ast.name}", file=sys.stderr)
@@ -276,16 +277,20 @@ class Compiler:
                     defines=self.defines,
                     include_paths=self.include_paths,
                 )
+                modules.append(ast)
 
-                # Phase 3: AST Optimization
-                if self.opt_level > 0:
+            # The names of every module, before any of them is optimized.
+            check_names(modules, multi=True)
+
+            # Phase 3: AST Optimization
+            if self.opt_level > 0:
+                for i, (ast, filename) in enumerate(zip(modules, filenames)):
                     if self.debug:
                         print(f"[DEBUG] Phase 3: AST Optimization for {filename}", file=sys.stderr)
                     optimizer = ASTOptimizer(self.opt_level)
                     ast = optimizer.optimize(ast)
                     ast.uplm80_file = filename  # a new Module; see names._file_name
-
-                modules.append(ast)
+                    modules[i] = ast
 
             # Phase 4: Code Generation with unified call graph
             if self.debug:

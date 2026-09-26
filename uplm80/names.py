@@ -351,6 +351,15 @@ class _Resolver:
 
     def _proc(self, p: P.ProcDecl, block: _Block) -> None:
         attrs = proc_attrs(p)
+        if attrs.interrupt_num is not None and block.kind != "module":
+            # Intel's PL/M-80 V3.1: ERROR 39, INVALID ATTRIBUTE OR
+            # INITIALIZATION, NOT AT MODULE LEVEL, in a procedure and in a
+            # DO block of the module alike.
+            where = "a DO block" if block.kind == "do" else f"procedure {block.proc.orig}"
+            raise CodeGenError(
+                f"{ident_text(p.name)}: an INTERRUPT procedure must be declared at the "
+                f"outer level of the module, not in {where} (Programming Manual "
+                "9800268B, 8.1.6)", source_location(p))
         d = self._declare(block, _key(p.name), "proc", (p, "name"), public=attrs.is_public,
                           external=attrs.is_external, reentrant=attrs.is_reentrant)
         end = p.body.end_label
@@ -734,6 +743,23 @@ class _Resolver:
                 continue
             for node, attr in d.sites + [(r.node, r.attr) for r in self.refs_of.get(id(d), [])]:
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
+
+
+def check_names(modules: list, multi: bool = False) -> None:
+    """Hold the names of ``modules``, as the parser gave them, to what
+    PL/M-80 allows, before the optimizer rewrites or drops any of them.
+
+    Raises CodeGenError for the first thing that is not allowed, as
+    :func:`resolve_names` does for the rest: an INTERRUPT procedure
+    anywhere but at the outer level of its module.  ``multi``: the
+    modules are compiled together (see resolve_names).
+    """
+    r = _Resolver()
+    for i, m in enumerate(modules):
+        r.add_module(m, i)
+    r.bind()
+    if multi:
+        r.check_private()
 
 
 def resolve_names(modules: list, multi: bool = False) -> list[tuple]:

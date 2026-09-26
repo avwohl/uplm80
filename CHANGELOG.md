@@ -30,6 +30,21 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **An INTERRUPT procedure nested in a procedure, or declared in a DO
+  block, is an error**, as it is to Intel's PL/M-80 V3.1 (ERROR #39,
+  INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL): "it may only
+  be used in a PROCEDURE statement at the outer level of a program
+  module" (8.1.6). uplm80 compiled a nested one, and a local of the
+  procedure around it that the interrupt read could be in `??AUTO`, in
+  another procedure's frame (Known issues, 0.3.7; 0.3.6 the same).
+
+      IH: an INTERRUPT procedure must be declared at the outer level of the
+      module, not in procedure OUTER (Programming Manual 9800268B, 8.1.6)
+
+  This and the other rules of a program's names below are checked as the
+  parser gives the program, before the optimizer rewrites or drops
+  anything, so every `-O` level finds the same errors; a multi-file
+  compile parses and checks every module before it optimizes any.
 - **A REENTRANT procedure's parameter declared with its locals,**
   `DECLARE (top, c) BYTE`, was declared a second time, as a local in the
   frame, which nothing set, and every use of it read that: `rp(3)` of a
@@ -1227,11 +1242,6 @@ Each fix has a regression test that fails without it.
   INVALID DOT OPERAND, LABEL ILLEGAL), whether or not the label is declared
   LABEL; it accepts one in a DATA list. uplm80 compiles both to the label's
   address, with no diagnostic, as 0.3.6 did.
-- **An INTERRUPT procedure nested in another procedure is accepted without
-  a diagnostic.** PL/M-80 requires an INTERRUPT procedure to be at the outer
-  level of the module; uplm80 compiles a nested one, and a local of the
-  procedure around it that the interrupt reads may be in `??AUTO`, where
-  another procedure's frame is (0.3.6 the same).
 
 ### Known issues — not this compiler
 

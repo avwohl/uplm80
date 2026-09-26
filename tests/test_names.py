@@ -973,3 +973,47 @@ end b;
     r = _compile_modules([PUBLIC_IN_A_BLOCK, other])
     assert r.returncode != 0
     assert "M0.PLM:4:9: error: AGAIN is declared a PUBLIC LABEL" in r.stderr, r.stderr
+
+
+# ---- what Intel's PL/M-80 V3.1 rejects --------------------------------------
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_an_interrupt_procedure_is_at_the_outer_level_of_its_module(opt):
+    """"It may only be used in a PROCEDURE statement at the outer level of a
+    program module" (8.1.6).  One nested in a procedure was compiled, and a
+    local of the procedure around it that the interrupt read could be in
+    ??AUTO, in another procedure's frame (0.3.6 the same).  Intel's PL/M-80
+    V3.1 rejects one in a procedure and one in a DO block of the module,
+    ERROR #39, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL."""
+    err = _compile_error(PRELUDE + """declare w address;
+outer: procedure;
+  declare l byte;
+  ih: procedure interrupt 3;
+    w = l;
+  end ih;
+  l = 1;
+end outer;
+call outer;
+end t;
+""", opt)
+    assert ("T.PLM:8:3: error: IH: an INTERRUPT procedure must be declared at the outer "
+            "level of the module, not in procedure OUTER (Programming Manual 9800268B, "
+            "8.1.6)") in err, err
+    err = _compile_error(PRELUDE + """declare w address;
+do;
+  ih2: procedure interrupt 4;
+    w = 2;
+  end ih2;
+end;
+end t;
+""", opt)
+    assert "T.PLM:7:3: error: IH2: an INTERRUPT procedure must be declared at the outer " \
+           "level of the module, not in a DO block" in err, err
+    ok = _compile(PRELUDE + """declare w address;
+ih3: procedure interrupt 5;
+  w = 3;
+end ih3;
+w = 0;
+end t;
+""", opt)
+    assert ok.returncode == 0, ok.stderr
