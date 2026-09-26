@@ -350,7 +350,18 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             pass
         elif isinstance(n, (P.MemberAccess, P.DottedMember)):
             self._visit(n.base, block)      # a member's name is not in scope
-        elif isinstance(n, (P.StructMember, P.StructMemberUntyped, P.EndLabel)):
+        elif isinstance(n, (P.StructMember, P.StructMemberUntyped)):
+            self._visit(n.array_size, block)    # a member's name is not in scope
+        elif isinstance(n, P.SizeIdent):
+            # The macro pass has put in place of a LITERALLY's name its text;
+            # a name left in a dimension is not a number.  Intel's PL/M-80
+            # V3.1: ERROR 59, ILLEGAL DIMENSION ATTRIBUTE.
+            text = ident_text(n.name)
+            raise CodeGenError(
+                f"({text}): the dimension of an array is a number, and {text} is not a "
+                "LITERALLY declared before it whose text is one (Programming Manual "
+                "9800268B, 6.2.5)", source_location(n))
+        elif isinstance(n, P.EndLabel):
             pass
         else:
             fields = getattr(n, "__dataclass_fields__", None)
@@ -657,6 +668,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 # (An AT names its own: _at_address.)
                 raise CodeGenError(f"{text} is not declared (Programming Manual "
                                    "9800268B, 6.1)", source_location(r.node))
+            if d is not None and d.kind == "lit":
+                # The macro pass has put the LITERALLY's text in place of
+                # its name everywhere after the declaration, in its scope;
+                # a name left is before it.  Intel's PL/M-80 V3.1: ERROR
+                # 105, UNDECLARED IDENTIFIER.
+                raise CodeGenError(
+                    f"{text} is not declared here: a LITERALLY declared after it puts its "
+                    f"text in place of {text} only in the text that follows the declaration "
+                    "(Programming Manual 9800268B, 6.4)", source_location(r.node))
             if r.after is not None:
                 # Intel's PL/M-80 V3.1: ERROR 127, INVALID SUBSCRIPT ON
                 # NON-ARRAY, or 102, MISSING PRIMARY OPERAND, after a member;

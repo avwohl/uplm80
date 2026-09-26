@@ -67,6 +67,30 @@ any.
 
   None of the 87 MP/M II and 80un compiles, `sample_code`, the test
   programs and intel80tools' 469 PL/M files has one.
+- **A LITERALLY's name used before its declaration, and a dimension that
+  is not a number, are errors.** A LITERALLY's text is "substituted for
+  each occurrence of the identifier in subsequent text" (6.4), and uplm80
+  put it in place of a use that comes before the declaration too: `p:
+  procedure; y = lit; end p; declare lit literally '5';` compiled to `y =
+  5`, and so did such a use in a DO CASE or in a procedure nested in the
+  one declaring `lit`. A dimension "is a numeric constant in parentheses"
+  (6.2.5), and `declare a (lit) byte` before `lit`'s declaration made `a`
+  a scalar, as did a dimension that names a variable, a LITERALLY out of
+  its scope or a name declared nowhere, of an array or of a structure's
+  member (0.4.0 the same). Intel's PL/M-80 V3.1 rejects each: ERROR #105,
+  UNDECLARED IDENTIFIER, and #59, ILLEGAL DIMENSION ATTRIBUTE. A variable
+  that a procedure names and an enclosing block declares after it is
+  still that variable, in both compilers.
+
+      LIT is not declared here: a LITERALLY declared after it puts its text
+      in place of LIT only in the text that follows the declaration
+      (Programming Manual 9800268B, 6.4)
+      (LIT): the dimension of an array is a number, and LIT is not a
+      LITERALLY declared before it whose text is one (Programming Manual
+      9800268B, 6.2.5)
+
+  None of the 87 MP/M II and 80un compiles, `sample_code`, the test
+  programs and intel80tools' 469 PL/M files has one.
 - **Empty parentheses after a variable, `x()`, after a structure member,
   `s.m()`, and after a subscript, `a(1)()`, are an error.** PL/M-80 has
   no empty subscript or argument list. `y = x() + 1` with x a BYTE compiled
@@ -280,7 +304,8 @@ any.
 
 - `tests/test_names.py`: each new error, at every level and where it is
   placed - a name declared nowhere, a parameter declared nowhere, twice or
-  as anything but a scalar, empty parentheses after each kind of
+  as anything but a scalar, a LITERALLY used before its declaration, a
+  dimension that is not a number, empty parentheses after each kind of
   variable, after a member and after a subscript, the address of a label
   in an expression, an INTERRUPT procedure in a procedure and in a DO
   block, a LITERALLY's name declared again - and every built-in compiling

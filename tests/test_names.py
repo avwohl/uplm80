@@ -1201,6 +1201,68 @@ p: procedure; declare n byte; n = 1; end p;
             "(Programming Manual 9800268B, 6.1)") in err, err
 
 
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("src, line, col", [
+    ("p: procedure;\n  y = lit;\nend p;\ndeclare lit literally '5';\ncall p;", 7, 7),
+    ("p: procedure;\n  do case y;\n    y = 1;\n    y = lit;\n  end;\nend p;\n"
+     "declare lit literally '5';\ncall p;", 9, 9),
+    ("p: procedure;\n  q: procedure;\n    y = lit;\n  end q;\n"
+     "  declare lit literally '5';\n  call q;\nend p;\ncall p;", 8, 9),
+])
+def test_a_literally_used_before_its_declaration_is_an_error(opt, src, line, col):
+    """A LITERALLY's text is "substituted for each occurrence of the
+    identifier in subsequent text" (6.4), so a use of the name before the
+    declaration is of a name not declared there.  uplm80 put the text in
+    its place anyway: `y = lit' in a procedure the module's `declare lit
+    literally '5'' follows compiled to `y = 5' (0.4.0 the same).  Intel's
+    PL/M-80 V3.1 rejects each: ERROR #105, UNDECLARED IDENTIFIER."""
+    err = _compile_error(PRELUDE + "declare y byte;\n" + src + "\nend t;\n", opt)
+    assert (f"T.PLM:{line}:{col}: error: LIT is not declared here: a LITERALLY declared "
+            "after it puts its text in place of LIT only in the text that follows the "
+            "declaration (Programming Manual 9800268B, 6.4)") in err, err
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("decl", [
+    "declare a (lit) byte;\ndeclare lit literally '3';",
+    "declare a (nosuch) byte;",
+    "declare n byte, a (n) byte;",
+    "p: procedure;\n  declare lit literally '4';\n  y = lit;\nend p;\ndeclare a (lit) byte;",
+    "declare s structure (m (lit) byte);\ndeclare lit literally '3';",
+])
+def test_a_dimension_that_is_not_a_number_is_an_error(opt, decl):
+    """"A dimension specifier is a numeric constant in parentheses"
+    (6.2.5), which a LITERALLY declared before it can give.  A name left
+    there - a LITERALLY declared after it, or out of its scope, a variable,
+    a name declared nowhere - made the array a scalar: `declare a (lit)
+    byte' with `lit literally '3'' after it was one byte (0.4.0 the same).
+    Intel's PL/M-80 V3.1 rejects each: ERROR #59, ILLEGAL DIMENSION
+    ATTRIBUTE."""
+    err = _compile_error(PRELUDE + "declare y byte;\n" + decl + "\ny = 1;\nend t;\n", opt)
+    name = re.search(r"\((\w+)\) byte", decl).group(1).upper()
+    assert (f"error: ({name}): the dimension of an array is a number, and {name} is not a "
+            "LITERALLY declared before it whose text is one (Programming Manual 9800268B, "
+            "6.2.5)") in err, err
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_literally_used_after_its_declaration_and_a_variable_before_its_own(opt):
+    """A LITERALLY declared before a procedure is its text in it, and a
+    variable declared after a procedure that uses it is the variable, in
+    both compilers."""
+    assert run_plm(PRELUDE + """declare lit literally '41h';
+declare y byte;
+p: procedure;
+  y = lit;
+  x = y + 1;
+end p;
+declare x byte;
+call p;
+call pc(y); call pc(x);
+end t;
+""", opt) == "AB"
+
+
 def test_a_built_in_needs_no_declaration():
     r = _compile(PRELUDE + """declare (x, y) address, b (4) byte;
 y = low(x) + high(x) + double(1) + shl(x, 1) + shr(x, 1) + rol(1, 1) + ror(1, 1)

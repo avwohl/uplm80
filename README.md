@@ -158,9 +158,13 @@ where:
 - A declaration hides the built-in of its name (9.2): a procedure DOUBLE
   or a variable OUTPUT, MEMORY or STACKPTR that a module declares is the
   module's there, and the compiler never takes it for the built-in.
-- A LITERALLY's text takes its name's place throughout its scope (6.4), a
-  declaration of the name in an inner block included: after `DECLARE N
-  LITERALLY '5'`, an inner `DECLARE N BYTE` is `DECLARE 5 BYTE`, an error.
+- A LITERALLY's text takes its name's place throughout its scope, in the
+  text after the declaration (6.4), a declaration of the name in an inner
+  block included: after `DECLARE N LITERALLY '5'`, an inner `DECLARE N
+  BYTE` is `DECLARE 5 BYTE`, an error.  The name used before the
+  declaration is not declared there.
+- A dimension is a number, or a LITERALLY declared before it whose text
+  is one (6.2.5).
 - Empty parentheses are an error after a variable, `x()`, after a
   structure member, `s.m()`, and after a subscript, `a(1)()`; `f()` of a
   procedure is taken for `f`.
