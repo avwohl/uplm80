@@ -41,6 +41,8 @@ rewrites for those are kept for older um80 releases, and cost nothing.  A
 register name is still not a symbol to it in Z80 code.
 """
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import dataclasses
@@ -271,6 +273,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.modules: list[_Module] = []
         self.globals = _Block("global", None, None, None)
         self.refs_of: dict[int, list[_Ref]] = {}
+        # What Intel's PL/M-80 V3.1 rejects and uplm80 compiles, because a
+        # program written for uplm80 relies on it: (location, text).
+        self.intel_warnings: list[tuple] = []
         self.used: set[str] = set()     # every name a declaration has
         self._lists = 0                 # DATA and INITIAL lists being visited
         self._at = 0                    # AT clauses being visited
@@ -363,6 +368,14 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 "9800268B, 6.2.5)", source_location(n))
         elif isinstance(n, P.EndLabel):
             pass
+        elif isinstance(n, P.SizeNumber):
+            if parse_plm_number(n.value.text) == 0:
+                # Intel's PL/M-80 V3.1: ERROR 57, INVALID DIMENSION, ZERO
+                # ILLEGAL, of an array and of a structure's member.
+                raise CodeGenError(
+                    f"({n.value.text}): an array has at least one element, and a "
+                    "dimension of 0 gives it none; Intel's PL/M-80 V3.1 rejects it "
+                    "(ERROR #57, INVALID DIMENSION, ZERO ILLEGAL)", source_location(n))
         else:
             fields = getattr(n, "__dataclass_fields__", None)
             if fields and not hasattr(n, "file_id"):
@@ -382,6 +395,12 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._empty_after(unwrap_paren(n.callee), block)
         elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Identifier):
             self._ref(block, unwrap_paren(n.operand), dot=True)
+        elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Call) \
+                and isinstance(unwrap_paren(unwrap_paren(n.operand).callee), P.Identifier):
+            # `.a(i)', `.output(3)': the dot is the subscripted name's.
+            call = unwrap_paren(n.operand)
+            self._ref(block, unwrap_paren(call.callee), dot=True)
+            self._visit(call.args, block)
         elif isinstance(n, P.AttrAt):
             self._at += 1
             self._visit(n.address, block)
@@ -433,6 +452,16 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 f"{ident_text(p.name)}: an INTERRUPT procedure must be declared at the "
                 f"outer level of the module, not in {where} (Programming Manual "
                 "9800268B, 8.1.6)", source_location(p))
+        if block.kind != "module" and (attrs.is_public or attrs.is_external):
+            # Intel's PL/M-80 V3.1: ERROR 39, INVALID ATTRIBUTE OR
+            # INITIALIZATION, NOT AT MODULE LEVEL, in a procedure and in a
+            # DO block of the module alike.
+            what = "PUBLIC" if attrs.is_public else "EXTERNAL"
+            raise CodeGenError(
+                f"{ident_text(p.name)}: a{'n' if what[0] == 'E' else ''} {what} procedure must be "
+                f"declared at the outer level of the module, not in {self._where(block)}; "
+                "Intel's PL/M-80 V3.1 rejects it (ERROR #39, INVALID ATTRIBUTE OR "
+                "INITIALIZATION, NOT AT MODULE LEVEL)", source_location(p))
         d = self._declare(block, _key(p.name), "proc", (p, "name"), public=attrs.is_public,
                           external=attrs.is_external, reentrant=attrs.is_reentrant)
         end = p.body.end_label
@@ -471,12 +500,40 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             if old is not None and old.kind == "param":
                 self._declare_param(old, item, node)
                 continue
+            if block.kind != "module":
+                self._below_module_level(node, attrs, block)
             kind = "label" if dtype == DataType.LABEL else "var"
             self._declare(block, name, kind, (node, "name"), public=attrs.is_public,
                           external=attrs.is_external, storage=storage and kind == "var")
         if item.based is not None:
             self._visit(item.based.base, block)
         self._visit([item.array_size, item.tail], block)
+
+    @staticmethod
+    def _where(block: _Block) -> str:
+        """The block a declaration below module level is in, in words."""
+        return "a DO block" if block.kind == "do" else f"procedure {block.proc.orig}"
+
+    def _below_module_level(self, node, attrs, block: _Block) -> None:
+        """A variable declared in a procedure or a DO block: PUBLIC and
+        EXTERNAL are errors, INITIAL a warning (uplm80 initializes the
+        variable once, when the program is loaded, and programs written
+        for it rely on that).  Intel's PL/M-80 V3.1 rejects all three:
+        ERROR 73, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE
+        LEVEL."""
+        text = ident_text(node.name)
+        why = ("Intel's PL/M-80 V3.1 rejects it (ERROR #73, INVALID ATTRIBUTE OR "
+               "INITIALIZATION, NOT AT MODULE LEVEL)")
+        for flag, what in ((attrs.is_public, "PUBLIC"), (attrs.is_external, "EXTERNAL")):
+            if flag:
+                raise CodeGenError(
+                    f"{text}: a{'n' if what[0] == 'E' else ''} {what} variable must be declared "
+                    f"at the outer level of the module, not in {self._where(block)}; {why}",
+                    source_location(node))
+        if attrs.initial_values is not None:
+            self.intel_warnings.append((source_location(node), (
+                f"{text}: INITIAL in {self._where(block)} initializes the variable once, "
+                f"when the program is loaded, not at each entry; {why}")))
 
     @staticmethod
     def _declare_param(d: _Decl, item: P.DeclItem, node) -> None:
@@ -687,17 +744,24 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     f"{after}(): {after} is {kind}, and PL/M-80 has neither an empty "
                     "subscript nor an empty argument list", source_location(r.node))
             if d is None:
+                self._check_builtin_use(r, text)
                 continue
             if r.empty and d.kind in self._KIND_WORDS:
                 # Intel's PL/M-80 V3.1: ERROR 127, INVALID SUBSCRIPT ON
                 # NON-ARRAY, and ERROR 102, MISSING PRIMARY OPERAND, for
                 # scalars and arrays, in an expression and in a CALL.
-                # (A procedure's `f()' is taken for `f', as it always has
-                # been; V3.1 rejects that too.)
                 raise CodeGenError(
                     f"{text}(): {text} is {self._KIND_WORDS[d.kind]}, and PL/M-80 has "
                     "neither an empty subscript nor an empty argument list",
                     source_location(r.node))
+            if r.empty and d.kind == "proc":
+                # A procedure's `f()' is taken for `f', as it always has
+                # been, and tests/test_implicit_calls.plm relies on it.
+                self.intel_warnings.append((source_location(r.node), (
+                    f"{text}(): PL/M-80 has no empty argument list, and this is taken for "
+                    f"{text}, a call with no arguments; Intel's PL/M-80 V3.1 rejects it "
+                    "(ERROR #102, MISSING PRIMARY OPERAND, and #153, INVALID NUMBER OF "
+                    "ARGUMENTS IN CALL)")))
             if r.dot and d.kind == "label" and not r.in_list:
                 # Intel's PL/M-80 V3.1: ERROR 158, INVALID DOT OPERAND,
                 # LABEL ILLEGAL, whether or not the label is declared LABEL.
@@ -706,6 +770,25 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     "or a procedure (Programming Manual 9800268B, 4.1.3); the address "
                     "of a label may be given only in a DATA or an INITIAL list",
                     source_location(r.node))
+
+    @staticmethod
+    def _check_builtin_use(r: _Ref, text: str) -> None:
+        """A built-in's name after a dot, or before empty parentheses: of
+        the built-ins only MEMORY has an address, and none takes an empty
+        argument list.  Intel's PL/M-80 V3.1: ERROR 123, INVALID DOT
+        OPERAND, BUILT-IN PROCEDURE ILLEGAL; ERROR 102, MISSING PRIMARY
+        OPERAND (and 153, INVALID NUMBER OF ARGUMENTS IN CALL)."""
+        if r.in_at:
+            return
+        if r.dot and _key(getattr(r.node, r.attr)) != "MEMORY":
+            raise CodeGenError(
+                f".{text}: {text} is a built-in, and of the built-ins only MEMORY has an "
+                "address; Intel's PL/M-80 V3.1 rejects it (ERROR #123, INVALID DOT "
+                "OPERAND, BUILT-IN PROCEDURE ILLEGAL)", source_location(r.node))
+        if r.empty:
+            raise CodeGenError(
+                f"{text}(): {text} is a built-in, and PL/M-80 has neither an empty "
+                "subscript nor an empty argument list", source_location(r.node))
 
     # The kind of declaration renamed first when two meet in one assembler
     # name: a LITERALLY, whose EQU nothing uses (the macro pass has put its
@@ -935,17 +1018,21 @@ def _after_kind(ref, decl: _Decl | None, name: str) -> str:
     return "a call" if decl.kind == "proc" else "a subscripted variable"
 
 
-def check_names(modules: list, multi: bool = False) -> None:
+def check_names(modules: list, multi: bool = False) -> list[tuple]:
     """Hold the names of ``modules``, as the parser gave them, to what
     PL/M-80 allows, before the optimizer rewrites or drops any of them.
 
     Raises CodeGenError for the first thing that is not allowed, as
     :func:`resolve_names` does for the rest: a name declared nowhere (a
-    built-in's aside), an INTERRUPT procedure anywhere but at the outer
-    level of its module, the address of a
-    label anywhere but in a DATA or an INITIAL list, and empty parentheses
-    after a variable.  ``multi``: the modules are compiled together (see
-    resolve_names).
+    built-in's aside), an INTERRUPT procedure, or a PUBLIC or EXTERNAL
+    one or variable, anywhere but at the outer level of its module, a
+    dimension of 0, the address of a label anywhere but in a DATA or an
+    INITIAL list, the address of a built-in but MEMORY, and empty
+    parentheses after a variable or a built-in.  ``multi``: the modules
+    are compiled together (see resolve_names).  Returns warnings,
+    (location, text) pairs, for what Intel's PL/M-80 V3.1 rejects and
+    uplm80 compiles, as programs written for it rely on: a procedure's
+    empty parentheses, `f()', and INITIAL below module level.
     """
     r = _Resolver()
     for i, m in enumerate(modules):
@@ -954,6 +1041,7 @@ def check_names(modules: list, multi: bool = False) -> None:
     if multi:
         r.check_private()
     r.check_uses()
+    return r.intel_warnings
 
 
 def resolve_names(modules: list, multi: bool = False) -> list[tuple]:

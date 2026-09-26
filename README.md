@@ -164,14 +164,19 @@ where:
   BYTE` is `DECLARE 5 BYTE`, an error.  The name used before the
   declaration is not declared there.
 - A dimension is a number, or a LITERALLY declared before it whose text
-  is one (6.2.5).
+  is one (6.2.5), and not 0.
 - Empty parentheses are an error after a variable, `x()`, after a
-  structure member, `s.m()`, and after a subscript, `a(1)()`; `f()` of a
-  procedure is taken for `f`.
+  structure member, `s.m()`, after a subscript, `a(1)()`, and after a
+  built-in, `carry()`; `f()` and `CALL g()` of a procedure are taken for
+  `f` and `g`, with a warning, as programs written for uplm80 rely on
+  them.
 - The address of a label, `.label`, may be given in a DATA or an INITIAL
-  list, not in an expression (4.1.3).
+  list, not in an expression (4.1.3); of the built-ins, only MEMORY has
+  an address.
 - An INTERRUPT procedure is declared at the outer level of its module and
-  has no parameters (8.1.6).
+  has no parameters (8.1.6); so is a PUBLIC or EXTERNAL procedure or
+  variable, not in a procedure or a DO block.  INITIAL there initializes
+  the variable once, when the program is loaded, with a warning.
 - A direct call passes as many arguments as the procedure has parameters.
 
 ## Conditional Compilation
@@ -620,16 +625,18 @@ takes since 0.4.2 (`qualsize` no longer leaves them out).
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
 after a statement (26), `NOT NOT x` (102), and a `CALL` of a typed
-procedure (129); and what the CHANGELOG lists under 0.4.1's Known issues:
-`f()` and `CALL g()` of a procedure and `carry()` of a built-in (102, 153),
-a subscript on a scalar (127), an array without a subscript (133, 134),
-`INITIAL` in a procedure (73), a procedure with no statements (174), a
-call of a procedure its block declares after the call (169), a zero
-dimension (57) and the address of a built-in.  uplm80 0.4.1 rejects, as
-V3.1 does, a name declared nowhere, empty parentheses after a variable,
-`.label` in an expression, an `INTERRUPT` procedure below module level, a
-parameter no `DECLARE` declares, and a `LITERALLY` used before its
-declaration.
+procedure (129); and what the CHANGELOG lists under Known issues: a
+subscript on a scalar (127), an array without a subscript (133, 134), a
+procedure with no statements (174), and a call of a procedure its block
+declares after the call (169).  uplm80 compiles, with a warning that
+names V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
+`INITIAL` in a procedure or a DO block (73), on which programs written
+for it rely.  It rejects, as V3.1 does, a name declared nowhere, empty
+parentheses after a variable or a built-in, `.label` in an expression, an
+`INTERRUPT` procedure below module level, a parameter no `DECLARE`
+declares, and a `LITERALLY` used before its declaration (since 0.4.1);
+and a dimension of 0, the address of a built-in but MEMORY, and a PUBLIC
+or EXTERNAL procedure or variable below module level (since 0.4.2).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),

@@ -78,6 +78,12 @@ def require_upeepz80(opt_level: int) -> None:
         raise CompilerError(problem)
 
 
+def _print_warnings(warnings: list[tuple]) -> None:
+    """Print ``warnings``, (location, text) pairs, as code generation's are."""
+    for loc, text in warnings:
+        print(f"{loc}: warning: {text}" if loc else f"warning: {text}", file=sys.stderr)
+
+
 class Compiler:
     """
     PL/M-80 Compiler.
@@ -138,7 +144,7 @@ class Compiler:
                 defines=self.defines,
                 include_paths=self.include_paths,
             )
-            check_names([ast])
+            _print_warnings(check_names([ast]))
 
             if self.debug:
                 print(f"[DEBUG] Parsed module: {ast.name}", file=sys.stderr)
@@ -293,7 +299,7 @@ class Compiler:
                 modules.append(ast)
 
             # The names of every module, before any of them is optimized.
-            check_names(modules, multi=True)
+            _print_warnings(check_names(modules, multi=True))
             modules = self._optimize_modules(modules, filenames)
 
             # Phase 4: Code Generation with unified call graph

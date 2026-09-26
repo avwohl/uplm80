@@ -10,6 +10,68 @@ uplm80 checked against Intel's own PL/M-80 V3.1 as a matter of course:
 compares what the builds print, and the suite runs it where Intel's
 binaries are found.
 
+### Incompatible: errors Intel's PL/M-80 gives
+
+More of what PL/M-80 does not allow, which uplm80 compiled (0.4.1's Known
+issues), is refused as Intel's PL/M-80 V3.1 refuses it, when the parser
+gives the program, at every `-O` level. What a program written for uplm80
+relies on is compiled as before, with a warning that names V3.1's error:
+of MP/M II's and 80un's sources, `sample_code` and the programs of
+`tests/`, only the tests use any of these, and only `f()` of a procedure
+(`tests/test_implicit_calls.plm`) and INITIAL in a procedure (the pytest's
+programs; 80un, uplm80's own, may use it too). Every one of the 87 MP/M II
+and 80un compiles, `sample_code` and the test programs compile to 0.4.1's
+assembly.
+
+- **A dimension of 0 is an error**, of an array or of a structure's
+  member, `declare b (0) byte` (ERROR #57, INVALID DIMENSION, ZERO
+  ILLEGAL). uplm80 took it for a scalar: one byte, and a SIZE of 1.
+
+      (0): an array has at least one element, and a dimension of 0 gives it
+      none; Intel's PL/M-80 V3.1 rejects it (ERROR #57, INVALID DIMENSION,
+      ZERO ILLEGAL)
+
+- **The address of a built-in is an error**, but MEMORY's: `.double`,
+  `.stackptr`, `.move`, `.output(3)` (ERROR #123, INVALID DOT OPERAND,
+  BUILT-IN PROCEDURE ILLEGAL). uplm80 compiled `.double` to the address
+  of a symbol DOUBLE, which nothing defines, and `.output(3)` to a call
+  of one.
+
+      .DOUBLE: DOUBLE is a built-in, and of the built-ins only MEMORY has an
+      address; Intel's PL/M-80 V3.1 rejects it (ERROR #123, INVALID DOT
+      OPERAND, BUILT-IN PROCEDURE ILLEGAL)
+
+- **Empty parentheses after a built-in are an error**, `carry()`,
+  `zero()`, `dec()` (ERROR #102, MISSING PRIMARY OPERAND, and #153,
+  INVALID NUMBER OF ARGUMENTS IN CALL), as after a variable (0.4.1).
+  After a procedure, `f()` and `CALL g()`, they are still taken for `f`
+  and `g` - `tests/test_implicit_calls.plm` has `result =
+  callee$func();` - with a warning:
+
+      CARRY(): CARRY is a built-in, and PL/M-80 has neither an empty
+      subscript nor an empty argument list
+      warning: F(): PL/M-80 has no empty argument list, and this is taken
+      for F, a call with no arguments; Intel's PL/M-80 V3.1 rejects it
+      (ERROR #102, MISSING PRIMARY OPERAND, and #153, INVALID NUMBER OF
+      ARGUMENTS IN CALL)
+
+- **A PUBLIC or EXTERNAL procedure or variable in a procedure or a DO
+  block is an error** (ERROR #39 and #73, INVALID ATTRIBUTE OR
+  INITIALIZATION, NOT AT MODULE LEVEL). INITIAL there initializes the
+  variable once, when the program is loaded, as before, with a warning:
+  the programs of the pytest have it, and 80un may.
+
+      X: a PUBLIC variable must be declared at the outer level of the
+      module, not in procedure P; Intel's PL/M-80 V3.1 rejects it (ERROR
+      #73, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL)
+      warning: K: INITIAL in procedure P initializes the variable once,
+      when the program is loaded, not at each entry; Intel's PL/M-80 V3.1
+      rejects it (ERROR #73, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT
+      MODULE LEVEL)
+
+  `tests/test_names.py` has each; V3.1 rejects each of its programs with
+  the error the message names (`tests/test_intel_oracle.py`).
+
 ### Fixed
 
 - **LENGTH, LAST and SIZE of a qualified reference**, as the manual
@@ -84,9 +146,9 @@ binaries are found.
 uplm80 still compiles these, which Intel's PL/M-80 V3.1 rejects (0.4.1
 the same):
 
-- `f()` and `CALL g()` of a procedure, and `carry()` of a built-in,
-  taken for `f`, `g` and `carry` (ERROR #102, MISSING PRIMARY OPERAND, and
-  #153, INVALID NUMBER OF ARGUMENTS IN CALL).
+- `f()` and `CALL g()` of a procedure, taken for `f` and `g`, with a
+  warning (ERROR #102, MISSING PRIMARY OPERAND, and #153, INVALID NUMBER
+  OF ARGUMENTS IN CALL; Incompatible).
 - A subscript on a scalar, `x(0)` or `x(1)`, the byte at X's address
   plus the subscript (#127, INVALID SUBSCRIPT ON NON-ARRAY); and `shl(w,
   3)` where the program declares SHL an ADDRESS, a call through SHL's
@@ -97,9 +159,10 @@ the same):
   structures is `s2(0).m(1)`, and `size(a)`, SIZE an array of the
   program's, is `size(a(0))` (#133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
   ARRAY, and #134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY).
-- INITIAL in a procedure's declaration, which initializes the variable
-  once, when the program is loaded (#73, INVALID ATTRIBUTE OR
-  INITIALIZATION, NOT AT MODULE LEVEL).
+- INITIAL in a procedure's declaration, or a DO block's, which
+  initializes the variable once, when the program is loaded, with a
+  warning (#73, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL;
+  Incompatible).
 - A procedure with no statements, `g: procedure; end g;`, which returns
   (#174, INVALID NULL PROCEDURE).
 - A call of a procedure that its block declares after the call, `p:
@@ -134,8 +197,6 @@ And these V3.1 compiles to other code (0.4.1 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
-- V3.1 rejects a zero dimension, `declare b (0) byte` (ERROR #57), and the
-  address of a built-in, `.double`; uplm80 accepts both.
 
 ## 0.4.1 — 2026-09-26
 

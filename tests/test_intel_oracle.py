@@ -24,6 +24,8 @@ import pytest
 from tests.plm_intel import generate
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, QUALIFIED_SIZES
+from tests.test_names import PRELUDE as NAMES_PRELUDE
+from tests.test_names import V31_DECLS, V31_REJECTS, V31_WARNS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -69,6 +71,20 @@ def test_a_release_program_prints_what_intels_build_prints(tools, name):
     text = _PRELUDE + RELEASE_PROGRAMS[name] + "\nend t;\n"
     res = oracle.check_text(tools, text, name)
     assert res.verdict == "same", oracle.format_result(res)
+
+
+@pytest.mark.parametrize("name", sorted(V31_REJECTS) + sorted(V31_WARNS))
+def test_v31_rejects_what_uplm80_rejects_or_warns_of(tools, name):
+    """Each program tests/test_names.py holds uplm80 to: V3.1 rejects it
+    with the errors uplm80's message names, and uplm80 rejects it too, or,
+    where programs written for it rely on it, compiles it."""
+    stmts, errors, _ = {**V31_REJECTS, **V31_WARNS}[name]
+    text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + stmts + "end t;\n")
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "intel-rejects", oracle.format_result(res)
+    for n in errors:
+        assert f"ERROR #{n}," in res.detail, res.detail
+    assert ("uplm80 rejects it too" in res.detail) == (name in V31_REJECTS), res.detail
 
 
 def test_corpus_program_prints_what_intels_build_prints(tools):

@@ -1118,7 +1118,8 @@ def test_empty_parentheses_after_a_variable_are_an_error(opt, stmt, name, kind):
     and so did an array, a BASED variable, a structure and `CALL w()'.
     Intel's PL/M-80 V3.1 rejects each, ERROR #127, INVALID SUBSCRIPT ON
     NON-ARRAY, and ERROR #102, MISSING PRIMARY OPERAND.  A procedure's
-    `f()' is still taken for `f' (V3.1 rejects that too)."""
+    `f()' is still taken for `f', with a warning (V3.1 rejects that too:
+    test_what_v31_rejects_and_programs_rely_on_is_a_warning)."""
     src = PRELUDE + """declare (x, y) byte, (w, p) address, a (3) byte, bb based p byte;
 declare s structure (m byte);
 f: procedure byte; return 3; end f;
@@ -1172,6 +1173,98 @@ def test_empty_parentheses_after_a_parameter_are_an_error():
     err = _compile_error(PRELUDE + "q: procedure (x) byte; declare x byte; return x(); end q;\n"
                          "call pc(q(1));\nend t;\n")
     assert "T.PLM:5:47: error: X(): X is a parameter" in err, err
+
+
+# What Intel's PL/M-80 V3.1 rejects, and uplm80 compiled (0.4.1's Known
+# issues): the statements, after PRELUDE and V31_DECLS; V3.1's errors; and
+# what uplm80 says.  tests/test_intel_oracle.py builds each with V3.1 too.
+V31_DECLS = """declare (b, c) byte, w address;
+f: procedure byte; return 3; end f;
+g: procedure; b = 1; end g;
+"""
+_OUTER = "must be declared at the outer level of the module, not in "
+V31_REJECTS = {
+    "zero-dimension": ("declare z (0) byte;\nz(0) = 1;\n", (57,),
+                       "T.PLM:8:12: error: (0): an array has at least one element"),
+    "zero-member": ("declare s structure (m (0) byte, x byte);\ns.x = 1;\n", (57,),
+                    "T.PLM:8:25: error: (0): an array has at least one element"),
+    "zero-local": ("p: procedure;\n  declare a (0) address;\n  a(0) = 1;\nend p;\ncall p;\n",
+                   (57,), "T.PLM:9:14: error: (0): an array has at least one element"),
+    "dot-double": ("w = .double;\n", (123,),
+                   "T.PLM:8:6: error: .DOUBLE: DOUBLE is a built-in, and of the built-ins only "
+                   "MEMORY has an address"),
+    "dot-stackptr": ("w = .stackptr;\n", (123,), "error: .STACKPTR: STACKPTR is a built-in"),
+    "dot-move": ("w = .move;\n", (123,), "error: .MOVE: MOVE is a built-in"),
+    "dot-output": ("w = .output(3);\n", (123,), "error: .OUTPUT: OUTPUT is a built-in"),
+    "carry()": ("b = carry();\n", (102, 153),
+                "T.PLM:8:5: error: CARRY(): CARRY is a built-in, and PL/M-80 has neither an "
+                "empty subscript nor an empty argument list"),
+    "zero()": ("if zero() then b = 1;\n", (102, 153), "error: ZERO(): ZERO is a built-in"),
+    "dec()": ("b = dec();\n", (102,), "error: DEC(): DEC is a built-in"),
+    "public-in-procedure": ("p: procedure;\n  declare x byte public;\n  x = 1;\nend p;\ncall p;\n",
+                            (73,), "T.PLM:9:11: error: X: a PUBLIC variable " + _OUTER
+                            + "procedure P"),
+    "external-in-procedure": ("p: procedure;\n  declare x byte external;\n  b = x;\nend p;\n"
+                              "call p;\n", (73,),
+                              "error: X: an EXTERNAL variable " + _OUTER + "procedure P"),
+    "public-in-do": ("do;\n  declare y byte public;\n  y = 1;\nend;\n", (73,),
+                     "error: Y: a PUBLIC variable " + _OUTER + "a DO block"),
+    "public-procedure-in-procedure": ("p: procedure;\n  q: procedure public;\n    b = 2;\n"
+                                      "  end q;\n  call q;\nend p;\ncall p;\n", (39,),
+                                      "T.PLM:9:3: error: Q: a PUBLIC procedure " + _OUTER
+                                      + "procedure P"),
+    "external-procedure-in-do": ("do;\n  r: procedure external;\n  end r;\n  call r;\nend;\n",
+                                 (39,), "error: R: an EXTERNAL procedure " + _OUTER + "a DO block"),
+}
+# What V3.1 rejects and uplm80 compiles, with a warning, as programs written
+# for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
+# the tests' INITIALs in procedures (80un may use them too).
+V31_WARNS = {
+    "f()": ("b = f();\n", (102, 153),
+            "T.PLM:8:5: warning: F(): PL/M-80 has no empty argument list, and this is taken "
+            "for F, a call with no arguments; Intel's PL/M-80 V3.1 rejects it (ERROR #102"),
+    "call g()": ("call g();\n", (102, 153),
+                 "T.PLM:8:6: warning: G(): PL/M-80 has no empty argument list"),
+    "initial-in-procedure": ("p: procedure;\n  declare k byte initial (7);\n  k = k + 1; "
+                             "b = k;\nend p;\ncall p; call p;\n", (73,),
+                             "T.PLM:9:11: warning: K: INITIAL in procedure P initializes the "
+                             "variable once, when the program is loaded, not at each entry; "
+                             "Intel's PL/M-80 V3.1 rejects it (ERROR #73"),
+    "initial-in-do": ("do;\n  declare k byte initial (7);\n  b = k;\nend;\n", (73,),
+                      "warning: K: INITIAL in a DO block initializes the variable once"),
+}
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("name", sorted(V31_REJECTS))
+def test_what_v31_rejects_is_an_error(opt, name):
+    """A dimension of 0, `declare z (0) byte', of an array or a member; the
+    address of a built-in but MEMORY, `.double'; empty parentheses after a
+    built-in, `carry()'; and a PUBLIC or EXTERNAL variable or procedure
+    in a procedure or a DO block.  uplm80 compiled each (0.4.1, Known
+    issues); Intel's PL/M-80 V3.1 rejects each, with the error the message
+    names.  No program of MP/M II, 80un, sample_code or tests/ has one."""
+    stmts, _, message = V31_REJECTS[name]
+    err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
+    assert message in err, err
+
+
+@pytest.mark.parametrize("name", sorted(V31_WARNS))
+def test_what_v31_rejects_and_programs_rely_on_is_a_warning(name):
+    """Empty parentheses after a procedure, `f()' and `call g()', which
+    uplm80 takes for `f' and `g', and INITIAL in a procedure or a DO
+    block, which initializes the variable once: V3.1 rejects them, and
+    uplm80 warns, with V3.1's error, and compiles them as before."""
+    stmts, _, message = V31_WARNS[name]
+    r = _compile(PRELUDE + V31_DECLS + stmts + "end t;\n")
+    assert r.returncode == 0, r.stderr
+    assert message in r.stderr, r.stderr
+
+
+def test_the_address_of_memory_is_no_error():
+    """MEMORY is the one built-in with an address."""
+    r = _compile(PRELUDE + V31_DECLS + "w = .memory; w = .memory(3);\nend t;\n")
+    assert r.returncode == 0 and "warning" not in r.stderr, r.stderr
 
 
 @pytest.mark.parametrize("opt", LEVELS)
