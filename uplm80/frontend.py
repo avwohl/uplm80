@@ -108,26 +108,22 @@ def _mark_ends(tree, ends: set[tuple[int, int]]) -> None:
     """Mark the labelled null statements :func:`label_the_ends` put in,
     each label of one too, with :data:`ast_view.END_OF_BLOCK` on their
     positions (which the optimizer carries over to what it rewrites)."""
-    stack: list = [tree]
-    while stack:
-        n = stack.pop()
-        if isinstance(n, (list, tuple)):
-            stack.extend(n)
-            continue
-        if isinstance(n, P.LabeledStmt):
-            chain = [n]
-            inner = n.stmt
-            while isinstance(inner, P.LabeledStmt):
-                chain.append(inner)
-                inner = inner.stmt
-            if isinstance(inner, P.NullStmt) and \
-                    (inner.pos.start_line, inner.pos.start_column) in ends:
-                for x in chain + [inner]:
-                    setattr(x.pos, END_OF_BLOCK, True)
-                continue
-        fields = getattr(n, "__dataclass_fields__", None)
-        if fields:
-            stack.extend(getattr(n, f, None) for f in fields if f != "pos")
+    if isinstance(tree, (list, tuple)):
+        for x in tree:
+            _mark_ends(x, ends)
+        return
+    if isinstance(tree, P.LabeledStmt):
+        chain = [tree]
+        while isinstance(chain[-1].stmt, P.LabeledStmt):
+            chain.append(chain[-1].stmt)
+        null = chain[-1].stmt
+        if isinstance(null, P.NullStmt) and (null.pos.start_line, null.pos.start_column) in ends:
+            for x in chain + [null]:
+                setattr(x.pos, END_OF_BLOCK, True)
+            return
+    for f in getattr(tree, "__dataclass_fields__", ()):
+        if f != "pos":
+            _mark_ends(getattr(tree, f, None), ends)
 
 
 def _origin(line_map: list[tuple[str, int]], line: int, filename: str) -> tuple[str, int]:

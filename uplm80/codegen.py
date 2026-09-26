@@ -5738,7 +5738,7 @@ class CodeGenerator:
         ref = self._sized_ref(arg)
         return None if ref is None else ref[0]
 
-    def _sized_ref(self, arg) -> tuple[int | None, int] | None:
+    def _sized_ref(self, arg) -> tuple[int | None, int] | None:  # pylint: disable=too-many-return-statements
         """(extent, size) of what ``arg``, the operand of LENGTH, LAST or
         SIZE, names (11.1.2); None when it names nothing of a known size.
 
