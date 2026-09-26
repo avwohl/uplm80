@@ -23,7 +23,7 @@ import pytest
 
 from tests.plm_intel import generate
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
-from tests.test_expression_types import _PRELUDE, QUALIFIED_SIZES
+from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
 from tests.test_names import V31_DECLS, V31_REJECTS, V31_WARNS
 
@@ -36,8 +36,7 @@ _spec.loader.exec_module(oracle)
 
 # The differences the README lists; each is a generator feature it can
 # leave out.
-KNOWN = frozenset({"shl-byte", "shift9", "wide-limit", "sub-zero", "zero-dividend",
-                   "neg-widened"})
+KNOWN = frozenset({"shift9", "wide-limit", "sub-zero", "zero-dividend", "neg-widened"})
 SEEDS = [3, 8, 10]
 # The programs of a release's tests whose expected output is what Intel's
 # build prints, transcribed there: each body follows tests/
@@ -47,6 +46,7 @@ RELEASE_PROGRAMS = {
     "memory-runs-on": MEMORY_RUNS_ON,            # 0.4.2, memory(5) = 20
     **{f"memory-runs-back-{k}": v for k, v in MEMORY_RUNS_BACK.items()},
     "end-labels": END_LABELS,                    # 0.4.2, out: end p;
+    "byte-shifts": BYTE_SHIFTS,                  # 0.4.3, shl(b, 4) of a BYTE
 }
 
 
@@ -94,7 +94,8 @@ def test_corpus_program_prints_what_intels_build_prints(tools):
 
 
 def test_a_difference_is_seen(tools):
-    """A BYTE SHL by 9: Intel's V3.1 shifts by 1, uplm80 by 9 (in 16 bits)."""
+    """A BYTE SHL by 9: Intel's V3.1 shifts by 1, and uplm80 by 9, which
+    leaves 0 of a BYTE (11.1.4)."""
     text = """t: do;
 mon1: procedure (f, a) external; declare f byte, a address; end mon1;
 declare b byte;

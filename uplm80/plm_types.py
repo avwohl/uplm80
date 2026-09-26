@@ -19,14 +19,11 @@ propagation, and the code generator's checks on constant operands:
   with PLM80.LIB's one 16-bit routine: see :func:`runtime.plm_div`.
 * A relation gives the BYTE 0FFH or 00H (4.4).
 * LOW, HIGH, ROL and ROR are BYTE procedures, DOUBLE is ADDRESS (11.1.3),
-  and SCL and SCR take the type of their pattern (12.3).
-
-One deliberate exception: the manual gives SHL and SHR their pattern's type
-too (11.1.4), and DRI's compiler shifts a BYTE in A (UTIL4/ERA.PRL codes
-`shl(dcnt,5)' as five `ADD A'), but uplm80 has always zero-extended a BYTE
-pattern and shifted sixteen bits, with an ADDRESS result, and programs written
-for it rely on that -- 80un builds words with `lo + shl(b, 8)'. SHL and SHR
-are ADDRESS here, consistently in the folder and the code generator.
+  SHL and SHR take the type of their pattern (11.1.4), and so do SCL and
+  SCR (12.3): `SHL(b, 4)' of a BYTE is a BYTE, the bits shifted out of it
+  lost, as DRI's compiler shifts it in A (UTIL4/ERA.PRL codes
+  `shl(dcnt,5)' as five `ADD A'). A word is built from two bytes with
+  `SHL(DOUBLE(hi), 8)'.
 
 A folded ADDRESS constant below 256 cannot be written as a plain numeric
 literal, which would be a BYTE; it is written as a call of DOUBLE, which
@@ -74,7 +71,7 @@ WIDTH_FOLLOWS_OPERANDS = frozenset({
 ALWAYS_ADDRESS = frozenset({BinaryOpKind.MUL, BinaryOpKind.DIV, BinaryOpKind.MOD})
 
 # Built-ins whose result type is that of their first argument.
-PATTERN_TYPED_BUILTINS = frozenset({"SCL", "SCR"})
+PATTERN_TYPED_BUILTINS = frozenset({"SHL", "SHR", "SCL", "SCR"})
 BYTE_BUILTINS = frozenset({"LOW", "HIGH", "ROL", "ROR", "INPUT", "DEC",
                            "CARRY", "ZERO", "SIGN", "PARITY", "MEMORY"})
 
@@ -170,13 +167,13 @@ def fold_builtin(name: str, args: list[tuple[int, DataType]]
             return v, ADDRESS
         return None
     if len(args) == 2:
-        (v, _), (count, _) = args
+        (v, t), (count, _) = args
         count &= 0xFF          # the count is converted to a BYTE
-        # uplm80's SHL and SHR are 16-bit, of a BYTE zero-extended.
+        # A BYTE pattern is shifted in 8 bits, an ADDRESS one in 16.
         if name == "SHL":
-            return (v << count) & 0xFFFF, ADDRESS
+            return (v << count) & mask(t), t
         if name == "SHR":
-            return (v & 0xFFFF) >> count, ADDRESS
+            return (v & mask(t)) >> count, t
         if name in ("ROL", "ROR"):
             v &= 0xFF
             n = count & 7

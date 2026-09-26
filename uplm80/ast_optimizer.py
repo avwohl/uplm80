@@ -563,7 +563,7 @@ class ASTOptimizer:
             name = raw.upper()
             if name in BYTE_BUILTINS:
                 return BYTE
-            if name in ("DOUBLE", "SIZE", "STACKPTR", "TIME", "SHL", "SHR", DOUBLE_MARK):
+            if name in ("DOUBLE", "SIZE", "STACKPTR", "TIME", DOUBLE_MARK):
                 return ADDRESS
             if name in PATTERN_TYPED_BUILTINS and isinstance(e, P.Call) and e.args:
                 return self._type_of(e.args[0])
@@ -2406,18 +2406,20 @@ class ASTOptimizer:
                 if self._type_of(left) is ADDRESS and self._is_side_effect_free(left):
                     return make_binary(BinaryOpKind.ADD, left, deepcopy(left), pos=pos)
                 return None
-            # x * 2^n -> SHL(x, n), which is an ADDRESS (see plm_types);
-            # not where the program declares a SHL of its own.
+            # x * 2^n -> SHL(x, n) of x as an ADDRESS, as the product is:
+            # SHL has its pattern's type (11.1.4), and SHL of a BYTE x
+            # would lose the bits shifted out of it. Not where the program
+            # declares a SHL of its own.
             if not self._is_builtin("SHL"):
                 return None
             return P.Call(
                 callee=make_identifier("SHL", pos=pos),
-                args=[left, make_number_literal(shift, pos=pos)],
+                args=[self._as_address(left, pos), make_number_literal(shift, pos=pos)],
                 pos=pos,
             )
 
-        # Divide by power of 2 -> shift right; SHR is an ADDRESS, as the
-        # quotient is.
+        # Divide by power of 2 -> shift right, widened to the ADDRESS the
+        # quotient is: SHR of a BYTE is a BYTE, of the same value.
         if kind == BinaryOpKind.DIV:
             if shift == 0:
                 return self._as_address(left, pos)

@@ -5711,15 +5711,12 @@ class CodeGenerator:
         """The type of a call to built-in ``name`` (upper case), or None.
 
         SCL and SCR have the type of their pattern (12.3), and LENGTH and
-        LAST are BYTE when the value fits in one (11.1.2). SHL and SHR are
-        always ADDRESS here: the manual gives them their pattern's type
-        (11.1.4), but uplm80 has always shifted a BYTE pattern as a
-        zero-extended ADDRESS, and programs written for it -- 80un's
-        `lo + shl(b, 8)' -- depend on that (see plm_types).
+        LAST are BYTE when the value fits in one (11.1.2). SHL and SHR have
+        their pattern's type too (11.1.4).
         """
         if name in BYTE_BUILTINS:
             return DataType.BYTE
-        if name in ('DOUBLE', 'SIZE', 'STACKPTR', 'TIME', 'CPUTIME', 'SHL', 'SHR'):
+        if name in ('DOUBLE', 'SIZE', 'STACKPTR', 'TIME', 'CPUTIME'):
             return DataType.ADDRESS
         args = expr.args if isinstance(expr, P.Call) else []
         if name in PATTERN_TYPED_BUILTINS and args:
@@ -7939,6 +7936,9 @@ class CodeGenerator:
             # else: ADDRESS value is already in HL, no conversion needed
             return DataType.ADDRESS
 
+        if name in ("SHL", "SHR") and self._get_expr_type(args[0]) == DataType.BYTE:
+            return self._gen_byte_shift(name, args)
+
         if name == "SHL":
             shift_count = self._try_eval_const(args[1])
 
@@ -8303,6 +8303,31 @@ class CodeGenerator:
             return DataType.ADDRESS
         self._emit("ld", "l,a")
         self._emit("ld", "h,0")
+        return DataType.BYTE
+
+    def _gen_byte_shift(self, name: str, args) -> DataType:
+        """SHL or SHR of a BYTE pattern: a BYTE, shifted in A (11.1.4).
+
+        Bits shifted past bit 7 or bit 0 are lost, so a count of 8 or more
+        leaves 0 (Intel's V3.1 shifts by the count mod 8; the manual's rule
+        is followed). The count is converted to a BYTE; a constant one is
+        unrolled.
+        """
+        ops = [("add", "a,a")] if name == "SHL" else [("srl", "a")]
+        count = self._try_eval_const(args[1])
+        self._gen_expr_to_a(args[0])
+        if count is not None:
+            count &= 0xFF
+            if count >= 8:
+                self._emit("xor", "a")
+            else:
+                for _ in range(count):
+                    self._emit(*ops[0])
+            return DataType.BYTE
+        self._emit("push", "af")
+        self._gen_count_to_b(args[1])
+        self._emit("pop", "af")
+        self._emit_counted_loop(name, ops)
         return DataType.BYTE
 
     def _gen_count_to_b(self, count) -> None:

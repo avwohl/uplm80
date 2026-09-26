@@ -902,6 +902,54 @@ def test_length_last_and_size_of_what_is_not_an_array_or_a_variable(expr):
     assert any("needs an array" in e or "SIZE() needs" in e for e in errors), errors
 
 
+# SHL and SHR of a BYTE are a BYTE (11.1.4), shifted in eight bits: the bits
+# shifted out are lost, and the arithmetic around them is a BYTE's.  uplm80
+# before 0.4.3 shifted a BYTE in sixteen bits, with an ADDRESS result, and
+# printed 0F00 0F00 0F00 0F00 0180 0F01 027F 0F00 000F FFFF 03F0 000F F000
+# 0060 00C0 0001 0002 0F00 00F0.  SHL(DOUBLE(b), n) keeps the bits, and
+# `b * 16' is still one of an ADDRESS.  Intel's PL/M-80 V3.1 compiles the
+# program to print what is expected (tests/test_intel_oracle.py checks it
+# again where Intel's tools are).
+BYTE_SHIFTS = """
+declare (b, c, n, z) byte, (w, v) address;
+declare ab(4) byte data (1, 2, 3, 4);
+sb: procedure (x) byte;
+  declare x byte;
+  return shl(x, 5);
+end sb;
+b = 0f0h; c = 3; n = 4; z = 0;
+w = shl(b, 4); call ph(w);
+w = shl(double(b), 4); call ph(w);
+w = b * 16; call ph(w);
+w = shl(b, n); call ph(w);
+w = shl(c, 7); call ph(w);
+w = shl(b, 4) + 1; call ph(w);
+w = shl(c, 7) + 0ffh; call ph(w);
+w = shl(0f0h, 4); call ph(w);
+w = shr(b, 4); call ph(w);
+w = shr(z, 4) - 1; call ph(w);
+w = shl(double(c), 8) or b; call ph(w);
+w = high(shl(b, 4)); call ph(w);
+w = shl(b, 8); call ph(w);
+w = sb(c); call ph(w);
+w = shl(c, 7) / 2; call ph(w);
+v = 0;
+if shl(b, 1) > 0f0h then v = 1;
+call ph(v);
+w = ab(shl(c, 6) + 1 - 0c0h); call ph(w);
+w = shl(b, 4) and 0ff00h; call ph(w);
+w = shr(shl(b, 1), 1); call ph(w);
+"""
+BYTE_SHIFTS_PRINT = [0, 0xF00, 0xF00, 0, 0x80, 1, 0x7F, 0, 0xF, 0xFF, 0x3F0, 0, 0, 0x60,
+                     0x40, 0, 2, 0, 0x70]
+
+
+def test_shl_and_shr_of_a_byte_are_bytes():
+    """`w = shl(b, 4)' with b = 0F0H was 0F00H, where the manual and V3.1
+    give 0000H (0.4.2's Known issues)."""
+    _check(BYTE_SHIFTS, BYTE_SHIFTS_PRINT)
+
+
 # ---- a name the program declares hides the built-in ------------------------
 
 def test_a_procedure_named_like_a_built_in_is_the_programs():

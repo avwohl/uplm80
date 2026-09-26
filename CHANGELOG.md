@@ -3,6 +3,147 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.4.3 — unreleased
+
+### Incompatible: SHL and SHR of a BYTE are a BYTE
+
+**SHL and SHR of a BYTE are a BYTE**, shifted in eight bits, as the manual
+gives them the type of their pattern (11.1.4) and Intel's PL/M-80 V3.1
+compiles them (0.4.2's Known issues).  uplm80 zero-extended a BYTE pattern
+and shifted it in sixteen bits, with an ADDRESS result: `w = shl(b, 4)`
+with b = 0F0H was 0F00H, and is 0000H.  The bits shifted out of a BYTE are
+lost, a count of 8 or more leaves 0 (V3.1 shifts by the count mod 8:
+README, Known differences), and the arithmetic around the shift is a
+BYTE's: with c = 3 and z = 0, `w = shl(c, 7) + 0ffh` is 007FH and `w =
+shr(z, 4) - 1` 00FFH, where they were 027FH and 0FFFFH.  A SHR of a BYTE
+has the value it had.  `b * 16` is still `SHL(DOUBLE(b), 4)`, and
+`SHL(DOUBLE(hi), 8) OR lo` still builds a word in two loads.  The program
+in `tests/test_expression_types.py` prints at `-O0` to `-O3` what V3.1's
+build of it prints.
+
+It changes what a program written for uplm80 computes where it shifts a
+BYTE and uses the bits shifted out: 80un built words with `lo + shl(b,
+8)` and buffer addresses with `shl(i, 7)`, and built with SHL of a BYTE a
+BYTE, its `80un test.arc` extracted one member of thirteen (0.4.2).  80un's
+sources shift `SHL(DOUBLE(x), n)` where they want the bits kept, since its
+branch fix/byte-shifts (80un 0.3.3, unreleased).  To keep the old meaning,
+write `SHL(DOUBLE(x), n)`, which is right under any compiler.
+
+The compiler warns where the two meanings can differ
+(`uplm80/byte_shifts.py`): at a SHL of a BYTE that can shift a set bit out,
+whose result, through what it is part of, reaches a place that uses the
+bits above its low byte - a store to an ADDRESS, an ADDRESS argument or
+RETURN, a subscript, a relation, `/` and `MOD`, SHR, SCL, SCR, HIGH and
+DOUBLE of it, a DO CASE's selector, or an ADDRESS beside it, which such a
+place then uses.  Intel's PL/M-80 gives no warning.
+
+    warning: SHL(B, 4): SHL of a BYTE is a BYTE (Programming Manual
+    9800268B, 11.1.4), and the bits shifted out of it, which this
+    expression uses, are lost; SHL(DOUBLE(B), 4) keeps them. uplm80 before
+    0.4.3 shifted a BYTE in 16 bits
+
+A SHL whose pattern's largest value, shifted by its count's, fits in eight
+bits loses nothing: `shl(dcnt and 11b, 5)`, `shl(3, 4)`, `shl(n, 2)` after
+`if n > 32 then return;`.  A variable's largest value is what the program
+assigns it anywhere, and at the SHL what the statements before it have left
+it, the tests it passed and the case of a DO CASE on it included; a typed
+procedure's is what its RETURNs give.  That is followed for a scalar whose
+address is never taken, nor AT, BASED, PUBLIC or EXTERNAL, across calls of
+procedures that do not assign it.  There is no warning for a SHR, nor for
+BYTE arithmetic around a shift that loses nothing (`shr(z, 4) - 1` above).
+The warnings, of the programs checked:
+
+- 80un's sources before the fix: the 29 places the fix changed, and no
+  other; its sources after it: none.  `tests/bug_80un.plm`, 80un's old
+  single-file source, which 80un keeps as `src/plm/archive/80un.plm`: 20,
+  each a place 80un's fix changed.
+- MP/M II, DRI's tree and mpm2's overrides: 7, in ERA, REN, SET (2), SHOW
+  (DRI's and mpm2's) and STAT, each `shl(dcnt, 5) + .buff` of a directory
+  code BDOS returns, 0 to 3 or 0FFH, which the program has tested against
+  0FFH.  The compiler cannot know it is below 8, and the programs are
+  right as V3.1 compiles them.
+- `sample_code` and the other programs of `tests/`: none.
+
+Of the 87 compiles of MP/M II's and 80un's PL/M, 24 of MP/M II's and 12
+of 80un's are smaller, by 619 and 209 bytes in all at `-O2`.
+
+### Fixed
+
+- `UPEEPZ80_MIN`, the upeepz80 the compiler takes at its word, is 0.2.7,
+  the floor `pyproject.toml` has required since 0.4.2; it said 0.2.6, and
+  `tests/test_upeepz80_version.py` failed.  An upeepz80 numbered below it
+  is still taken if it keeps the probe's `call`, as 0.2.6 does.
+
+### Known issues
+
+uplm80 still compiles these, which Intel's PL/M-80 V3.1 rejects (0.4.2
+the same):
+
+- `f()` and `CALL g()` of a procedure, taken for `f` and `g`, with a
+  warning (ERROR #102, MISSING PRIMARY OPERAND, and #153, INVALID NUMBER
+  OF ARGUMENTS IN CALL; Incompatible).
+- A subscript on a scalar, `x(0)` or `x(1)`, the byte at X's address
+  plus the subscript (#127, INVALID SUBSCRIPT ON NON-ARRAY); and `shl(w,
+  3)` where the program declares SHL an ADDRESS, a call through SHL's
+  value (#127, and #114, MULTIPLE SUBSCRIPTS ILLEGAL).
+- An array, or an array member, without a subscript anywhere but in a
+  location reference or LENGTH, LAST and SIZE (3.6.2): `a = 3` and `x =
+  a` are `a(0)`, `s.m = 4` is `s.m(0)`, `s2.m(1)` of an array of
+  structures is `s2(0).m(1)`, and `size(a)`, SIZE an array of the
+  program's, is `size(a(0))` (#133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+  ARRAY, and #134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY).
+- INITIAL in a procedure's declaration, or a DO block's, which
+  initializes the variable once, when the program is loaded, with a
+  warning (#73, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL;
+  Incompatible).
+- A procedure with no statements, `g: procedure; end g;`, which returns
+  (#174, INVALID NULL PROCEDURE).
+- A call of a procedure that its block declares after the call, `p:
+  procedure; call q; end p; q: procedure; ... end q;`, and `y = f + 1`
+  of a typed procedure `f` declared after it (#169, ILLEGAL FORWARD
+  CALL).
+- These four, which 0.4.2's release check found, each rejected by V3.1
+  with the error named: an END that names another block, `p: procedure;
+  ... end q;` or `out: end q;` (#20, MISMATCHED IDENTIFIER AT END OF
+  BLOCK); a DO CASE with no case, `do case n; end;`, and, since a label
+  on an END is taken, `do case n; l: end;` (#201, INVALID DO CASE BLOCK,
+  AT LEAST ONE CASE REQUIRED); `.p(1)` of a procedure (#104, ILLEGAL
+  PROCEDURE INVOCATION WITH DOT OPERATOR); and a subscript that calls a
+  procedure inside SIZE, LENGTH or LAST, `size(ab(f(1)))` or
+  `length(sa(f(1)).z)` (#32, INVALID SYNTAX), which uplm80 compiles
+  without calling `f`.
+
+And this V3.1 compiles to other code (0.4.2 the same):
+
+- **What a store through a pointer or an overrun reaches in or from
+  `??AUTO`** is uplm80's layout, not DRI's (Known issues, 0.3.7), and a
+  counted loop over a local in `??AUTO` does not see all of it. `??AUTO`
+  comes first in the data segment, before the module's variables, and
+  holds the frames of procedures active together one after another: an
+  overrun of a local in it can reach another frame or the module's first
+  variables, and `.x - 1` of the first variable after it its last byte.
+  A loop over a local in `??AUTO` ends where a pointer or an overrun from
+  a local of its own procedure declared before the index sets it, and
+  nowhere else. With q's `ql(2) byte, k byte` just before run's index `i`
+  in `??AUTO`, `ql(3) = 20` from inside run's loop sets `i` and the loop
+  still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
+  whose layout has `i` there too, prints 0003 0015. Counting no such loop
+  would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+
+Also: where a label's colon is followed at once by END, `out:end p;`,
+a message about what follows on that line gives a column one too far,
+for the null statement put before the END.
+
+In the oracle, `scripts/intel_oracle.py`:
+
+- `--avoid zero-dividend` leaves out `0 / x`, but not a dividend that
+  folds to 0, `(8 / 0FF00H) / (0F82AH <= 1)`, which V3.1 folds to 0 and
+  uplm80 divides (seed 20275; 4.2.3: undefined).
+- Intel's build is stopped by a HLT patched in where the LINES record
+  puts the module's END. For `fin: end t;` V3.1 puts an `LXI SP` there,
+  before its `EI; HLT`, and the build runs past the HLT: the verdict is
+  `timeout`, where uplm80's build prints what it should.
+
 ## 0.4.2 — 2026-09-26
 
 uplm80 checked against Intel's own PL/M-80 V3.1 as a matter of course:
@@ -226,6 +367,10 @@ In the oracle, `scripts/intel_oracle.py`:
   puts the module's END. For `fin: end t;` V3.1 puts an `LXI SP` there,
   before its `EI; HLT`, and the build runs past the HLT: the verdict is
   `timeout`, where uplm80's build prints what it should.
+
+### Changed
+
+- Requires upeepz80 0.2.7, the release 0.4.2 is checked with.
 
 ### Verified
 

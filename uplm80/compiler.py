@@ -22,6 +22,7 @@ from .names import check_names, fix_symbols
 
 # Import AST optimizer (PL/M-80 specific)
 from .ast_optimizer import ASTOptimizer
+from .byte_shifts import check_byte_shifts
 
 # The oldest upeepz80 whose code is right under PL/M-80's calling convention,
 # as pyproject.toml's dependency has it (a test keeps the two the same).
@@ -145,6 +146,7 @@ class Compiler:
                 include_paths=self.include_paths,
             )
             _print_warnings(check_names([ast]))
+            _print_warnings(check_byte_shifts([ast]))
 
             if self.debug:
                 print(f"[DEBUG] Parsed module: {ast.name}", file=sys.stderr)
@@ -300,6 +302,7 @@ class Compiler:
 
             # The names of every module, before any of them is optimized.
             _print_warnings(check_names(modules, multi=True))
+            _print_warnings(check_byte_shifts(modules))
             modules = self._optimize_modules(modules, filenames)
 
             # Phase 4: Code Generation with unified call graph

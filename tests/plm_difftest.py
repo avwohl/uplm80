@@ -267,10 +267,12 @@ class Builtin(Expr):
             return x, A
         c, _ = self.args[1].ev(env)
         c &= 0xFF
+        # SHL and SHR have their pattern's type (11.1.4): a BYTE is shifted
+        # in eight bits, and a count of 8 or more leaves 0.
         if n == "shl":
-            return (x << c) & 0xFFFF, A
+            return conv(x << c, xt), xt
         if n == "shr":
-            return x >> c, A
+            return x >> c, xt
         x &= 0xFF
         c &= 7
         if n == "rol":

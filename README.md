@@ -178,6 +178,12 @@ where:
   variable, not in a procedure or a DO block.  INITIAL there initializes
   the variable once, when the program is loaded, with a warning.
 - A direct call passes as many arguments as the procedure has parameters.
+- SHL and SHR of a BYTE are a BYTE (11.1.4), and the bits shifted out of
+  it are lost; `SHL(DOUBLE(b), n)` keeps them.  uplm80 before 0.4.3
+  shifted a BYTE in 16 bits, and where a SHL of a BYTE can shift a set bit
+  out and the bits above its low byte are used - stored to an ADDRESS,
+  compared, used as a subscript, ... - the compiler warns (CHANGELOG,
+  0.4.3).
 
 ## Conditional Compilation
 
@@ -609,13 +615,15 @@ that printed it, which the source carries as `/* S1F */`.
 The generator can leave out those with a name (`--avoid NAME,...`), and the
 pytest does.  In the first campaign - 1,200 generated programs and the 67
 programs of `tests/` and `sample_code/`, at `-O0` to `-O3` - every difference
-was one of these, and none depended on the optimization level; one more,
-LENGTH, LAST and SIZE of a qualified reference, which uplm80 rejected, it
-takes since 0.4.2 (`qualsize` no longer leaves them out).
+was one of these, and none depended on the optimization level.  Two more
+are gone: LENGTH, LAST and SIZE of a qualified reference, which uplm80
+rejected, it takes since 0.4.2 (`qualsize` no longer leaves them out); and
+SHL and SHR of a BYTE, which uplm80 shifted in 16 bits, with an ADDRESS
+result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
+(`shl-byte` is still taken, and leaves out nothing).
 
 | `--avoid` | Program | Intel V3.1 | uplm80 | |
 |---|---|---|---|---|
-| `shl-byte` | `b = 0F0H; w = SHL(b, 4);` | `0000` | `0F00H` | uplm80 shifts a BYTE in 16 bits, with an ADDRESS result (uplm80/plm_types.py); the manual (11.1.4) and Intel make it a BYTE |
 | `shift9` | `b = 7; r = SHL(b, 9);` (r BYTE) | `0EH` | `0` | V3.1 shifts a BYTE by the count mod 8 (0 counts as 8), folded or not; the manual: 0 |
 | `wide-limit` | `DO i = 250 TO 300;` (i BYTE) | 6 times | never | V3.1 compares the BYTE index with the 16-bit limit; the manual (5.1.4) converts the limit to the index's type |
 | `sub-zero` | `w = (b - DOUBLE(0)) + 0F0H;` (b = 0F0H) | `00E0H` | `01E0H` | V3.1 drops `- 0` and with it the ADDRESS type (also `b - (c * 0)`); the manual (4.2.1): ADDRESS |

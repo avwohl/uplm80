@@ -41,10 +41,8 @@ names the statement.  :func:`generate` returns a :class:`Program`, whose
 told to - the reducer in scripts/intel_oracle.py drops chunks while the
 difference persists.
 
-Features ``avoid`` can leave out - the first six are differences from V3.1
+Features ``avoid`` can leave out - the first five are differences from V3.1
 the README lists:
-* shl-byte: SHL or SHR of a BYTE, which uplm80 shifts in 16 bits
-  (uplm80/plm_types.py);
 * shift9: SHL or SHR of a BYTE by more than 8, which V3.1 shifts by the
   count mod 8;
 * wide-limit: a BYTE index counted to a limit above 255, which V3.1
@@ -58,6 +56,8 @@ the README lists:
 * qualsize (LENGTH, LAST and SIZE of a structure member, which uplm80
   refused before 0.4.2), carry, div0, strings, based, struct, move, case,
   while, loops, procs, reentrant, embedded, nested, str2.
+``shl-byte``, which left out SHL and SHR of a BYTE while uplm80 shifted a
+BYTE in 16 bits (before 0.4.3), is still taken, and leaves out nothing.
 """
 
 from __future__ import annotations
@@ -615,9 +615,6 @@ class Generator:  # pylint: disable=too-many-instance-attributes,too-many-public
             if name in ("low", "high", "double"):
                 return Builtin(name, [x])
             byte_shift = name in ("shl", "shr") and typ(x, self.types) == B
-            if byte_shift and not self.use("shl-byte"):
-                x = Builtin("double", [x])
-                byte_shift = False
             limit = 17 if name in ("shl", "shr") else 9
             if byte_shift and "shift9" in self.avoid:
                 limit = 8
