@@ -1489,6 +1489,44 @@ def test_what_v31_takes_of_those_forms_is_compiled_without_a_word(capsys):
     assert "warning" not in capsys.readouterr().err
 
 
+# What Intel's PL/M-80 V3.1 takes in a restricted expression, which has no
+# built-in in it (V31_REJECTS): MEMORY's location, in a DATA or an INITIAL
+# list as in an AT, and a constant list of sums and differences.  V3.1
+# compiles the program to print what is expected (tests/test_intel_oracle.py
+# builds it again).
+V31_RESTRICTED = """
+declare a(5) byte;
+declare dm address data (.memory), dm3 address data (.memory(3));
+declare im(3) address initial (.a, .memory - 1, .memory + 2);
+declare atm byte at (.memory);
+declare p address, c based p (4) byte;
+call ph(dm - .memory); call ph(dm3 - .memory);
+call ph(im(0) - .a); call ph(im(1) - .memory); call ph(im(2) - .memory);
+call ph(.atm - .memory);
+p = .(1 + 2, -1, 'a', 9 - 2);
+call ph(c(0)); call ph(c(1)); call ph(c(2)); call ph(c(3));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_what_v31_takes_in_a_restricted_expression_is_laid_out(opt):
+    """`.memory' in a DATA or INITIAL list is the linker's end of the
+    program, as in an expression; it was `dw MEMORY', which um80 did not
+    know.  And an expression in a constant list is its value at -O0 too,
+    where nothing has folded it; it was left out, and `.(1 + 2, 7)' was
+    `.(7)'."""
+    asm = Compiler(opt_level=opt).compile(_PH_PRELUDE + V31_RESTRICTED + "end t;\n", "T.PLM")
+    lines = [" ".join(line.split()) for line in asm.splitlines()]
+    for want in ("dw __END__", "dw __END__+3", "dw (__END__-1)", "dw (__END__+2)"):
+        assert want in lines, want
+    at = lines.index("db 3")
+    assert lines[at:at + 4] == ["db 3", "db 0FFH", "db 'a'", "db 7"], lines[at - 1:at + 4]
+
+
+def test_what_v31_takes_in_a_restricted_expression_prints_what_it_prints():
+    _check(V31_RESTRICTED, [0, 3, 0, 0xFFFF, 2, 0, 3, 0xFF, 0x61, 7])
+
+
 def test_an_untyped_data_string_is_an_array():
     """uplm80 takes `declare hx data ('0123')', which V3.1 does not (ERROR
     #61), for an array of the string's bytes, as 80un's bas.plm has it:

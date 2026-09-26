@@ -3314,6 +3314,13 @@ class CodeGenerator:
             return self._format_number(number_value(expr))
         elif isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
+            if self._builtin_name(expr) == "MEMORY":
+                # `.memory' in a DATA or INITIAL list, which Intel's PL/M-80
+                # V3.1 takes, as it does in an AT: the linker's end of the
+                # program, as in an expression (_gen_location).  It was
+                # `dw MEMORY', which um80 did not know.
+                self._use_end_symbol()
+                return "__END__"
             label = getattr(expr, "uplm80_asm", None)
             if label is not None:
                 return label        # a label: `@proc$label' in a procedure
@@ -8388,13 +8395,18 @@ class CodeGenerator:
             for val in expr.values or []:
                 v = unwrap_paren(val)
                 if isinstance(v, P.NumberLiteral):
-                    self.const_segment.append(
-                        AsmLine(opcode="db", operands=self._format_number(number_value(v)))
-                    )
+                    operand = self._format_number(number_value(v))
                 elif isinstance(v, P.StringLiteral):
-                    self.const_segment.append(
-                        AsmLine(opcode="db", operands=self._escape_string(string_value(v)))
-                    )
+                    operand = self._escape_string(string_value(v))
+                else:
+                    # `.(1 + 2, -1)' at -O0, where nothing has folded it, as
+                    # in a DATA list (_constant_list_label).  It was left
+                    # out, and the next constant took its place.
+                    value = self._try_eval_const(v)
+                    if value is None:
+                        raise CodeGenError(f"`.(...)' holds constants, not {type(v).__name__}")
+                    operand = self._format_number(value & 0xFF)
+                self.const_segment.append(AsmLine(opcode="db", operands=operand))
             self._emit("ld", f"hl,{label}")
             return DataType.ADDRESS
 
