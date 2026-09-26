@@ -4,11 +4,11 @@ BYTE Condition Tests
 if_b0  0
 if_b1  1
 if_b255  1
-if_b128  1
-whl_b  5
-whl_b2  10
+if_b128  0
+whl_b  1
+whl_b2  0
 whl_b0  99
-expr_c1  1
+expr_c1  0
 expr_c2  0
 expr_c3  0
 expr_c4  1
@@ -18,7 +18,7 @@ nest_c1  2
 nest_c2  3
 addr_c0  0
 addr_c1  1
-addr_c2  1
+addr_c2  0
 addr_c3  1
 
 Done.

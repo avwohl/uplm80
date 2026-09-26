@@ -3,6 +3,21 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.4.1 — unreleased
+
+The Known issues of 0.3.7 and 0.4.0, each settled by the Programming
+Manual (9800268B) and, where it leaves room, by what Intel's PL/M-80
+V3.1 does with the same source: its listing, its diagnostics, and the
+code it generates, linked with DRI's `X0100` and run.
+
+### Fixed
+
+- `tests/run_tests.sh`'s `test_byte_conditions` expected an IF and a DO
+  WHILE to test for non-zero, as uplm80 did before 0.3.5, and failed.
+  They test the least significant bit (5.1.2): 128, 10, 2 and 256 are
+  false. The expected output is now what the program prints compiled by
+  Intel's PL/M-80 V3.1, and by uplm80; all 22 programs pass.
+
 ## 0.4.0 — 2026-09-25
 
 Procedures are now called the way Intel's PL/M-80 calls them, so code
@@ -1200,8 +1215,6 @@ Each fix has a regression test that fails without it.
   level of the module; uplm80 compiles a nested one, and a local of the
   procedure around it that the interrupt reads may be in `??AUTO`, where
   another procedure's frame is (0.3.6 the same).
-- `tests/test_byte_conditions` in `run_tests.sh` expects the pre-0.3.5
-  non-zero truth test, and fails against 0.3.6 and this release alike.
 
 ### Known issues — not this compiler
 

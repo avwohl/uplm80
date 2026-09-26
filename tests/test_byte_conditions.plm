@@ -6,6 +6,12 @@
  * Bug: BYTE conditions were tested as ADDRESS (MOV A,L; ORA H)
  * instead of using the correct ORA A.
  *
+ * An IF or a DO WHILE tests the value's least significant bit, not
+ * whether it is zero (PL/M-80 Programming Manual 9800268B, 5.1.2 and
+ * 5.2): 128, 10, 2 and 256 are false and 255, 5, 11H and 0ABCDH true.
+ * The expected output is what Intel's PL/M-80 V3.1 compiles this
+ * program to print.
+ *
  * BUILD:
  *   python -m uplm80.compiler tests/test_byte_conditions.plm -o tests/build/test_byte_conditions.mac
  *   um80 tests/build/test_byte_conditions.mac -o tests/build/test_byte_conditions.rel
@@ -114,30 +120,30 @@ TEST$IF$BYTE: PROCEDURE;
         RESULT = 1;
     ELSE
         RESULT = 0;
-    CALL PRINT$TEST(.'if_b128 $', RESULT);       /* Expected: 1 */
+    CALL PRINT$TEST(.'if_b128 $', RESULT);       /* Expected: 0 (even) */
 END TEST$IF$BYTE;
 
 TEST$WHILE$BYTE: PROCEDURE;
     DECLARE X BYTE;
     DECLARE COUNT BYTE;
 
-    /* Test BYTE condition in DO WHILE */
+    /* Test BYTE condition in DO WHILE: 5 is odd, 4 even */
     X = 5;
     COUNT = 0;
     DO WHILE X;
         COUNT = COUNT + 1;
         X = X - 1;
     END;
-    CALL PRINT$TEST(.'whl_b $', COUNT);          /* Expected: 5 */
+    CALL PRINT$TEST(.'whl_b $', COUNT);          /* Expected: 1 */
 
-    /* Test with higher value */
+    /* Test with an even value (should not execute) */
     X = 10;
     COUNT = 0;
     DO WHILE X;
         COUNT = COUNT + 1;
         X = X - 1;
     END;
-    CALL PRINT$TEST(.'whl_b2 $', COUNT);         /* Expected: 10 */
+    CALL PRINT$TEST(.'whl_b2 $', COUNT);         /* Expected: 0 */
 
     /* Test with 0 (should not execute) */
     X = 0;
@@ -156,11 +162,11 @@ TEST$BYTE$EXPR$COND: PROCEDURE;
     /* Test BYTE expression in condition */
     X = 5;
     Y = 3;
-    IF X - Y THEN  /* 2, non-zero = TRUE */
+    IF X - Y THEN  /* 2, even = FALSE */
         RESULT = 1;
     ELSE
         RESULT = 0;
-    CALL PRINT$TEST(.'expr_c1 $', RESULT);       /* Expected: 1 */
+    CALL PRINT$TEST(.'expr_c1 $', RESULT);       /* Expected: 0 */
 
     X = 5;
     Y = 5;
@@ -181,7 +187,7 @@ TEST$BYTE$EXPR$COND: PROCEDURE;
 
     X = 0FFH;
     Y = 011H;
-    IF X AND Y THEN  /* 0x11 = non-zero = TRUE */
+    IF X AND Y THEN  /* 0x11, odd = TRUE */
         RESULT = 1;
     ELSE
         RESULT = 0;
@@ -270,13 +276,13 @@ TEST$ADDRESS$COND: PROCEDURE;
         RESULT = 0;
     CALL PRINT$TEST(.'addr_c1 $', RESULT);       /* Expected: 1 */
 
-    /* ADDRESS non-zero high byte only */
+    /* ADDRESS non-zero high byte only: even, FALSE */
     A = 256;
     IF A THEN
         RESULT = 1;
     ELSE
         RESULT = 0;
-    CALL PRINT$TEST(.'addr_c2 $', RESULT);       /* Expected: 1 */
+    CALL PRINT$TEST(.'addr_c2 $', RESULT);       /* Expected: 0 */
 
     /* ADDRESS with both bytes non-zero */
     A = 0ABCDH;
