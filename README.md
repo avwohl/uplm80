@@ -275,21 +275,17 @@ upeepz80.
 
 A module-level name is its own name in the assembly, and a procedure's
 names are `@proc$name`, but for the parameters and locals that share
-storage in `??AUTO` (see [Procedure locals](#procedure-locals)).  A static
-parameter is also named by an EQU, `?@proc$name`, which costs nothing:
-upeepz80 drops the store of an argument at a procedure's entry when
-nothing else names its storage, and a pointer from the parameter before it
-can reach it.  Where PL/M-80 would let two declarations meet in one
-assembler name - a label in each of two DO blocks, a procedure in each of
-two blocks, a LITERALLY in each of two procedures, a procedure or label in
-a DO block named like a local or a parameter of the procedure around it -
-one is renamed `NAME?2` (no PL/M-80 identifier has a `?`): a LITERALLY
-before a label, a label before a procedure, a procedure before a variable.
-A name the assembler reads as a register or an operator (`A`, `HL`, `EQ`,
-`NUL`, ...) is `@NAME`.  `uplm80/names.py` binds every name to the
-declaration PL/M-80 means and checks every GOTO against the Programming
-Manual (9.3): out of a procedure only to a label at the outer level of the
-main program module.
+storage in `??AUTO` (see [Procedure locals](#procedure-locals)).  Where
+PL/M-80 would let two declarations meet in one assembler name - a label in
+each of two DO blocks, a procedure in each of two blocks, a LITERALLY in
+each of two procedures, a procedure or label in a DO block named like a
+local or a parameter of the procedure around it - one is renamed `NAME?2`
+(no PL/M-80 identifier has a `?`): a LITERALLY before a label, a label
+before a procedure, a procedure before a variable.  A name the assembler
+reads as a register or an operator (`A`, `HL`, `EQ`, `NUL`, ...) is
+`@NAME`.  `uplm80/names.py` binds every name to the declaration PL/M-80
+means and checks every GOTO against the Programming Manual (9.3): out of a
+procedure only to a label at the outer level of the main program module.
 
 ## Runtime Modes
 

@@ -10,6 +10,18 @@ Manual (9800268B) and, where it leaves room, by what Intel's PL/M-80
 V3.1 does with the same source: its listing, its diagnostics, and the
 code it generates, linked with DRI's `X0100` and run.
 
+### Changed
+
+- A static parameter is no longer named a second time by an EQU
+  (`?@proc$name equ @proc$name`). upeepz80 before 0.2.6 dropped the store
+  of an argument at a procedure's entry when nothing else named the
+  parameter's storage, though a pointer from the parameter before it can
+  reach it (Known issues, 0.3.7); 0.2.6, which 0.4.0 requires, keeps it.
+  `pq: procedure (a, b) byte; declare (a, b) byte; ... pp = .a + 1; return
+  c;`, `c` BASED on `pp`, still keeps `ld (@PQ$@B),a` and returns `B` at
+  `-O1` to `-O3`. Over the 87 compiles of MP/M II and 80un, the assembly at
+  `-O1`, `-O2` and `-O3` is 0.4.0's less its 25 such EQUs, line for line.
+
 ### Fixed
 
 - `tests/run_tests.sh`'s `test_byte_conditions` expected an IF and a DO
@@ -1173,10 +1185,6 @@ Each fix has a regression test that fails without it.
   possibly another procedure's) only where that variable is static. In
   `??AUTO` it reaches another frame, or nothing (0.3.6 the same). Keeping all
   of that in DRI's order would make every local static.
-- **upeepz80 drops a store at a procedure's entry when nothing names the
-  storage**, taking storage that nothing else names to be unreachable. uplm80
-  names every static parameter with an EQU so that its store is kept. The rule
-  itself should be fixed in upeepz80.
 - **A LITERALLY's name declared again in an inner block** is a syntax error:
   the macro pass puts the LITERALLY's text in place of the name there too
   (`declare n literally '5'` and, in a procedure, `declare n byte` reads
