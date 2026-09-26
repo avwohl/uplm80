@@ -51,6 +51,71 @@ binaries are found.
   output is transcribed from Intel's build, each built by both compilers.
   Without Intel's binaries - as on CI - it skips, building nothing.
 
+### Known issues
+
+uplm80 still compiles these, which Intel's PL/M-80 V3.1 rejects (0.4.1
+the same):
+
+- `f()` and `CALL g()` of a procedure, and `carry()` of a built-in,
+  taken for `f`, `g` and `carry` (ERROR #102, MISSING PRIMARY OPERAND, and
+  #153, INVALID NUMBER OF ARGUMENTS IN CALL).
+- A subscript on a scalar, `x(0)` or `x(1)`, the byte at X's address
+  plus the subscript (#127, INVALID SUBSCRIPT ON NON-ARRAY); and `shl(w,
+  3)` where the program declares SHL an ADDRESS, a call through SHL's
+  value (#127, and #114, MULTIPLE SUBSCRIPTS ILLEGAL).
+- An array, or an array member, without a subscript anywhere but in a
+  location reference or LENGTH, LAST and SIZE (3.6.2): `a = 3` and `x =
+  a` are `a(0)`, `s.m = 4` is `s.m(0)`, `s2.m(1)` of an array of
+  structures is `s2(0).m(1)`, and `size(a)`, SIZE an array of the
+  program's, is `size(a(0))` (#133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+  ARRAY, and #134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY).
+- INITIAL in a procedure's declaration, which initializes the variable
+  once, when the program is loaded (#73, INVALID ATTRIBUTE OR
+  INITIALIZATION, NOT AT MODULE LEVEL).
+- A procedure with no statements, `g: procedure; end g;`, which returns
+  (#174, INVALID NULL PROCEDURE).
+- A call of a procedure that its block declares after the call, `p:
+  procedure; call q; end p; q: procedure; ... end q;`, and `y = f + 1`
+  of a typed procedure `f` declared after it (#169, ILLEGAL FORWARD
+  CALL).
+
+And these V3.1 compiles to other code (0.4.1 the same):
+
+- **SHL and SHR of a BYTE are an ADDRESS**, the BYTE zero-extended and
+  shifted in sixteen bits (`uplm80/plm_types.py`): `w = shl(b, 4)` with
+  b = 0F0H is 0F00H, where the manual gives SHL and SHR their pattern's
+  type (11.1.4) and V3.1's build gives 0000H (the oracle's `shl-byte`).
+  Programs written for uplm80 rely on it: 80un builds words with `lo +
+  shl(b, 8)` (common.plm's READ16 and READWORD, the ARC and LBR headers'
+  sizes), and compiled with SHL of a BYTE a BYTE, its `80un test.arc`
+  extracts one member of the archive's thirteen. DRI's programs, written
+  for Intel's compiler, shift a BYTE at 62 places in 18 of MP/M II's
+  source files, and 24 of the MP/M II compiles would change. uplm80 keeps
+  the 16-bit shift.
+- **What a store through a pointer or an overrun reaches in or from
+  `??AUTO`** is uplm80's layout, not DRI's (Known issues, 0.3.7), and a
+  counted loop over a local in `??AUTO` does not see all of it. `??AUTO`
+  comes first in the data segment, before the module's variables, and
+  holds the frames of procedures active together one after another: an
+  overrun of a local in it can reach another frame or the module's first
+  variables, and `.x - 1` of the first variable after it its last byte.
+  A loop over a local in `??AUTO` ends where a pointer or an overrun from
+  a local of its own procedure declared before the index sets it, and
+  nowhere else. With q's `ql(2) byte, k byte` just before run's index `i`
+  in `??AUTO`, `ql(3) = 20` from inside run's loop sets `i` and the loop
+  still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
+  whose layout has `i` there too, prints 0003 0015. Counting no such loop
+  would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+- A loop over the last module-level variable is still counted where a
+  store through MEMORY reaches it: MEMORY follows the last variable, in
+  V3.1's layout as in uplm80's, so `p = .memory - 1` with a BASED `b`, or
+  `memory(0ffffh) = 20`, sets that variable, and the loop runs its count
+  (000B 0014 at `-O0` to `-O3`, where V3.1's build prints 0003 0015).
+- A label on an END statement, `out: end p;` (Programming Manual A.4.4.1),
+  is a syntax error; V3.1 compiles it.
+- V3.1 rejects a zero dimension, `declare b (0) byte` (ERROR #57), and the
+  address of a built-in, `.double`; uplm80 accepts both.
+
 ## 0.4.1 — 2026-09-26
 
 The Known issues 0.3.7 listed, and 0.4.0 carried, each settled by the
