@@ -41,16 +41,24 @@ names the statement.  :func:`generate` returns a :class:`Program`, whose
 told to - the reducer in scripts/intel_oracle.py drops chunks while the
 difference persists.
 
-Features ``avoid`` can leave out: carry, shl-byte (SHL/SHR of a BYTE, which
-uplm80 shifts in 16 bits: see uplm80/plm_types.py), sub-zero (a BYTE less an
-ADDRESS that folds to 0, which V3.1 leaves a BYTE), zero-dividend (a constant
-0 divided by a variable, which V3.1 folds to 0 even when the divisor is 0,
-where uplm80 divides: 0FFFFH), shift9 (SHL or SHR of a
-BYTE by more than 8, which Intel's V3.1 shifts by the count mod 8),
-wide-limit (a BYTE index counted to a limit above 255, which V3.1 compares
-in 16 bits where 5.1.4 says the limit is made a BYTE), qualsize (LENGTH,
-LAST and SIZE of a structure member, which uplm80 refuses), div0, strings, based, struct, move, case,
-while, loops, procs, reentrant, embedded, nested, str2.
+Features ``avoid`` can leave out - the first seven are differences from V3.1
+the README lists:
+* shl-byte: SHL or SHR of a BYTE, which uplm80 shifts in 16 bits
+  (uplm80/plm_types.py);
+* shift9: SHL or SHR of a BYTE by more than 8, which V3.1 shifts by the
+  count mod 8;
+* wide-limit: a BYTE index counted to a limit above 255, which V3.1
+  compares in 16 bits where 5.1.4 makes the limit a BYTE;
+* sub-zero: a BYTE less an ADDRESS that folds to 0, which V3.1 leaves a
+  BYTE;
+* zero-dividend: a constant 0 divided by a variable, which V3.1 folds to 0
+  even when the divisor is 0, where uplm80 divides (0FFFFH);
+* neg-widened: `-b' or `0 - b' of a BYTE the expression also uses
+  elsewhere, which V3.1 may negate in 16 bits;
+* qualsize: LENGTH, LAST and SIZE of a structure member, which uplm80
+  refuses;
+* carry, div0, strings, based, struct, move, case, while, loops, procs,
+  reentrant, embedded, nested, str2.
 """
 
 from __future__ import annotations
@@ -58,7 +66,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 
-from .plm_difftest import (INTERESTING, Bin, Builtin, EAsg, Env, Expr, Num, Un, Var,
+from .plm_difftest import (INTERESTING, Bin, Builtin, EAsg, Expr, Num, Un, Var,
                            _hex, run_loop)
 
 B, A = "BYTE", "ADDRESS"
@@ -212,17 +220,94 @@ def typ(e: Expr, env: dict) -> str:
     return A
 
 
-def const_value(e: Expr) -> int | None:
-    """The value of ``e`` when it is a constant expression, else None."""
-    if not e.is_const() or any(isinstance(n, (Raw, Ref, Call)) for n in nodes(e)):
-        return None
+# LENGTH and element width of what every program declares, for const_value;
+# the generator adds the DATA arrays, whose lengths it draws.
+EXTENTS = {"ab": (8, 1), "aw": (8, 2), "tb": (8, 1), "tw": (4, 2), "st": (1, 7),
+           "sa": (4, 5), "st.z": (4, 1), "sa.z": (2, 1), "sa(1).z": (2, 1), "st.y": (1, 2)}
+
+
+class _NotConst(Exception):
+    pass
+
+
+def const_value(e: Expr, extents: dict | None = None, lits: dict | None = None) -> int | None:
+    """The value of ``e`` when it is a constant expression - LENGTH, LAST
+    and SIZE of the arrays in ``extents``, and the LITERALLY names in
+    ``lits``, included - else None."""
     try:
-        return e.ev(Env())[0]
-    except (KeyError, AttributeError, ZeroDivisionError):
+        return _cv(e, dict(EXTENTS, **(extents or {})), lits or {})[0]
+    except (_NotConst, KeyError):
         return None
 
 
-def folds_to_address_zero(e: Expr, env: dict) -> bool:
+def _cv(e: Expr, ext: dict, lits: dict) -> tuple[int, str]:  # pylint: disable=too-many-return-statements
+    if isinstance(e, Num):
+        return e.v, B if e.style == "str" or e.v <= 0xFF else A
+    if isinstance(e, Raw) and e.const:
+        if e.txt in lits:
+            return lits[e.txt], B if lits[e.txt] <= 0xFF else A
+        if len(e.txt) == 4 and e.txt[0] == e.txt[3] == "'":
+            return ord(e.txt[1]) << 8 | ord(e.txt[2]), A
+        raise _NotConst
+    if isinstance(e, Builtin) and e.name in ("length", "last", "size"):
+        n, width = ext[e.args[0].name]
+        v = {"length": n, "last": n - 1, "size": n * width}[e.name]
+        return v, A if e.name == "size" or v > 0xFF else B
+    if isinstance(e, Builtin):
+        x, xt = _cv(e.args[0], ext, lits)
+        if e.name == "low":
+            return x & 0xFF, B
+        if e.name == "high":
+            return (x >> 8 if xt == A else 0), B
+        if e.name == "double":
+            return x, A
+        c = _cv(e.args[1], ext, lits)[0] & 0xFF
+        if e.name in ("shl", "shr"):
+            v = (x << c) if e.name == "shl" else (x >> c)
+            return v & MASK[xt], xt
+        x &= 0xFF
+        c &= 7
+        v = (x << c | x >> (8 - c)) if e.name == "rol" else (x >> c | x << (8 - c))
+        return v & 0xFF, B
+    if isinstance(e, Un):
+        v, t = _cv(e.operand, ext, lits)
+        return (-v if e.op == "-" else ~v) & MASK[t], t
+    if isinstance(e, Bin):
+        (lv, lt), (rv, rt) = _cv(e.left, ext, lits), _cv(e.right, ext, lits)
+        if e.op in ("=", "<>", "<", ">", "<=", ">="):
+            ok = {"=": lv == rv, "<>": lv != rv, "<": lv < rv, ">": lv > rv,
+                  "<=": lv <= rv, ">=": lv >= rv}[e.op]
+            return (0xFF if ok else 0), B
+        if e.op == "*":
+            return (lv * rv) & 0xFFFF, A
+        if e.op in ("/", "mod"):
+            from .plm_difftest import divide   # pylint: disable=import-outside-toplevel
+            q, r = divide(lv, rv)
+            return (q if e.op == "/" else r), A
+        t = B if lt == B and rt == B else A
+        v = {"+": lv + rv, "-": lv - rv, "and": lv & rv, "or": lv | rv, "xor": lv ^ rv}[e.op]
+        return v & MASK[t], t
+    raise _NotConst
+
+
+def neg_widened(e: Expr, env: dict) -> bool:
+    """Whether ``e`` negates a BYTE variable - `-b' or `0 - b' - that it
+    also uses elsewhere, which V3.1 may then negate in 16 bits."""
+    negated = set()
+    for n in nodes(e):
+        if isinstance(n, Un) and n.op == "-" and isinstance(n.operand, Var):
+            negated.add(n.operand.name)
+        elif isinstance(n, Bin) and n.op == "-" and isinstance(n.left, Num) \
+                and n.left.v == 0 and isinstance(n.right, Var):
+            negated.add(n.right.name)
+    negated = {v for v in negated if env.get(v) == B}
+    if not negated:
+        return False
+    uses = [n.name for n in nodes(e) if isinstance(n, Var)]
+    return any(uses.count(v) > 1 for v in negated)
+
+
+def folds_to_address_zero(e: Expr, env: dict, extents=None, lits=None) -> bool:
     """Whether ``e`` is an ADDRESS a compiler folds to 0: a constant
     expression of value 0, or a product with a literal 0."""
     if typ(e, env) != A:
@@ -230,7 +315,7 @@ def folds_to_address_zero(e: Expr, env: dict) -> bool:
     if isinstance(e, Bin) and e.op == "*" and any(
             isinstance(x, Num) and x.v == 0 for x in (e.left, e.right)):
         return True
-    return const_value(e) == 0
+    return const_value(e, extents, lits) == 0
 
 
 # ---- procedures ---------------------------------------------------------------------
@@ -377,6 +462,7 @@ class Generator:  # pylint: disable=too-many-instance-attributes,too-many-public
         self.lits: dict[str, int] = {}
         self.data: dict[str, list[int]] = {}
         self.msg = ""
+        self.extents: dict[str, tuple[int, int]] = {}   # the DATA arrays' LENGTH, width
         # The statement being generated: features it uses.
         self.cur: list[str] = []
 
@@ -514,10 +600,11 @@ class Generator:  # pylint: disable=too-many-instance-attributes,too-many-public
             right = self.expr(ctx, depth - 1, calls)
             if op in ("/", "mod") and "div0" in self.avoid:
                 right = Bin("or", right, Num(1))
-            if op == "-" and folds_to_address_zero(right, self.types) \
+            if op == "-" and folds_to_address_zero(right, self.types, self.extents, self.lits) \
                     and not self.use("sub-zero"):
                 right = Bin("or", right, Num(1))
-            if op == "/" and const_value(left) == 0 and not isinstance(right, Num) \
+            if op == "/" and const_value(left, self.extents, self.lits) == 0 \
+                    and const_value(right, self.extents, self.lits) is None \
                     and not self.use("zero-dividend"):
                 right = Bin("or", right, Num(1))
             return Bin(op, left, right)
@@ -613,6 +700,8 @@ class Generator:  # pylint: disable=too-many-instance-attributes,too-many-public
         for _ in range(tries):
             self.cur = list(saved)
             e = make()
+            if neg_widened(e, self.types) and not self.use("neg-widened"):
+                continue
             if self.order_free([e], targets, target_reads):
                 return e
         self.cur = saved
@@ -1074,6 +1163,8 @@ class Generator:  # pylint: disable=too-many-instance-attributes,too-many-public
         decls.append("declare cw(*) address data (" + ", ".join(_hex(v) for v in self.data["cw"])
                      + ");")
         self.msg = r.choice(["HELLO, WORLD$", "PL/M-80 V3.1$", "abc$", "x=1; y=2$"])
+        self.extents = {"cb": (len(self.data["cb"]), 1), "cw": (len(self.data["cw"]), 2),
+                        MSG: (len(self.msg), 1)}
         decls.append(f"declare ms(*) byte data ('{self.msg}');")
         decls.append("declare st structure (x byte, y address, z(4) byte);")
         decls.append("declare sa(4) structure (x byte, y address, z(2) byte);")

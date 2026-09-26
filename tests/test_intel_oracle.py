@@ -30,7 +30,8 @@ _spec.loader.exec_module(oracle)
 
 # The differences the README lists; each is a generator feature it can
 # leave out.
-KNOWN = frozenset({"shl-byte", "shift9", "wide-limit", "sub-zero", "zero-dividend", "qualsize"})
+KNOWN = frozenset({"shl-byte", "shift9", "wide-limit", "sub-zero", "zero-dividend",
+                   "neg-widened", "qualsize"})
 SEEDS = [3, 8, 10]
 
 
