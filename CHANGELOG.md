@@ -41,10 +41,23 @@ code it generates, linked with DRI's `X0100` and run.
       IH: an INTERRUPT procedure must be declared at the outer level of the
       module, not in procedure OUTER (Programming Manual 9800268B, 8.1.6)
 
-  This and the other rules of a program's names below are checked as the
-  parser gives the program, before the optimizer rewrites or drops
-  anything, so every `-O` level finds the same errors; a multi-file
-  compile parses and checks every module before it optimizes any.
+- **`.label`, the address of a label, in an expression is an error.** The
+  dot operator takes a variable or a procedure (4.1.3), and Intel's
+  PL/M-80 V3.1 rejects `.label` in an expression, ERROR #158, INVALID DOT
+  OPERAND, LABEL ILLEGAL, whether or not the label is declared LABEL and
+  whether it is defined before the expression or after; it accepts one in
+  a DATA or an INITIAL list, and so does uplm80, as before (MP/M II's
+  MPMLDR begins `DATA (0C3H, .start-3)`). uplm80 compiled the expression to
+  the label's address (Known issues, 0.3.7; 0.3.6 the same).
+
+      .HERE: HERE is a label, and the dot operator takes a variable or a
+      procedure (Programming Manual 9800268B, 4.1.3); the address of a
+      label may be given only in a DATA or an INITIAL list
+
+  These rules of a program's names are checked as the parser gives the
+  program, before the optimizer rewrites or drops anything, so every `-O`
+  level finds the same errors; a multi-file compile parses and checks
+  every module before it optimizes any.
 - **A REENTRANT procedure's parameter declared with its locals,**
   `DECLARE (top, c) BYTE`, was declared a second time, as a local in the
   frame, which nothing set, and every use of it read that: `rp(3)` of a
@@ -1236,12 +1249,6 @@ Each fix has a regression test that fails without it.
   reads SP. (0.3.6 folded all three comparisons at `-O3` to "equal".) The
   manual gives STACKPTR as the stack pointer register (11.2.3), not as it
   was when the statement began.
-- **`.label`, the address of a label, is accepted in an expression.** The
-  dot operator takes a variable or a procedure (Programming Manual, 4.1.3),
-  and Intel's PL/M-80 V3.1 rejects `.label` in an expression (ERROR #158,
-  INVALID DOT OPERAND, LABEL ILLEGAL), whether or not the label is declared
-  LABEL; it accepts one in a DATA list. uplm80 compiles both to the label's
-  address, with no diagnostic, as 0.3.6 did.
 
 ### Known issues — not this compiler
 

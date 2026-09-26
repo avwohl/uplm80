@@ -57,6 +57,7 @@ from .ast_view import (
     literally_value,
     parse_plm_number,
     proc_attrs,
+    unwrap_paren,
 )
 from .errors import CodeGenError
 from .frontend import source_location
@@ -234,12 +235,14 @@ class _Block:
 
 
 @dataclass(eq=False)
-class _Ref:
+class _Ref:  # pylint: disable=too-many-instance-attributes
     block: _Block
     node: object
     attr: str
     goto: bool = False
     decl: _Decl | None = None
+    dot: bool = False           # the operand of a dot, `.name'
+    in_list: bool = False       # in a DATA or INITIAL list
 
 
 def _key(tok) -> str:
@@ -264,6 +267,7 @@ class _Resolver:
         self.globals = _Block("global", None, None, None)
         self.refs_of: dict[int, list[_Ref]] = {}
         self.used: set[str] = set()     # every name a declaration has
+        self._lists = 0                 # DATA and INITIAL lists being visited
 
     # ---- collecting ----------------------------------------------------
 
@@ -337,7 +341,19 @@ class _Resolver:
             for f in ("condition", "start", "bound", "step", "selector", "items"):
                 self._visit(getattr(n, f, None), inner)
         elif isinstance(n, (P.Identifier, P.DottedIdent)):
-            self.refs.append(_Ref(block, n, "name"))
+            self.refs.append(_Ref(block, n, "name", in_list=self._lists > 0))
+        elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Identifier):
+            self.refs.append(_Ref(block, unwrap_paren(n.operand), "name", dot=True,
+                                  in_list=self._lists > 0))
+        elif isinstance(n, P.AttrInitial) or hasattr(n, "data_values"):
+            # A DATA or an INITIAL list, where the address of a label may be.
+            for f in n.__dataclass_fields__:
+                if f == "pos":
+                    continue
+                inside = f in ("values", "data_values")
+                self._lists += inside
+                self._visit(getattr(n, f), block)
+                self._lists -= inside
         elif isinstance(n, (P.MemberAccess, P.DottedMember)):
             self._visit(n.base, block)      # a member's name is not in scope
         elif isinstance(n, (P.StructMember, P.StructMemberUntyped, P.EndLabel)):
@@ -542,6 +558,23 @@ class _Resolver:
                 f"{text} is not declared in module {r.block.module.name}; module "
                 f"{d.block.module.name} declares it but does not make it PUBLIC "
                 "(declare it PUBLIC there and EXTERNAL here)", source_location(r.node))
+
+    def check_uses(self) -> None:
+        """Every name used as PL/M-80 allows: not the address of a label,
+        but in a DATA or an INITIAL list."""
+        for r in self.refs:
+            d = r.decl
+            if r.goto or d is None:
+                continue
+            text = ident_text(getattr(r.node, r.attr))
+            if r.dot and d.kind == "label" and not r.in_list:
+                # Intel's PL/M-80 V3.1: ERROR 158, INVALID DOT OPERAND,
+                # LABEL ILLEGAL, whether or not the label is declared LABEL.
+                raise CodeGenError(
+                    f".{text}: {text} is a label, and the dot operator takes a variable "
+                    "or a procedure (Programming Manual 9800268B, 4.1.3); the address "
+                    "of a label may be given only in a DATA or an INITIAL list",
+                    source_location(r.node))
 
     # The kind of declaration renamed first when two meet in one assembler
     # name: a LITERALLY, whose EQU nothing uses (the macro pass has put its
@@ -751,7 +784,8 @@ def check_names(modules: list, multi: bool = False) -> None:
 
     Raises CodeGenError for the first thing that is not allowed, as
     :func:`resolve_names` does for the rest: an INTERRUPT procedure
-    anywhere but at the outer level of its module.  ``multi``: the
+    anywhere but at the outer level of its module, and the address of a
+    label anywhere but in a DATA or an INITIAL list.  ``multi``: the
     modules are compiled together (see resolve_names).
     """
     r = _Resolver()
@@ -760,6 +794,7 @@ def check_names(modules: list, multi: bool = False) -> None:
     r.bind()
     if multi:
         r.check_private()
+    r.check_uses()
 
 
 def resolve_names(modules: list, multi: bool = False) -> list[tuple]:

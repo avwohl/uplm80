@@ -175,32 +175,38 @@ end t;
 """, opt) == "53"
 
 
-@pytest.mark.parametrize("opt", (0, 3))
-def test_the_address_of_a_procedures_label(opt):
-    """`.there' in a procedure is its own label, `@P$THERE'; it was `THERE',
-    which nothing defines."""
-    assert run_plm(PRELUDE + """
-declare a address;
-p: procedure;
-   declare q address;
-   q = .there;
-   goto there;
-there:
-   call pc('P');
-end p;
-a = .here;
-call p;
-here:
-call pc('M');
-end t;
-""", opt) == "PM"
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("where, stmt, name, at", [
+    ("module", "a = .here;", "HERE", "13:6"),
+    ("module", "a = .there + 1;", "THERE", "13:6"),
+    ("procedure", "q = .there;", "THERE", "9:9"),
+    ("procedure", "if .here <> 0 then q = 1;", "HERE", "9:8"),
+])
+def test_the_address_of_a_label_in_an_expression_is_an_error(opt, where, stmt, name, at):
+    """The dot operator takes a variable or a procedure (4.1.3).  Intel's
+    PL/M-80 V3.1 rejects `.label' in an expression, ERROR #158, INVALID DOT
+    OPERAND, LABEL ILLEGAL, whether or not the label is declared LABEL and
+    whether it is defined before or after; uplm80 compiled it to the
+    label's address (0.3.6 the same).  In a DATA or INITIAL list it is
+    allowed (below)."""
+    src = (PRELUDE + "declare a address;\ndeclare there label;\np: procedure;\n"
+           "   declare q address;\n" + (f"   {stmt}\n" if where == "procedure" else "")
+           + "   goto inner;\ninner:\n   call pc('P');\nend p;\n"
+           + (f"{stmt}\n" if where == "module" else "")
+           + "call p;\nhere:\nthere:\ncall pc('M');\nend t;\n")
+    err = _compile_error(src, opt)
+    assert (f"T.PLM:{at}: error: .{name}: {name} is a label, and the dot operator takes a "
+            "variable or a procedure (Programming Manual 9800268B, 4.1.3); the address of "
+            "a label may be given only in a DATA or an INITIAL list") in err, err
 
 
 @pytest.mark.parametrize("opt", LEVELS)
 def test_the_address_of_a_label_in_data_and_initial(opt):
-    """`.there' in a procedure's DATA or INITIAL list named the bare THERE."""
+    """`.there' in a procedure's DATA or INITIAL list named the bare THERE.
+    (`.here' may not be compared with `m' in an expression; see above.)"""
     assert run_plm(PRELUDE + """
 declare m address data (.here);
+declare m2 address initial (.here);
 p: procedure;
    declare t address data (.there);
    declare q address initial (.there);
@@ -210,7 +216,7 @@ there:
    call pc('P');
 end p;
 call p;
-if m = .here then call pc('m');
+if m = m2 and m <> 0 then call pc('m');
 here:
 call pc('.');
 end t;
