@@ -44,9 +44,10 @@ any.
   to a CALL through x's value (0.3.6: `call X`), and so did an array, a
   BASED variable, a structure, a parameter and `CALL w()` of an ADDRESS
   (Known issues, 0.3.7); `y = s.m()` compiled to `ld a,(S) / ld l,a / ld
-  h,0 / call ??jphl`, a call through the member's value, and so did `w =
-  s.a()`, `y = sa(1).m()`, `CALL s.a()`, `y = a(1)()` and `y = q(1)()`
-  (0.4.0 the same). Intel's PL/M-80 V3.1 rejects each: ERROR #127,
+  h,0 / call ??jphl`, a call through the member's value, and `w =
+  s.a()`, `y = sa(1).m()` and `CALL s.a()` the same, and `y = a(1)()` and
+  `y = q(1)()` called through the element's value and through what `q(1)`
+  returned (0.4.0 the same). Intel's PL/M-80 V3.1 rejects each: ERROR #127,
   INVALID SUBSCRIPT ON NON-ARRAY, and #102, MISSING PRIMARY OPERAND, in
   an expression after a scalar, a parameter or a BASED variable, and after
   a structure with #135, ILLEGAL REFERENCE TO AN UNQUALIFIED STRUCTURE;
