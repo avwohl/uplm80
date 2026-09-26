@@ -1527,6 +1527,67 @@ def test_what_v31_takes_in_a_restricted_expression_prints_what_it_prints():
     _check(V31_RESTRICTED, [0, 3, 0, 0xFFFF, 2, 0, 3, 0xFF, 0x61, 7])
 
 
+# Locations in a DATA or INITIAL list that Intel's PL/M-80 V3.1 takes, and
+# code generation laid out wrongly or refused: an element of an ADDRESS
+# array, a member, an element of an array of structures and a member of
+# one, a variable declared further down, a subscript that is a sum at -O0;
+# and in a constant list what a byte holds of V3.1's arithmetic.  V3.1
+# compiles the program to print what is expected (tests/test_intel_oracle.py
+# builds it again).
+V31_LOCATIONS = """
+declare arr (3) address, s structure (m (3) byte, k address);
+declare sa (3) structure (x byte, y address);
+declare da address data (.arr(2)), dk address data (.s.k), dm address data (.s.m(1));
+declare dy address data (.sa(1).y), dsa address data (.sa(2)), dx address data (.sa(2).x + 1);
+declare ia (2) address initial (.later(2), .arr(1 + 1));
+declare later (3) address;
+declare p address, c based p (3) byte;
+call ph(da - .arr); call ph(dk - .s); call ph(dm - .s);
+call ph(dy - .sa); call ph(dsa - .sa); call ph(dx - .sa);
+call ph(ia(0) - .later); call ph(ia(1) - .arr);
+p = .(0ffffh + 1, 300 - 100, -1 - 1);
+call ph(c(0)); call ph(c(1)); call ph(c(2));
+"""
+
+
+def test_a_location_in_a_list_is_where_v31_puts_it():
+    """The module's DATA is laid out before its other variables, and an
+    INITIAL list may name a variable declared further down: the element
+    of an array not yet laid out was taken for a byte, `.arr(2)' of an
+    ADDRESS array ARR+2, and an array of structures' for a word; a
+    member, `.s.k', was refused, and so was `.arr(1 + 1)' at -O0, where
+    nothing had folded the subscript."""
+    _check(V31_LOCATIONS, [4, 3, 1, 4, 6, 7, 4, 4, 0, 0xC8, 0xFE])
+
+
+# A name the program declares that is also a built-in's, MEMORY or SIZE, in
+# a DATA list at module level: the program's variable.  It was taken for
+# the built-in's while the module's DATA was laid out, before the variable
+# was: `.memory' for the end of the program, and `.size(2)' of a BYTE array
+# for SIZE+4, as if SIZE were an ADDRESS one.  V3.1 prints what is expected
+# (tests/test_intel_oracle.py).
+V31_DECLARED_BUILTINS = {
+    "arrays": ("""
+declare memory (4) byte, size (3) byte;
+declare dm address data (.memory), dm1 address data (.memory(1));
+declare ds address data (.size(2)), ds1 address data (.size(2) + 1);
+call ph(dm - .memory); call ph(dm1 - .memory); call ph(ds - .size); call ph(ds1 - .size);
+""", [0, 1, 2, 3]),
+    "scalar": ("""
+declare memory address;
+declare dm address data (.memory);
+call ph(dm - .memory);
+""", [0]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(V31_DECLARED_BUILTINS))
+def test_a_declared_memory_or_size_in_a_data_list_is_the_programs(name):
+    body, expect = V31_DECLARED_BUILTINS[name]
+    _check(body, expect)
+
+
+
 def test_an_untyped_data_string_is_an_array():
     """uplm80 takes `declare hx data ('0123')', which V3.1 does not (ERROR
     #61), for an array of the string's bytes, as 80un's bas.plm has it:

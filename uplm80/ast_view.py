@@ -587,6 +587,10 @@ def expr_text(expr) -> str:  # pylint: disable=too-many-return-statements
         return f"{op}{expr_text(e.operand)}"
     if isinstance(e, P.LocationOf):
         return f".{expr_text(e.operand)}"
+    if isinstance(e, P.LocationOfList):
+        return f".({', '.join(expr_text(v) for v in e.values)})"
+    if isinstance(e, P.LocationOfString):
+        return f".{e.value.text}"
     return "..."
 
 

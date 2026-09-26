@@ -33,6 +33,7 @@ from .ast_view import (
     decl_item_type as _view_decl_item_type,
     decl_item_struct_members,
     decl_item_based,
+    expr_text,
     struct_member_names,
     struct_member_type,
     struct_member_dim,
@@ -3011,22 +3012,14 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
-    def _declared_later(self, name: str) -> tuple[Symbol, tuple[str | None, int] | None] | None:
-        """A module-level variable an AT names before the DECLARE that makes it.
+    def _module_declaration(self, name: str) -> tuple[Symbol, object, list] | None:
+        """The symbol a module-level DECLARE makes of ``name``, read from the
+        declaration itself, whether or not code generation has reached it:
+        the symbol, the DeclItem and the names it declares, or None.
 
-        PL/M-80 asks for the variable to be declared first, and DRI's compiler
-        did not insist: UTIL5/SUB.PLM declares `rbuff(1) byte at
-        (.minimum$buffer)' two hundred lines above minimum$buffer, and
-        UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.  A subscript or a
-        member needs the variable's shape, so it is read from the declaration
-        itself rather than guessed.
-
-        Returns the symbol, and where it is if it is itself AT: the (root,
-        offset) of :meth:`_at_address`.  An AT is defined by an EQU, and the
-        EQUs go out in declaration order, so naming the later variable would
-        name a symbol um80 has not reached yet and reads as zero.  An
-        EXTERNAL further down is entered in `_extern_names' now, so a
-        variable AT it is aliased to it (see :meth:`_emit_at_decl`).
+        A subscript or a member needs the variable's shape, so it is read
+        from the declaration rather than guessed; the assembly name is the
+        one :meth:`_gen_one_var` gives a module-level variable.
         """
         for item in self._module_decl_items:
             names = decl_item_names(item)
@@ -3047,21 +3040,44 @@ class CodeGenerator:
                          dimension=dimension, struct_members=struct_members,
                          based_on=based_on, is_external=attrs.is_external,
                          asm_name=self._mangle_name(name))
-            if attrs.is_external and sym.asm_name not in self._compile_publics:
-                self._extern_names.add(sym.asm_name)
-            if attrs.at_location is None or based_on:
-                return sym, None
-            if name in self._resolving_at:
-                raise CodeGenError(f"AT(.{name}): the AT addresses name each other in a circle")
-            self._resolving_at.add(name)
-            try:
-                root, offset = self._at_address(attrs.at_location)
-            finally:
-                self._resolving_at.discard(name)
-            # A factored AT places each name after the last (6.2.8).
-            size = self._element_width(sym) * max(dimension or 1, 1)
-            return sym, (root, offset + names.index(name) * size)
+            return sym, item, names
         return None
+
+    def _declared_later(self, name: str) -> tuple[Symbol, tuple[str | None, int] | None] | None:
+        """A module-level variable an AT names before the DECLARE that makes it.
+
+        PL/M-80 asks for the variable to be declared first, and DRI's compiler
+        did not insist: UTIL5/SUB.PLM declares `rbuff(1) byte at
+        (.minimum$buffer)' two hundred lines above minimum$buffer, and
+        UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.  Its shape is
+        read from the declaration (:meth:`_module_declaration`).
+
+        Returns the symbol, and where it is if it is itself AT: the (root,
+        offset) of :meth:`_at_address`.  An AT is defined by an EQU, and the
+        EQUs go out in declaration order, so naming the later variable would
+        name a symbol um80 has not reached yet and reads as zero.  An
+        EXTERNAL further down is entered in `_extern_names' now, so a
+        variable AT it is aliased to it (see :meth:`_emit_at_decl`).
+        """
+        found = self._module_declaration(name)
+        if found is None:
+            return None
+        sym, item, names = found
+        attrs = decl_attrs(item)
+        if attrs.is_external and sym.asm_name not in self._compile_publics:
+            self._extern_names.add(sym.asm_name)
+        if attrs.at_location is None or sym.based_on:
+            return sym, None
+        if name in self._resolving_at:
+            raise CodeGenError(f"AT(.{name}): the AT addresses name each other in a circle")
+        self._resolving_at.add(name)
+        try:
+            root, offset = self._at_address(attrs.at_location)
+        finally:
+            self._resolving_at.discard(name)
+        # A factored AT places each name after the last (6.2.8).
+        size = self._element_width(sym) * max(sym.dimension or 1, 1)
+        return sym, (root, offset + names.index(name) * size)
 
     @staticmethod
     def _element_width(sym: Symbol) -> int:
@@ -3072,40 +3088,58 @@ class CodeGenerator:
         return 1 if sym.data_type == DataType.BYTE else 2
 
     def _at_designator(self, expr) -> tuple[Symbol | None, str, int, int]:
+        """Resolve a constant `.designator' in an AT to (base symbol, name,
+        offset, elem) (:meth:`_designator`).
+
+        A variable declared further down is found from its declaration, and
+        if it is itself AT, it is where it is, not its name (see
+        :meth:`_declared_later`).  Raises CodeGenError for anything that is
+        not a constant address.
+        """
+        return self._designator(expr, self._at_root, "AT(...)")
+
+    def _at_root(self, expr) -> tuple[Symbol | None, str, int, int]:
+        """The name a location in an AT starts from, as :meth:`_designator`
+        takes it."""
+        name = ident_text(expr.name)
+        if self._builtin_name(expr) == "MEMORY":
+            self._use_end_symbol()
+            return None, "__END__", 0, 1
+        base_sym = self._lookup_scoped(name)
+        if base_sym is None:
+            later = self._declared_later(name)
+            if later is None:
+                raise CodeGenError(f"AT(.{name}): {name} is not declared")
+            base_sym, at = later
+            if at is not None:
+                # Itself AT, further down: where it is, not its name.
+                root, offset = at
+                return base_sym, root or "", offset, self._element_width(base_sym)
+        if base_sym.based_on or base_sym.stack_offset is not None:
+            raise CodeGenError(
+                f"AT(.{name}): {name} has no fixed address "
+                f"({'BASED' if base_sym.based_on else 'a REENTRANT local'})")
+        asm = base_sym.asm_name or self._mangle_name(name)
+        return base_sym, asm, 0, self._element_width(base_sym)
+
+    def _designator(self, expr, root, where: str) -> tuple[Symbol | None, str, int, int]:
         """Resolve a constant `.designator' to (base symbol, name, offset, elem).
 
         Handles NAME, NAME(const), STRUCT.MEMBER and any chain of those, which
         is what DRI's sources put in an AT clause: UTIL6/PIP.PLM declares
         ``DESTR ADDRESS AT(.DEST.FCB(33))`` and UTIL5/PRLCM.PLM
         ``code$size ADDRESS AT (.buffer(0).sector(1))``.  ``elem`` is the width
-        of one element of whatever a further subscript would index.
-
-        Raises CodeGenError for anything that is not a constant address.
+        of one element of whatever a further subscript would index: a
+        subscript steps by an element of the array, a structure's whole
+        size for an array of structures.  ``root`` resolves the name the
+        designator starts from (:meth:`_at_root`, :meth:`_list_root`);
+        ``where`` begins a message.
         """
         expr = unwrap_paren(expr)
         if isinstance(expr, P.Identifier):
-            name = ident_text(expr.name)
-            if self._builtin_name(expr) == "MEMORY":
-                self._use_end_symbol()
-                return None, "__END__", 0, 1
-            base_sym = self._lookup_scoped(name)
-            if base_sym is None:
-                later = self._declared_later(name)
-                if later is None:
-                    raise CodeGenError(f"AT(.{name}): {name} is not declared")
-                base_sym, at = later
-                if at is not None:
-                    # Itself AT, further down: where it is, not its name.
-                    root, offset = at
-                    return base_sym, root or "", offset, self._element_width(base_sym)
-            if base_sym.based_on or base_sym.stack_offset is not None:
-                raise CodeGenError(
-                    f"AT(.{name}): {name} has no fixed address "
-                    f"({'BASED' if base_sym.based_on else 'a REENTRANT local'})")
-            asm = base_sym.asm_name or self._mangle_name(name)
-            return base_sym, asm, 0, self._element_width(base_sym)
+            return root(expr)
         if isinstance(expr, P.MemberAccess):
-            base_sym, asm, off, _ = self._at_designator(expr.base)
+            base_sym, asm, off, _ = self._designator(expr.base, root, where)
             member = ident_text(expr.member)
             m_off = 0
             for m in (base_sym.struct_members if base_sym else None) or []:
@@ -3113,16 +3147,16 @@ class CodeGenerator:
                 if m.name == member:
                     return base_sym, asm, off + m_off, width
                 m_off += width * (m.dimension or 1)
-            raise CodeGenError(f"AT(...): no member {member} in the structure")
+            raise CodeGenError(f"{where}: {expr_text(expr)}: no member {member} in the structure")
         if isinstance(expr, P.Call):
             args = list(expr.args or [])
             index = self._try_eval_const(args[0]) if len(args) == 1 else None
             if index is None:
-                raise CodeGenError("AT(...): a subscript in an AT address must be a constant")
-            base_sym, asm, off, elem = self._at_designator(expr.callee)
+                raise CodeGenError(f"{where}: {expr_text(expr)}: the subscript of a location "
+                                   "here is a constant")
+            base_sym, asm, off, elem = self._designator(expr.callee, root, where)
             return base_sym, asm, off + index * elem, elem
-        raise CodeGenError(
-            f"AT(...): cannot take the location of a {type(expr).__name__}")
+        raise CodeGenError(f"{where}: {expr_text(expr)} is not a location")
 
     def _at_address(self, expr) -> tuple[str | None, int]:
         """An AT address as (symbol, offset), or (None, address) for a number.
@@ -3269,34 +3303,56 @@ class CodeGenerator:
                 self._emit_data_values([val.inner], dtype, target)
             else:
                 raise CodeGenError(
-                    f"Unsupported value in DATA/INITIAL: {type(val).__name__}")
+                    f"{expr_text(val)}: a DATA or INITIAL value is a restricted expression, "
+                    "of constants and locations only")
 
     def _location_operand(self, operand) -> str:
         """Assembly operand for the target of a `.' address-of in DATA/INITIAL.
 
         ``.name`` is the symbol; ``.name(n)`` is the n-th element of it, which
         DRI's sources use to point into an array - MP/M II's UTIL7/DM.PLM
-        initialises a structure with ``.buff(0)`` and ``.fcb(0)``.  The offset
-        is in elements, so it is scaled by the element width.
+        initialises a structure with ``.buff(0)`` and ``.fcb(0)``; ``.s.m``
+        and ``.s.m(n)`` are a member, ``.sa(n).m`` a member of an element of
+        an array of structures, as in an AT (:meth:`_designator`).  The
+        offset is in elements, and an element of an ADDRESS array is two
+        bytes, of an array of structures the structure's size: `.arr(2)' of
+        an ADDRESS array was ARR+2, and `.sa(2)' took each structure for a
+        word.  A member was not taken at all.
         """
-        if isinstance(operand, P.ParenExpr):
-            return self._location_operand(operand.inner)
-        if isinstance(operand, P.Identifier):
-            return self._data_expr_to_string(operand)
-        if isinstance(operand, P.Call):
-            base = self._data_expr_to_string(operand.callee)
-            args = list(operand.args or [])
-            if len(args) != 1 or not isinstance(args[0], P.NumberLiteral):
-                raise CodeGenError(
-                    f"Unsupported subscript in DATA location expression: {operand}")
-            index = number_value(args[0])
-            width = 1
-            if isinstance(operand.callee, P.Identifier):
-                sym = self._lookup_scoped(ident_text(operand.callee.name))
-                if sym is not None and sym.data_type != DataType.BYTE:
-                    width = 2
-            return self._sym_offset(base, index * width)
-        raise CodeGenError(f"Unsupported operand in DATA location expression: {operand}")
+        _, asm, offset, _ = self._designator(operand, self._list_root, "DATA(...)")
+        return self._sym_offset(asm, offset) if offset else asm
+
+    def _list_root(self, expr) -> tuple[Symbol | None, str, int, int]:
+        """The name a location in a DATA or INITIAL list starts from, as
+        :meth:`_designator` takes it.
+
+        It is resolved against the module's declarations, not against what
+        code generation has laid out so far: the module's own DATA is laid
+        out before its other variables, and an INITIAL list may name a
+        variable declared further down, so a variable not yet in the symbol
+        table was taken for a byte, and `.arr(2)' of an ADDRESS array was
+        ARR+2 - and a name the program declares that is also a built-in's,
+        MEMORY or SIZE, for the built-in: `declare memory (4) byte; declare
+        w address data (.memory)' was the end of the program, and `.size(2)'
+        of `size (3) byte' SIZE+4.  MEMORY is the linker's end of the
+        program only where the program does not declare it (Intel's PL/M-80
+        V3.1 takes `.memory' there, as in an AT).
+        """
+        label = getattr(expr, "uplm80_asm", None)
+        if label is not None:
+            return None, label, 0, 1       # a label: `@proc$label' in a procedure
+        name = ident_text(expr.name)
+        if name in self.literal_macros:
+            return None, self.literal_macros[name], 0, 1
+        sym = self._lookup_scoped(name)
+        if sym is None or sym.kind == SymbolKind.BUILTIN or sym is self._predeclared.get(sym.name):
+            found = self._module_declaration(name)
+            sym = found[0] if found is not None else None
+        if sym is None and name.upper() == "MEMORY":
+            self._use_end_symbol()
+            return None, "__END__", 0, 1
+        asm = sym.asm_name if sym is not None and sym.asm_name else self._mangle_name(name)
+        return sym, asm, 0, self._element_width(sym) if sym is not None else 1
 
     def _lookup_scoped(self, name: str):
         """Look a name up in the enclosing procedure scopes, then at module level."""
@@ -3308,61 +3364,39 @@ class CodeGenerator:
                     return sym
         return self.symbols.lookup(name)
 
+    _DATA_OPERATORS = {
+        BinaryOpKind.ADD: '+',
+        BinaryOpKind.SUB: '-',
+        BinaryOpKind.MUL: '*',
+        BinaryOpKind.DIV: '/',
+        BinaryOpKind.MOD: ' MOD ',
+        BinaryOpKind.AND: ' AND ',
+        BinaryOpKind.OR: ' OR ',
+        BinaryOpKind.XOR: ' XOR ',
+    }
+
     def _data_expr_to_string(self, expr) -> str:
         """Convert a typed DATA expression to an assembly operand string."""
         if isinstance(expr, P.NumberLiteral):
             return self._format_number(number_value(expr))
-        elif isinstance(expr, P.Identifier):
-            name = ident_text(expr.name)
-            if self._builtin_name(expr) == "MEMORY":
-                # `.memory' in a DATA or INITIAL list, which Intel's PL/M-80
-                # V3.1 takes, as it does in an AT: the linker's end of the
-                # program, as in an expression (_gen_location).  It was
-                # `dw MEMORY', which um80 did not know.
-                self._use_end_symbol()
-                return "__END__"
-            label = getattr(expr, "uplm80_asm", None)
-            if label is not None:
-                return label        # a label: `@proc$label' in a procedure
-            if name in self.literal_macros:
-                return self.literal_macros[name]
-            sym = None
-            if self.current_proc:
-                parts = self.current_proc.split('$')
-                for i in range(len(parts), 0, -1):
-                    scoped_name = '$'.join(parts[:i]) + '$' + name
-                    sym = self.symbols.lookup(scoped_name)
-                    if sym:
-                        break
-            if sym is None:
-                sym = self.symbols.lookup(name)
-            return sym.asm_name if sym and sym.asm_name else self._mangle_name(name)
-        elif isinstance(expr, P.LocationOf):
+        if isinstance(expr, P.Identifier):
+            return self._list_root(expr)[1]
+        if isinstance(expr, P.LocationOf):
             return self._location_operand(expr.operand)
-        elif isinstance(expr, P.Call):
+        if isinstance(expr, P.Call):
             return self._location_operand(expr)
-        elif isinstance(expr, P.ParenExpr):
+        if isinstance(expr, P.ParenExpr):
             return self._data_expr_to_string(expr.inner)
-        elif isinstance(expr, P.BinaryOp):
+        if isinstance(expr, P.BinaryOp):
             left = self._data_expr_to_string(expr.left)
             right = self._data_expr_to_string(expr.right)
-            op_map = {
-                BinaryOpKind.ADD: '+',
-                BinaryOpKind.SUB: '-',
-                BinaryOpKind.MUL: '*',
-                BinaryOpKind.DIV: '/',
-                BinaryOpKind.MOD: ' MOD ',
-                BinaryOpKind.AND: ' AND ',
-                BinaryOpKind.OR: ' OR ',
-                BinaryOpKind.XOR: ' XOR ',
-            }
-            op = op_map.get(binop_kind(expr))
+            op = self._DATA_OPERATORS.get(binop_kind(expr))
             if op is None:
-                raise CodeGenError(
-                    f"Unsupported operator in DATA expression: {binop_kind(expr).name}")
+                raise CodeGenError(f"{expr_text(expr)}: a DATA or INITIAL value adds and "
+                                   "subtracts constants and locations only")
             return f"({left}{op}{right})"
-        else:
-            raise CodeGenError(f"Unsupported expression in DATA: {type(expr)}")
+        raise CodeGenError(f"{expr_text(expr)}: a DATA or INITIAL value is a restricted "
+                           "expression, of constants and locations only")
 
     def _data_element_count(self, values, dtype: DataType) -> int:
         """How many elements a DATA/INITIAL list supplies.
@@ -3412,7 +3446,7 @@ class CodeGenerator:
             else:
                 value = self._try_eval_const(v)
                 if value is None:
-                    raise CodeGenError(f"`.(...)' holds constants, not {type(v).__name__}")
+                    raise CodeGenError(f"{expr_text(v)}: a constant list holds constants only")
                 operand = self._format_number(value & 0xFF)
             self._pending_constants.append(AsmLine(opcode="db", operands=operand))
         return label
@@ -8404,7 +8438,7 @@ class CodeGenerator:
                     # out, and the next constant took its place.
                     value = self._try_eval_const(v)
                     if value is None:
-                        raise CodeGenError(f"`.(...)' holds constants, not {type(v).__name__}")
+                        raise CodeGenError(f"{expr_text(v)}: a constant list holds constants only")
                     operand = self._format_number(value & 0xFF)
                 self.const_segment.append(AsmLine(opcode="db", operands=operand))
             self._emit("ld", f"hl,{label}")
