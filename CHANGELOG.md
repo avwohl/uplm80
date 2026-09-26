@@ -241,10 +241,14 @@ And this V3.1 compiles to other code (0.4.2 the same):
 
 ### Verified
 
-On 56fad40, with upeepz80 0.2.7 and um80 0.3.52.
+On 56fad40, with upeepz80 0.2.7 and um80 0.3.52; the suite, pylint,
+`run_tests.sh`, the three fuzzers, the oracle's corpus and the release
+check's campaign again on 5408683, whose `uplm80/` and `scripts/` are
+56fad40's.
 
-- The suite: 1458 tests pass.  Without Intel's binaries the oracle's 58
-  tests that need them skip, and its 8 others pass.  pylint rates the
+- The suite: 1462 tests pass.  Without Intel's binaries the oracle's 60
+  tests that need them skip, as does `tests/test_divmod_dri.py`'s check of
+  `PLM80.LIB`'s divide, and the oracle's 9 others pass.  pylint rates the
   package 9.75, with no message 0.4.2 did not have.
 - `tests/run_tests.sh`: all 22 programs pass.
 - `scripts/difftest.py`, `scripts/abifuzz.py` and `scripts/namestest.py`,
@@ -260,6 +264,13 @@ On 56fad40, with upeepz80 0.2.7 and um80 0.3.52.
   adds in 16 bits, 01D8H for b = 0ECH, where the embedded assignment is a
   BYTE (4.6.3) and the sum 00D8H.  The first run had a third, seed 50094,
   a product with 0 divided by 0, which `zero-dividend` now leaves out.
+- The release check's `scripts/intel_oracle.py --random 600` (seeds
+  80001-80600), leaving out the same: 599 programs print what V3.1's build
+  prints.  Seed 80353 is another V3.1 bug (README, Known differences):
+  `w2, w3 = (eb := w2)` of ADDRESS w2 and w3 and a BYTE eb, where V3.1
+  takes w2's value, 0FFFEH, for an address, stores 0FFF5H at 0FFF5H and
+  in w3, and leaves w2 unstored, where the manual makes each target
+  0FFFEH (4.6.3).
 - `scripts/intel_oracle.py --corpus --normalize`: of the 67 programs of
   `tests/` and `sample_code/`, 38 print what V3.1's build prints, V3.1
   rejects 28, and `tests/test_move_builtin.plm` differs where V3.1's MOVE
