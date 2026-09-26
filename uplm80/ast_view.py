@@ -614,6 +614,13 @@ def make_identifier(name: str, pos=None) -> P.Identifier:
     return P.Identifier(name=tok, pos=pos)
 
 
+# The name the optimizer calls the built-in DOUBLE by, where it widens a
+# value to ADDRESS or writes an ADDRESS constant below 256 (plm_types): no
+# PL/M-80 identifier has a `?', so no declaration of the program's can hide
+# it, as one of DOUBLE hides the built-in (9.2).
+DOUBLE_MARK = "??DOUBLE"
+
+
 # Reverse of _BINOP_TOKEN_TO_KIND: BinaryOpKind -> TokenKind. Used to
 # synthesise a fresh operator token when the optimizer builds a new
 # BinaryOp node (constant fold, algebraic rewrite, etc.). The synthetic

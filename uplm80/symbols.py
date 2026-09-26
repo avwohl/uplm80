@@ -7,6 +7,7 @@ Tracks variables, procedures, labels, and their attributes across scopes.
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from .ast_nodes import DataType, StructMember
+from .ast_view import DOUBLE_MARK
 
 
 class SymbolKind(Enum):
@@ -144,6 +145,9 @@ class SymbolTable:
                     params=params,
                 )
             )
+        # The optimizer's DOUBLE (ast_view.DOUBLE_MARK) is the built-in,
+        # whatever the program declares.
+        self._double = self.global_scope.symbols["DOUBLE"]
 
         # Built-in variables
         # MEMORY array - maps to all of memory
@@ -189,6 +193,8 @@ class SymbolTable:
 
     def lookup(self, name: str) -> Symbol | None:
         """Look up a symbol by name."""
+        if name == DOUBLE_MARK:
+            return self._double
         return self.current_scope.lookup(name)
 
     def lookup_local(self, name: str) -> Symbol | None:

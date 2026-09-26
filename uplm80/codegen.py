@@ -47,6 +47,7 @@ from .ast_view import (
     string_bytes,
     unwrap_paren,
     DataType as ViewDataType,
+    DOUBLE_MARK,
     BinaryOpKind,
     UnaryOpKind,
 )
@@ -62,7 +63,6 @@ from .plm_types import (
     PATTERN_TYPED_BUILTINS,
     eval_typed,
     is_derived,
-    is_double_call,
     typed_const,
 )
 
@@ -821,9 +821,8 @@ class CodeGenerator:
                     pass
         elif isinstance(expr, P.Call) and len(expr.args) == 1:
             # LENGTH / LAST of an array is a BYTE constant when it fits.
-            callee = unwrap_paren(expr.callee)
-            if isinstance(callee, P.Identifier):
-                name = ident_text(callee.name).upper()
+            name = self._builtin_name(expr.callee)
+            if name is not None:
                 if name in ('LENGTH', 'LAST'):
                     extent = self._array_extent(expr.args[0])
                     if extent is not None:
@@ -854,9 +853,11 @@ class CodeGenerator:
                     return self._parse_plm_number(self.literal_macros[name])
                 except ValueError:
                     pass
-        elif is_double_call(expr):
+        elif (isinstance(expr, P.Call) and len(expr.args) == 1
+              and self._builtin_name(expr.callee) == "DOUBLE"):
             # DOUBLE(n) is how the optimizer writes an ADDRESS constant
-            # below 256; its value is n.
+            # below 256; its value is n.  A DOUBLE the program declares
+            # is a procedure like any other.
             return self._try_eval_const(expr.args[0])
         elif isinstance(expr, P.UnaryOp):
             kind = unop_kind(expr)
@@ -976,9 +977,9 @@ class CodeGenerator:
             return None
         # Two constants make a constant, which the optimizer folds; the
         # check is about a BYTE the program computes.
-        if eval_typed(byte_side, self._literal_macro_value) is not None:
+        if eval_typed(byte_side, self._literal_macro_value, self._is_builtin) is not None:
             return None
-        typed = eval_typed(const_side, self._literal_macro_value)
+        typed = eval_typed(const_side, self._literal_macro_value, self._is_builtin)
         if typed is None:
             return None
         value, _, derived = typed
@@ -1328,7 +1329,7 @@ class CodeGenerator:
             if isinstance(e, P.UnaryOp):
                 return walk(e.operand)
             if isinstance(e, P.Call) and isinstance(e.callee, P.Identifier):
-                n = ident_text(e.callee.name).upper()
+                n = self._builtin_name(e.callee)
                 if n in ("LAST", "LENGTH", "SIZE"):
                     return True
                 if n in ("LOW", "HIGH", "DOUBLE", "SHL", "SHR", "ROL", "ROR"):
@@ -2930,7 +2931,7 @@ class CodeGenerator:
         expr = unwrap_paren(expr)
         if isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
-            if name.upper() == "MEMORY":
+            if self._builtin_name(expr) == "MEMORY":
                 self._use_end_symbol()
                 return None, "__END__", 0, 1
             base_sym = self._lookup_scoped(name)
@@ -5319,7 +5320,7 @@ class CodeGenerator:
         """``expr`` as a constant, typed the way PL/M-80 types it (so `-1'
         is 0FFH), or None. LENGTH, LAST and SIZE of a declared variable are
         constants too: `DO i = 0 TO LAST(a)' has a limit known here."""
-        typed = eval_typed(expr, self._literal_macro_value)
+        typed = eval_typed(expr, self._literal_macro_value, self._is_builtin)
         if typed is not None:
             return typed[0]
         e = unwrap_paren(expr)
@@ -5355,7 +5356,7 @@ class CodeGenerator:
             self._load_based_ptr(sym)
             return "(hl)"
         name = ident_text(var.name)
-        if name in self.literal_macros or name.upper() == "STACKPTR":
+        if name in self.literal_macros or self._builtin_name(var) == "STACKPTR":
             return None
         self._emit("ld", f"hl,{sym.asm_name if sym.asm_name else self._mangle_name(name)}")
         return "(hl)"
@@ -5512,10 +5513,9 @@ class CodeGenerator:
                 _, member_type = self._get_member_info(callee)
                 return member_type
             if isinstance(callee, P.Identifier):
-                name = ident_text(callee.name).upper()
+                name = self._builtin_name(callee)
                 # Built-ins first, as _gen_call_expr dispatches them.
-                builtin_type = (None if self._declared(ident_text(callee.name))
-                                else self._builtin_type(name, expr))
+                builtin_type = None if name is None else self._builtin_type(name, expr)
                 if builtin_type is not None:
                     return builtin_type
                 sym = self._lookup_symbol(ident_text(callee.name))
@@ -5611,7 +5611,7 @@ class CodeGenerator:
             self._emit("ld", f"de,{self._format_number(number_value(expr))}")
         elif isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
-            if name.upper() == "MEMORY":
+            if self._builtin_name(expr) == "MEMORY":
                 self.needs_end_symbol = True
                 self._emit("ld", "de,__END__")
                 return
@@ -5640,7 +5640,7 @@ class CodeGenerator:
             inner = unwrap_paren(expr.operand)
             if isinstance(inner, P.Identifier):
                 name = ident_text(inner.name)
-                if name.upper() == "MEMORY":
+                if self._builtin_name(inner) == "MEMORY":
                     self.needs_end_symbol = True
                     self._emit("ld", "de,__END__")
                     return
@@ -5997,16 +5997,16 @@ class CodeGenerator:
             # reading the Z flag in its place made every number print with
             # leading zeros - `(00001 file, 00001-1k blocks)'.
             #
-            # STACKPTR is deliberately not in this list.  A program assigns to
-            # it to SET the stack pointer - UTIL3/LOAD.PLM has `STACKPTR = SP'
-            # - which registers a variable of that name as a side effect, so
-            # shadowing on it would break every later read.
+            # STACKPTR is a built-in variable, in the symbol table from the
+            # start (a program assigns to it to SET the stack pointer -
+            # UTIL3/LOAD.PLM has `STACKPTR = SP'), so it is hidden only by a
+            # declaration of the program's own (_declared).
             _shadow_sym = self._lookup_symbol(name)
             shadowed = (_shadow_sym is not None
                         and _shadow_sym.kind != SymbolKind.BUILTIN)
 
             # Handle built-in STACKPTR variable
-            if upper_name == "STACKPTR":
+            if upper_name == "STACKPTR" and not self._declared(name):
                 # Read stack pointer into HL
                 self._emit("ld", "hl,0")
                 self._emit("add", "hl,sp")  # HL = HL + SP = SP
@@ -6184,7 +6184,7 @@ class CodeGenerator:
         if isinstance(expr, P.Identifier):
             name = ident_text(expr.name)
 
-            if name == "STACKPTR":
+            if name == "STACKPTR" and not self._declared(name):
                 self._emit("ld", "sp,hl")
                 return
 
@@ -6289,7 +6289,7 @@ class CodeGenerator:
         elif isinstance(expr, P.Call):
             callee = unwrap_paren(expr.callee)
             # Special built-in assignment targets: OUTPUT(port) = value
-            if isinstance(callee, P.Identifier) and ident_text(callee.name).upper() == "OUTPUT":
+            if self._builtin_name(callee) == "OUTPUT":
                 port_arg = expr.args[0]
                 port_num = self._try_eval_const(port_arg)
                 if port_num is not None:
@@ -6310,16 +6310,12 @@ class CodeGenerator:
                 return
 
             # Special built-in: MEMORY(addr) = value
-            if (
-                isinstance(callee, P.Identifier)
-                and ident_text(callee.name).upper() == "MEMORY"
-                and len(expr.args) == 1
-            ):
+            if self._builtin_name(callee) == "MEMORY" and len(expr.args) == 1:
                 self.needs_end_symbol = True
                 addr_arg = expr.args[0]
                 # The subscript is an expression like any other: `MEMORY(-1)'
                 # is MEMORY(0FFH), -1 being a BYTE (4.2.2).
-                typed = eval_typed(addr_arg, self._literal_macro_value)
+                typed = eval_typed(addr_arg, self._literal_macro_value, self._is_builtin)
                 addr_val = None if typed is None else typed[0]
                 if addr_val is not None:
                     if val_type != DataType.BYTE:
@@ -6487,10 +6483,7 @@ class CodeGenerator:
         expr = unwrap_paren(expr)
         if not isinstance(expr, P.Call):
             return None
-        callee = unwrap_paren(expr.callee)
-        if not isinstance(callee, P.Identifier):
-            return None
-        if ident_text(callee.name).upper() != 'SHL':
+        if self._builtin_name(expr.callee) != 'SHL':
             return None
         if len(expr.args) != 2:
             return None
@@ -6502,10 +6495,7 @@ class CodeGenerator:
         double_expr = unwrap_paren(expr.args[0])
         if not isinstance(double_expr, P.Call):
             return None
-        d_callee = unwrap_paren(double_expr.callee)
-        if not isinstance(d_callee, P.Identifier):
-            return None
-        if ident_text(d_callee.name).upper() != 'DOUBLE':
+        if self._builtin_name(double_expr.callee) != 'DOUBLE':
             return None
         if len(double_expr.args) != 1:
             return None
@@ -7137,12 +7127,10 @@ class CodeGenerator:
         from ``x`` itself.
         """
         expr = unwrap_paren(expr)
-        if isinstance(expr, P.Call) and len(expr.args) == 1:
-            callee = unwrap_paren(expr.callee)
-            if (isinstance(callee, P.Identifier)
-                    and ident_text(callee.name).upper() == 'DOUBLE'
-                    and self._get_expr_type(expr.args[0]) == DataType.BYTE):
-                return expr.args[0]
+        if (isinstance(expr, P.Call) and len(expr.args) == 1
+                and self._builtin_name(expr.callee) == 'DOUBLE'
+                and self._get_expr_type(expr.args[0]) == DataType.BYTE):
+            return expr.args[0]
         return None
 
     def _low_byte_form(self, expr):
@@ -7194,7 +7182,8 @@ class CodeGenerator:
         the operation is 16-bit anyway.
 
         The optimizer writes an ADDRESS constant below 256 as ``DOUBLE(n)``
-        so that it widens what it meets. Against an ADDRESS, or in a
+        (its own DOUBLE, ast_view.DOUBLE_MARK) so that it widens what it
+        meets, and a program may write one so too. Against an ADDRESS, or in a
         product, quotient or remainder, the operation is 16-bit either way,
         and the plain literal is what the short forms (`inc hl', `ld de,n')
         look for.
@@ -7206,9 +7195,12 @@ class CodeGenerator:
         always_wide = op in (BinaryOpKind.MUL, BinaryOpKind.DIV, BinaryOpKind.MOD)
 
         def strip(x, other):
-            if (is_double_call(x) and typed_const(x) is not None
+            u = unwrap_paren(x)
+            if (isinstance(u, P.Call) and len(u.args) == 1
+                    and self._builtin_name(u.callee) == "DOUBLE"
+                    and typed_const(u.args[0]) is not None
                     and (always_wide or self._get_expr_type(other) == DataType.ADDRESS)):
-                return unwrap_paren(unwrap_paren(x).args[0])
+                return unwrap_paren(u.args[0])
             return x
 
         left = strip(e.left, e.right)
@@ -7537,7 +7529,8 @@ class CodeGenerator:
         # Handle built-in functions
         if isinstance(callee, P.Identifier):
             name = ident_text(callee.name)
-            result = None if self._declared(name) else self._gen_builtin(name, args)
+            builtin = self._builtin_name(callee)
+            result = None if builtin is None else self._gen_builtin(builtin, args)
             if result is not None:
                 return result
 
@@ -7613,6 +7606,29 @@ class CodeGenerator:
         sym = self._lookup_symbol(name)
         return (sym is not None and sym.kind != SymbolKind.BUILTIN
                 and sym is not self._predeclared.get(sym.name))
+
+    def _is_builtin(self, name: str) -> bool:
+        """Whether ``name`` here would be a built-in, if one is so called:
+        the program does not declare it (plm_types.eval_typed)."""
+        return name == DOUBLE_MARK or not self._declared(name)
+
+    def _builtin_name(self, node) -> str | None:
+        """The built-in the name ``node`` means here, upper case, or None.
+
+        None for anything but an identifier, and for a name the program
+        declares, which hides the built-in (9.2): a procedure of its own
+        called DOUBLE, an array called OUTPUT.  The optimizer's own DOUBLE
+        (ast_view.DOUBLE_MARK) is DOUBLE, whatever the program declares.
+        Any other name comes back upper case, for the caller to compare
+        with the built-in it is looking for.
+        """
+        node = unwrap_paren(node)
+        if not isinstance(node, P.Identifier):
+            return None
+        name = ident_text(node.name)
+        if name == DOUBLE_MARK:
+            return "DOUBLE"
+        return None if self._declared(name) else name.upper()
 
     def _gen_builtin(self, name: str, args) -> DataType | None:
         """Generate code for built-in function. Returns type if handled, None otherwise.
@@ -8125,7 +8141,7 @@ class CodeGenerator:
         if isinstance(operand, P.Identifier):
             name = ident_text(operand.name)
 
-            if name.upper() == "MEMORY":
+            if self._builtin_name(operand) == "MEMORY":
                 self.needs_end_symbol = True
                 self._emit("ld", "hl,__END__")
                 return DataType.ADDRESS

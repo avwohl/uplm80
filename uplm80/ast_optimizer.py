@@ -33,6 +33,7 @@ from enum import Enum
 from . import _plm_parser as P
 from .runtime import plm_div, plm_mod
 from .ast_view import (
+    DOUBLE_MARK,
     BinaryOpKind,
     UnaryOpKind,
     binop_kind,
@@ -75,6 +76,7 @@ from .plm_types import (
     make_typed_const,
     typed_const,
     untyped_root,
+    widen,
 )
 
 
@@ -82,7 +84,7 @@ from .plm_types import (
 # loop-invariant when all their arguments are.
 _PURE_BUILTINS = {
     "LOW", "HIGH", "DOUBLE", "SHL", "SHR", "ROL", "ROR",
-    "LENGTH", "LAST", "SIZE",
+    "LENGTH", "LAST", "SIZE", DOUBLE_MARK,
 }
 
 # Built-ins that DO something: reading a port, writing one, moving memory,
@@ -276,6 +278,10 @@ def _expr_key(expr) -> str | None:
             if name in _PURE_BUILTINS:
                 arg_keys = [_expr_key(a) for a in e.args]
                 if all(k is not None for k in arg_keys):
+                    if name == DOUBLE_MARK:
+                        # Apart from a DOUBLE the program may declare, and
+                        # sorted as the built-in's (_normalize_commutative).
+                        return f"CALL:DOUBLE:{':'.join(arg_keys)}~"
                     return f"CALL:{name}:{':'.join(arg_keys)}"
         return None
     if isinstance(e, P.CallNoArgs):
@@ -557,7 +563,7 @@ class ASTOptimizer:
             name = raw.upper()
             if name in BYTE_BUILTINS:
                 return BYTE
-            if name in ("DOUBLE", "SIZE", "STACKPTR", "TIME", "SHL", "SHR"):
+            if name in ("DOUBLE", "SIZE", "STACKPTR", "TIME", "SHL", "SHR", DOUBLE_MARK):
                 return ADDRESS
             if name in PATTERN_TYPED_BUILTINS and isinstance(e, P.Call) and e.args:
                 return self._type_of(e.args[0])
@@ -603,14 +609,16 @@ class ASTOptimizer:
         PL/M-80 has no BYTE divide: DRI's compiler zero-extends BYTE operands
         and calls its one 16-bit routine, so a quotient or remainder is an
         ADDRESS and the arithmetic around it is 16-bit. A rewrite of one must
-        not narrow it. DOUBLE of an ADDRESS generates no code.
+        not narrow it. DOUBLE of an ADDRESS generates no code. The DOUBLE
+        is the optimizer's own, which a DOUBLE the program declares does
+        not hide (plm_types.widen).
         """
         if self._type_of(expr) is ADDRESS:
             return expr
         tc = typed_const(expr)
         if tc is not None:
             return make_typed_const(tc[0], ADDRESS, pos, derived=is_derived(expr))
-        return P.Call(callee=make_identifier("DOUBLE", pos=pos), args=[expr], pos=pos)
+        return widen(expr, pos)
 
     def _optimize_value(self, expr, keep_type: bool = False):
         """Optimize an expression a statement evaluates for its value.
@@ -1531,7 +1539,7 @@ class ASTOptimizer:
                 # a PLUS in the procedure keeps from being folded. Its value
                 # is the relation's operand (the flags of computing it are
                 # dead after the compare), so it goes over as that value.
-                typed = eval_typed(left)
+                typed = eval_typed(left, builtin=self._is_builtin)
                 if typed is not None:
                     left = make_typed_const(typed[0], typed[1], getattr(left, "pos", None),
                                             derived=typed[2])
@@ -2398,7 +2406,10 @@ class ASTOptimizer:
                 if self._type_of(left) is ADDRESS and self._is_side_effect_free(left):
                     return make_binary(BinaryOpKind.ADD, left, deepcopy(left), pos=pos)
                 return None
-            # x * 2^n -> SHL(x, n), which is an ADDRESS (see plm_types).
+            # x * 2^n -> SHL(x, n), which is an ADDRESS (see plm_types);
+            # not where the program declares a SHL of its own.
+            if not self._is_builtin("SHL"):
+                return None
             return P.Call(
                 callee=make_identifier("SHL", pos=pos),
                 args=[left, make_number_literal(shift, pos=pos)],
@@ -2410,6 +2421,8 @@ class ASTOptimizer:
         if kind == BinaryOpKind.DIV:
             if shift == 0:
                 return self._as_address(left, pos)
+            if not self._is_builtin("SHR"):
+                return None
             return self._as_address(P.Call(
                 callee=make_identifier("SHR", pos=pos),
                 args=[left, make_number_literal(shift, pos=pos)],
@@ -2623,7 +2636,7 @@ class ASTOptimizer:
         if not all(_is_number(a) for a in args):
             return None
         values = [_num_value(a) for a in args]
-        name = name.upper()
+        name = "DOUBLE" if name == DOUBLE_MARK else name.upper()
         if len(values) == 1:
             v = values[0]
             result = {"LOW": v & 0xFF, "HIGH": (v >> 8) & 0xFF, "DOUBLE": v & 0xFFFF}.get(name)

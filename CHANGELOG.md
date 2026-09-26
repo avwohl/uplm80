@@ -30,6 +30,25 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **A procedure or a variable named like a built-in is the program's,** as
+  a declaration hides the built-in of its name (9.2), and as Intel's
+  PL/M-80 V3.1 compiles it. The optimizer wrote an ADDRESS constant below
+  256, and a value it widened to ADDRESS, as a call of DOUBLE, and every
+  call of DOUBLE of a constant was taken for one: with a procedure DOUBLE
+  of the program's, `double(30h)` was 30H at `-O1` and up however the
+  procedure was written (Known issues, 0.3.7). The optimizer's DOUBLE is
+  now called by a name no program can declare, `??DOUBLE`. And wherever
+  the optimizer or code generation knew a built-in by its name alone, it
+  now also checks that the program does not declare the name there. These
+  were wrong too (0.3.6 the same): a DOUBLE or LOW of the program's in a
+  condition or in a DO's bound was folded as the built-in, at every level;
+  `w * 8` and `w / 2` became calls of the program's SHL and SHR at `-O2`
+  and `-O3`; an array OUTPUT or MEMORY was stored to as the port, or as
+  memory past the end of the program, and `.memory` of one was the end of
+  the program, and a variable STACKPTR was SP, at every level. A program
+  that declares no built-in's name compiles to the code 0.4.0 compiles it
+  to: the 87 MP/M II and 80un compiles, and 300 random programs and the
+  test programs, at `-O0` to `-O3`.
 - **A LITERALLY's name declared again in an inner block** is PL/M-80's
   rule, not a defect (Known issues, 0.3.7): a LITERALLY's text is
   "substituted for each occurrence of the identifier in subsequent text"
@@ -1268,8 +1287,6 @@ Each fix has a regression test that fails without it.
   possibly another procedure's) only where that variable is static. In
   `??AUTO` it reaches another frame, or nothing (0.3.6 the same). Keeping all
   of that in DRI's order would make every local static.
-- **A procedure named DOUBLE** is taken for the built-in where code generation
-  folds constants: `double(30h)` is 30H however the procedure is written.
 - **`STACKPTR` read inside an expression can see a temporary the compiler
   pushed.** Where an operand evaluated before it is kept on the stack,
   STACKPTR reads 2 less than it does at the start of the statement. After

@@ -29,8 +29,13 @@ for it rely on that -- 80un builds words with `lo + shl(b, 8)'. SHL and SHR
 are ADDRESS here, consistently in the folder and the code generator.
 
 A folded ADDRESS constant below 256 cannot be written as a plain numeric
-literal, which would be a BYTE; it is written ``DOUBLE(n)``, which every
-consumer already treats as the ADDRESS it is.
+literal, which would be a BYTE; it is written as a call of DOUBLE, which
+every consumer treats as the ADDRESS it is.  The call is the optimizer's
+own, by a name no program can declare (:data:`ast_view.DOUBLE_MARK`): a
+program may declare a procedure called DOUBLE, which hides the built-in
+(9.2), and ``double(30h)`` then calls it.  The same holds for every
+built-in, so what folds a call of one - :func:`eval_typed`, here - is told
+which names the program has not declared where the call is.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from typing import Callable, Optional
 
 from . import _plm_parser as P
 from .ast_view import (
+    DOUBLE_MARK,
     BinaryOpKind,
     DataType,
     UnaryOpKind,
@@ -148,8 +154,12 @@ def fold_unary(kind: UnaryOpKind, value: int, t: DataType) -> tuple[int, DataTyp
 
 def fold_builtin(name: str, args: list[tuple[int, DataType]]
                  ) -> Optional[tuple[int, DataType]]:
-    """A built-in procedure of typed constant arguments, or None."""
-    name = name.upper()
+    """A built-in procedure of typed constant arguments, or None.
+
+    ``name`` must be one the program has not declared where the call is;
+    DOUBLE_MARK is DOUBLE.
+    """
+    name = "DOUBLE" if name == DOUBLE_MARK else name.upper()
     if len(args) == 1:
         (v, t), = args
         if name == "LOW":
@@ -186,13 +196,21 @@ def fold_builtin(name: str, args: list[tuple[int, DataType]]
 DERIVED = "DERIVED_NUMBER"
 
 
-def is_double_call(expr) -> bool:
-    """Whether ``expr`` is a call of the built-in DOUBLE."""
+def is_widening(expr) -> bool:
+    """Whether ``expr`` is the optimizer's call of the built-in DOUBLE
+    (DOUBLE_MARK); a call the program writes, of the built-in or of a
+    DOUBLE of its own, is not."""
     expr = unwrap_paren(expr)
     if not (isinstance(expr, P.Call) and len(expr.args) == 1):
         return False
     callee = unwrap_paren(expr.callee)
-    return isinstance(callee, P.Identifier) and ident_text(callee.name).upper() == "DOUBLE"
+    return isinstance(callee, P.Identifier) and ident_text(callee.name) == DOUBLE_MARK
+
+
+def widen(expr, pos=None):
+    """``expr`` converted to ADDRESS: the built-in DOUBLE of it, called by
+    the name no declaration hides."""
+    return P.Call(callee=make_identifier(DOUBLE_MARK, pos=pos), args=[expr], pos=pos)
 
 
 def is_derived(expr) -> bool:
@@ -200,7 +218,7 @@ def is_derived(expr) -> bool:
     expr = unwrap_paren(expr)
     if isinstance(expr, P.NumberLiteral):
         return getattr(expr.value, "name", None) == DERIVED
-    if is_double_call(expr):
+    if is_widening(expr):
         return is_derived(unwrap_paren(expr).args[0])
     return False
 
@@ -209,7 +227,7 @@ def typed_const(expr) -> Optional[tuple[int, DataType]]:
     """(value, type) of a constant operand, or None.
 
     A numeric literal, a string of one character (a BYTE) or two (an
-    ADDRESS, the first character high), or ``DOUBLE`` of one.
+    ADDRESS, the first character high), or the optimizer's DOUBLE of one.
     """
     expr = unwrap_paren(expr)
     if isinstance(expr, P.NumberLiteral):
@@ -222,7 +240,7 @@ def typed_const(expr) -> Optional[tuple[int, DataType]]:
         if len(s) == 2:
             return (ord(s[0]) << 8) | ord(s[1]), ADDRESS
         return None
-    if is_double_call(expr):
+    if is_widening(expr):
         inner = typed_const(expr.args[0])
         if inner is not None:
             return inner[0], ADDRESS
@@ -236,12 +254,12 @@ def make_typed_const(value: int, t: DataType, pos=None, derived: bool = False):
     if derived:
         lit.value.name = DERIVED
     if t is ADDRESS and value <= 0xFF:
-        return P.Call(callee=make_identifier("DOUBLE", pos=pos), args=[lit], pos=pos)
+        return widen(lit, pos)
     return lit
 
 
 def untyped_root(expr):
-    """``expr`` with a ``DOUBLE`` of a constant at its root removed.
+    """``expr`` with the optimizer's DOUBLE of a constant at its root removed.
 
     Where a value is converted to a known type before anything else sees it
     -- stored, passed, returned, tested, used as a subscript -- a constant's
@@ -249,18 +267,22 @@ def untyped_root(expr):
     generation has its short forms for.
     """
     e = unwrap_paren(expr)
-    if is_double_call(e) and typed_const(e.args[0]) is not None:
+    if is_widening(e) and typed_const(e.args[0]) is not None:
         return unwrap_paren(e.args[0])
     return expr
 
 
-def eval_typed(expr, ident_value: Callable[[str], Optional[int]] | None = None
+def eval_typed(expr, ident_value: Callable[[str], Optional[int]] | None = None,
+               builtin: Callable[[str], bool] | None = None
                ) -> Optional[tuple[int, DataType, bool]]:
     """Evaluate a constant expression by PL/M-80's rules.
 
     Returns (value, type, derived) or None when ``expr`` is not constant.
     ``ident_value`` resolves an identifier naming a constant (a LITERALLY
-    macro); its value is typed like a literal.
+    macro); its value is typed like a literal.  ``builtin`` says whether a
+    name is a built-in where ``expr`` is - the program does not declare it
+    there -, so that a call of it may be folded; without it only the
+    optimizer's DOUBLE is.
     """
     expr = unwrap_paren(expr)
     if isinstance(expr, P.NumberLiteral):
@@ -282,14 +304,14 @@ def eval_typed(expr, ident_value: Callable[[str], Optional[int]] | None = None
         v &= 0xFFFF
         return v, literal_type(v), False
     if isinstance(expr, P.UnaryOp):
-        inner = eval_typed(expr.operand, ident_value)
+        inner = eval_typed(expr.operand, ident_value, builtin)
         if inner is None:
             return None
         v, t = fold_unary(unop_kind(expr), inner[0], inner[1])
         return v, t, inner[2]
     if isinstance(expr, P.BinaryOp):
-        left = eval_typed(expr.left, ident_value)
-        right = eval_typed(expr.right, ident_value)
+        left = eval_typed(expr.left, ident_value, builtin)
+        right = eval_typed(expr.right, ident_value, builtin)
         if left is None or right is None:
             return None
         folded = fold_binary(binop_kind(expr), left[0], left[1], right[0], right[1])
@@ -300,11 +322,13 @@ def eval_typed(expr, ident_value: Callable[[str], Optional[int]] | None = None
         callee = unwrap_paren(expr.callee)
         if not isinstance(callee, P.Identifier):
             return None
-        args = [eval_typed(a, ident_value) for a in expr.args]
+        name = ident_text(callee.name)
+        if name != DOUBLE_MARK and (builtin is None or not builtin(name)):
+            return None
+        args = [eval_typed(a, ident_value, builtin) for a in expr.args]
         if not args or any(a is None for a in args):
             return None
-        folded = fold_builtin(ident_text(callee.name),
-                              [(a[0], a[1]) for a in args])  # type: ignore[index]
+        folded = fold_builtin(name, [(a[0], a[1]) for a in args])  # type: ignore[index]
         if folded is None:
             return None
         return folded[0], folded[1], any(a[2] for a in args)  # type: ignore[index]

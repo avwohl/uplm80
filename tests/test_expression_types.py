@@ -772,6 +772,77 @@ call run;
 """, [0, 0x10, 1, 0x2D])
 
 
+# ---- a name the program declares hides the built-in ------------------------
+
+def test_a_procedure_named_like_a_built_in_is_the_programs():
+    """PL/M-80's built-ins are declared outside the program, and a
+    declaration of the name hides one (9.2); Intel's PL/M-80 V3.1 calls the
+    program's DOUBLE, LOW, SHL and the rest.  The optimizer wrote an ADDRESS
+    constant below 256 as DOUBLE(n), and took every DOUBLE(n) for one, so
+    `double(30h)' was 30H at -O1 and up however DOUBLE was written; and code
+    generation folded `double(1)' in a condition, and `low(3)' in a DO's
+    bound, by the built-ins at every level.  The optimizer's DOUBLE is now
+    called by a name no program can declare (ast_view.DOUBLE_MARK), and
+    what folds a built-in folds only a name the program does not declare;
+    `w * 8' is no longer turned into a call of the program's SHL.  The
+    program compiled by Intel's PL/M-80 V3.1 prints what is expected
+    here."""
+    _check("""
+declare (w, z) address, (b, c) byte;
+p: procedure;
+  double: procedure (x) address; declare x byte; return x + 1000h; end double;
+  low: procedure (x) byte; declare x address; return 11h; end low;
+  high: procedure (x) byte; declare x address; return 22h; end high;
+  shl: procedure (x, n) address; declare x address, n byte; return x + n; end shl;
+  shr: procedure (x, n) address; declare x address, n byte; return x - n; end shr;
+  rol: procedure (x, n) byte; declare (x, n) byte; return x + n + 1; end rol;
+  ror: procedure (x, n) byte; declare (x, n) byte; return x + n + 2; end ror;
+  scl: procedure (x, n) byte; declare (x, n) byte; return x + n + 3; end scl;
+  scr: procedure (x, n) byte; declare (x, n) byte; return x + n + 4; end scr;
+  dec: procedure (x) byte; declare x byte; return x + 5; end dec;
+  call ph(double(30h));
+  w = double(30h) + 1; call ph(w);
+  b = 5; w = double(b); call ph(w);
+  call ph(low(1234h)); call ph(high(1234h));
+  w = 1234h; call ph(low(w)); call ph(high(w));
+  call ph(shl(1, 8)); call ph(shr(8000h, 15));
+  call ph(rol(1, 1)); call ph(ror(1, 1)); call ph(scl(1, 1)); call ph(scr(1, 1));
+  call ph(dec(9));
+  if double(1) = 1001h then call ph(0aaaah);
+  c = 0; do b = 0 to low(3); c = c + 1; end;
+  call ph(c);
+  w = 3; call ph(w * 8); call ph(w / 2); z = w * 4; call ph(z);
+end p;
+call p;
+""", [0x1030, 0x1031, 0x1005, 0x11, 0x22, 0x11, 0x22, 9, 0x7FF1, 3, 4, 5, 6, 0xE,
+      0xAAAA, 0x12, 0x18, 1, 0xC])
+
+
+def test_a_variable_named_like_a_built_in_is_the_programs():
+    """An array OUTPUT or MEMORY of the program's was stored to as the port
+    or as memory past the end of the program, `.memory' was the end of the
+    program, and a STACKPTR of its own was SP, at every level (0.3.6 the
+    same).  Intel's PL/M-80 V3.1 prints what is expected here."""
+    _check("""
+declare w address;
+r: procedure;
+  declare output (2) byte, memory (2) byte, stackptr address, move byte, input (2) byte;
+  declare length address, last byte, size (2) address, time byte, zero byte;
+  declare carry byte, sign byte, parity byte;
+  output(1) = 16h; memory(1) = 17h; stackptr = 18h; move = 19h; input(0) = 1ah;
+  call ph(output(1)); call ph(memory(1)); call ph(stackptr); call ph(move);
+  call ph(input(0)); w = .memory(1) - .memory; call ph(w);
+  w = stackptr + 1; call ph(w);
+  length = 7; last = 8; size(1) = 9; time = 10; zero = 12;
+  carry = 13; sign = 14; parity = 15;
+  call ph(length); call ph(last); call ph(size(1)); call ph(time);
+  call ph(zero); call ph(carry); call ph(sign); call ph(parity);
+  if zero then call ph(1); if carry then call ph(2);
+end r;
+call r;
+""", [0x16, 0x17, 0x18, 0x19, 0x1A, 1, 0x19, 7, 8, 9, 0xA, 0xC, 0xD, 0xE, 0xF, 2])
+
+
 # ---- the differential test -------------------------------------------------
 
 @pytest.mark.parametrize("seed", [11, 12, 13])
