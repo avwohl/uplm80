@@ -621,16 +621,20 @@ takes since 0.4.2 (`qualsize` no longer leaves them out).
 | `sub-zero` | `w = (b - DOUBLE(0)) + 0F0H;` (b = 0F0H) | `00E0H` | `01E0H` | V3.1 drops `- 0` and with it the ADDRESS type (also `b - (c * 0)`); the manual (4.2.1): ADDRESS |
 | `zero-dividend` | `z = 0; w = 0 / z;` | `0` | `0FFFFH` | V3.1 folds `0 / x` to 0; uplm80 divides, and a division by 0 gives what Intel's own divide routine gives (4.2.3: undefined) |
 | `neg-widened` | `b = 0E7H; w = 0FFFEH; v = (b - w) + (-b);` | `0002` | `0102H` | V3.1 negates `b` in 16 bits when `b - w` has already widened it (the manual: `-b` is a BYTE, 19H) |
-| | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` (b1-b4 BYTE, w1-w4 ADDRESS), as a program's first statement or later, is coded `INX H; INX SP; MOV M,A`, and a later CALL overwrites `b1` (the random campaign's seed 233) |
+| | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` (b1-b4 BYTE, w1-w4 ADDRESS), as a program's first statement or later, is coded `INX H; INX SP; MOV M,A`, and a later CALL overwrites `b1` (the random campaign's seed 233).  The decrement form is the same: `MOV A,L; DCX SP` (`DCX PSW`) where it means `DCR A`, in `DO CASE ((-(LAST(sa.z))) / ROL(0FFFFH, 9)) MOD 5;` (seed 20226) |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
+| | `rw = ((08B1FH - b3) XOR (-((b4 >= ms(3)) AND 0))) + 0;` (b3 = 20H, b4 = 0, `ms DATA('x=1; y=2$')`) | `0` | `8AFFH` | V3.1's count of what it has on the stack goes below zero (its listing counts 0, 255, 254, ...) and it pops what it never pushed, a run of `POP PSW` (seed 20090); 8AFFH is the manual's value |
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
 after a statement (26), `NOT NOT x` (102), and a `CALL` of a typed
 procedure (129); and what the CHANGELOG lists under Known issues: a
 subscript on a scalar (127), an array without a subscript (133, 134), a
-procedure with no statements (174), and a call of a procedure its block
-declares after the call (169).  uplm80 compiles, with a warning that
+procedure with no statements (174), a call of a procedure its block
+declares after the call (169), an `END` that names another block, `p:
+procedure; ... end q;` (20), a DO CASE with no case (201), `.p(1)` of a
+procedure (104), and a subscript that calls a procedure inside SIZE,
+LENGTH or LAST, `size(ab(f(1)))` (32).  uplm80 compiles, with a warning that
 names V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
 `INITIAL` in a procedure or a DO block (73), on which programs written
 for it rely.  It rejects, as V3.1 does, a name declared nowhere, empty

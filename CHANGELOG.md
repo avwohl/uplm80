@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## 0.4.2 — unreleased
+## 0.4.2 — 2026-09-26
 
 uplm80 checked against Intel's own PL/M-80 V3.1 as a matter of course:
 `scripts/intel_oracle.py` builds a program with both compilers and
@@ -174,6 +174,16 @@ the same):
   procedure; call q; end p; q: procedure; ... end q;`, and `y = f + 1`
   of a typed procedure `f` declared after it (#169, ILLEGAL FORWARD
   CALL).
+- These four, which 0.4.2's release check found, each rejected by V3.1
+  with the error named: an END that names another block, `p: procedure;
+  ... end q;` or `out: end q;` (#20, MISMATCHED IDENTIFIER AT END OF
+  BLOCK); a DO CASE with no case, `do case n; end;`, and, since a label
+  on an END is taken, `do case n; l: end;` (#201, INVALID DO CASE BLOCK,
+  AT LEAST ONE CASE REQUIRED); `.p(1)` of a procedure (#104, ILLEGAL
+  PROCEDURE INVOCATION WITH DOT OPERATOR); and a subscript that calls a
+  procedure inside SIZE, LENGTH or LAST, `size(ab(f(1)))` or
+  `length(sa(f(1)).z)` (#32, INVALID SYNTAX), which uplm80 compiles
+  without calling `f`.
 
 And these V3.1 compiles to other code (0.4.1 the same):
 
@@ -202,6 +212,24 @@ And these V3.1 compiles to other code (0.4.1 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+
+Also: where a label's colon is followed at once by END, `out:end p;`,
+a message about what follows on that line gives a column one too far,
+for the null statement put before the END.
+
+In the oracle, `scripts/intel_oracle.py`:
+
+- `--avoid zero-dividend` leaves out `0 / x`, but not a dividend that
+  folds to 0, `(8 / 0FF00H) / (0F82AH <= 1)`, which V3.1 folds to 0 and
+  uplm80 divides (seed 20275; 4.2.3: undefined).
+- Intel's build is stopped by a HLT patched in where the LINES record
+  puts the module's END. For `fin: end t;` V3.1 puts an `LXI SP` there,
+  before its `EI; HLT`, and the build runs past the HLT: the verdict is
+  `timeout`, where uplm80's build prints what it should.
+
+### Changed
+
+- Requires upeepz80 0.2.7, the release 0.4.2 is checked with.
 
 ### Verified
 
@@ -241,6 +269,17 @@ On 830b234, with upeepz80 0.2.7 and um80 0.3.52.
   11b, 5)`, `shl(a, 4) or b` of a BCD digit - and its SHR sites give the
   same value in eight bits; 24 of the MP/M II compiles are smaller, 619
   bytes in all at `-O2`, SHOW.PLM the most, by 79.
+- Checked again, on 75131f9, by a separate release check: the suite,
+  with Intel's binaries and without; `run_tests.sh`; difftest,
+  abifuzz, namestest and the storage fuzzer, 200 to 300 new seeds each,
+  with no failure; the 87 MP/M II and 80un compiles and the test
+  programs, 0.4.1's assembly; 80un's two programs extracting all 28 test
+  inputs byte for byte as 0.4.1's build does; MP/M II V2.0 and V2.1 built
+  from source, `run_tests.sh all` and `src` passing, and `verify_dri.py`
+  finding XDOS, BNKXDOS, RESBDOS, TMP, BNKBDOS, RDT, DDT and GENMOD
+  identical to DRI's. `intel_oracle.py --random 500`, seeds 20000-20499:
+  496 print what V3.1's build prints, and the 4 others are V3.1's bugs
+  (README, Known differences) or a division by 0.
 
 ## 0.4.1 — 2026-09-26
 
