@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-09-25
 
 Procedures are now called the way Intel's PL/M-80 calls them, so code
 uplm80 compiles links, unmodified, with assembly written for PL/M-80 -
@@ -194,6 +194,14 @@ leaves the stack alone after the call.
   * one)` passes 0 there and 0FFFEH here. And it pushes a next-to-last
   argument it has computed while it evaluates the last: `call p2(sp0 -
   stackptr, stackptr - sp0)` passes 0FFFEH there and 0 here.
+- A call's arguments are evaluated from left to right. PL/M-80 V3.1 loads
+  a next-to-last argument that is a variable into BC after it has
+  evaluated the last one, so where the last argument's code changes that
+  variable (`call p2(v, f)`, with `f` assigning `v`), its code passes the
+  new value and uplm80's the old one. The language leaves this open: "PL/M
+  does not guarantee the order of evaluation of operands", and where the
+  order matters "the value of the expression is undefined" (9800268B,
+  4.5.1).
 - `??jphl` replaces `??jpde`.
 
 ### Fixed
