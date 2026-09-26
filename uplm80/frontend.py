@@ -93,9 +93,8 @@ def _literally_at(e: Exception, src: str, substitutions) -> str:
     for at, name, text in substitutions:
         if at == offset:
             return (f"; that is the text of {name}, declared LITERALLY '{text}', which "
-                    f"PL/M-80 puts in place of {name} throughout the LITERALLY's scope, a "
-                    f"declaration of {name} in an inner block included (Programming Manual "
-                    "9800268B, 6.4)")
+                    f"PL/M-80 puts in place of {name} wherever it occurs in the LITERALLY's "
+                    "scope (Programming Manual 9800268B, 6.4)")
     return ""
 
 

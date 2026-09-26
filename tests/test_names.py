@@ -1123,8 +1123,8 @@ end t;
 """, opt)
     assert ("T.PLM:8:11: error: unexpected token 'NUMBER' '5'; expected one of: IDENT, LPAREN; "
             "that is the text of N, declared LITERALLY '5', which PL/M-80 puts in place of N "
-            "throughout the LITERALLY's scope, a declaration of N in an inner block included "
-            "(Programming Manual 9800268B, 6.4)") in err, err
+            "wherever it occurs in the LITERALLY's scope (Programming Manual 9800268B, "
+            "6.4)") in err, err
 
 
 @pytest.mark.parametrize("opt", LEVELS)
