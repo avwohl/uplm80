@@ -25,7 +25,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "upeepz80>=0.2.7",
+    "upeepz80>=0.2.6",
     "uplox>=3.3.1",
 ]
 

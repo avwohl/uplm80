@@ -227,10 +227,6 @@ In the oracle, `scripts/intel_oracle.py`:
   before its `EI; HLT`, and the build runs past the HLT: the verdict is
   `timeout`, where uplm80's build prints what it should.
 
-### Changed
-
-- Requires upeepz80 0.2.7, the release 0.4.2 is checked with.
-
 ### Verified
 
 On 830b234, with upeepz80 0.2.7 and um80 0.3.52.
