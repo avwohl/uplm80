@@ -54,6 +54,19 @@ code it generates, linked with DRI's `X0100` and run.
       procedure (Programming Manual 9800268B, 4.1.3); the address of a
       label may be given only in a DATA or an INITIAL list
 
+- **`x()`, empty parentheses after a variable, is an error.** PL/M-80 has
+  no empty subscript or argument list. `y = x() + 1` with x a BYTE compiled
+  to a CALL through x's value (0.3.6: `call X`), and so did an array, a
+  BASED variable, a structure, a parameter and `CALL w()` of an ADDRESS
+  (Known issues, 0.3.7). Intel's PL/M-80 V3.1 rejects each, ERROR #127,
+  INVALID SUBSCRIPT ON NON-ARRAY, and #102, MISSING PRIMARY OPERAND.
+
+      X(): X is a variable, and PL/M-80 has neither an empty subscript nor
+      an empty argument list
+
+  A procedure's `f()` is still taken for `f`, as uplm80 always has; V3.1
+  rejects that too (#102).
+
   These rules of a program's names are checked as the parser gives the
   program, before the optimizer rewrites or drops anything, so every `-O`
   level finds the same errors; a multi-file compile parses and checks
@@ -1234,11 +1247,6 @@ Each fix has a regression test that fails without it.
 - **A name that is declared nowhere is not an error.** `y = nosuch + 1`
   compiles to `ld hl,(NOSUCH)`, and only um80 reports it, as an undefined
   symbol (0.3.6 the same).
-- **`x()`, with empty parentheses, where x is a variable, is accepted
-  without a diagnostic.** In an expression, `y = x() + 1` with x a BYTE
-  compiles to a CALL through x's value (`ld a,(X) / ... / call ??jpde`);
-  0.3.6 compiled it to `call X`. PL/M-80 has no empty argument list; `f()`
-  of a procedure is taken as `f`.
 - **`STACKPTR` read inside an expression can see a temporary the compiler
   pushed.** Where an operand evaluated before it is kept on the stack,
   STACKPTR reads 2 less than it does at the start of the statement. After

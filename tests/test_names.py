@@ -1023,3 +1023,40 @@ w = 0;
 end t;
 """, opt)
     assert ok.returncode == 0, ok.stderr
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("stmt, name, kind", [
+    ("y = x() + 1;", "X", "a variable"),
+    ("w = x();", "X", "a variable"),
+    ("y = a();", "A", "a variable"),
+    ("y = bb();", "BB", "a variable"),
+    ("y = s();", "S", "a variable"),
+    ("call w();", "W", "a variable"),
+    ("y = q(1) + x;", None, None),
+])
+def test_empty_parentheses_after_a_variable_are_an_error(opt, stmt, name, kind):
+    """PL/M-80 has no empty argument list or subscript.  `y = x() + 1'
+    with x a BYTE compiled to a CALL through x's value (0.3.6: `call X'),
+    and so did an array, a BASED variable, a structure and `CALL w()'.
+    Intel's PL/M-80 V3.1 rejects each, ERROR #127, INVALID SUBSCRIPT ON
+    NON-ARRAY, and ERROR #102, MISSING PRIMARY OPERAND.  A procedure's
+    `f()' is still taken for `f' (V3.1 rejects that too)."""
+    src = PRELUDE + """declare (x, y) byte, (w, p) address, a (3) byte, bb based p byte;
+declare s structure (m byte);
+f: procedure byte; return 3; end f;
+q: procedure (v) byte; declare v byte; return v + f(); end q;
+""" + stmt + "\nend t;\n"
+    if name is None:
+        r = _compile(src, opt)
+        assert r.returncode == 0, r.stderr
+        return
+    err = _compile_error(src, opt)
+    assert (f"T.PLM:9:{stmt.index(name.lower()) + 1}: error: {name}(): {name} is {kind}, "
+            "and PL/M-80 has neither an empty subscript nor an empty argument list") in err, err
+
+
+def test_empty_parentheses_after_a_parameter_are_an_error():
+    err = _compile_error(PRELUDE + "q: procedure (x) byte; declare x byte; return x(); end q;\n"
+                         "call pc(q(1));\nend t;\n")
+    assert "T.PLM:5:47: error: X(): X is a parameter" in err, err
