@@ -55,7 +55,7 @@ from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError, CompilerError
 from .frontend import source_location
-from .local_storage import AUTO, PARAM, LocalStorage
+from .local_storage import AUTO, PARAM, LocalStorage, folded_reference, runs_outside
 from .names import REGISTER_NAMES, data_name, resolve_names
 from .runtime import get_runtime_library, plm_div, plm_mod
 from .plm_types import (
@@ -1236,10 +1236,10 @@ class CodeGenerator:
         """Record the names a store can reach without naming them: a name
         whose address is taken anywhere (``.x``, ``.x(i)``, ``.x.m``), and one
         placed AT something (see :meth:`_only_the_loop_sees`); and, for
-        each name subscripted anywhere, its largest constant subscript, or
-        None where a subscript is not a constant (:meth:`_module_reach`)."""
+        each name subscripted anywhere, itself or a member of it, the
+        subscripted references to it (:meth:`_module_reach`)."""
         self._aliased = set()
-        self._subscripted: dict[str, int | None] = {}
+        self._subscripted: dict[str, set[tuple]] = {}
         stack: list = list(modules)
         while stack:
             n = stack.pop()
@@ -1261,25 +1261,17 @@ class CodeGenerator:
                 stack.extend(getattr(n, f, None) for f in fields if f != "pos")
 
     def _note_subscript(self, call) -> None:
-        """Note ``call``, a subscript or a call, for _survey_aliases: a
-        variable's largest constant subscript, and None for one that is
-        not a constant.  A member's subscript (``s.m(i)``) counts, for
-        ``s``, only where it is not a constant."""
-        base = unwrap_paren(call.callee)
-        member = False
-        while isinstance(base, P.MemberAccess):
-            base, member = unwrap_paren(base.base), True
-        if not isinstance(base, P.Identifier):
-            return
-        name = ident_text(base.name)
-        values = [eval_typed(a) for a in call.args]
-        if any(v is None for v in values):
-            self._subscripted[name] = None
-            return
-        if member or (name in self._subscripted and self._subscripted[name] is None):
-            return
-        top = max(v[0] for v in values)     # type: ignore[index]
-        self._subscripted[name] = max(top, self._subscripted.get(name) or 0)
+        """Note ``call``, a subscript or a call, for _survey_aliases: the
+        path of the reference - ``s2(1).m(k)`` as much as ``a(2)`` - under
+        the name it starts from, each subscript folded to its constant, or
+        None where it is not one."""
+        def fold(arg) -> int | None:
+            got = eval_typed(arg)
+            return None if got is None else got[0]
+
+        ref = folded_reference(call, fold)
+        if ref is not None:
+            self._subscripted.setdefault(ref[0], set()).add(ref[1])
 
     def _survey_layout(self, modules) -> None:
         """Where each module-level variable is in the layout, and where the
@@ -1288,12 +1280,14 @@ class CodeGenerator:
 
         Variables are laid out in the order the source declares them, a
         procedure's static ones among the module's (_number_declarations).
-        A variable is such a start if its address is taken (_aliased) or it
-        is subscripted past its end or by what is not a constant, which
-        makes it and everything after it reachable without a name, as for a
-        procedure's locals (local_storage).  Names are matched whatever
-        block declares them, which can only find more starts.  A BASED
-        variable has no place of its own, and DATA is with the code.
+        A variable is such a start if its address is taken (_aliased) or a
+        reference to it can run outside it - a subscript past the end of it
+        or of one of its members, or one that is not a constant
+        (local_storage.runs_outside) -, which makes it and everything after
+        it reachable without a name, as for a procedure's locals
+        (local_storage).  Names are matched whatever block declares them,
+        which can only find more starts.  A BASED variable has no place of
+        its own, and DATA is with the code.
         """
         self._module_seq: dict[str, tuple[int, int]] = {}
         starts: list[tuple[int, int]] = []
@@ -1301,13 +1295,8 @@ class CodeGenerator:
         def starts_here(item, name: str) -> bool:
             if item.based is not None or decl_attrs(item).data_values:
                 return False
-            if name in self._aliased:
-                return True
-            if name not in self._subscripted:
-                return False
-            _, dim = _view_decl_item_type(item)
-            top = self._subscripted[name]
-            return top is None or top >= (dim if dim and dim > 0 else 1)
+            return name in self._aliased or any(
+                runs_outside(item, path) for path in self._subscripted.get(name, ()))
 
         def walk(n, top: bool) -> None:
             if isinstance(n, (list, tuple)):

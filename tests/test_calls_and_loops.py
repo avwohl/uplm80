@@ -9,6 +9,8 @@ its fix.
 
 import re
 
+import pytest
+
 from tests.test_expression_types import _PRELUDE, _asm, _check
 
 
@@ -447,6 +449,38 @@ run: procedure;
 end run;
 call run;
 """, [3, 0x15, 4, 0x1F, 5, 0x29])
+
+
+@pytest.mark.parametrize("decl, store", [
+    ("declare s structure (m(2) byte);", "s.m(2) = 20;"),
+    ("declare s structure (m(2) byte, q byte);", "s.m(3) = 20;"),
+    ("declare s2 (2) structure (m(2) byte);", "s2(1).m(2) = 20;"),
+    ("declare s2 (2) structure (m(2) byte);", "s2(1).m(k) = 20;"),
+])
+def test_a_counted_loop_ends_where_a_members_overrun_sets_its_index(decl, store):
+    """A structure's member subscripted past its end reaches the variables
+    laid out after the structure, as an array does: `s.m(2)' of a module-
+    level `s structure (m(2) byte)' is the i declared after it, and so is
+    `s2(1).m(2)' of an `s2 (2) structure (m(2) byte)', and `s2(1).m(k)'
+    with k = 2.  A loop over i was still counted in B, so the store did
+    not end it: n was 11, not 3, at every level.  Nothing noted a
+    member's constant subscript, nor any subscript of a member whose
+    structure is itself subscripted.  A procedure's local was right.
+    Intel's PL/M-80 V3.1 build of each prints what is expected here."""
+    _check(f"""
+{decl}
+declare i byte, n byte;
+declare k byte;
+run: procedure;
+  n = 0; k = 2;
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then {store}
+  end;
+  call ph(n); call ph(i);
+end run;
+call run;
+""", [3, 0x15])
 
 
 def test_a_reentrant_procedures_parameter_factored_with_its_locals():

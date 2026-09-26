@@ -133,17 +133,20 @@ any.
   1` (`a` declared just before `i`) a store through `p` in the body did
   not end the loop (Known issues, 0.3.7), and neither did `buf(k) = 30`
   with `k` past the end of a `buf` declared before `i`, or with `p = .a2 +
-  1` after `declare (a2, i2) byte`. Now a module-level index is not
+  1` after `declare (a2, i2) byte`, or `s.m(2) = 20` of an `s structure
+  (m(2) byte)` declared before `i`, or `s2(1).m(2)` or `s2(1).m(k)`, k =
+  2, of an `s2 (2) structure (m(2) byte)`. Now a module-level index is not
   counted either when a variable laid out before it - the module's and the
   procedures' static ones, in the source's order - has its address taken,
-  or is subscripted past its end or by what is not a constant. DRI's
-  compiler never counts a loop, and the program in
-  `tests/test_calls_and_loops.py` prints, at `-O0` to `-O3`, what it
-  prints compiled by Intel's PL/M-80 V3.1. Of the 87 MP/M II and 80un
-  compiles, one loop changes, `DO jtab = 0 TO itab` in MSPL.PLM's LIST$BUF
-  (DRI's and mpm2's), since `.pcb` is taken and PCB is declared before
-  JTAB: 7 bytes more at `-O1` to `-O3` and 8 at `-O0`, in each of the two,
-  and nothing else; ED's, PIP's and 80un's counted loops are over locals.
+  or is subscripted, itself or a member of it, past the end of what is
+  subscripted or by what is not a constant. DRI's compiler never counts a
+  loop, and the programs in `tests/test_calls_and_loops.py` print, at
+  `-O0` to `-O3`, what they print compiled by Intel's PL/M-80 V3.1. Of
+  the 87 MP/M II and 80un compiles, one loop changes, `DO jtab = 0 TO
+  itab` in MSPL.PLM's LIST$BUF (DRI's and mpm2's), since `.pcb` is taken
+  and PCB is declared before JTAB: 7 bytes more at `-O1` to `-O3` and 8
+  at `-O0`, in each of the two, and nothing else; ED's, PIP's and 80un's
+  counted loops are over locals.
 - **A REENTRANT procedure's parameter declared with its locals,**
   `DECLARE (top, c) BYTE`, was declared a second time, as a local in the
   frame, which nothing set, and every use of it read that: `rp(3)` of a
@@ -204,7 +207,7 @@ any.
   MINUS, SCL and SCR after `+ 4` and `- 4`, and 1 to 3 still `inc hl`.
 - `tests/test_calls_and_loops.py`: REENTRANT procedures with their
   parameters factored with locals; counted loops whose index a pointer or
-  an overrun sets.
+  an overrun sets, of an array and of a structure's member.
 - Each program in them that runs prints, at `-O0` to `-O3`, what it prints
   compiled by Intel's PL/M-80 V3.1 (DRI's `PLM_WORK` copy, under an ISIS
   emulator), linked with DRI's `X0100` and `PLM80.LIB` by Intel's LINK

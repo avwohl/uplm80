@@ -297,6 +297,41 @@ def _select(local: Local, path: list) -> tuple[frozenset, bool, bool]:
     return frozenset(c for c in local.keys if c[:n] == prefix), exact, reach
 
 
+def folded_reference(expr, fold: Callable[[object], Optional[int]]
+                     ) -> Optional[tuple[str, tuple]]:
+    """(root name, path) of the variable reference ``expr``, or None.
+
+    The path is :func:`_designator`'s, each subscript's args replaced by
+    ``fold``'s value of them, None where one is not a constant, as a tuple
+    of tuples, for :func:`runs_outside`.
+    """
+    des = _designator(expr)
+    if des is None:
+        return None
+    root, path = des
+    return root, tuple(("idx", tuple(fold(a) for a in part[1])) if part[0] == "idx"
+                       else part for part in path)
+
+
+def runs_outside(decl, path) -> bool:
+    """Whether a reference through the folded ``path`` into a variable
+    ``decl`` declares may read or write outside that variable - into the
+    variables laid out after it.
+
+    It may if a subscript, of the variable or of one of its members, is
+    past the end of what it subscripts, or is not a constant, or if a
+    subscript is missing, as in ``s2.m(1)`` of an array of structures,
+    which is ``s2(0).m(1)``.  A ``(*)`` array is taken to have one element.
+    """
+    _, dim = decl_item_type(decl)
+    if dim is not None:
+        if path and path[0][0] != "idx":
+            return True
+        dim = max(dim, 1)
+    local = Local("", 0, 0, dim, _members(decl))
+    return _path_prefix(local, list(path))[2] or _varies(list(path))
+
+
 class _Effects:  # pylint: disable=too-few-public-methods
     """What evaluating an expression does to the procedure's own locals."""
 
