@@ -801,8 +801,8 @@ w2, w3 = (eb := w2); call ph(w2); call ph(w3); call ph(eb);
 def test_a_multiple_assignment_of_an_embedded_assignment_of_a_target():
     """`w2, w3 = (ew := w2)' gives w2, w3 and ew all of w2, the embedded
     assignment's right half (4.6.3), and `(eb := w2)' eb its low byte;
-    V3.1 gives w3 the word 34H bytes on from w2's value (0.4.3's release
-    check, seed 80353)."""
+    V3.1's build of this program gives w3 the word 34H bytes on from w2's
+    value, and seed 80353 of 0.4.3's release check the word 9 back."""
     _check(EMBEDDED_TARGET, [0xFFFE] * 5 + [0xFE])
 
 
