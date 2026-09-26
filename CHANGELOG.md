@@ -149,22 +149,28 @@ any.
   with `k` past the end of a `buf` declared before `i`, or with `p = .a2 +
   1` after `declare (a2, i2) byte`, or `s.m(2) = 20` of an `s structure
   (m(2) byte)` declared before `i`, or `s2(1).m(2)` or `s2(1).m(k)`, k =
-  2, of an `s2 (2) structure (m(2) byte)`. Now a module-level index is not
-  counted either when a variable laid out before it - the module's and the
-  procedures' static ones, in the source's order - has its address taken,
-  or is subscripted, itself or a member of it, past the end of what is
-  subscripted or by what is not a constant. So is a procedure's local
-  after `s2.m(4) = 20` of a local `s2 (2) structure (m(2) byte)`, which
-  PL/M-80 does not allow and uplm80 compiles as `s2(0).m(4)` (Known
-  issues): the overrun was taken to reach no further than `s2`. DRI's
-  compiler never counts a loop, and the programs in
-  `tests/test_calls_and_loops.py` that V3.1 accepts print, at `-O0` to
-  `-O3`, what they print compiled by Intel's PL/M-80 V3.1. Of
-  the 87 MP/M II and 80un compiles, one loop changes, `DO jtab = 0 TO
-  itab` in MSPL.PLM's LIST$BUF (DRI's and mpm2's), since `.pcb` is taken
-  and PCB is declared before JTAB: 7 bytes more at `-O1` to `-O3` and 8
-  at `-O0`, in each of the two, and nothing else; ED's, PIP's and 80un's
-  counted loops are over locals.
+  2, of an `s2 (2) structure (m(2) byte)`. Nor did a store that runs
+  back to `i` from a variable laid out after it: through `p = .x - 1`, to
+  a `z byte at (.x - 1)`, and `a(0ffffh) = 20` of an `a (2) byte`
+  declared after `i`, the subscript wrapping, or `a(k) = 20` with `k` an
+  ADDRESS set to 0FFFFH; nor, to a procedure's static local `i`, `.x - 1`
+  of the local `x` declared after it. Now a module-level index, and a
+  procedure's static local, which is laid out among the module's
+  variables, is not counted when any variable - the module's, or a
+  procedure's - has its address taken, or is subscripted, itself or a
+  member of it, past the end of what is subscripted or by what is not a
+  constant: a pointer or a subscript runs backwards through the variables
+  as well as on. So is a procedure's local after `s2.m(4) = 20` of a
+  local `s2 (2) structure (m(2) byte)`, which PL/M-80 does not allow and
+  uplm80 compiles as `s2(0).m(4)` (Known issues): the overrun was taken
+  to reach no further than `s2`. DRI's compiler never counts a loop, and
+  the programs in `tests/test_calls_and_loops.py` that V3.1 accepts
+  print, at `-O0` to `-O3`, what they print compiled by Intel's PL/M-80
+  V3.1. Of the 87 MP/M II and 80un compiles, one loop changes, `DO jtab
+  = 0 TO itab` in MSPL.PLM's LIST$BUF (DRI's and mpm2's), since `.pcb` is
+  taken and PCB is declared before JTAB: 7 bytes more at `-O1` to `-O3`
+  and 8 at `-O0`, in each of the two, and nothing else; ED's, PIP's and
+  80un's counted loops are over locals in `??AUTO` (Known issues).
 - **A REENTRANT procedure's parameter declared with its locals,**
   `DECLARE (top, c) BYTE`, was declared a second time, as a local in the
   frame, which nothing set, and every use of it read that: `rp(3)` of a
@@ -241,7 +247,8 @@ any.
   MINUS, SCL and SCR after `+ 4` and `- 4`, and 1 to 3 still `inc hl`.
 - `tests/test_calls_and_loops.py`: REENTRANT procedures with their
   parameters factored with locals; counted loops whose index a pointer or
-  an overrun sets, of an array and of a structure's member.
+  an overrun sets, of an array and of a structure's member, run on or
+  back to it.
 - Each program in them that runs prints, at `-O0` to `-O3`, what it prints
   compiled by Intel's PL/M-80 V3.1 (DRI's `PLM_WORK` copy, under an ISIS
   emulator), linked with DRI's `X0100` and `PLM80.LIB` by Intel's LINK
@@ -271,6 +278,23 @@ the same):
   INITIALIZATION, NOT AT MODULE LEVEL).
 - A procedure with no statements, `g: procedure; end g;`, which returns
   (#174, INVALID NULL PROCEDURE).
+
+And one that V3.1 compiles to other code (0.4.0 the same):
+
+- **What a store through a pointer or an overrun reaches in or from
+  `??AUTO`** is uplm80's layout, not DRI's (Known issues, 0.3.7), and a
+  counted loop over a local in `??AUTO` does not see all of it. `??AUTO`
+  comes first in the data segment, before the module's variables, and
+  holds the frames of procedures active together one after another: an
+  overrun of a local in it can reach another frame or the module's first
+  variables, and `.x - 1` of the first variable after it its last byte.
+  A loop over a local in `??AUTO` ends where a pointer or an overrun from
+  a local of its own procedure declared before the index sets it, and
+  nowhere else. With q's `ql(2) byte, k byte` just before run's index `i`
+  in `??AUTO`, `ql(3) = 20` from inside run's loop sets `i` and the loop
+  still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
+  whose layout has `i` there too, prints 0003 0015. Counting no such loop
+  would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
 
 ### Verified
 

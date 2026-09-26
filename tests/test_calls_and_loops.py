@@ -483,6 +483,57 @@ call run;
 """, [3, 0x15])
 
 
+@pytest.mark.parametrize("decl, before, store", [
+    ("i byte, x byte, n byte, p address, b based p byte", "p = .x - 1;", "b = 20;"),
+    ("i byte, x byte, n byte, z byte at (.x - 1)", "", "z = 20;"),
+    ("i byte, a (2) byte, n byte", "", "a(0ffffh) = 20;"),
+    ("i byte, a (2) byte, n byte, k address", "k = 0ffffh;", "a(k) = 20;"),
+])
+def test_a_counted_loop_ends_where_a_store_runs_back_to_its_index(decl, before, store):
+    """A pointer or a subscript runs backwards as well as on: `.x - 1' is
+    the i laid out just before x, and so is `a(0ffffh)' of an `a (2) byte'
+    declared after i, the subscript wrapping, and `a(k)' with k = 0FFFFH.
+    A module-level index was not counted only when what reaches it is laid
+    out before it, so the loop over i was counted in B and the store did
+    not end it: n was 11, not 3, at every level (0.4.0 the same).  Intel's
+    PL/M-80 V3.1 build of each prints what is expected here."""
+    _check(f"""
+declare {decl};
+run: procedure;
+  n = 0; {before}
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then {store}
+  end;
+  call ph(n); call ph(i);
+end run;
+call run;
+""", [3, 0x15])
+
+
+def test_a_counted_loop_ends_where_a_store_runs_back_to_a_static_index():
+    """A procedure's static local is laid out among the module's variables,
+    in the source's order, as in DRI's layout: the i read before it is
+    written is static, and so is the x after it whose address is taken, so
+    `.x - 1' is i.  The loop over i was counted, since only a pointer from
+    a local declared before i was taken to reach it: n was 11, not 3, at
+    every level (0.4.0 the same).  Intel's PL/M-80 V3.1 build prints what
+    is expected here."""
+    _check("""
+run: procedure;
+  declare i byte, x byte, n byte, p address, b based p byte;
+  if i = 99 then n = 1;
+  n = 0; p = .x - 1;
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then b = 20;
+  end;
+  call ph(n); call ph(i);
+end run;
+call run;
+""", [3, 0x15])
+
+
 @pytest.mark.parametrize("where", ["module", "local"])
 def test_a_member_of_an_unsubscripted_array_of_structures_runs_on(where):
     """`s2.m(4)' of an `s2 (2) structure (m(2) byte)' is s2(0).m(4) to

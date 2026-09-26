@@ -1274,23 +1274,23 @@ class CodeGenerator:
             self._subscripted.setdefault(ref[0], set()).add(ref[1])
 
     def _survey_layout(self, modules) -> None:
-        """Where each module-level variable is in the layout, and where the
-        first variable is from which a pointer or an overrun can run on
-        into the variables after it (:meth:`_module_reach`).
+        """Which variables are laid out at module level, and whether any
+        variable is one from which a pointer or an overrun can reach the
+        others (:meth:`_module_reach`).
 
-        Variables are laid out in the order the source declares them, a
-        procedure's static ones among the module's (_number_declarations).
         A variable is such a start if its address is taken (_aliased) or a
         reference to it can run outside it - a subscript past the end of it
         or of one of its members, or one that is not a constant
         (local_storage.runs_outside) -, which makes it and everything after
         it reachable without a name, as for a procedure's locals
-        (local_storage).  Names are matched whatever block declares them,
-        which can only find more starts.  A BASED variable has no place of
-        its own, and DATA is with the code.
+        (local_storage), and everything before it as well: `.x - 1', a
+        subscript that wraps, `a(0ffffh)', and an ADDRESS subscript run
+        backwards.  Names are matched whatever block declares them, which
+        can only find more starts.  A BASED variable has no place of its
+        own, and DATA is with the code.
         """
-        self._module_seq: dict[str, tuple[int, int]] = {}
-        starts: list[tuple[int, int]] = []
+        self._module_vars: set[str] = set()
+        starts: list[str] = []
 
         def starts_here(item, name: str) -> bool:
             if item.based is not None or decl_attrs(item).data_values:
@@ -1304,14 +1304,11 @@ class CodeGenerator:
                     walk(x, top)
                 return
             if isinstance(n, P.DeclItem):
-                # The names of a factored declaration are contiguous, in
-                # their order (6.2.4).
-                seq = self._decl_seq.get(id(n), 0)
-                for i, name in enumerate(decl_item_names(n)):
+                for name in decl_item_names(n):
                     if top:
-                        self._module_seq.setdefault(name, (seq, i))
+                        self._module_vars.add(name)
                     if starts_here(n, name):
-                        starts.append((seq, i))
+                        starts.append(name)
                 return
             if isinstance(n, P.ProcDecl):
                 walk(proc_body_items(n), False)
@@ -1328,16 +1325,17 @@ class CodeGenerator:
             shape = module_shape(m)
             walk(list(shape.decls), True)
             walk(list(shape.stmts), False)
-        self._first_reach = min(starts) if starts else None
+        self._any_reach = bool(starts)
 
     def _module_reach(self, name: str) -> bool:
         """Whether the module-level variable ``name`` can be read or written
-        without its name: through a pointer run on from a variable laid out
-        before it whose address is taken, or an overrun of one laid out
-        before it (_survey_layout).  DRI's PL/M-80 lays variables out in the
-        source's order too, and never counts a loop."""
-        seq = self._module_seq.get(name)
-        return seq is None or (self._first_reach is not None and self._first_reach < seq)
+        without its name: through a pointer made from the address of any
+        variable, or an overrun of any (_survey_layout).  The module's
+        variables, and the procedures' static ones among them, are laid out
+        in the source's order, as DRI's PL/M-80 lays them out, which never
+        counts a loop; a pointer or a subscript runs backwards through them
+        as well as on."""
+        return name not in self._module_vars or self._any_reach
 
     def _only_the_loop_sees(self, name: str, body_stmts, after_return: bool) -> bool:
         """Whether nothing but the loop's own code can read or write `name'
@@ -1374,12 +1372,18 @@ class CodeGenerator:
     def _reached_unnamed(self, owner: str | None, name: str) -> bool:
         """Whether local ``name`` of ``owner`` can be read or written without
         its name: through a pointer run on from a local declared before it,
-        or an overrun of an array declared before it (see local_storage);
-        for a module-level variable (``owner`` None), :meth:`_module_reach`."""
+        or an overrun of an array declared before it (see local_storage),
+        and, if it is static, from any variable, as a module-level one can
+        be; for a module-level variable (``owner`` None),
+        :meth:`_module_reach`."""
         if owner is None:
             return self._module_reach(name)
         storage = getattr(self, "local_storage", None)
-        return storage is not None and (owner, name) in storage.reachable
+        if storage is not None and (owner, name) in storage.reachable:
+            return True
+        # A static local is laid out among the module's variables.
+        sym = self._lookup_symbol(name)
+        return sym is not None and self._keeps_its_value(sym) and self._any_reach
 
     @staticmethod
     def _keeps_its_value(sym: Symbol) -> bool:
