@@ -8,7 +8,12 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 uplm80 checked against Intel's own PL/M-80 V3.1 as a matter of course:
 `scripts/intel_oracle.py` builds a program with both compilers and
 compares what the builds print, and the suite runs it where Intel's
-binaries are found.
+binaries are found. What it and 0.4.1's Known issues found is settled:
+LENGTH, LAST and SIZE of a qualified reference, which uplm80 refused; a
+store through MEMORY that a counted loop did not see; a label on an END
+statement; and the errors V3.1 gives and uplm80 did not, which stay
+warnings where a program written for uplm80 relies on the form. SHL and
+SHR of a BYTE stay an ADDRESS, as 80un relies on them (Known issues).
 
 ### Incompatible: errors Intel's PL/M-80 gives
 
@@ -197,6 +202,45 @@ And these V3.1 compiles to other code (0.4.1 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+
+### Verified
+
+On 830b234, with upeepz80 0.2.7 and um80 0.3.52.
+
+- The suite: 1162 tests pass. Without Intel's binaries the oracle's 32
+  tests that need them skip, and its 6 others pass. pylint rates the
+  package 9.73, with no message 0.4.1 did not have.
+- `tests/run_tests.sh`: all 22 programs pass.
+- `scripts/difftest.py`, `scripts/abifuzz.py` and `scripts/namestest.py`,
+  200 seeds each (7000-7199): every program prints what the model, its
+  `-O0` build or its scopes say.
+- `scripts/intel_oracle.py --random 300` (seeds 1-300), leaving out
+  `shl-byte`, `shift9`, `wide-limit`, `sub-zero`, `zero-dividend` and
+  `neg-widened`: 299 programs print at `-O0` to `-O3` what Intel's
+  PL/M-80 V3.1 build prints. Seed 233 does not, at any level: V3.1 codes
+  its `w1, b2 = b2;` as `INX H; INX SP; MOV M,A` and a later CALL
+  overwrites `b1` (README, Known differences); with `w1 = b2;` in its
+  place the program prints what V3.1's build prints. 0.4.1 gives the same
+  on those seeds with `qualsize` left out as well.
+- `scripts/intel_oracle.py --corpus --normalize`: of the 67 programs of
+  `tests/` and `sample_code/`, 38 print what V3.1's build prints, V3.1
+  rejects 28, and `tests/test_move_builtin.plm` differs where V3.1's MOVE
+  of 0 bytes moves 65536, as with 0.4.1.
+- The 87 compiles of MP/M II's and 80un's PL/M (DRI's tree and mpm2's
+  overrides, each in the mode `tools/build.py` uses; 80un's files one at a
+  time and its two programs) at `-O0`, `-O2` and `-O3` compile to 0.4.1's
+  assembly, and the ten that stop, stop with 0.4.1's errors. The code at
+  `-O2` is 165,182 bytes, the data 45,088 (with upeepz80 0.2.7). The
+  `sample_code` programs and the 47 test programs compile to 0.4.1's
+  assembly at `-O0`, `-O2` and `-O3`; `tests/test_implicit_calls.plm`
+  now with the warning for its `callee$func()`.
+- SHL and SHR of a BYTE made a BYTE, as the manual and V3.1 make them
+  (Known issues), was built and checked, and not kept: 80un's `test.arc`
+  extracts one member of thirteen. MP/M II's SHL sites store the result
+  in a BYTE, or shift a value too small to lose a bit - `shl(dcnt and
+  11b, 5)`, `shl(a, 4) or b` of a BCD digit - and its SHR sites give the
+  same value in eight bits; 24 of the MP/M II compiles are smaller, 619
+  bytes in all at `-O2`, SHOW.PLM the most, by 79.
 
 ## 0.4.1 — 2026-09-26
 

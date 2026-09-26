@@ -554,8 +554,10 @@ runs it with the rest where Intel's binaries are found (building
 building nothing; the oracle's own pieces that need no tools - the source
 normalisation, the halt patch, the skip - are checked either way.  It
 checks three generated programs and one of `tests/`, that a known
-difference is seen and a V3.1 rejection is, and each program of a
-release's tests whose output the release transcribed from Intel's build.
+difference is seen and a V3.1 rejection is, each program of a release's
+tests whose output the release transcribed from Intel's build, and, for
+each program `tests/test_names.py` expects uplm80 to reject or warn of as
+V3.1 rejects it, that V3.1 does, with the error uplm80's message names.
 
 Intel's binaries are not part of this repository.  The oracle finds them
 through `--tools DIR` or `$PLM80_TOOLS`, or on DRI's MP/M II work disk at
@@ -619,7 +621,7 @@ takes since 0.4.2 (`qualsize` no longer leaves them out).
 | `sub-zero` | `w = (b - DOUBLE(0)) + 0F0H;` (b = 0F0H) | `00E0H` | `01E0H` | V3.1 drops `- 0` and with it the ADDRESS type (also `b - (c * 0)`); the manual (4.2.1): ADDRESS |
 | `zero-dividend` | `z = 0; w = 0 / z;` | `0` | `0FFFFH` | V3.1 folds `0 / x` to 0; uplm80 divides, and a division by 0 gives what Intel's own divide routine gives (4.2.3: undefined) |
 | `neg-widened` | `b = 0E7H; w = 0FFFEH; v = (b - w) + (-b);` | `0002` | `0102H` | V3.1 negates `b` in 16 bits when `b - w` has already widened it (the manual: `-b` is a BYTE, 19H) |
-| | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` as a program's first statement (b1-b4 BYTE, w1-w4 ADDRESS) is coded `INX H; INX SP; MOV M,A`, and the next CALL overwrites `b1` |
+| | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` (b1-b4 BYTE, w1-w4 ADDRESS), as a program's first statement or later, is coded `INX H; INX SP; MOV M,A`, and a later CALL overwrites `b1` (the random campaign's seed 233) |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
