@@ -57,3 +57,6 @@ Thumbs.db
 # Temporary files
 /tmp/
 *.bak
+
+# The ISIS emulator (make -C tools/isis)
+tools/isis/isis

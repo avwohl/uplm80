@@ -514,6 +514,104 @@ registers or on the stack until the callee's entry stores them, when its
 caller is active too, so a procedure called while they are evaluated may
 overlay the callee's frame.
 
+## Testing against Intel's PL/M-80
+
+`scripts/intel_oracle.py` is a differential test with Intel's own compiler as
+the oracle.  It builds a program - a CP/M main program that prints through
+MON1/MON2 - with Intel's PL/M-80 V3.1 the way Digital Research's `P.SUB`
+built its CP/M programs:
+
+```
+PLM80 T.PLM DEBUG PAGEWIDTH(80)
+LINK T.OBJ,X0100,PLM80.LIB TO T.MOD
+LOCATE T.MOD CODE(0100H) STACKSIZE(1024)
+OBJCPM T
+```
+
+and with uplm80 at `-O0` to `-O3` (linked with the same `X0100` equates),
+runs every build under cpmemu with a time limit, and compares what each
+prints with what Intel's build prints.  Each program is `same`, `differs`
+(both outputs are shown, and where they first part), `intel-rejects`,
+`uplm80-rejects` or `timeout`.
+
+```bash
+make -C tools/isis                                   # the ISIS-II emulator, once
+python3.14 scripts/intel_oracle.py prog.plm          # programs of your own
+python3.14 scripts/intel_oracle.py --random 300      # generated programs
+python3.14 scripts/intel_oracle.py --corpus          # tests/ and sample_code/
+python3.14 scripts/intel_oracle.py --random 50 --first 1000 --reduce --keep out/
+python3.14 -m pytest tests/test_intel_oracle.py
+```
+
+Intel's binaries are not part of this repository.  The oracle finds them
+through `--tools DIR` or `$PLM80_TOOLS`, or on DRI's MP/M II work disk at
+`~/src/mpm2/mpm2_external/mpm2src/PLM_WORK` (`PLM80`, `PLM80.OV0`-`OV4`,
+`PLM80.LIB`, `LINK`, `LINK.OVL`, `LOCATE`, `X0100`, `OBJCPM.COM`), and when
+they are missing it says so and checks nothing, as the pytest skips.  It runs
+them on `tools/isis/isis`, a small ISIS-II emulator (`tools/isis/isis.cc`)
+on cpmemu's qkz80 core, which `make -C tools/isis` finds the way romwbw_emu
+does (pkg-config, else a `../cpmemu` checkout beside this one); without it,
+on romwbw_emu's `tools/romwbw-plm80`, which runs the same recipe under DRI's
+ISX, some ten times slower.  `OBJCPM` is a CP/M program and runs on cpmemu.
+
+Two things the recipe needs that DRI's own programs did for themselves:
+
+- LOCATE starts a program behind its constants (DATA, and strings in
+  `.(...)`), not at 0100H, where CP/M enters it; DRI's programs begin with a
+  DATA jump.  A program that does not start at 0100H is located again at
+  0103H, where OBJCPM puts a jump to the start in front of it.
+- A PL/M-80 main program ends in `EI; HLT`, which cpmemu runs past.  The
+  HLT at the module's last statement (found through the LINES records
+  `DEBUG` writes) becomes `RST 0`, a warm boot, as uplm80's CP/M mode ends.
+
+A module with no statements of its own, entered through a DATA jump that
+Intel's layout puts at 0100H - DRI's CP/M 2.0 `LOAD`, `STAT` and `SUBMIT` -
+is built with uplm80's `-m bare`, which lays it out the same way (`--mode`
+chooses otherwise).
+
+`--normalize` rewrites three spellings only uplm80 takes into their Intel
+equivalents before both compilers see the program: `.'string'` into
+`.('string')`, an untyped `DATA` into `BYTE DATA`, and a program with no
+`name: DO;` into a module.  `--reduce` cuts a program that differs, or that
+uplm80 rejects, down to the statements, then the lines, the difference needs
+(Zeller's ddmin); the result needs tidying by hand before it is a test.
+
+The generator, `tests/plm_intel.py`, writes programs in the dialect both
+compilers share, with no behaviour PL/M-80 leaves undefined but two, which
+V3.1 defines and uplm80 follows: division by zero (what Intel's divide
+routine returns) and the carry of PLUS, MINUS, SCL and SCR in the form where
+the statement itself sets it.  It covers BYTE and ADDRESS arithmetic,
+relations and logic, the built-ins, arrays, structures, BASED variables,
+DATA/INITIAL, LITERALLY, strings, MOVE, LENGTH/LAST/SIZE, IF, DO CASE, DO
+WHILE, iterative DO (with limits and steps the body changes), nested
+procedures with 0 to 5 parameters, typed and untyped, and REENTRANT
+recursion.  Evaluation order is kept out of what a program prints.  Each printed line starts with the number of the statement
+that printed it, which the source carries as `/* S1F */`.
+
+### Known differences from Intel's PL/M-80 V3.1
+
+The generator can leave out those with a name (`--avoid NAME,...`), and the
+pytest does.  In the first campaign - 1,200 generated programs and the 67
+programs of `tests/` and `sample_code/`, at `-O0` to `-O3` - every difference
+was one of these, and none depended on the optimization level.
+
+| `--avoid` | Program | Intel V3.1 | uplm80 | |
+|---|---|---|---|---|
+| `shl-byte` | `b = 0F0H; w = SHL(b, 4);` | `0000` | `0F00H` | uplm80 shifts a BYTE in 16 bits, with an ADDRESS result (uplm80/plm_types.py); the manual (11.1.4) and Intel make it a BYTE |
+| `shift9` | `b = 7; r = SHL(b, 9);` (r BYTE) | `0EH` | `0` | V3.1 shifts a BYTE by the count mod 8 (0 counts as 8), folded or not; the manual: 0 |
+| `wide-limit` | `DO i = 250 TO 300;` (i BYTE) | 6 times | never | V3.1 compares the BYTE index with the 16-bit limit; the manual (5.1.4) converts the limit to the index's type |
+| `sub-zero` | `w = (b - DOUBLE(0)) + 0F0H;` (b = 0F0H) | `00E0H` | `01E0H` | V3.1 drops `- 0` and with it the ADDRESS type (also `b - (c * 0)`); the manual (4.2.1): ADDRESS |
+| `zero-dividend` | `z = 0; w = 0 / z;` | `0` | `0FFFFH` | V3.1 folds `0 / x` to 0; uplm80 divides, and a division by 0 gives what Intel's own divide routine gives (4.2.3: undefined) |
+| `qualsize` | `LENGTH(st.z)`, `SIZE(sa(2))`, `LAST(sa.z)` | 4, ... | rejected | uplm80 does not take a qualified reference in LENGTH, LAST or SIZE (11.1.2) |
+| `neg-widened` | `b = 0E7H; w = 0FFFEH; v = (b - w) + (-b);` | `0002` | `0102H` | V3.1 negates `b` in 16 bits when `b - w` has already widened it (the manual: `-b` is a BYTE, 19H) |
+| | `w = 1; v = HIGH(0FH + w) >= (ROR(SIZE(aw), 2) AND w);` (aw(8) ADDRESS) | `0` | `0FFH` | V3.1 makes 10H from the 0FH in C with `MOV A,C` and `INX SP` (its listing: `INX PSW`) where it means `INR A`: the value is one short and SP one long.  `w1, b2 = b2;` as a program's first statement (b1-b4 BYTE, w1-w4 ADDRESS) is coded `INX H; INX SP; MOV M,A`, and the next CALL overwrites `b1` |
+| | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
+
+V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
+untyped `DATA` (61), a program that is not a module (89), a declaration
+after a statement (26), `NOT NOT x` and `f()` (102), and a `CALL` of a typed
+procedure (129).
+
 ## Project Structure
 
 ```
