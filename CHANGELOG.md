@@ -263,9 +263,13 @@ On 56fad40, with upeepz80 0.2.7 and um80 0.3.52.
   warnings.
 - 80un's two programs, built from fix/byte-shifts at `-O0`, `-O2` and
   `-O3`, extract the 136 files of the 23 archives and compressed files of
-  80un's tests, and detokenize its five BASIC files, byte for byte as
-  0.4.2's build of 80un's own sources does (cpmemu, binary mode); what
-  they print differs only in the size cpmemu says it loaded.
+  80un's tests, detokenize its one tokenized BASIC file, `PALLOPS.BAS`,
+  refuse its four text `.bas` files (`samples/bas/`: "Not a tokenized
+  BASIC file"), and detokenize MBASIC 5.21's tokenized copies of those
+  four (`SAVE` under cpmemu), `GOTO` line numbers, `&H` and `&O`
+  included, all byte for byte as 0.4.2's build of 80un's own sources does
+  (cpmemu, binary mode); what they print differs only in the size cpmemu
+  says it loaded.
 - The warnings of `tests/`' programs, the pytest's included, besides those
   above: the SHL of a BYTE warning in the programs that test it
   (`tests/test_shl_of_a_byte.py`, `tests/test_expression_types.py`'s
