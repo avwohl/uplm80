@@ -5,50 +5,96 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 
 ## 0.4.1 — unreleased
 
-The Known issues of 0.3.7 and 0.4.0, each settled by the Programming
-Manual (9800268B) and, where it leaves room, by what Intel's PL/M-80
-V3.1 does with the same source: its listing, its diagnostics, and the
-code it generates, linked with DRI's `X0100` and run.
+The Known issues 0.3.7 listed, and 0.4.0 carried, each settled by the
+Programming Manual (9800268B) and, where it leaves room, by what Intel's
+PL/M-80 V3.1 does with the same source: its listing, its diagnostics,
+and the code it generates, linked with DRI's `X0100` and run. Four of
+them were code the compiler got wrong, four were programs it should
+have refused; one is PL/M-80's own rule, one a test's wrong
+expectation, and the others were fixed by 0.4.0, upeepz80 0.2.6 and
+um80 0.3.51.
 
-### Changed
+### Incompatible: errors Intel's PL/M-80 gives
 
-- A static parameter is no longer named a second time by an EQU
-  (`?@proc$name equ @proc$name`). upeepz80 before 0.2.6 dropped the store
-  of an argument at a procedure's entry when nothing else named the
-  parameter's storage, though a pointer from the parameter before it can
-  reach it (Known issues, 0.3.7); 0.2.6, which 0.4.0 requires, keeps it.
-  `pq: procedure (a, b) byte; declare (a, b) byte; ... pp = .a + 1; return
-  c;`, `c` BASED on `pp`, still keeps `ld (@PQ$@B),a` and returns `B` at
-  `-O1` to `-O3`. Over the 87 compiles of MP/M II and 80un, the assembly at
-  `-O1`, `-O2` and `-O3` is 0.4.0's less its 25 such EQUs, line for line.
-- The CHANGELOG's Known issues of 0.3.7 no longer list what 0.4.0 fixed:
-  a CALL through an address passes any number of arguments to any
-  procedure. um80 0.3.51 needs none of uplm80's renames and rewrites of
-  names spelled like an operator (`@EQ`, `2+TYPE`, `jp 0+P`), which are
-  kept, and cost nothing, for older um80 releases (README, Names in the
-  Output).
+A program PL/M-80 does not allow, which uplm80 compiled, is now refused
+as Intel's compiler refuses it. These rules of a program's names are
+checked as the parser gives the program, before the optimizer rewrites
+or drops anything, so every `-O` level finds the same errors; a
+multi-file compile parses and checks every module before it optimizes
+any.
+
+- **A name declared nowhere is an error**, as it is to Intel's PL/M-80
+  V3.1 (ERROR #105, UNDECLARED IDENTIFIER). `y = nosuch + 1` compiled to
+  `ld hl,(NOSUCH)`, and only um80 reported it, as an undefined symbol, or
+  nothing did where the optimizer dropped the use (Known issues, 0.3.7;
+  0.3.6 the same). A built-in needs no declaration, and in a multi-file
+  compile a module still names another's PUBLIC name without declaring it
+  EXTERNAL.
+
+      NOSUCH is not declared (Programming Manual 9800268B, 6.1)
+
+  Of the 87 compiles of MP/M II and 80un, the ten that did not assemble,
+  for this reason, now stop here: MP/M II's `MSCMN.PLM`, which
+  `MSBRS.PLM` and `MSRSP.PLM` include after declaring what it uses, and
+  eight of 80un's modules compiled alone, which name each other's
+  procedures (80un compiles them together).
+- **`x()`, empty parentheses after a variable, is an error.** PL/M-80 has
+  no empty subscript or argument list. `y = x() + 1` with x a BYTE compiled
+  to a CALL through x's value (0.3.6: `call X`), and so did an array, a
+  BASED variable, a structure, a parameter and `CALL w()` of an ADDRESS
+  (Known issues, 0.3.7). Intel's PL/M-80 V3.1 rejects each, ERROR #127,
+  INVALID SUBSCRIPT ON NON-ARRAY, and #102, MISSING PRIMARY OPERAND.
+
+      X(): X is a variable, and PL/M-80 has neither an empty subscript nor
+      an empty argument list
+
+  A procedure's `f()` is still taken for `f`, as uplm80 always has; V3.1
+  rejects that too (#102).
+- **`.label`, the address of a label, in an expression is an error.** The
+  dot operator takes a variable or a procedure (4.1.3), and Intel's
+  PL/M-80 V3.1 rejects `.label` in an expression, ERROR #158, INVALID DOT
+  OPERAND, LABEL ILLEGAL, whether or not the label is declared LABEL and
+  whether it is defined before the expression or after; it accepts one in
+  a DATA or an INITIAL list, and so does uplm80, as before (MP/M II's
+  MPMLDR begins `DATA (0C3H, .start-3)`). uplm80 compiled the expression to
+  the label's address (Known issues, 0.3.7; 0.3.6 the same).
+
+      .HERE: HERE is a label, and the dot operator takes a variable or a
+      procedure (Programming Manual 9800268B, 4.1.3); the address of a
+      label may be given only in a DATA or an INITIAL list
+
+- **An INTERRUPT procedure nested in a procedure, or declared in a DO
+  block, is an error**, as it is to Intel's PL/M-80 V3.1 (ERROR #39,
+  INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL): "it may only
+  be used in a PROCEDURE statement at the outer level of a program
+  module" (8.1.6). uplm80 compiled a nested one, and a local of the
+  procedure around it that the interrupt read could be in `??AUTO`, in
+  another procedure's frame (Known issues, 0.3.7; 0.3.6 the same).
+
+      IH: an INTERRUPT procedure must be declared at the outer level of the
+      module, not in procedure OUTER (Programming Manual 9800268B, 8.1.6)
 
 ### Fixed
 
-- **A counted loop over a module-level index ends where a pointer or an
-  overrun sets the index.** A BYTE `DO i = 0 TO n` whose body does not
-  name `i` counts its passes in B, which is right only if nothing else can
-  reach `i` while it runs. For a procedure's local that took in a pointer
-  run on from a local declared before it and an overrun of an array
-  declared before it; for a module-level `i` it did not, so with `p = .a +
-  1` (`a` declared just before `i`) a store through `p` in the body did not
-  end the loop (Known issues, 0.3.7), and neither did `buf(k) = 30` with
-  `k` past the end of a `buf` declared before `i`, or with `p = .a2 + 1`
-  after `declare (a2, i2) byte`. Now a module-level index is not counted
-  either when a variable laid out before it - the module's and the
-  procedures' static ones, in the source's order - has its address taken,
-  or is subscripted past its end or by what is not a constant. DRI's compiler never counts a loop, and the program in
-  `tests/test_calls_and_loops.py` prints, at `-O0` to `-O3`, what it prints
-  compiled by Intel's PL/M-80 V3.1. Of the 87 MP/M II and 80un compiles,
-  one loop changes, `DO jtab = 0 TO itab` in MSPL.PLM's LIST$BUF (DRI's and
-  mpm2's), since `.pcb` is taken and PCB is declared before JTAB: 7 bytes
-  more at `-O1` to `-O3` and 8 at `-O0`, in each of the two, and nothing
-  else; ED's, PIP's and 80un's counted loops are over locals.
+- **A procedure or a variable named like a built-in is the program's,** as
+  a declaration hides the built-in of its name (9.2), and as Intel's
+  PL/M-80 V3.1 compiles it. The optimizer wrote an ADDRESS constant below
+  256, and a value it widened to ADDRESS, as a call of DOUBLE, and every
+  call of DOUBLE of a constant was taken for one: with a procedure DOUBLE
+  of the program's, `double(30h)` was 30H at `-O1` and up however the
+  procedure was written (Known issues, 0.3.7). The optimizer's DOUBLE is
+  now called by a name no program can declare, `??DOUBLE`. And wherever
+  the optimizer or code generation knew a built-in by its name alone, it
+  now also checks that the program does not declare the name there. These
+  were wrong too (0.3.6 the same): a DOUBLE or LOW of the program's in a
+  condition or in a DO's bound was folded as the built-in, at every level;
+  `w * 8` and `w / 2` became calls of the program's SHL and SHR at `-O2`
+  and `-O3`; an array OUTPUT or MEMORY was stored to as the port, or as
+  memory past the end of the program, and `.memory` of one was the end of
+  the program, and a variable STACKPTR was SP, at every level. A program
+  that declares no built-in's name compiles to the code 0.4.0 compiles it
+  to: the 87 MP/M II and 80un compiles, and 300 random programs and the
+  test programs, at `-O0` to `-O3`.
 - **PLUS, MINUS, SCL and SCR after `+ 4` or `- 4` of an ADDRESS read the
   carry that the addition or subtraction sets**, as in Intel's PL/M-80
   V3.1. uplm80 stepped an ADDRESS by 1 to 4 with `inc hl` and `dec hl`,
@@ -78,97 +124,26 @@ code it generates, linked with DRI's `X0100` and run.
   in `tests/test_expression_types.py` prints what V3.1's code prints at
   `-O0` to `-O3`. None of the 87 MP/M II and 80un compiles has such an
   expression.
-- **A procedure or a variable named like a built-in is the program's,** as
-  a declaration hides the built-in of its name (9.2), and as Intel's
-  PL/M-80 V3.1 compiles it. The optimizer wrote an ADDRESS constant below
-  256, and a value it widened to ADDRESS, as a call of DOUBLE, and every
-  call of DOUBLE of a constant was taken for one: with a procedure DOUBLE
-  of the program's, `double(30h)` was 30H at `-O1` and up however the
-  procedure was written (Known issues, 0.3.7). The optimizer's DOUBLE is
-  now called by a name no program can declare, `??DOUBLE`. And wherever
-  the optimizer or code generation knew a built-in by its name alone, it
-  now also checks that the program does not declare the name there. These
-  were wrong too (0.3.6 the same): a DOUBLE or LOW of the program's in a
-  condition or in a DO's bound was folded as the built-in, at every level;
-  `w * 8` and `w / 2` became calls of the program's SHL and SHR at `-O2`
-  and `-O3`; an array OUTPUT or MEMORY was stored to as the port, or as
-  memory past the end of the program, and `.memory` of one was the end of
-  the program, and a variable STACKPTR was SP, at every level. A program
-  that declares no built-in's name compiles to the code 0.4.0 compiles it
-  to: the 87 MP/M II and 80un compiles, and 300 random programs and the
-  test programs, at `-O0` to `-O3`.
-- **A LITERALLY's name declared again in an inner block** is PL/M-80's
-  rule, not a defect (Known issues, 0.3.7): a LITERALLY's text is
-  "substituted for each occurrence of the identifier in subsequent text"
-  (6.4), throughout its scope, so after `declare n literally '5'` a
-  procedure's `declare n byte` is `declare 5 byte`. Intel's PL/M-80 V3.1
-  does the same, ERROR #48, ILLEGAL DECLARATION STATEMENT SYNTAX; with
-  `m literally 'w'` an inner `declare m byte` declares a W of that block's
-  own in both compilers, and MP/M II's MPMLDR needs `mon1 literally
-  'ldmon1'` to make its `mon1: procedure external` LDMON1. The syntax
-  error now says where the text came from:
-
-      unexpected token 'NUMBER' '5'; expected one of: IDENT, LPAREN; that
-      is the text of N, declared LITERALLY '5', which PL/M-80 puts in place
-      of N throughout the LITERALLY's scope, a declaration of N in an inner
-      block included (Programming Manual 9800268B, 6.4)
-
-- **A name declared nowhere is an error**, as it is to Intel's PL/M-80
-  V3.1 (ERROR #105, UNDECLARED IDENTIFIER). `y = nosuch + 1` compiled to
-  `ld hl,(NOSUCH)`, and only um80 reported it, as an undefined symbol, or
-  nothing did where the optimizer dropped the use (Known issues, 0.3.7;
-  0.3.6 the same). A built-in needs no declaration, and in a multi-file
-  compile a module still names another's PUBLIC name without declaring it
-  EXTERNAL.
-
-      NOSUCH is not declared (Programming Manual 9800268B, 6.1)
-
-  Of the 87 compiles of MP/M II and 80un, the ten that did not assemble,
-  for this reason, now stop here: MP/M II's `MSCMN.PLM`, which
-  `MSBRS.PLM` and `MSRSP.PLM` include after declaring what it uses, and
-  eight of 80un's modules compiled alone, which name each other's
-  procedures (80un compiles them together).
-- **An INTERRUPT procedure nested in a procedure, or declared in a DO
-  block, is an error**, as it is to Intel's PL/M-80 V3.1 (ERROR #39,
-  INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL): "it may only
-  be used in a PROCEDURE statement at the outer level of a program
-  module" (8.1.6). uplm80 compiled a nested one, and a local of the
-  procedure around it that the interrupt read could be in `??AUTO`, in
-  another procedure's frame (Known issues, 0.3.7; 0.3.6 the same).
-
-      IH: an INTERRUPT procedure must be declared at the outer level of the
-      module, not in procedure OUTER (Programming Manual 9800268B, 8.1.6)
-
-- **`.label`, the address of a label, in an expression is an error.** The
-  dot operator takes a variable or a procedure (4.1.3), and Intel's
-  PL/M-80 V3.1 rejects `.label` in an expression, ERROR #158, INVALID DOT
-  OPERAND, LABEL ILLEGAL, whether or not the label is declared LABEL and
-  whether it is defined before the expression or after; it accepts one in
-  a DATA or an INITIAL list, and so does uplm80, as before (MP/M II's
-  MPMLDR begins `DATA (0C3H, .start-3)`). uplm80 compiled the expression to
-  the label's address (Known issues, 0.3.7; 0.3.6 the same).
-
-      .HERE: HERE is a label, and the dot operator takes a variable or a
-      procedure (Programming Manual 9800268B, 4.1.3); the address of a
-      label may be given only in a DATA or an INITIAL list
-
-- **`x()`, empty parentheses after a variable, is an error.** PL/M-80 has
-  no empty subscript or argument list. `y = x() + 1` with x a BYTE compiled
-  to a CALL through x's value (0.3.6: `call X`), and so did an array, a
-  BASED variable, a structure, a parameter and `CALL w()` of an ADDRESS
-  (Known issues, 0.3.7). Intel's PL/M-80 V3.1 rejects each, ERROR #127,
-  INVALID SUBSCRIPT ON NON-ARRAY, and #102, MISSING PRIMARY OPERAND.
-
-      X(): X is a variable, and PL/M-80 has neither an empty subscript nor
-      an empty argument list
-
-  A procedure's `f()` is still taken for `f`, as uplm80 always has; V3.1
-  rejects that too (#102).
-
-  These rules of a program's names are checked as the parser gives the
-  program, before the optimizer rewrites or drops anything, so every `-O`
-  level finds the same errors; a multi-file compile parses and checks
-  every module before it optimizes any.
+- **A counted loop over a module-level index ends where a pointer or an
+  overrun sets the index.** A BYTE `DO i = 0 TO n` whose body does not
+  name `i` counts its passes in B, which is right only if nothing else can
+  reach `i` while it runs. For a procedure's local that took in a pointer
+  run on from a local declared before it and an overrun of an array
+  declared before it; for a module-level `i` it did not, so with `p = .a +
+  1` (`a` declared just before `i`) a store through `p` in the body did
+  not end the loop (Known issues, 0.3.7), and neither did `buf(k) = 30`
+  with `k` past the end of a `buf` declared before `i`, or with `p = .a2 +
+  1` after `declare (a2, i2) byte`. Now a module-level index is not
+  counted either when a variable laid out before it - the module's and the
+  procedures' static ones, in the source's order - has its address taken,
+  or is subscripted past its end or by what is not a constant. DRI's
+  compiler never counts a loop, and the program in
+  `tests/test_calls_and_loops.py` prints, at `-O0` to `-O3`, what it
+  prints compiled by Intel's PL/M-80 V3.1. Of the 87 MP/M II and 80un
+  compiles, one loop changes, `DO jtab = 0 TO itab` in MSPL.PLM's LIST$BUF
+  (DRI's and mpm2's), since `.pcb` is taken and PCB is declared before
+  JTAB: 7 bytes more at `-O1` to `-O3` and 8 at `-O0`, in each of the two,
+  and nothing else; ED's, PIP's and 80un's counted loops are over locals.
 - **A REENTRANT procedure's parameter declared with its locals,**
   `DECLARE (top, c) BYTE`, was declared a second time, as a local in the
   frame, which nothing set, and every use of it read that: `rp(3)` of a
@@ -182,6 +157,86 @@ code it generates, linked with DRI's `X0100` and run.
   They test the least significant bit (5.1.2): 128, 10, 2 and 256 are
   false. The expected output is now what the program prints compiled by
   Intel's PL/M-80 V3.1, and by uplm80; all 22 programs pass.
+
+### Changed
+
+- **A LITERALLY's name declared again in an inner block** is PL/M-80's
+  rule, not a defect (Known issues, 0.3.7): a LITERALLY's text is
+  "substituted for each occurrence of the identifier in subsequent text"
+  (6.4), throughout its scope, so after `declare n literally '5'` a
+  procedure's `declare n byte` is `declare 5 byte`. Intel's PL/M-80 V3.1
+  does the same, ERROR #48, ILLEGAL DECLARATION STATEMENT SYNTAX; with
+  `m literally 'w'` an inner `declare m byte` declares a W of that block's
+  own in both compilers, and MP/M II's MPMLDR needs `mon1 literally
+  'ldmon1'` to make its `mon1: procedure external` LDMON1. The syntax
+  error now says where the text came from:
+
+      unexpected token 'NUMBER' '5'; expected one of: IDENT, LPAREN; that
+      is the text of N, declared LITERALLY '5', which PL/M-80 puts in place
+      of N wherever it occurs in the LITERALLY's scope (Programming Manual
+      9800268B, 6.4)
+
+- A static parameter is no longer named a second time by an EQU
+  (`?@proc$name equ @proc$name`). upeepz80 before 0.2.6 dropped the store
+  of an argument at a procedure's entry when nothing else named the
+  parameter's storage, though a pointer from the parameter before it can
+  reach it (Known issues, 0.3.7); 0.2.6, which 0.4.0 requires, keeps it.
+  `pq: procedure (a, b) byte; declare (a, b) byte; ... pp = .a + 1; return
+  c;`, `c` BASED on `pp`, still keeps `ld (@PQ$@B),a` and returns `B` at
+  `-O1` to `-O3`. Over the 87 compiles of MP/M II and 80un, the assembly at
+  `-O1`, `-O2` and `-O3` is 0.4.0's less its 25 such EQUs, line for line.
+- The CHANGELOG's Known issues of 0.3.7 no longer list what 0.4.0 fixed:
+  a CALL through an address passes any number of arguments to any
+  procedure. um80 0.3.51 needs none of uplm80's renames and rewrites of
+  names spelled like an operator (`@EQ`, `2+TYPE`, `jp 0+P`), which are
+  kept, and cost nothing, for older um80 releases (README, Names in the
+  Output).
+
+### Added
+
+- `tests/test_names.py`: each new error, at every level and where it is
+  placed - a name declared nowhere, empty parentheses after each kind of
+  variable, the address of a label in an expression, an INTERRUPT
+  procedure in a procedure and in a DO block, a LITERALLY's name declared
+  again - and every built-in compiling undeclared.
+- `tests/test_expression_types.py`: a procedure named like each built-in
+  that is one, and a variable named like each that can be one; PLUS,
+  MINUS, SCL and SCR after `+ 4` and `- 4`, and 1 to 3 still `inc hl`.
+- `tests/test_calls_and_loops.py`: REENTRANT procedures with their
+  parameters factored with locals; counted loops whose index a pointer or
+  an overrun sets.
+- Each program in them that runs prints, at `-O0` to `-O3`, what it prints
+  compiled by Intel's PL/M-80 V3.1 (DRI's `PLM_WORK` copy, under an ISIS
+  emulator), linked with DRI's `X0100` and `PLM80.LIB` by Intel's LINK
+  and LOCATE, and run under cpmemu. The expected output is transcribed:
+  Intel's binaries are not in this repository.
+
+### Verified
+
+On 1b210ad, with upeepz80 0.2.6 and um80 0.3.51.
+
+- The suite: 873 tests pass. pylint rates the package 9.73.
+- `tests/run_tests.sh`: all 22 programs pass.
+- `scripts/difftest.py --seeds 200`: every program prints what the model
+  says at `-O0` to `-O3`. `scripts/abifuzz.py --seeds 200`: every program
+  prints, in each of its builds, what its `-O0` build prints.
+  `scripts/namestest.py --seeds 200`, and `--modules --seeds 40`: every
+  program prints what its scopes say.
+- The 87 compiles of MP/M II's and 80un's PL/M (DRI's tree and mpm2's
+  overrides, each in the mode `tools/build.py` uses; 80un's files one at a
+  time and its two programs), at each of `-O0` to `-O3`: 75 of the 77 that
+  assemble compile to 0.4.0's assembly less its 25 EQUs, line for line,
+  80un's two programs among them; MSPL.PLM, DRI's and mpm2's, is 7 bytes
+  larger at `-O1` to `-O3` and 8 at `-O0` (a loop no longer counted,
+  Fixed); the other ten, which never assembled, stop at compile time with
+  "is not declared". The code at `-O2` is 165,326 bytes against 165,312,
+  the data 45,088 as before.
+- `sample_code`: the five programs that compile compile to the same
+  assembly as with 0.4.0; the others stop where they stopped, three of
+  them now saying that the number they stopped at is a LITERALLY's text.
+- 300 random programs, 150 each of `tests/plm_difftest.py` and
+  `tests/names_difftest.py`, and the 47 test programs compile, at `-O0` to
+  `-O3`, to 0.4.0's assembly less the EQUs, line for line.
 
 ## 0.4.0 — 2026-09-25
 
