@@ -222,9 +222,10 @@ def test_zero_dividend_leaves_out_a_dividend_that_folds_to_0():
     """`--avoid zero-dividend' left out `0 / x' but not a dividend that
     folds to 0 by what folds to 0 too, `(8 / 0FF00H) / (0F82AH <= 1)',
     which V3.1 folds to 0 and uplm80 divides, 0FFFFH (0.4.2's Known
-    issues)."""
+    issues), nor a product with 0, `((k0 * 0) * x) / y' (seed 50094)."""
     assert zero_dividend(Bin("/", Num(8), Num(0xFF00)), Bin("<=", Num(0xF82A), Num(1)))
     assert zero_dividend(Num(0), Var("b1"))
+    assert zero_dividend(Bin("*", Bin("*", Num(65534), Num(0)), Var("b1")), Var("w1"))
     assert not zero_dividend(Num(0), Num(3))
     assert not zero_dividend(Num(8), Var("b1"))
     avoid = KNOWN | {"zero-dividend"}
