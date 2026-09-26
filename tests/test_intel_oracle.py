@@ -22,6 +22,7 @@ import sys
 import pytest
 
 from tests.plm_intel import generate
+from tests.test_calls_and_loops import MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, QUALIFIED_SIZES
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +42,8 @@ SEEDS = [3, 8, 10]
 # test_expression_types.py's _PRELUDE.
 RELEASE_PROGRAMS = {
     "qualified-sizes": QUALIFIED_SIZES,          # 0.4.2, LENGTH(st.z), SIZE(sa(2))
+    "memory-runs-on": MEMORY_RUNS_ON,            # 0.4.2, memory(5) = 20
+    **{f"memory-runs-back-{k}": v for k, v in MEMORY_RUNS_BACK.items()},
 }
 
 

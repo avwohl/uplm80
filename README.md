@@ -632,14 +632,11 @@ parameter no `DECLARE` declares, and a `LITERALLY` used before its
 declaration.
 
 The other way round, V3.1 compiles a label on an `END` statement, `out:
-end p;` (A.4.4.1), which uplm80 0.4.1 does not.  And two kinds of program
-compile to other code in each (0.4.1, Known issues): a store through a
+end p;` (A.4.4.1), which uplm80 0.4.1 does not.  And a store through a
 pointer or an overrun in or from `??AUTO` reaches what uplm80's layout puts
-there, not what DRI's does; and a counted loop over the last module-level
-variable does not see a store through MEMORY that reaches it,
-`p = .memory - 1` with a BASED `b`, or `memory(0FFFFH) = 20` (V3.1's build
-prints `0003 0015`, uplm80's `000B 0014`).  Neither is in the generator's
-dialect.
+there, not what DRI's does (CHANGELOG, Known issues), which the generator
+never writes; a counted loop over the last module-level variable sees a
+store through MEMORY that reaches it since 0.4.2.
 
 ## Project Structure
 

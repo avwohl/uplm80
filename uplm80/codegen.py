@@ -1325,7 +1325,29 @@ class CodeGenerator:
             shape = module_shape(m)
             walk(list(shape.decls), True)
             walk(list(shape.stmts), False)
+        if self._memory_runs_back():
+            starts.append("MEMORY")
         self._any_reach = bool(starts)
+
+    def _memory_runs_back(self) -> bool:
+        """Whether a store through MEMORY can reach the variables.
+
+        MEMORY begins where the last variable ends (`__END__'), in
+        DRI's layout as in uplm80's, so `.memory - 1', or a BASED variable
+        on a pointer made from `.memory', is the last variable's last byte,
+        and so is `memory(0ffffh)', the subscript wrapping.  A pointer made
+        from `.memory' may run back anywhere, and so may a subscript that is
+        not a constant; a constant one runs back if it is 8000H or more, a
+        displacement back from the end.  A program's own MEMORY is only
+        taken for the built-in, which can only make more starts.
+        """
+        if "MEMORY" in self._aliased:
+            return True
+        for path in self._subscripted.get("MEMORY", ()):
+            for part in path:
+                if part[0] == "idx" and any(v is None or v >= 0x8000 for v in part[1]):
+                    return True
+        return False
 
     def _module_reach(self, name: str) -> bool:
         """Whether the module-level variable ``name`` can be read or written

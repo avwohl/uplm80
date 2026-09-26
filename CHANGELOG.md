@@ -30,6 +30,23 @@ binaries are found.
   LENGTH OR LAST), and so is SIZE of a subscripted scalar (#127) or of a
   member no structure has (#112). The oracle's generator no longer leaves
   them out (README, Known differences).
+- **A counted loop over the last variable ends where a store through
+  MEMORY sets it.** MEMORY begins where the last variable ends, in V3.1's
+  layout as in uplm80's, so `p = .memory - 1` with a BASED `b`,
+  `memory(0ffffh)`, the subscript wrapping, and `memory(k)` with k =
+  0FFFFH each reach the last module-level variable, or a procedure's
+  static local laid out last, and a BYTE loop over it, counted in B, ran
+  its count: 000B 0014 at `-O0` to `-O3`, where Intel's PL/M-80 V3.1
+  build prints 0003 0015 (Known issues, 0.4.1). A store through MEMORY
+  now makes every module-level variable and static local reachable, as
+  the address of a variable does (0.4.1, Fixed), where `.memory` is
+  taken or MEMORY is subscripted by what is not a constant, or by a
+  constant of 8000H or more; `memory(5)` runs on from the end, and a
+  loop beside it is still counted. The programs in
+  `tests/test_calls_and_loops.py` print, at `-O0` to `-O3`, what Intel's
+  build of each prints. The 87 MP/M II and 80un compiles, MP/M II's ED
+  and STAT among them, which take `.memory` and subscript MEMORY by a
+  variable, compile to 0.4.1's assembly at `-O0`, `-O2` and `-O3`.
 
 ### Added
 
@@ -106,11 +123,6 @@ And these V3.1 compiles to other code (0.4.1 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
-- A loop over the last module-level variable is still counted where a
-  store through MEMORY reaches it: MEMORY follows the last variable, in
-  V3.1's layout as in uplm80's, so `p = .memory - 1` with a BASED `b`, or
-  `memory(0ffffh) = 20`, sets that variable, and the loop runs its count
-  (000B 0014 at `-O0` to `-O3`, where V3.1's build prints 0003 0015).
 - A label on an END statement, `out: end p;` (Programming Manual A.4.4.1),
   is a syntax error; V3.1 compiles it.
 - V3.1 rejects a zero dimension, `declare b (0) byte` (ERROR #57), and the

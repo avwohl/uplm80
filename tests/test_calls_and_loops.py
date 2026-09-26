@@ -534,6 +534,75 @@ call run;
 """, [3, 0x15])
 
 
+# A counted loop over the last variable, which MEMORY follows, and
+# a store through MEMORY that reaches it: a pointer made from `.memory', a
+# constant subscript that wraps, one that is not a constant.  Each body
+# follows _PRELUDE; tests/test_intel_oracle.py builds each with Intel's
+# PL/M-80 V3.1 too.
+_MEMORY_LOOP = """
+{decl}
+run: procedure;
+  {local}
+  n = 0; {before}
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then {store}
+  end;
+  call ph(n); call ph(i);
+end run;
+call run;
+"""
+MEMORY_RUNS_BACK = {
+    "pointer": _MEMORY_LOOP.format(
+        decl="declare n byte, p address, b based p byte, i byte;", local="",
+        before="p = .memory - 1;", store="b = 20;"),
+    "wraps": _MEMORY_LOOP.format(
+        decl="declare n byte, i byte;", local="", before="", store="memory(0ffffh) = 20;"),
+    "variable": _MEMORY_LOOP.format(
+        decl="declare n byte, k address, i byte;", local="", before="k = 0ffffh;",
+        store="memory(k) = 20;"),
+    "static": _MEMORY_LOOP.format(
+        decl="", local="declare n byte, i byte;\n  if i = 99 then n = 1;", before="",
+        store="memory(0ffffh) = 20;"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MEMORY_RUNS_BACK))
+def test_a_counted_loop_ends_where_a_store_through_memory_sets_its_index(case):
+    """MEMORY begins where the last variable ends, in DRI's layout as in
+    uplm80's, so `.memory - 1' is the last variable, and so is
+    `memory(0ffffh)', the subscript wrapping, and `memory(k)' with k =
+    0FFFFH; a procedure's static local is laid out among the module's
+    variables.  Nothing but a declared variable was taken to reach the
+    others, so a loop over the last one was counted in B and the store did
+    not end it: 000B 0014, where Intel's PL/M-80 V3.1 build prints 0003
+    0015, at every level (0.4.1 the same)."""
+    _check(MEMORY_RUNS_BACK[case], [3, 0x15])
+
+
+MEMORY_RUNS_ON = """
+declare n byte, i byte;
+run: procedure;
+  n = 0;
+  do i = 0 to 10;
+    n = n + 1;
+    if n = 3 then memory(5) = 20;
+  end;
+  call ph(n); call ph(i + memory(5));
+end run;
+call run;
+"""
+
+
+def test_memory_run_on_from_its_start_leaves_a_loop_counted():
+    """A constant subscript below 8000H runs on from the end of the
+    variables, never back into them: the loop over the last one is still
+    counted in B, and prints what Intel's V3.1 build prints."""
+    _check(MEMORY_RUNS_ON, [11, 0x1F])
+    asm = _asm(_PRELUDE + MEMORY_RUNS_ON + "\nend t;\n", 2)
+    assert "djnz" in asm[asm.index("RUN:"):]
+
+
 @pytest.mark.parametrize("where", ["module", "local"])
 def test_a_member_of_an_unsubscripted_array_of_structures_runs_on(where):
     """`s2.m(4)' of an `s2 (2) structure (m(2) byte)' is s2(0).m(4) to
