@@ -1060,3 +1060,41 @@ def test_empty_parentheses_after_a_parameter_are_an_error():
     err = _compile_error(PRELUDE + "q: procedure (x) byte; declare x byte; return x(); end q;\n"
                          "call pc(q(1));\nend t;\n")
     assert "T.PLM:5:47: error: X(): X is a parameter" in err, err
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("stmt, name, col", [
+    ("y = nosuch + 1;", "NOSUCH", 5),
+    ("call noproc;", "NOPROC", 6),
+    ("call noproc2(1, 2);", "NOPROC2", 6),
+    ("y = nofunc(3);", "NOFUNC", 5),
+    ("y = .nowhere;", "NOWHERE", 6),
+    ("if 0 then y = gone;", "GONE", 15),
+    ("y = n;", "NN", 5),
+])
+def test_a_name_declared_nowhere_is_an_error(opt, stmt, name, col):
+    """`y = nosuch + 1' compiled to `ld hl,(NOSUCH)', and only um80
+    reported it, as an undefined symbol (0.3.6 the same); the optimizer
+    dropped a use it could prove unreached, so that `if 0 then y = gone'
+    compiled at -O1 and up.  Intel's PL/M-80 V3.1: ERROR #105, UNDECLARED
+    IDENTIFIER, for each, and for a LITERALLY whose text is a name
+    declared nowhere (`n literally 'nn''; its own name is declared again
+    in `p', which the macro pass makes a declaration of NN there)."""
+    src = PRELUDE + """declare n literally 'nn';
+declare (x, y) address;
+p: procedure; declare n byte; n = 1; end p;
+""" + stmt + "\nend t;\n"
+    err = _compile_error(src, opt)
+    assert (f"T.PLM:8:{col}: error: {name} is not declared "
+            "(Programming Manual 9800268B, 6.1)") in err, err
+
+
+def test_a_built_in_needs_no_declaration():
+    r = _compile(PRELUDE + """declare (x, y) address, b (4) byte;
+y = low(x) + high(x) + double(1) + shl(x, 1) + shr(x, 1) + rol(1, 1) + ror(1, 1)
+  + scl(x, 1) + scr(x, 1) + length(b) + last(b) + size(b) + input(3) + dec(1)
+  + memory(0) + stackptr + carry + zero + sign + parity;
+call move(1, .x, .y); call time(1); output(3) = 1;
+end t;
+""")
+    assert r.returncode == 0, r.stderr

@@ -244,6 +244,7 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     dot: bool = False           # the operand of a dot, `.name'
     in_list: bool = False       # in a DATA or INITIAL list
     empty: bool = False         # followed by empty parentheses, `name()'
+    in_at: bool = False         # in an AT clause
 
 
 def _key(tok) -> str:
@@ -269,6 +270,7 @@ class _Resolver:
         self.refs_of: dict[int, list[_Ref]] = {}
         self.used: set[str] = set()     # every name a declaration has
         self._lists = 0                 # DATA and INITIAL lists being visited
+        self._at = 0                    # AT clauses being visited
 
     # ---- collecting ----------------------------------------------------
 
@@ -342,13 +344,15 @@ class _Resolver:
             for f in ("condition", "start", "bound", "step", "selector", "items"):
                 self._visit(getattr(n, f, None), inner)
         elif isinstance(n, (P.Identifier, P.DottedIdent)):
-            self.refs.append(_Ref(block, n, "name", in_list=self._lists > 0))
+            self._ref(block, n)
         elif isinstance(n, P.CallNoArgs) and isinstance(unwrap_paren(n.callee), P.Identifier):
-            self.refs.append(_Ref(block, unwrap_paren(n.callee), "name", empty=True,
-                                  in_list=self._lists > 0))
+            self._ref(block, unwrap_paren(n.callee), empty=True)
         elif isinstance(n, P.LocationOf) and isinstance(unwrap_paren(n.operand), P.Identifier):
-            self.refs.append(_Ref(block, unwrap_paren(n.operand), "name", dot=True,
-                                  in_list=self._lists > 0))
+            self._ref(block, unwrap_paren(n.operand), dot=True)
+        elif isinstance(n, P.AttrAt):
+            self._at += 1
+            self._visit(n.address, block)
+            self._at -= 1
         elif isinstance(n, P.AttrInitial) or hasattr(n, "data_values"):
             # A DATA or an INITIAL list, where the address of a label may be.
             for f in n.__dataclass_fields__:
@@ -368,6 +372,11 @@ class _Resolver:
                 for f in fields:
                     if f != "pos":
                         self._visit(getattr(n, f), block)
+
+    def _ref(self, block: _Block, node, **kw) -> None:
+        """A use of the name ``node`` spells, in ``block``."""
+        self.refs.append(_Ref(block, node, "name", in_list=self._lists > 0,
+                              in_at=self._at > 0, **kw))
 
     def _proc(self, p: P.ProcDecl, block: _Block) -> None:
         attrs = proc_attrs(p)
@@ -566,14 +575,21 @@ class _Resolver:
     _KIND_WORDS = {"var": "a variable", "param": "a parameter", "label": "a label"}
 
     def check_uses(self) -> None:
-        """Every name used as PL/M-80 allows: not the address of a label,
-        but in a DATA or an INITIAL list, and no empty parentheses after
-        anything but a procedure."""
+        """Every name used as PL/M-80 allows: declared, or a built-in; not
+        the address of a label, but in a DATA or an INITIAL list; and no
+        empty parentheses after anything but a procedure."""
         for r in self.refs:
             d = r.decl
-            if r.goto or d is None:
+            if r.goto:
                 continue
             text = ident_text(getattr(r.node, r.attr))
+            if d is None:
+                # Intel's PL/M-80 V3.1: ERROR 105, UNDECLARED IDENTIFIER.
+                # (An AT names its own: _at_address.)
+                if _key(getattr(r.node, r.attr)) in _BUILTINS or r.in_at:
+                    continue
+                raise CodeGenError(f"{text} is not declared (Programming Manual "
+                                   "9800268B, 6.1)", source_location(r.node))
             if r.empty and d.kind in self._KIND_WORDS:
                 # Intel's PL/M-80 V3.1: ERROR 127, INVALID SUBSCRIPT ON
                 # NON-ARRAY, and ERROR 102, MISSING PRIMARY OPERAND, for
@@ -800,8 +816,9 @@ def check_names(modules: list, multi: bool = False) -> None:
     PL/M-80 allows, before the optimizer rewrites or drops any of them.
 
     Raises CodeGenError for the first thing that is not allowed, as
-    :func:`resolve_names` does for the rest: an INTERRUPT procedure
-    anywhere but at the outer level of its module, the address of a
+    :func:`resolve_names` does for the rest: a name declared nowhere (a
+    built-in's aside), an INTERRUPT procedure anywhere but at the outer
+    level of its module, the address of a
     label anywhere but in a DATA or an INITIAL list, and empty parentheses
     after a variable.  ``multi``: the modules are compiled together (see
     resolve_names).

@@ -30,6 +30,21 @@ code it generates, linked with DRI's `X0100` and run.
 
 ### Fixed
 
+- **A name declared nowhere is an error**, as it is to Intel's PL/M-80
+  V3.1 (ERROR #105, UNDECLARED IDENTIFIER). `y = nosuch + 1` compiled to
+  `ld hl,(NOSUCH)`, and only um80 reported it, as an undefined symbol, or
+  nothing did where the optimizer dropped the use (Known issues, 0.3.7;
+  0.3.6 the same). A built-in needs no declaration, and in a multi-file
+  compile a module still names another's PUBLIC name without declaring it
+  EXTERNAL.
+
+      NOSUCH is not declared (Programming Manual 9800268B, 6.1)
+
+  Of the 87 compiles of MP/M II and 80un, the ten that did not assemble,
+  for this reason, now stop here: MP/M II's `MSCMN.PLM`, which
+  `MSBRS.PLM` and `MSRSP.PLM` include after declaring what it uses, and
+  eight of 80un's modules compiled alone, which name each other's
+  procedures (80un compiles them together).
 - **An INTERRUPT procedure nested in a procedure, or declared in a DO
   block, is an error**, as it is to Intel's PL/M-80 V3.1 (ERROR #39,
   INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL): "it may only
@@ -1244,9 +1259,6 @@ Each fix has a regression test that fails without it.
   literally 'ldmon1'`.
 - **A procedure named DOUBLE** is taken for the built-in where code generation
   folds constants: `double(30h)` is 30H however the procedure is written.
-- **A name that is declared nowhere is not an error.** `y = nosuch + 1`
-  compiles to `ld hl,(NOSUCH)`, and only um80 reports it, as an undefined
-  symbol (0.3.6 the same).
 - **`STACKPTR` read inside an expression can see a temporary the compiler
   pushed.** Where an operand evaluated before it is kept on the stack,
   STACKPTR reads 2 less than it does at the start of the statement. After
