@@ -188,7 +188,7 @@ where:
   subscripts have nothing in parentheses in them.  A scalar takes no
   subscript: `x(1)`, the element that far past x, and `s2.m(1)` of an
   array of structures, `s2(0).m(1)`, are compiled with a warning, as
-  programs written for uplm80 rely on them.
+  before, since uplm80's own tests test them.
 - SHL and SHR of a BYTE are a BYTE (11.1.4), and the bits shifted out of
   it are lost; `SHL(DOUBLE(b), n)` keeps them.  uplm80 before 0.4.3
   shifted a BYTE in 16 bits, and where a SHL of a BYTE can shift a set bit
@@ -654,16 +654,20 @@ result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
-after a statement (26), `NOT NOT x` (102), and a `CALL` of a typed
-procedure (129); and what the CHANGELOG lists under Known issues: a
-non-REENTRANT procedure's call of itself (170), a procedure nested in a
-REENTRANT one or a REENTRANT one nested in another (88, 39), and more
-`INITIAL` or `DATA` values than a scalar holds (209).  uplm80 compiles,
-with a warning that names V3.1's error, `f()` and `CALL g()` of a
-procedure (102, 153), `INITIAL` in a procedure or a DO block (73), a
-subscript on a scalar, `x(1)` (127), and a member of an array of
-structures without its subscript, `s2.m(1)` (133), on which programs
-written for it rely.  It rejects, as V3.1 does, a name declared nowhere,
+after a statement or among a DO CASE's cases (26; uplm80 refuses a DO
+CASE of declarations alone as a DO CASE with no case, 201), `NOT NOT x`
+(102), and a `CALL` of a typed procedure (129); and what the CHANGELOG
+lists under Known issues: a non-REENTRANT procedure's call of itself
+(170), a procedure nested in a REENTRANT one or a REENTRANT one nested in
+another (88, 39), more `INITIAL` or `DATA` values than a scalar holds
+(209), an `END` that names the first of two labels on a DO, `a: c: do;
+... end a;` (20), and, at `-O1` and up, SHL and SHR in a DATA or INITIAL
+list or an AT address (151).  uplm80 compiles, with a warning that names
+V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
+`INITIAL` in a procedure or a DO block (73), on which programs written
+for it rely, and a subscript on a scalar, `x(1)` (127), and a member of
+an array of structures without its subscript, `s2.m(1)` (133), which its
+own tests test.  It rejects, as V3.1 does, a name declared nowhere,
 empty parentheses after a variable or a built-in, `.label` in an
 expression, an `INTERRUPT` procedure below module level, a parameter no
 `DECLARE` declares, and a `LITERALLY` used before its declaration (since

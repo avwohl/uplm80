@@ -58,10 +58,14 @@ it, the tests it passed and the case of a DO CASE on it included; a typed
 procedure's is what its RETURNs give.  That is followed for a scalar whose
 address is never taken, nor AT, BASED, PUBLIC or EXTERNAL, across calls of
 procedures that do not assign it.  There is no warning for a SHR, nor for
-BYTE arithmetic around a shift that loses nothing (`shr(z, 4) - 1` above):
-of the programs checked, only CP/M 2.0's STAT in `sample_code` has such
-arithmetic, `.devr(shl(iobyte and 11b, 2) + j)`, whose j keeps the sum
-below 256.  The warnings, of the programs checked:
+BYTE arithmetic around a shift that loses nothing (`shr(z, 4) - 1` above).
+Of the programs checked, only CP/M 2.0's STAT in `sample_code` has such
+arithmetic whose value the compiler cannot bound, `.devr(shl(iobyte and
+11b, 2) + j)`, whose j keeps the sum below 256.  Where it can, the values
+are 0.4.2's: STAT's `.devr(shl(i, 4) + j)`, i at most 3 and j 12, and
+MP/M II MPMLDR's `(shr(nmb$cns - 1, 2) + 1) * 256` and the like, DRI's
+and mpm2's, at most 64 before the product.  The warnings, of the programs
+checked:
 
 - 80un's sources before the fix: the 29 places the fix changed, and no
   other; its sources after it: none.  `tests/bug_80un.plm`, 80un's old
@@ -70,8 +74,10 @@ below 256.  The warnings, of the programs checked:
 - MP/M II, DRI's tree and mpm2's overrides: 7, in ERA, REN, SET (2), SHOW
   (DRI's and mpm2's) and STAT, each `shl(dcnt, 5) + .tbuff` or the like,
   of a directory code BDOS returns, 0 to 3 or 0FFH, which the program has
-  tested against 0FFH.  The compiler cannot know it is below 8, and the programs are
-  right as V3.1 compiles them.
+  tested against 0FFH, but for SHOW: its `readlbl` leaves 0FFH when the
+  search does not find the label `getlbl` reported, and `shl(dcnt, 5)` is
+  then 0E0H, as V3.1 computes it.  The compiler cannot know dcnt is below
+  8, and the programs do what V3.1's builds of them do.
 - `sample_code`, and the programs of `tests/` but those that test the
   warning and the generators' (Verified): none.
 
@@ -207,6 +213,14 @@ And these, without a word, which checking 0.4.3 against V3.1 found:
 - More INITIAL or DATA values than a scalar holds, `declare y byte
   initial (1, 2)`, which fill the bytes after it (#209, ILLEGAL
   INITIALIZATION OF MORE SPACE THAN DECLARED).
+- An END that names the first of two labels on a DO, `a: c: do; ... end
+  a;` (#20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes only the
+  label next to DO, `end c;`.
+- SHL and SHR in a DATA or INITIAL list or an AT address, `declare w
+  address data (shl(0f0h, 4))` (#151, INVALID OPERAND IN RESTRICTED
+  EXPRESSION), which `-O0` refuses, and `-O1` and up fold with the BYTE
+  shifted in 16 bits, 0F00H, where the same SHL in a statement is 0 (0.4.2
+  the same).
 
 And this V3.1 compiles to other code (0.4.2 the same):
 
@@ -275,8 +289,9 @@ On 56fad40, with upeepz80 0.2.7 and um80 0.3.52.
   (`tests/test_shl_of_a_byte.py`, `tests/test_expression_types.py`'s
   byte shifts, `shl(b, 9)` of `tests/test_intel_oracle.py`) and in the
   generators' programs, which shift a BYTE by a computed count; the
-  warning of `x(1)` in `tests/test_optimizer_soundness.py` and of
-  `s2.m(4)` in `tests/test_calls_and_loops.py`.
+  warning of `x(1)` in `tests/test_optimizer_soundness.py`, of `s2.m(4)`
+  in `tests/test_calls_and_loops.py`, and of `size(i(1))` in
+  `tests/test_expression_types.py`, whose program is an error anyway.
 
 ## 0.4.2 — 2026-09-26
 
