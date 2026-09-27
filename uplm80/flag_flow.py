@@ -20,8 +20,9 @@ and such operations of them - not both constants, that is the value of an
 assignment statement, the argument of DEC or the left operand of a PLUS or
 MINUS of BYTEs (:meth:`FlagFlow._kills`).  Code generation makes it an
 8-bit `add', `sub', `and', `or' or `xor', which sets the carry, zero, sign,
-parity and half carry; the peephole optimizer changes no flag an
-instruction after it reads.
+parity and half carry; the optimizer leaves as they are the operations
+whose flags a reader can read (:meth:`FlagFlow.live`), and the peephole
+optimizer changes no flag an instruction after it reads.
 
 Over-approximate: a reader is taken to read the flags of any operation of
 its own statement, in whatever order the statement's operands are
@@ -757,6 +758,53 @@ class FlagFlow:  # pylint: disable=too-many-instance-attributes
                         work.append(c)
         return flags, returns
 
+    # ---- where flags can be read (the optimizer) ---------------------------
+
+    def live(self) -> set[int]:
+        """The nodes, expressions and statements, whose flags a reader can
+        read, and every reader: the optimizer leaves them as they are."""
+        if not any(u.readers for u in self.units):
+            return set()
+        entry_live: dict[int, bool] = {}
+        live_in: dict[int, bool] = {id(u): False for u in self.units}
+
+        def reads(u: _Unit) -> bool:
+            # A reader of the flags its operand's operation sets reads no
+            # others.
+            return any(chain is None for _, _, chain in u.readers) or any(
+                entry_live.get(id(q), False) for c in u.calls for q in c.targets)
+
+        def after(u: _Unit) -> bool:
+            return any(live_in[id(s)] for s in u.succ)
+
+        changed = True
+        while changed:
+            changed = False
+            for u in reversed(self.units):
+                if live_in[id(u)]:
+                    continue
+                q = u.exit_of
+                now = (reads(u) or (after(u) and not u.kill)) if q is None else any(
+                    reads(c) or after(c) for c in q.callers)
+                if now:
+                    live_in[id(u)] = changed = True
+            for q in self.procs.values():
+                if live_in[id(q.entry)] and not entry_live.get(id(q)):
+                    entry_live[id(q)] = changed = True
+        if any(q.interrupt and entry_live.get(id(q)) for q in self.procs.values()):
+            # Entered with the flags of whatever it interrupts.
+            return {id(node) for u in self.units for node, _ in u.nodes} | {
+                id(u.stmt) for u in self.units if u.stmt is not None}
+        out: set[int] = set()
+        for u in self.units:
+            for node, _, chain in u.readers:
+                out.update(id(n) for n in [node] + (chain or []))
+            if reads(u) or after(u):
+                if u.stmt is not None:
+                    out.add(id(u.stmt))
+                out.update(id(node) for node, killed in u.nodes if not killed)
+        return out
+
 
 _RELATIONS = (BinaryOpKind.EQ, BinaryOpKind.NE, BinaryOpKind.LT, BinaryOpKind.GT,
               BinaryOpKind.LE, BinaryOpKind.GE)
@@ -772,3 +820,21 @@ def _mask(nodes: list, index: dict) -> int:
 def _order(node) -> tuple:
     pos = getattr(node, "pos", None)
     return (getattr(pos, "start_line", 0), getattr(pos, "start_column", 0))
+
+
+def flag_live(modules: list) -> set[int]:
+    """The nodes of ``modules`` whose flags a flag reader can read
+    (:meth:`FlagFlow.live`)."""
+    if not any(_reads_flags(n) for n in _nodes(modules)):
+        return set()
+    return FlagFlow(modules).live()
+
+
+def _reads_flags(n) -> bool:
+    """Whether node ``n`` may read the flags: a PLUS or MINUS, or a name
+    that may be a flag reader's."""
+    if isinstance(n, P.BinaryOp):
+        return binop_kind(n) in _READER_OPS
+    if isinstance(n, P.Identifier):
+        return ident_text(n.name).upper() in FLAG_NAMES | _READER_CALLS
+    return False

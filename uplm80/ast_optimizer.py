@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import _plm_parser as P
+from .flag_flow import flag_live
 from .runtime import plm_div, plm_mod
 from .ast_view import (
     DOUBLE_MARK,
@@ -341,9 +342,18 @@ class ASTOptimizer:
         self,
         opt_level: int = 2,
         optimize_for: OptimizeFor = OptimizeFor.BALANCED,
+        context: list | None = None,
     ) -> None:
         self.opt_level = opt_level
         self.optimize_for = optimize_for
+        # The other modules of the compilation, which the flags a module's
+        # operations set can reach through calls (flag_flow).
+        self.context = list(context or [])
+        # The nodes, by id, whose flags a flag reader can read, or that
+        # read them (flag_flow.FlagFlow.live): each is left as it is, with
+        # its operands of the same kind, so that every level reads the
+        # flags -O0 does.
+        self.flag_live: set[int] = set()
         self.stats = OptimizationStats()
         # Known constant values for propagation: name -> (value, type,
         # derived). The value is already converted to the variable's type.
@@ -454,6 +464,21 @@ class ASTOptimizer:
                     continue
                 stack.append(getattr(n, f, None))
         return False
+
+    def _live(self, node) -> bool:
+        """Whether a flag reader can read the flags ``node`` sets, or it is a
+        reader: it is not to be folded, rewritten or removed."""
+        return id(node) in self.flag_live
+
+    @staticmethod
+    def _keep(orig, opt):
+        """An operand of what a flag reader reads the flags of, ``opt``
+        optimized from ``orig``: not a constant where it was not one, which
+        code generation computes with other instructions - `inc hl' for
+        `w + 1', where `w + one' is `add hl,de'."""
+        if opt is not orig and typed_const(opt) is not None and typed_const(orig) is None:
+            return orig
+        return opt
 
     def _contains_label(self, node) -> bool:
         """Whether ``node`` holds a labelled statement anywhere inside it.
@@ -816,6 +841,7 @@ class ASTOptimizer:
             changed = False
             passes += 1
             self._reset_flow_state()
+            self.flag_live = flag_live([module] + self.context)
             self.flag_sensitive = any(self._reads_a_flag(x) for x in module.items)
             self.scopes = [_scope_of(module.items)]
             self.inlinable_procs.clear()
@@ -1078,6 +1104,7 @@ class ASTOptimizer:
             stmt = stmts[i]
 
             if (i + 1 < len(stmts)
+                    and not self._live(stmt)
                     and self._single_plain_target(stmt) is not None
                     and self._single_plain_target(stmt) == self._single_plain_target(stmts[i + 1])
                     and self._is_side_effect_free(stmt.value)
@@ -1563,6 +1590,8 @@ class ASTOptimizer:
         if isinstance(inner, P.Call):
             callee = self._optimize_target(inner.callee)
             opt_args = [untyped_root(self._optimize_expr(a)) for a in inner.args]
+            if self._live(inner):
+                opt_args = [self._keep(a, b) for a, b in zip(inner.args, opt_args)]
             if callee is not inner.callee or any(a is not b for a, b in zip(opt_args, inner.args)):
                 return P.Call(callee=callee, args=opt_args, pos=inner.pos)
         elif isinstance(inner, P.MemberAccess):
@@ -1587,6 +1616,8 @@ class ASTOptimizer:
 
         if isinstance(stmt, P.ReturnStmtValue):
             opt_value = self._optimize_value(stmt.value)
+            if self._live(stmt):
+                opt_value = self._keep(stmt.value, opt_value)
             return P.ReturnStmtValue(value=opt_value, pos=stmt.pos)
 
         if isinstance(stmt, (P.IfStmt, P.IfStmtElse)):
@@ -1638,6 +1669,9 @@ class ASTOptimizer:
         # Stored, the value takes the target's type, so its own type does
         # not matter when it is a constant.
         opt_value = untyped_root(self._optimize_expr(stmt.value))
+        if self._live(stmt):
+            # `x = y' of y known to be 0 would be `xor a', which sets flags.
+            opt_value = self._keep(stmt.value, opt_value)
         if effectful:
             self._reset_flow_state()
         opt_targets = [self._optimize_target(t) for t in stmt.targets]
@@ -1699,10 +1733,15 @@ class ASTOptimizer:
         opt_callee = self._optimize_expr(callee_expr)
         # Each argument is converted to its parameter's type.
         opt_args = [untyped_root(self._optimize_expr(a)) for a in args]
+        live = self._live(stmt) or self._live(inner)
+        if live:
+            opt_args = [self._keep(a, b) for a, b in zip(args, opt_args)]
 
-        # Level 3: Inline small procedures
+        # Level 3: Inline small procedures -- not where a flag reader can
+        # read the flags the call leaves, or those it is made with.
         if (
             self.opt_level >= 3
+            and not live
             and self.optimize_for != OptimizeFor.SIZE
             and isinstance(unwrap_paren(opt_callee), P.Identifier)
             and not opt_args
@@ -1739,12 +1778,17 @@ class ASTOptimizer:
         whose else-branch optimizes away into :class:`P.IfStmt`.
         """
         opt_cond = self._optimize_value(stmt.condition)
+        live = self._live(stmt)
+        if live:
+            opt_cond = self._keep(stmt.condition, opt_cond)
 
         # Constant condition elimination (level 2+). Not when either arm
-        # declares a label: a GOTO elsewhere in the procedure still names it.
+        # declares a label: a GOTO elsewhere in the procedure still names it;
+        # nor where a flag reader can read the flags of the test.
         else_stmt = stmt.else_stmt if isinstance(stmt, P.IfStmtElse) else None
         if (
             self.opt_level >= 2
+            and not live
             and isinstance(unwrap_paren(opt_cond), P.NumberLiteral)
             and not self._contains_label(stmt.then_stmt)
             and not (else_stmt is not None and self._contains_label(else_stmt))
@@ -1882,11 +1926,16 @@ class ASTOptimizer:
         # back edge, so it cannot use a fact the body invalidates.
         self._invalidate_modified(stmt.items)
         opt_cond = self._optimize_value(stmt.condition)
+        live = self._live(stmt)
+        if live:
+            opt_cond = self._keep(stmt.condition, opt_cond)
 
         # A DO WHILE whose condition has bit 0 clear never executes -- but
-        # only drop the loop when its body declares no label.
+        # only drop the loop when its body declares no label, and no flag
+        # reader can read the flags of its test.
         if (
             self.opt_level >= 2
+            and not live
             and isinstance(unwrap_paren(opt_cond), P.NumberLiteral)
             and not any(self._contains_label(i) for i in stmt.items)
         ):
@@ -1950,6 +1999,14 @@ class ASTOptimizer:
         opt_start = self._optimize_value(stmt.start)
         opt_bound = self._optimize_value(stmt.bound)
         opt_step = self._optimize_value(stmt.step) if is_by else None
+        live = self._live(stmt)
+        if live:
+            # Where a flag reader can read the flags of its control, the
+            # loop is as it is written: of limits of the same kind, and
+            # neither dropped nor unrolled.
+            opt_start = self._keep(stmt.start, opt_start)
+            opt_bound = self._keep(stmt.bound, opt_bound)
+            opt_step = self._keep(stmt.step, opt_step) if is_by else None
 
         index_decl = self._lookup(index_name)
         index_type = (index_decl.dtype if index_decl is not None and index_decl.kind == "var"
@@ -1968,6 +2025,7 @@ class ASTOptimizer:
         # A loop that never runs still assigns its index the start value.
         if (
             self.opt_level >= 2
+            and not live
             and bounds_known
             and convert(start_c[0], index_type) > convert(bound_c[0], index_type)
             and not any(self._contains_label(i) for i in stmt.items)
@@ -1985,7 +2043,7 @@ class ASTOptimizer:
         # pointer that _body_may_move could see.
         max_iter = 4 if self.optimize_for == OptimizeFor.SPEED else 2
         run = (self._loop_values(start_c[0], bound_c[0], step_c[0], index_type, max_iter)
-               if constant and index_decl.plain and self.opt_level >= 3
+               if constant and index_decl.plain and self.opt_level >= 3 and not live
                and self.optimize_for != OptimizeFor.SIZE else None)
         if (
             run is not None
@@ -2061,11 +2119,16 @@ class ASTOptimizer:
     def _optimize_do_case(self, stmt: P.DoCaseBlock):
         """Optimize a ``DO CASE selector ... END`` block."""
         opt_selector = self._optimize_value(stmt.selector)
+        live = self._live(stmt)
+        if live:
+            opt_selector = self._keep(stmt.selector, opt_selector)
 
         # If selector is constant, keep only that case (level 2+) -- unless
-        # a discarded case declares a label a GOTO still names.
+        # a discarded case declares a label a GOTO still names, or a flag
+        # reader can read the flags of the jump.
         if (
             self.opt_level >= 2
+            and not live
             and isinstance(unwrap_paren(opt_selector), P.NumberLiteral)
             and not any(self._contains_label(c) for c in stmt.items)
         ):
@@ -2166,6 +2229,9 @@ class ASTOptimizer:
                           and self._is_builtin(ident_text(callee.name)))
             opt_args = [a if (keep_first and i == 0) else untyped_root(a)
                         for i, a in enumerate(opt_args)]
+            if self._live(expr):
+                opt_args = [self._keep(a, b) for a, b in zip(expr.args, opt_args)]
+                return P.Call(callee=opt_callee, args=opt_args, pos=expr.pos)
 
             # Optimize built-in calls with constant args.
             if self.opt_level >= 1 and isinstance(unwrap_paren(opt_callee), P.Identifier):
@@ -2228,6 +2294,10 @@ class ASTOptimizer:
         kind = binop_kind(expr)
         left = self._optimize_expr(expr.left)
         right = self._optimize_expr(expr.right)
+        if self._live(expr):
+            # A flag reader can read its flags, or it reads them itself.
+            return make_binary(kind, self._keep(expr.left, left), self._keep(expr.right, right),
+                               pos=expr.pos)
 
         # In a region that reads a flag (CARRY, PLUS...), an arithmetic
         # operation's carry is observable, so the operation has to survive
@@ -2311,6 +2381,8 @@ class ASTOptimizer:
         """Optimize a unary expression."""
         kind = unop_kind(expr)
         operand = self._optimize_expr(expr.operand)
+        if self._live(expr):
+            return make_unary(kind, self._keep(expr.operand, operand), pos=expr.pos)
 
         # Constant folding: `-x' and `NOT x' keep x's type, so NOT 7 is the
         # BYTE 0F8H and -1 the BYTE 0FFH (4.2.2).

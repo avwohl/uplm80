@@ -247,13 +247,15 @@ class Compiler:
         """Phase 3, AST optimization, of each module of a multi-file compile."""
         if self.opt_level == 0:
             return modules
-        out = []
-        for ast, filename in zip(modules, filenames):
+        out = list(modules)
+        for i, filename in enumerate(filenames):
             if self.debug:
                 print(f"[DEBUG] Phase 3: AST Optimization for {filename}", file=sys.stderr)
-            ast = ASTOptimizer(self.opt_level).optimize(ast)
+            # The other modules, for the flags their calls take in and out.
+            context = out[:i] + out[i + 1:]
+            ast = ASTOptimizer(self.opt_level, context=context).optimize(out[i])
             ast.uplm80_file = filename  # a new Module; see names._file_name
-            out.append(ast)
+            out[i] = ast
         return out
 
     def compile_files(self, input_paths: list[Path], output_path: Path | None = None) -> bool:
