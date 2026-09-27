@@ -696,7 +696,7 @@ result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
 | | `b = 0ECH; w = (ew := b) + b;` (ew, w ADDRESS) | `01D8H` | `00D8H` | V3.1 widens b to store it in ew and adds that 16-bit copy to itself, `SHLD EW; MOV D,H; MOV E,L; DAD D` (0.4.3's campaign, seed 50252); the manual (4.6.3): the embedded assignment is its right half, a BYTE, and BYTE + BYTE is a BYTE |
 | | `w2 = 0FFFEH; w2, w3 = (ew := w2);` (w2, w3, ew ADDRESS) | w3 `0000` | w3 `0FFFEH` | Where a multiple assignment's value is an embedded assignment of one of its targets but the last, V3.1 takes that target's value for an address, `LHLD W2; SHLD EW; MOV D,H; MOV E,L; XCHG` and 52 `INX H`: it copies the word there, at 0032H, onto itself and into each target after w2, and does not store w2.  With a BYTE, `w2, w3 = (eb := w2);`, it stores that address, 0032H, at itself and in w3.  How far from the value it goes changes with the program: 54 bytes on in another, 9 back in 0.4.3's release check's seed 80353, which stored 0FFF5H.  `w3, w2 = (ew := w2);` is right; the manual: the embedded assignment is w2 (4.6.3), which each target gets |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
-| | `b = SHL(k, 1); c = d OR 0; e = CARRY;` (k = 0FFH, d = 1) | `0FFH` | `0` | V3.1 compiles no instruction for `x OR 0`, `x XOR 0`, `x + 0`, `x - 0`, `x AND 0FFH` and an operation of constants, `DEC(34H + 21H)`, and a flag read after one reads the flags of what came before; uplm80 computes each, as its `-O0` build always did and every level does since 0.4.4.  And the control code of a loop leaves other flags: `DO i = 1 TO 2; c = 5; END; e = CARRY;` is 0FFH with V3.1 and 0 with uplm80, `DO WHILE z; ...; END; e = ZERO;` of z = 0 the other way round.  The manual: the flags are not to be relied on (12.1) |
+| | `b = SHL(k, 1); c = d OR 0; e = CARRY;` (k = 0FFH, d = 1) | `0FFH` | `0` | V3.1 compiles no instruction for `x OR 0`, `x XOR 0`, `x + 0`, `x - 0`, `x AND 0FFH` and an operation of constants, `DEC(34H + 21H)`, and a flag read after one reads the flags of what came before; uplm80 computes each, as its `-O0` build always did and every level does since 0.4.4.  And the control code of a loop leaves other flags: `DO i = 1 TO 2; c = 5; END; e = CARRY;` is 0FFH with V3.1 and 0 with uplm80, `DO WHILE z; ...; END; e = ZERO;` of z = 0 the other way round.  Other operations leave other flags with V3.1 than with uplm80 too, as in 0.4.2 and 0.4.3: `x + 1` and `x - 1` of a BYTE are `INR` and `DCR`, which set no carry, `c = d + 1; e = CARRY;` after the SHL 0FFH with V3.1 and 0 with uplm80; a SHR of a BYTE, and a SHL V3.1 makes a rotation, is an `ANI` and then `RAR`s, so that SIGN, ZERO and PARITY after it are of the masked value before the shift, `b = SHR(k, 3); e = SIGN;` 0FFH with V3.1 and 0 with uplm80; and after some comparisons and IF tests, a MOVE (V3.1's leaves ZERO set), TIME, a DO CASE's dispatch, subscript arithmetic, `x * 0`, `x / 1` and NOT of a comparison.  Of 275 cases of 0.4.4's checks where a reader reads the flags of a shift, 256 print what V3.1's build prints and 19 are of these kinds.  The manual: the flags are not to be relied on (12.1) |
 | | `rw = ((08B1FH - b3) XOR (-((b4 >= ms(3)) AND 0))) + 0;` (b3 = 20H, b4 = 0, `ms DATA('x=1; y=2$')`) | `0` | `8AFFH` | V3.1's count of what it has on the stack goes below zero (its listing counts 0, 255, 254, ...) and it pops what it never pushed, a run of `POP PSW` (seed 20090); 8AFFH is the manual's value |
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
@@ -705,8 +705,13 @@ after a statement or among a DO CASE's cases (26; uplm80 refuses a DO CASE
 of declarations alone as a DO CASE with no case, 201), `NOT NOT x` (102),
 and a `CALL` of a typed procedure the program declares (129); and what the
 CHANGELOG lists under Known issues: more `INITIAL` or `DATA` values than a
-scalar or an array holds (209), an AT that names a variable AT something
-further down (213), and a typed procedure with no RETURN (156).  uplm80
+scalar or an array holds, or an empty string in a DATA list (209), an AT
+that names a variable AT something further down (213), a typed procedure
+with no RETURN (156), a label as a value or an assignment's target, `w =
+lb` (132), a number above 0FFFFH (94), a port of INPUT or OUTPUT that is
+not a constant, `INPUT(b)` (107), a REENTRANT EXTERNAL procedure (41,
+174), and `.memory.x`, which uplm80 compiles to a MEMORY symbol that um80
+finds undefined (32, 110).  uplm80
 compiles, with a warning that names V3.1's error, `f()` and `CALL g()` of
 a procedure (102, 153) and `INITIAL` in a procedure or a DO block (73), on
 which programs written for it rely, and a subscript on a scalar, `x(1)`

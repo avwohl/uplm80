@@ -37,7 +37,8 @@ columns after a LITERALLY's text are the source's.
 
 What uplm80 compiled and Intel's PL/M-80 V3.1 rejects is refused as V3.1
 refuses it, with the number and text of each error V3.1 gives, at every
-`-O` level.  No program of MP/M II (DRI's tree and mpm2's overrides), of
+`-O` level (of some combinations of two errors, not every one: Known
+issues).  No program of MP/M II (DRI's tree and mpm2's overrides), of
 80un 0.3.3 or of `sample_code` has any of these, and none of the 88
 compiles of their PL/M gives a new error; one test's program, which called
 through an array's element to have its address found in DE, calls through
@@ -684,6 +685,36 @@ a later release (0.4.3 the same):
   compiles, to a read of the code at the label or a store into it (0.4.3
   the same); of a LABEL that labels no statement, `w = lb`, the message
   names #105 and #172, not #132 (found checking 0.4.4).
+- **Some combinations of two errors**, of which the message names fewer of
+  V3.1's errors than V3.1 gives, or another (0.4.4's release check): a
+  procedure in a REENTRANT one whose location an AT or a constant list
+  names, #88 without the list's #211 or #210; a LABEL that labels no
+  statement in `at (.lb)` or `data (.lb(1))`, #211 or #149 without #105
+  and #172; `b = f(1)(2)` of a procedure without parameters, #32 without
+  #153; `length(w, b) = 1` of a scalar W, #126 and #128 without #157; and
+  `output(a(1, 2)) = b`, #114, where V3.1, which takes no port that is not
+  a constant (below), gives #107, #108, #116 and #32.
+- **A port of INPUT or OUTPUT that is not a constant**, `input(b)`,
+  `output(b) = 1`, which V3.1 rejects (#107, ILLEGAL INPUT/OUTPUT PORT
+  NUMBER, NOT NUMERIC CONSTANT, and #108), uplm80 compiles, to a call of
+  `??inp` or `??outp` (0.4.3 the same).
+- These, which 0.4.3 has too (0.4.4's release check): `w = .memory.x`,
+  which V3.1 rejects (#110, INVALID LEFT OPERAND OF QUALIFICATION, NOT A
+  STRUCTURE, and #32), uplm80 compiles to a load from MEMORY's address,
+  and um80 then fails, "Undefined symbol MEMORY"; `e: procedure reentrant
+  external`, which V3.1 rejects (#41, CONFLICTING ATTRIBUTE, and #174),
+  compiles; and `w = size()` and `w = last(aa(f))` (V3.1: #125, ILLEGAL
+  ARGUMENT FOR BUILT-IN PROCEDURE), LENGTH or LAST of a scalar (#157,
+  INVALID ARGUMENT, ARRAY REQUIRED FOR LENGTH OR LAST) and `b = f1(1, 2)`
+  of a procedure of one parameter (#153) are refused in uplm80's own
+  words, whose message names none of V3.1's errors.
+- **Flags that V3.1's build leaves otherwise**, at every level, as in
+  0.4.2 and 0.4.3: `x + 1` and `x - 1` of a BYTE are `INR` and `DCR` to
+  V3.1, which set no carry; a SHR of a BYTE an `ANI` and then `RAR`s, so
+  that SIGN, ZERO and PARITY after it are of the masked value before the
+  shift; and after some comparisons and IF tests, a MOVE, TIME, a DO
+  CASE's dispatch, subscript arithmetic, `x * 0`, `x / 1` and NOT of a
+  comparison the flags are other ones too (README, Known differences).
 
 ### Verified
 
