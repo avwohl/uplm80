@@ -1340,6 +1340,28 @@ V31_REJECTS = {
     "call-through-a-member-of-an-element": ("declare sa(2) structure (g address);\n"
                                             "call sa(1).g;\n", (118, 32),
                                             "error: CALL SA(1).G: SA is an array"),
+    "call-through-a-byte-member-of-an-array": ("declare sa(2) structure (k byte, g address);\n"
+                                               "call sa.k;\n", (118,),
+                                               "T.PLM:9:6: error: CALL SA.K: K is a BYTE"),
+    "call-through-a-member-array-of-an-array": ("declare sa(2) structure (m(2) address);\n"
+                                                "call sa.m;\n", (118,),
+                                                "error: CALL SA.M: M is an array"),
+    "call-through-an-element-of-a-member-array-of-an-array": (
+        "declare sa(2) structure (m(2) address);\ncall sa.m(1);\n", (118, 32),
+        "error: CALL SA.M(1): M is an array"),
+    "call-through-a-label": ("l: b = 1;\ncall l;\n", (118,),
+                             "T.PLM:9:6: error: CALL L: L is a label, and a CALL calls a "
+                             "procedure, or through an ADDRESS scalar"),
+    "call-through-a-label-with-arguments": ("declare l label;\ncall l(1);\nl: b = 1;\n",
+                                            (118, 32), "error: CALL L(1): L is a label"),
+    "call-of-stackptr": ("call stackptr;\n", (129,),
+                         "T.PLM:8:6: error: CALL STACKPTR: STACKPTR is a built-in with a type, "
+                         "and a CALL calls a procedure without one, or through an ADDRESS "
+                         "scalar; Intel's PL/M-80 V3.1 rejects it (ERROR #129, ILLEGAL 'CALL' "
+                         "WITH TYPED PROCEDURE)"),
+    "call-of-carry": ("call carry;\n", (129,), "error: CALL CARRY: CARRY is a built-in with"),
+    "call-of-a-typed-built-in": ("call rol(b, 1);\n", (129, 32),
+                                 "error: CALL ROL(B, 1): ROL is a built-in with a type"),
     "call-through-memory": ("call memory(1);\n", (118, 32),
                             "error: CALL MEMORY(1): MEMORY is an array"),
     # 0.4.3's Known issues: MEMORY without a subscript, a procedure that
@@ -1839,12 +1861,15 @@ end t;
 
 
 # What V3.1 takes of a CALL through an address (8.2.1): an ADDRESS scalar,
-# a structure's ADDRESS member or a BASED one, with arguments or without
+# a structure's ADDRESS member or a BASED one, with arguments or without,
+# and the ADDRESS member of an array of structures, BASED or not, named
+# without a subscript, which calls through the first element's
 # (tests/test_intel_oracle.py builds it again).
 V31_CALLS = """
 declare n byte, q address;
 declare sg structure (k byte, g address);
 declare pq address, qb based pq address;
+declare sa(2) structure (g address), ps address, sb based ps (2) structure (g address);
 add2: procedure (x, y);
   declare (x, y) byte;
   n = x + y;
@@ -1855,14 +1880,19 @@ end seven;
 q = .seven; call q; call ph(n);
 sg.g = .add2; call sg.g(3, 4); call ph(n + 1);
 pq = .sg.g; call qb(5, 6); call ph(n);
+sa(0).g = .add2; sa(1).g = .seven; call sa.g(4, 5); call ph(n);
+ps = .sa(1); n = 0; call sb.g; call ph(n);
 """
 
 
 def test_a_call_through_an_address_scalar_is_compiled_without_a_word(capsys):
-    """V3.1 calls through an ADDRESS scalar, a member of a structure that
-    is not an array, and a BASED one; not through an array, an element, a
-    structure or a BYTE (V31_REJECTS)."""
-    _check(V31_CALLS, [7, 8, 0xB])
+    """V3.1 calls through an ADDRESS scalar, an ADDRESS member of a
+    structure, and a BASED one; through the member of an array of
+    structures named without a subscript, `call sa.g', the first
+    element's; not through an array, an element, a structure, a BYTE or a
+    label (V31_REJECTS).  0.4.4 refused `call sa.g' as it refuses `call
+    sa(1).g', which V3.1 rejects."""
+    _check(V31_CALLS, [7, 8, 0xB, 9, 7])
     capsys.readouterr()
     assert Compiler(opt_level=0).compile(_PH_PRELUDE + V31_CALLS + "end t;\n", "T.PLM")
     assert "warning" not in capsys.readouterr().err

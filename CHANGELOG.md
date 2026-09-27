@@ -9,7 +9,7 @@ What 0.4.3's final release check found and left for a later release, and
 what 0.4.3's Known issues listed as compiled without a word: more of the
 errors Intel's PL/M-80 V3.1 gives, V3.1's numbers and texts, at every
 level - more than one subscript, a CALL through what is not an ADDRESS
-scalar, MEMORY without a subscript, a procedure that calls itself, a
+scalar or of a built-in with a type, MEMORY without a subscript, a procedure that calls itself, a
 REENTRANT procedure where V3.1 refuses one.  The SHL of a BYTE warning
 follows the flags, and what it does not see is stated.  Smaller code
 after an 8-bit operation, and the columns after a LITERALLY's text are
@@ -54,10 +54,22 @@ of the same forms to print what uplm80's builds print.
   parentheses follow): an array, `call aa(1)` and `call aa(1)(b, c)`,
   which uplm80 took for a call through `aa(0)`, with 1, and through
   `aa(1)`; a member array, a member of an element of an array of
-  structures, `call sa(1).g`, MEMORY, a structure, and a BYTE - a
-  variable, a parameter or a member - whose value uplm80 called.  A CALL
-  through an ADDRESS, a structure's ADDRESS member or a BASED ADDRESS,
-  with arguments or without, is compiled as before, as V3.1 compiles it.
+  structures, `call sa(1).g`, where V3.1 takes SA for what is called and
+  the rest for its arguments, MEMORY, a structure, and a BYTE - a
+  variable, a parameter or a member - whose value uplm80 called; and a
+  label, `call l`, which uplm80 called and the link found no L for.  A
+  CALL through an ADDRESS, a structure's ADDRESS member or a BASED
+  ADDRESS, with arguments or without, is compiled as before, as V3.1
+  compiles it, and so is one through the ADDRESS member of an array of
+  structures, BASED or not, named without a subscript, `call sa.g`, which
+  calls through `sa(0).g`: V3.1 takes it in a CALL, and rejects it in an
+  expression (ERROR #133, of which uplm80 warns: 0.4.3).
+- **A CALL of a built-in with a type** (ERROR #129, ILLEGAL 'CALL' WITH
+  TYPED PROCEDURE, and #32 where parentheses follow): `call stackptr`,
+  which uplm80 compiled to a call through the value of SP, `call carry`,
+  to a call of an undefined CARRY, and `call rol(b, 1)` and the like, to
+  the built-in's value, unused.  A CALL of a typed procedure the program
+  declares is still taken (README).
 
       CALL AA(1): AA is an array, and a CALL calls a procedure, or
       through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1);

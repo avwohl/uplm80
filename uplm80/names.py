@@ -183,6 +183,11 @@ _BUILTINS = frozenset(
     {"INPUT", "OUTPUT", "LOW", "HIGH", "DOUBLE", "LENGTH", "LAST", "SIZE", "SHL", "SHR",
      "ROL", "ROR", "SCL", "SCR", "MOVE", "TIME", "CARRY", "SIGN", "ZERO", "PARITY", "DEC",
      "MEMORY", "STACKPTR", "CPUTIME"})
+# The built-ins with a type, which a CALL does not call (Intel's PL/M-80
+# V3.1: ERROR 129, ILLEGAL 'CALL' WITH TYPED PROCEDURE).
+_TYPED_BUILTINS = frozenset(
+    {"INPUT", "LOW", "HIGH", "DOUBLE", "LENGTH", "LAST", "SIZE", "SHL", "SHR", "ROL", "ROR",
+     "SCL", "SCR", "CARRY", "SIGN", "ZERO", "PARITY", "DEC", "STACKPTR"})
 
 _DO_BLOCKS = (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock)
 
@@ -557,6 +562,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
         118: "INVALID INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
+        129: "ILLEGAL 'CALL' WITH TYPED PROCEDURE",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
         169: "ILLEGAL FORWARD CALL",
@@ -982,6 +988,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._check_recursive(r, d, text)
         elif d.kind in ("var", "param"):
             self._check_variable(r, d, text)
+        elif d.kind == "label" and r.called:
+            self._check_called(r, d, text)
 
     def _check_variable(self, r: _Ref, d: _Decl, text: str) -> None:
         """A variable or a parameter called through, subscripted, or named
@@ -1004,7 +1012,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         port.  Intel's PL/M-80 V3.1: ERROR 114, INVALID SUBSCRIPT,
         MULTIPLE SUBSCRIPTS ILLEGAL; 118, INVALID INDIRECT CALL, IDENTIFIER
         NOT AN ADDRESS SCALAR; 133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
-        ARRAY; 108, MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER."""
+        ARRAY; 108, MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER; 129, ILLEGAL
+        'CALL' WITH TYPED PROCEDURE, of a built-in with a type."""
         name = _key(getattr(r.node, r.attr))
         if r.in_at or r.in_list:
             return
@@ -1014,6 +1023,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self.intel(r.node, f"CALL {what}: MEMORY is an array, and a CALL calls a "
                        "procedure, or through an ADDRESS scalar (Programming Manual "
                        "9800268B, 8.2.1)", *((118, 32) if r.call is not None else (118,)))
+            return
+        if name in _TYPED_BUILTINS and r.called:
+            # `call stackptr' called through the value of SP, and `call
+            # carry' an undefined CARRY.  And ERROR 32, INVALID SYNTAX, of
+            # what follows it in parentheses.
+            what = expr_text(r.call) if r.call is not None else text
+            self.intel(r.node, f"CALL {what}: {text} is a built-in with a type, and a CALL "
+                       "calls a procedure without one, or through an ADDRESS scalar",
+                       *((129, 32) if r.call is not None else (129,)))
             return
         if name == "MEMORY" and r.args is None and not r.dot and not self._extent(r.extent):
             self.intel(r.node, f"{text}: MEMORY is an array, and an array is named without a "
@@ -1030,13 +1048,13 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
 
     def _check_called(self, r: _Ref, d: _Decl, text: str) -> None:
         """What a CALL statement calls through: an ADDRESS scalar, not an
-        array, a structure or a BYTE, with a subscript or without.  Intel's
-        PL/M-80 V3.1: ERROR 118, INVALID INDIRECT CALL, IDENTIFIER NOT AN
-        ADDRESS SCALAR."""
-        if d.address and d.dim is None and d.members is None:
+        array, a structure, a BYTE or a label, with a subscript or without.
+        Intel's PL/M-80 V3.1: ERROR 118, INVALID INDIRECT CALL, IDENTIFIER
+        NOT AN ADDRESS SCALAR."""
+        if d.kind != "label" and d.address and d.dim is None and d.members is None:
             return
-        kind = ("an array" if d.dim is not None else "a structure" if d.members is not None
-                else "a BYTE")
+        kind = ("a label" if d.kind == "label" else "an array" if d.dim is not None
+                else "a structure" if d.members is not None else "a BYTE")
         what = expr_text(r.call) if r.call is not None else text
         # And ERROR 32, INVALID SYNTAX, of what follows it in parentheses.
         self.intel(r.node, f"CALL {what}: {text} is {kind}, and a CALL calls a procedure, "
@@ -1044,16 +1062,22 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                    *((118, 32) if r.call is not None else (118,)))
 
     def _check_called_member(self, u: _MemberUse) -> None:
-        """A CALL through a structure's member: an ADDRESS scalar member of
-        a structure that is not an array (ERROR 118)."""
+        """A CALL through a structure's member: an ADDRESS scalar member, of
+        a structure, or of an array of structures named without a
+        subscript, `call sa.g', which calls through the first element's,
+        as V3.1 takes it.  Not of an element, `call sa(1).g', where V3.1
+        takes SA for what is called and the rest for its arguments (ERROR
+        118, and 32)."""
         d, member = self._member_decl(u)
         if d is None or member not in (d.members or {}):
             return
-        if d.dim is None and d.members[member] is None and member in d.address_members:
+        element = isinstance(unwrap_paren(u.node.base), P.Call)
+        if not element and d.members[member] is None and member in d.address_members:
             return
-        kind = (f"{ident_text(u.node.member)} is an array" if d.members[member] is not None
-                else f"{d.orig} is an array" if d.dim is not None
-                else f"{ident_text(u.node.member)} is a BYTE")
+        name = ident_text(u.node.member)
+        kind = (f"{d.orig} is {'an array' if d.dim is not None else 'a structure'}" if element
+                else f"{name} is an array" if d.members[member] is not None
+                else f"{name} is a BYTE")
         callee = u.call if u.call is not None else u.node
         self.intel(u.node, f"CALL {expr_text(callee)}: {kind}, and a CALL calls a procedure, "
                    "or through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1)",
@@ -1077,8 +1101,12 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         """An array without a subscript, but after a dot or in LENGTH, LAST
         or SIZE (3.6.2).  A member of an array of structures, `s2.m(4)', is
         taken for `s2(0).m(4)', as tests/test_calls_and_loops.py relies
-        on; the rest is an error.  Intel's PL/M-80 V3.1: ERROR 133, ILLEGAL
+        on, and V3.1 takes it in a CALL, `call sa.g'; the rest is an
+        error.  Intel's PL/M-80 V3.1: ERROR 133, ILLEGAL
         REFERENCE TO UNSUBSCRIPTED ARRAY."""
+        if r.member is not None and any(u.called and u.node is r.member
+                                        for u in self.member_uses):
+            return          # `call sa.g', which V3.1 takes (_check_called_member)
         if r.member is not None:
             member = ident_text(r.member.member)
             self.intel(r.node, f"{text}.{member}: {text} is an array, and this is taken for "

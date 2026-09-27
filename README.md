@@ -185,7 +185,10 @@ where:
   procedure of one that is REENTRANT too; `.p(1)` of a procedure is no
   address.  `CALL q(1, 2)` of an ADDRESS q calls through it (8.2.1), as
   a CALL does through a structure's ADDRESS member or a BASED ADDRESS, and
-  not through an array, an element, a structure or a BYTE.
+  through the ADDRESS member of an array of structures named without a
+  subscript, `CALL sa.g`, `sa(0).g`'s; not through an array, an element,
+  `CALL sa(1).g`, a structure, a BYTE or a label, nor of a built-in with a
+  type, `CALL STACKPTR`.
 - An END that names a block names its own, the procedure or the label
   next to the DO; a DO CASE has a case, and a procedure a statement.
 - An array, MEMORY or a member array, is named without a subscript only
@@ -664,10 +667,11 @@ V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
 after a statement or among a DO CASE's cases (26; uplm80 refuses a DO
 CASE of declarations alone as a DO CASE with no case, 201), `NOT NOT x`
-(102), and a `CALL` of a typed procedure (129); and what the CHANGELOG
-lists under Known issues: more `INITIAL` or `DATA` values than a scalar
-holds (209), and, at `-O1` and up, SHL and SHR in a DATA or INITIAL list
-or an AT address (151).  uplm80 compiles, with a warning that names
+(102), and a `CALL` of a typed procedure the program declares (129); and
+what the CHANGELOG lists under Known issues: more `INITIAL` or `DATA`
+values than a scalar holds (209), and, at `-O1` and up, SHL and SHR in a
+DATA or INITIAL list or an AT address (151).  uplm80 compiles, with a
+warning that names
 V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
 `INITIAL` in a procedure or a DO block (73), on which programs written
 for it rely, and a subscript on a scalar, `x(1)` (127), and a member of
@@ -686,11 +690,12 @@ a procedure with no statements (174), two subscripts on a scalar (127,
 call of a procedure declared further on (169) (since 0.4.3); and more than
 one subscript (114), a subscript on a scalar member (127) or after a
 subscript (32), a second port of INPUT or OUTPUT (108), a CALL through
-what is not an ADDRESS scalar (118), MEMORY without a subscript (133), a
-non-REENTRANT procedure's call of itself (170), a procedure nested in a
-REENTRANT one or a REENTRANT one nested in another (88, 39), and an `END`
-that names the first of two labels on a DO, `a: c: do; ... end a;` (20)
-(since 0.4.4).
+what is not an ADDRESS scalar (118) or of a built-in with a type, `CALL
+STACKPTR` (129), MEMORY without a subscript (133), a non-REENTRANT
+procedure's call of itself (170), a procedure nested in a REENTRANT one
+or a REENTRANT one nested in another (88, 39), and an `END` that names
+the first of two labels on a DO, `a: c: do; ... end a;` (20) (since
+0.4.4).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),
