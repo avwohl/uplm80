@@ -1,29 +1,28 @@
-# Work in progress — 2026-09-26
+# Work in progress — 2026-09-27
 
-Everything from the 2026-09-23 handoff is finished, merged and released.  Every
-repository below is on `main`, has no other branches and no extra worktrees, and
-nothing is left unpushed.  What remains are the follow-ups listed under
-**Still open**, none of which blocks anything.
+Every bug found in this round is fixed, merged and released.  Every repository
+below is on `main`, has no other branches, no extra worktrees and no stash, and
+nothing is left unpushed.  What remains is under **Still open**: each
+repository's CHANGELOG lists it as Known issues, and none of it blocks anything.
 
 ## Released
 
-| Repository         | Release | What it brought |
-|--------------------|---------|-----------------|
-| `uplm80`           | 0.3.7, **0.4.0** | 0.3.7: procedure locals stored as PL/M-80 specifies (overlaid in `??AUTO` only when provably safe), names and labels as PL/M-80's scopes give them, a GOTO out of a procedure reloads SP where DRI's compiler does. 0.4.0: calls across module boundaries, and through addresses, use **Intel PL/M-80's calling convention** (one argument in BC/C; two or more: next-to-last in BC/C, last in DE/E, earlier ones pushed, callee pops; BYTE result in A, ADDRESS in HL). |
-| `upeepz80`         | 0.2.5, **0.2.6** | 0.2.5: rewrites made only where nothing reads what they change (an instruction model and liveness). 0.2.6: dead-store elimination sound against address arithmetic, stack slots and return addresses reachable through SP pointers, and no tail call where arguments are pushed under the return address (needed by uplm80 0.4.0). |
-| `um80_and_friends` | 0.3.49, 0.3.50, **0.3.51** | 0.3.51: `--dri` reads DRI's MAC/RMAC sources (DRI's unmodified MP/M II nucleus assembles to the genuine RMAC 1.1 objects); M80's reading made exact against the genuine M80 3.44 (bit 7, column-1 words, operator words, `%`, macro-argument splitting); ul80's LINK-80 `%Mult. Def. Global` and `--fatal-mult-def`. |
+| Repository         | Releases | What they brought |
+|--------------------|----------|-------------------|
+| `uplm80`           | 0.3.7, 0.4.0, 0.4.1, 0.4.2, 0.4.3, **0.4.4** | 0.3.7: procedure locals as PL/M-80 specifies them, overlaid in `??AUTO` only when provably safe; names and labels as PL/M-80's scopes give them. 0.4.0: **Intel PL/M-80's calling convention** across modules and through addresses. 0.4.1: the errors Intel's PL/M-80 V3.1 gives. 0.4.2: uplm80 checked against V3.1 itself (`scripts/intel_oracle.py`, in the suite); LENGTH/LAST/SIZE of qualified references; MEMORY and counted loops; a label on END. 0.4.3: **SHL and SHR of a BYTE are a BYTE**, as in V3.1, with a warning where the old 16-bit meaning differs; more of V3.1's errors. 0.4.4: DATA, INITIAL, AT and constant lists as V3.1 takes them - a name there is its block's variable (a program's own MEMORY or SIZE, and factored BASED names, were miscompiled); BASED bases and LABELs checked; a warning at every flag reader a shift of a BYTE's flags may reach, and no `-O` level drops an operation whose flags are read; more of V3.1's errors; less dead code after 8-bit shifts. |
+| `upeepz80`         | 0.2.5, 0.2.6, **0.2.7** | Rewrites only where nothing reads what they change; dead-store elimination sound against address arithmetic and stack slots; no tail call over pushed arguments (needed by uplm80 0.4.0); patched instructions and `TABLE equ $` jump tables. |
+| `um80_and_friends` | 0.3.49 - **0.3.52** | `--dri` reads DRI's MAC/RMAC sources (DRI's MP/M II nucleus assembles to the genuine RMAC 1.1 objects), and 0.3.52 follows MAC in a two-character string's byte order, IF's bit 0 and MACLIB; M80's reading exact against the genuine M80 3.44; ul80's LINK-80 `%Mult. Def. Global`. |
+| `80un`             | **0.3.3** | Built with uplm80 0.4.3: BYTE shifts written `SHL(DOUBLE(x), n)` where 16 bits are wanted; members of 64K and more extracted to their end (all 18 of `test.arc`); Crunch V1; a CP/M name for every member; empty, broken and cut-short archives end cleanly. The first 80un on PyPI since 0.3.1 (0.3.2 was tagged, never published). |
+| `mpm2`             | 0.3.6, **0.3.7** | MP/M II V2.1 from source as well as V2.0; DRI's PL/M and assembler sources build unmodified wherever only the toolchain needed a change; `verify_dri.py` compares more of DRI's files, whole; CI's source-built system tested for real. |
+| `romwbw_emu`       | 1.48, **1.49** | `tools/romwbw-batch` and `tools/romwbw-plm80` (Intel PL/M-80 under DRI's ISX); console-idle and piped-input fixes; `--max-instructions`; 1.49: a SYSCONF autoboot countdown takes the seconds it says. |
 | `cpmemu`           | **4.10.0** | The `.cfg` file alone decides text/binary and CR LF conversion (`default_mode` applies to opens too). |
-| `romwbw_emu`       | **1.48** | `tools/romwbw-batch` (unattended CP/M runs on a disk image) and `tools/romwbw-plm80` (Intel PL/M-80 under DRI's ISX, as DRI built MP/M II); console-idle and piped-input fixes; `--max-instructions`. |
-| `mpm2`             | **0.3.6** | MP/M II V2.1 from source as well as V2.0; DRI's PL/M and assembler sources build unmodified wherever only the toolchain needed a change; DRI's own X0100/BRSPBI/LDMONX linked; DRI's four RSPs in every system; the XIOS result race, the disk-bank bug and the SFTP/SUBMIT/SPOOL faults fixed. CI pins the toolchain release tags. |
 
 `mbasic2025` (2d19520) is a test input of `um80_and_friends`: every historic
-MBASIC variant builds byte for byte with um80/ul80 and with the genuine
-M80/L80 in every mix (`tests/test_mbasic2025.py`, `tools/fourway_mbasic.py`).
+MBASIC variant builds byte for byte with um80/ul80 and with the genuine M80/L80.
 
 ### Toolchain on a fresh machine
 
-Editable installs under Homebrew's Python 3.14 (plain `python3` on this machine
-is Apple's 3.9.6):
+Editable installs under Homebrew's Python 3.14:
 
 ```bash
 for r in uplm80 upeepz80 um80_and_friends; do
@@ -32,92 +31,70 @@ done
 make -C ~/src/cpmemu/src          # cpmemu; mpm2 also uses ~/src/cpmemu/util/cpm_disk.py
 ```
 
-or from PyPI: `uplm80>=0.4.0` (pulls `upeepz80>=0.2.6`), `um80>=0.3.51`.
-uplm80 0.4.0 refuses, at -O1 and up, an upeepz80 without the tail-call guard.
+or from PyPI: `uplm80>=0.4.4` (pulls `upeepz80>=0.2.6`), `um80>=0.3.52`,
+`80un>=0.3.3`.
+
+### Checking uplm80 against Intel's PL/M-80 V3.1
+
+`scripts/intel_oracle.py` builds a program with Intel's PLM80, LINK, LOCATE
+and OBJCPM (run on `tools/isis`, `make -C tools/isis`) and with uplm80 at
+`-O0` to `-O3`, and compares what the builds print.  Intel's binaries are not
+in the repository; it finds them on DRI's MP/M II work disk
+(`mpm2/mpm2_external/mpm2src/PLM_WORK`) or through `$PLM80_TOOLS`.
+`--random N` checks generated programs, `--corpus` the programs of `tests/`
+and `sample_code/`.  The README's Known differences lists V3.1's own bugs the
+campaigns found.
 
 ### How MP/M II is checked
 
 ```bash
 cd ~/src/mpm2
-python3.14 tools/build.py && python3.14 tools/build.py --version 2.1   # 44/44 each
-python3.14 tools/verify_dri.py        # XDOS, BNKXDOS, RESBDOS, TMP, RDT, DDT identical
+python3.14 tools/build.py && python3.14 tools/build.py --version 2.1
+python3.14 tools/verify_dri.py
 ./scripts/build_all.sh --tree=src --version=2.1 && ./scripts/run_tests.sh all
 ```
 
-`docs/mpm2_v21.md` is the V2.1 write-up; `tools/v21/` the research tools.
-
 ## Still open
 
-### uplm80
+None of these is a regression; each is listed, with its examples, in the
+CHANGELOG named.
 
-* Differential testing against Intel's own compiler.  `romwbw_emu`'s
-  `tools/romwbw-plm80` runs DRI's ISX with Intel's PLM80 V3.1 (from
-  `mpm2/mpm2_external/mpm2src/PLM_WORK`) in about 1.5 CPU seconds per small
-  compile; a 174-line test program already prints the same 66 lines from both
-  compilers.  The next step is a `scripts/` oracle that feeds the random-program
-  difftest through it.  (A native ISIS emulator written during the 0.4.0
-  research rebuilt 18 DRI programs byte for byte; it lived only in a session
-  scratch directory.  Intel's binaries cannot be vendored into this repository.)
-* The CHANGELOG's Known issues, 0.3.7 and 0.4.0: a procedure named DOUBLE is
-  taken for the built-in; a LITERALLY's name declared again in an inner block is
-  a syntax error; `STACKPTR` read inside an expression can see a pushed
-  temporary (Intel V3.1 does too); `.label` is accepted; a name declared nowhere
-  is not an error; a REENTRANT procedure's parameter factored with its locals.
-* Argument evaluation order differs from Intel V3.1 where the last argument
-  changes a variable passed next-to-last; the language leaves it undefined
-  (9800268B 4.5.1), so it is documented, not changed.
-* The workarounds for upeepz80 0.2.5's dead-store rule (the `?` EQU) and um80
-  0.3.50's operator words (names.fix_symbols) are harmless and can go now that
-  0.4.0 requires the fixed releases.
-
-### um80_and_friends (0.3.52)
-
-* `--dri` does not yet follow MAC in three things (CHANGELOG Known issues): a
-  two-character string's byte order (`DW 'AB'` is 41 42 in MAC), `IF` truth (MAC
-  tests bit 0 only), and a `MACLIB` library (MAC assembles none of its code).
-  Also: `MACLIB NAME` should read `NAME.LIB`; `LOCAL` after a `!`; `END START`
-  with START defined later; a label on an `ORG` line is placed at the old
-  address (MAC: the new one), so mpm2's `genmod.py` still refuses that form.
-* The documented choice that a `!` after a macro call's arguments is M80's
-  quote accounts for all remaining silent differences from MAC in the fuzzers.
-* Pre-existing M80 differences: `-1 SHR 8`, M80's signed division, `.XCREF` /
-  `.CREF`.  Packaging: the sdist omits CHANGELOG.md; `package-data` lists a
-  `py.typed` that does not exist.
-
-### upeepz80
-
-* Known issues in its CHANGELOG, none produced by uplm80: a tail call in code
-  only address arithmetic reaches; a `pop` of the return address where the
-  entry height is unknown; a public `jp` table entered by offset turned into
-  `jr`s.
-
-### mpm2
-
-* `verify_dri.py` does not cover ABORT.RSP, DUMP.PRL or BNKBDOS.SPR (all match
-  DRI's).  GENHEX and GENMOD differ from DRI's by 64 and 102 bytes (not
-  investigated).  The .RSP program lengths are larger than DRI's (0050H/0095H
-  against 0044H); only bytes DRI's DATA/INITIAL lists define are claimed.
-* `run_tests.sh src` carries on after a failed build.  `tools/v21/where.py`
-  hardcodes `/Users/wohl/src/mpm2`.  The MPMLDR.PLM override skips the serial
-  check even under `--dri-exact`.  Some overrides drop DRI's trailing ^Z or
-  change only a `$title`.
-* LOAD.PRL (built from UTIL3/LOAD.PLM; DRI shipped LOAD.COM) addresses page
-  zero absolutely, so it is right only in a segment based at 0000H — which
-  every segment `gensys.sh` generates is.
-* BNKBDOS has no V2.0 source; `--version 2.0` uses the V2.1 banked BDOS, on
-  purpose (see `docs/mpm2_v21.md`).
-* SDIR built through ISX (romwbw_emu) differs from DRI's in 526 uninitialised
-  bytes, because DRI built on a 62K CP/M; RomWBW cannot provide that TPA.
-
-### romwbw_emu
-
-* `romwbw-batch` and `romwbw-plm80` are not in the .deb/.rpm packages and need
-  cpmemu's `cpm_disk.py`; batch mode needs a CP/M 2.2 CCP and uses A:, B: and
-  user 0 only.  A SYSCONF-set autoboot countdown runs about three times too fast
-  (it stalled before 1.48).
+- **uplm80** (CHANGELOG 0.4.4, Known issues): forms V3.1 rejects that uplm80
+  still compiles or refuses in its own words (a typed procedure with no
+  RETURN, #156; a label as a value, #132; a number above 0FFFFH, #94; an
+  empty string in DATA; an untyped DATA list, #61; LENGTH/LAST/SIZE with two
+  subscripts); messages that name fewer of V3.1's errors than V3.1 gives,
+  for some combinations of two errors; the flags V3.1's own code leaves
+  otherwise (`INR`/`DCR`, `ANI`+`RAR`), documented in the README; `??AUTO`'s
+  layout is uplm80's, not DRI's.  The 7 SHL warnings and 4 flags warnings on
+  DRI's MP/M II sources are expected: each is a place the old 16-bit shift
+  and V3.1's differ, and the program is right as V3.1 compiles it.
+- **um80_and_friends** (CHANGELOG 0.3.52): forms MAC, RMAC or M80 flag that
+  um80 assembles without a word; M80's multi-line `.COMMENT`; `DS` with no
+  operand; with `--dri`, a `!` after `DB`/`DW`, `LOCAL` in a `REPT`/`IRP`,
+  a `MACLIB` inside a library, and RMAC's segment sizes.
+- **upeepz80** (CHANGELOG 0.2.7): its stated assumptions about the stack -
+  reached only through SP, and a jump out of the text taken to find its
+  return address on top.
+- **80un** (CHANGELOG 0.3.3): past about 100 names in a 64K CP/M 2.2, names
+  are made but not kept, so two members made alike can land on one file;
+  CrLZH decodes on past a cut-short member's end; `src/plm/archive/80un.plm`,
+  the old one-file program, is not built and still relies on the 16-bit
+  shift.
+- **mpm2** (CHANGELOG 0.3.6 and 0.3.7): GENHEX differs from DRI's in 70 bytes
+  no source sets; `--version 2.0` uses V2.1's banked BDOS, on purpose; SDIR
+  built through ISX (romwbw_emu) differs from DRI's in uninitialised bytes,
+  because DRI built on a 62K CP/M.
+- **romwbw_emu** (`todo.txt`, `DECISIONS.md`): `romwbw-batch` and
+  `romwbw-plm80` are not in the .deb/.rpm packages and need cpmemu's
+  `cpm_disk.py`.
 
 ### Housekeeping
 
-* `uplm80/todo.txt`: `../uplox`'s `examples/plm_subset.uplox` still forbids a
+- `docs/git_stash_bug.md`: `git stash` / `git stash pop` in a clean worktree
+  pops another worktree's entry.  The owner is reviewing it; no rule has been
+  added to `CLAUDE.md`.  Two bug-report drafts about it are queued in
+  `~/.claude/feedback/drafts` (`/feedback` sends or dismisses them).
+- `uplm80/todo.txt`: `../uplox`'s `examples/plm_subset.uplox` still forbids a
   line break in a string; only uplox's own tests use it.
-* `uplm80/mpm.sys` is an untracked local file, left as it was.
+- `uplm80/mpm.sys` is an untracked local file, left as it was.
