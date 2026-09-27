@@ -1535,6 +1535,27 @@ V31_REJECTS = {
     "forward-call-from-a-reentrant": ("r: procedure reentrant;\n  call s;\nend r;\n"
                                       "s: procedure;\n  b = 1;\nend s;\ncall r;\n", (169,),
                                       "error: S: procedure S is declared after this call of it"),
+    # What an assignment stores to is a variable, an element or a member,
+    # or MEMORY, OUTPUT or STACKPTR (found checking 0.4.4): `input(1) = b'
+    # stored to an INPUT only the link found undefined.
+    "assign-to-input": ("input(1) = b;\n", (128,),
+                        "T.PLM:8:1: error: INPUT(1): INPUT is a built-in procedure, and an "
+                        "assignment stores to a variable, an element of an array or a "
+                        "structure's member, or to MEMORY, OUTPUT or STACKPTR; Intel's PL/M-80 "
+                        "V3.1 rejects it (ERROR #128, INVALID LEFT-HAND OPERAND OF ASSIGNMENT)"),
+    "assign-to-low": ("low(w) = b;\n", (128,), "T.PLM:8:1: error: LOW(W): LOW is a built-in"),
+    "assign-to-carry": ("b, carry = 1;\n", (128,),
+                        "T.PLM:8:4: error: CARRY: CARRY is a built-in procedure"),
+    "assign-to-time": ("time(1) = b;\n", (131, 128),
+                       "error: TIME(1): TIME is a built-in procedure, and an assignment stores "
+                       "to a variable, an element of an array or a structure's member, or to "
+                       "MEMORY, OUTPUT or STACKPTR; Intel's PL/M-80 V3.1 rejects it (ERROR #131, "
+                       "ILLEGAL REFERENCE TO UNTYPED PROCEDURE, and #128, INVALID LEFT-HAND "
+                       "OPERAND OF ASSIGNMENT)"),
+    "assign-to-a-typed-procedure": ("f = b;\n", (128,), "T.PLM:8:1: error: F: F is a procedure"),
+    "assign-to-a-procedure": ("g = b;\n", (131, 128), "T.PLM:8:1: error: G: G is a procedure"),
+    "embedded-assign-to-input": ("w = (input(2) := b);\n", (128,),
+                                 "T.PLM:8:6: error: INPUT(2): INPUT is a built-in procedure"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and

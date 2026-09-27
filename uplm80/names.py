@@ -280,6 +280,7 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     call: object = None         # the subscripted reference or call it names
     called: bool = False        # a CALL's: `call q(1, 2)' of an ADDRESS calls through it
     member: object = None       # the member of what it names, `s.m', if any
+    target: bool = False        # what an assignment stores to, `x = ...', `(x := ...)'
 
 
 class _MemberUse(NamedTuple):
@@ -410,6 +411,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._visit(n.stmt, block)
         elif isinstance(n, P.GotoStmt):
             self.refs.append(_Ref(block, n, "label", goto=True))
+        elif isinstance(n, (P.AssignStmt, P.EmbeddedAssign)):
+            for t in n.targets if isinstance(n, P.AssignStmt) else [n.target]:
+                self._reference(t, block, target=True)
+            self._visit(n.value, block)
         elif isinstance(n, _DO_BLOCKS):
             self._check_do(n)
             inner = _Block("do", block, block.module, block.proc)
@@ -509,16 +514,19 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         return r
 
     def _reference(self, n, block: _Block, dot: bool = False, *, extent=None,  # pylint: disable=too-many-arguments
-                   args: int | None = None, call=None, called: bool = False) -> None:
+                   args: int | None = None, call=None, called: bool = False,
+                   target: bool = False) -> None:
         """A reference: a name, a member of what a reference names, or
         either subscripted, or a call.  ``dot``: it is the operand of a dot;
         ``extent``: the argument of the call of LENGTH, LAST or SIZE given;
         ``args``: the subscripts or arguments of ``call`` that follow it;
-        ``called``: it is what a CALL statement calls.  What is inside a
-        subscript is visited on its own."""
+        ``called``: it is what a CALL statement calls; ``target``: what an
+        assignment stores to.  What is inside a subscript is visited on its
+        own."""
         n = unwrap_paren(n)
         if isinstance(n, P.Identifier):
-            self._ref(block, n, dot=dot, extent=extent, args=args, call=call, called=called)
+            self._ref(block, n, dot=dot, extent=extent, args=args, call=call, called=called,
+                      target=target)
         elif isinstance(n, P.Call):
             callee = unwrap_paren(n.callee)
             name = _key(callee.name) if isinstance(callee, P.Identifier) else ""
@@ -526,7 +534,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self.chains.append(n)
             start = len(self.refs)
             self._reference(callee, block, dot, extent=extent, args=len(n.args), call=n,
-                            called=called)
+                            called=called, target=target)
             if name in ("LENGTH", "LAST", "SIZE") and len(n.args) == 1 and not dot:
                 self.extent_calls[id(n)] = (n, self.refs[start])
                 self._reference(n.args[0], block, extent=n)
@@ -535,7 +543,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         elif isinstance(n, P.MemberAccess):
             self.member_uses.append(_MemberUse(n, block, dot, extent, args, call, called))
             start = len(self.refs)
-            self._reference(n.base, block, dot, extent=extent)
+            self._reference(n.base, block, dot, extent=extent, target=target)
             if len(self.refs) > start and self.refs[start].member is None \
                     and unwrap_paren(n.base) is self.refs[start].node:
                 self.refs[start].member = n
@@ -574,7 +582,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         125: "ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE",
         126: "MISSING ')' AFTER BUILT-IN PROCEDURE ARGUMENT LIST",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
+        128: "INVALID LEFT-HAND OPERAND OF ASSIGNMENT",
         129: "ILLEGAL 'CALL' WITH TYPED PROCEDURE",
+        131: "ILLEGAL REFERENCE TO UNTYPED PROCEDURE",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
         153: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO MANY",
@@ -1006,6 +1016,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         """How a name is used, for what it names."""
         d = r.decl
         text = ident_text(getattr(r.node, r.attr))
+        if r.target:
+            self._check_target(r, d, text)
         if d is None:
             self._check_builtin_form(r, text)
         elif d.kind == "proc":
@@ -1019,6 +1031,27 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._check_variable(r, d, text)
         elif d.kind == "label" and r.called:
             self._check_called(r, d, text)
+
+    def _check_target(self, r: _Ref, d: _Decl | None, text: str) -> None:
+        """What an assignment stores to: a variable, an element or a
+        member, or MEMORY, OUTPUT or STACKPTR; not a procedure or another
+        built-in, whose value uplm80 stored to a symbol of its name, which
+        only the link found undefined (`input(1) = b', found checking
+        0.4.4).  Intel's PL/M-80 V3.1: ERROR 128, INVALID LEFT-HAND OPERAND
+        OF ASSIGNMENT, and 131, ILLEGAL REFERENCE TO UNTYPED PROCEDURE, of
+        one without a type."""
+        name = _key(getattr(r.node, r.attr))
+        if d is None and name in _BUILTINS and name not in ("MEMORY", "OUTPUT", "STACKPTR",
+                                                             "CPUTIME"):
+            kind, untyped = "a built-in procedure", name in ("MOVE", "TIME")
+        elif d is not None and d.kind == "proc":
+            kind, untyped = "a procedure", proc_return_type(d.node) is None
+        else:
+            return
+        what = expr_text(r.call) if r.call is not None else text
+        self.intel(r.node, f"{what}: {text} is {kind}, and an assignment stores to a variable, "
+                   "an element of an array or a structure's member, or to MEMORY, OUTPUT or "
+                   "STACKPTR", *((131, 128) if untyped else (128,)))
 
     def _check_variable(self, r: _Ref, d: _Decl, text: str) -> None:
         """A variable or a parameter called through, subscripted, or named
