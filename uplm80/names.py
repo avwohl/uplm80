@@ -565,6 +565,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         54: "UNDECLARED BASE",
         55: "UNDECLARED STRUCTURE MEMBER IN BASE",
         104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
+        105: "UNDECLARED IDENTIFIER",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
         125: "ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
@@ -973,9 +974,11 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     source_location(r.node))
 
     def check_declarations(self) -> None:
-        """The base of each BASED variable, as Intel's PL/M-80 V3.1 takes
-        it (:meth:`_check_bases`)."""
+        """The base of each BASED variable, and each LABEL declared, as
+        Intel's PL/M-80 V3.1 takes them (:meth:`_check_bases`,
+        :meth:`_check_labels`)."""
         self._check_bases()
+        self._check_labels()
 
     def _check_bases(self) -> None:
         """The base of each BASED variable is what Intel's PL/M-80 V3.1
@@ -1061,6 +1064,35 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         if decl_item_type(d.item)[0] != DataType.ADDRESS:
             return f"{name} is a BYTE, and a base is an ADDRESS", 50
         return None
+
+    def _check_labels(self) -> None:
+        """A LABEL declared in a block, not PUBLIC nor EXTERNAL, labels a
+        statement of the block (Programming Manual 9800268B, 9.3); a label
+        of the name in a block nested in it is another label, that block's.
+        Intel's PL/M-80 V3.1 rejects one that labels none, ERROR 172,
+        INVALID LABEL: UNDEFINED, named or not, and ERROR 105, UNDECLARED
+        IDENTIFIER, where the program names it.  uplm80 took it without a
+        word; the location of it in a DATA list, `dw LB', was um80's
+        "Undefined symbol", and a GOTO to it was refused only where no
+        optimization had left the GOTO out (resolve_names).  A PUBLIC one is
+        check_public_labels'."""
+        for d in self.decls:
+            if d.kind != "label" or d.defined or d.shared:
+                continue
+            node, attr = d.sites[0]
+            text = ident_text(getattr(node, attr))
+            inner = next((x for x in self.decls if x.kind == "label" and x.orig == d.orig
+                          and x.defined and x.block.module is d.block.module), None)
+            also = (f" (the {text}: in {self._place(inner)} is another label, that block's)"
+                    if inner is not None else "")
+            uses = self.refs_of.get(id(d), [])
+            if not uses:
+                self.intel(node, f"{text} is declared a LABEL but labels no statement{also}", 172)
+                continue
+            r = uses[0]
+            what = f"GOTO {text}" if r.goto else f".{text}" if r.dot else text
+            self.intel(r.node, f"{what}: {text} is declared a LABEL but labels no statement"
+                       f"{also}", 105, 172)
 
     def check_forms(self) -> None:
         """How each name is used, as Intel's PL/M-80 V3.1 allows (0.4.2's
@@ -2142,8 +2174,8 @@ def check_names(modules: list, multi: bool = False) -> list[tuple]:
     one or variable, anywhere but at the outer level of its module, a
     dimension of 0, the address of a label anywhere but in a DATA or an
     INITIAL list, the address of a built-in but MEMORY, empty
-    parentheses after a variable or a built-in, and a base Intel's PL/M-80
-    V3.1 does not take.  ``multi``: the modules
+    parentheses after a variable or a built-in, a base Intel's PL/M-80
+    V3.1 does not take and a LABEL that labels no statement.  ``multi``: the modules
     are compiled together (see resolve_names).  Returns warnings,
     (location, text) pairs, for what Intel's PL/M-80 V3.1 rejects and
     uplm80 compiles, as programs written for it rely on: a procedure's

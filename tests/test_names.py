@@ -1822,6 +1822,28 @@ V31_REJECTS = {
     "base-a-byte-parameter": (
         "p: procedure (q);\n  declare q byte;\n  declare a based q byte;\n  a = 1;\nend p;\n"
         "call p(0);\n", (50,), "T.PLM:10:19: error: A BASED Q: Q is a BYTE"),
+    # A LABEL that labels no statement of its block, which 0.4.3 took
+    # without a word, in a DATA list for an address um80 did not know
+    # ("Undefined symbol 'LB'"); a GOTO to it it refused at -O0, in words of
+    # its own, and took at -O2 where the GOTO was dead code.  Where a DO
+    # block in it labels a statement LB:, that is another label, the
+    # block's.
+    "label-that-labels-no-statement": ("declare lb label;\nw = 1;\n", (172,),
+                                       "T.PLM:8:9: error: LB is declared a LABEL but labels no "
+                                       "statement; Intel's PL/M-80 V3.1 rejects it (ERROR #172, "
+                                       "INVALID LABEL: UNDEFINED)"),
+    "label-that-labels-no-statement-in-data": (
+        "declare lb label;\ndeclare d address data (.lb);\nw = d;\n", (105, 172),
+        "T.PLM:9:26: error: .LB: LB is declared a LABEL but labels no statement; Intel's PL/M-80 "
+        "V3.1 rejects it (ERROR #105, UNDECLARED IDENTIFIER, and #172, INVALID LABEL: "
+        "UNDEFINED)"),
+    "goto-a-label-that-labels-no-statement": (
+        "declare lb label;\nif w = 7 then goto lb;\n", (105, 172),
+        "T.PLM:9:15: error: GOTO LB: LB is declared a LABEL but labels no statement; Intel's"),
+    "label-that-a-do-block-labels": (
+        "declare lb label;\ndo;\n  declare d address data (.lb);\n  lb: w = d;\nend;\n", (172,),
+        "T.PLM:8:9: error: LB is declared a LABEL but labels no statement (the LB: in a DO "
+        "block is another label, that block's); Intel's PL/M-80 V3.1 rejects it (ERROR #172"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
