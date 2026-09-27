@@ -572,12 +572,19 @@ assembly it did.
 
 ### Known issues
 
-0.4.3's Known issues stand, but for SHL and SHR in a DATA or INITIAL list
-or an AT address, which are V3.1's errors now, `declare p address initial
-(a)` of an array, whose message names V3.1's #151 now, and a subscript on
-a scalar, `x(1)` (#127), which uplm80 still compiles with a warning, but
-for the location of one in a restricted expression, `data (.x(1))`, V3.1's
-#149 now (Incompatible).  More INITIAL or DATA values than a scalar holds
+0.4.3's Known issues stand, but for these, which are V3.1's errors now
+(Incompatible): a call of a procedure from inside itself (#170), a
+procedure declared in a REENTRANT one and a REENTRANT one in another
+procedure (#88, #39), an END that names the first of two labels on a DO
+(#20), `b = a(1, 2)` of an array (#114), and SHL and SHR in a DATA or
+INITIAL list or an AT address; `declare p address initial (a)` of an
+array, whose message names V3.1's #151 now; the `ld l,a / ld h,0` before
+an 8-bit SHR (Changed); of the places where the SHL warning was not
+given, all but a store past an array's end into the variable shifted,
+which it still does not see (Fixed); and a subscript on a scalar, `x(1)`
+(#127), which uplm80 still compiles with a warning, but for the location
+of one in a restricted expression, `data (.x(1))`, V3.1's #149 now
+(Incompatible).  More INITIAL or DATA values than a scalar holds
 (#209) is so of an array's too, `declare b (2) byte data (1, 2, 3)`, which
 uplm80 lays out after it.  And these, which checking 0.4.4 found, left for
 a later release (0.4.3 the same):
@@ -1040,9 +1047,18 @@ warning that names V3.1's error (Incompatible):
 
 And these, without a word, which checking 0.4.3 against V3.1 found:
 
+- A call of a procedure, not REENTRANT, from inside itself, `r:
+  procedure; ... call r; end r;` (#170, ILLEGAL RECURSIVE CALL).
+- A procedure declared in a REENTRANT one (#88, INVALID PROCEDURE
+  NESTING, ILLEGAL IN REENTRANT PROCEDURE), and a REENTRANT procedure
+  declared in another procedure (#39, INVALID ATTRIBUTE OR
+  INITIALIZATION, NOT AT MODULE LEVEL).
 - More INITIAL or DATA values than a scalar holds, `declare y byte
   initial (1, 2)`, which fill the bytes after it (#209, ILLEGAL
   INITIALIZATION OF MORE SPACE THAN DECLARED).
+- An END that names the first of two labels on a DO, `a: c: do; ... end
+  a;` (#20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes only the
+  label next to DO, `end c;`.
 - SHL and SHR in a DATA or INITIAL list or an AT address, `declare w
   address data (shl(0f0h, 4))` (#151, INVALID OPERAND IN RESTRICTED
   EXPRESSION), which `-O0` refuses, and `-O1` and up fold with the BYTE
@@ -1068,8 +1084,21 @@ And this V3.1 compiles to other code (0.4.2 the same):
 
 Found by 0.4.3's final release check, and left for a later release:
 
+- `b = a(1, 2)` of an array (#114, INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS
+  ILLEGAL) compiles, to a call through the value of `a(0)`; 0.4.3 makes
+  the same of a scalar an error, not of an array (0.4.2 the same).
 - `declare p address initial (a)` of an array is refused, but the message
   names V3.1's #133, where V3.1 gives #151.
+- The SHL warning is not given where only these tell the two meanings
+  apart; 0.4.3 computes V3.1's value at each: PLUS, MINUS or CARRY after
+  an operation on a SHL of a BYTE (`b = (shl(k, 4) + 10h) plus 0` with k =
+  0FFH was 00 and is 01; `b = shl(k, 1); c = carry;` was 00 and is 0FFH),
+  the carry now coming from an 8-bit operation; a test that assigns the
+  variable it bounds, `if k < 4 and (k := 200) > 0 then w = shl(k, 6);`;
+  a store past an array's end into the variable shifted; and an INTERRUPT
+  procedure's assignments.
+- An 8-bit SHR can leave a `ld l,a / ld h,0` before it that nothing reads
+  (DA.PLM): bytes, not wrong code.
 
 ### Verified
 
