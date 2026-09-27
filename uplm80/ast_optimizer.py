@@ -354,6 +354,9 @@ class ASTOptimizer:
         # its operands of the same kind, so that every level reads the
         # flags -O0 does.
         self.flag_live: set[int] = set()
+        # What a live statement is rebuilt as, which is live too
+        # (_optimize_stmt); held, so that no other node takes its id.
+        self.rebuilt_live: list = []
         self.stats = OptimizationStats()
         # Known constant values for propagation: name -> (value, type,
         # derived). The value is already converted to the variable's type.
@@ -842,6 +845,7 @@ class ASTOptimizer:
             passes += 1
             self._reset_flow_state()
             self.flag_live = flag_live([module] + self.context)
+            self.rebuilt_live = []
             self.flag_sensitive = any(self._reads_a_flag(x) for x in module.items)
             self.scopes = [_scope_of(module.items)]
             self.inlinable_procs.clear()
@@ -1601,7 +1605,22 @@ class ASTOptimizer:
         return target
 
     def _optimize_stmt(self, stmt):
-        """Optimize a typed statement. Returns ``None`` to remove it."""
+        """Optimize a typed statement. Returns ``None`` to remove it.
+
+        What a statement a flag reader can read the flags of is rebuilt as
+        is such a statement too: dead-store elimination, which looks at the
+        rebuilt statements of a body, keeps `c = d AND 1' of `c = d AND 1;
+        c = 5; e = CARRY;', which it dropped at -O3 (found checking 0.4.4;
+        0.4.3 the same).
+        """
+        opt = self._optimize_stmt_form(stmt)
+        if opt is not None and opt is not stmt and self._live(stmt):
+            self.flag_live.add(id(opt))
+            self.rebuilt_live.append(opt)
+        return opt
+
+    def _optimize_stmt_form(self, stmt):
+        """Optimize a typed statement (_optimize_stmt)."""
         if stmt is None:
             return None
 

@@ -5,11 +5,12 @@ PLUS and MINUS its carry, SCL and SCR rotate through it, and DEC adjusts by
 it and the half carry (Programming Manual 9800268B, 12.1 to 12.5).  The
 optimizer folded `d OR 0', `d XOR 0' and `SHL(3, 2)' from -O1 on, and at
 -O3 an operation of a variable whose value it knew, `c = z' of z = 0 to
-`xor a', a loop it unrolled or a test it decided, so that a flag read after
-one read the flags of what came before at some levels and the operation's
-own at -O0 (found checking 0.4.4; 0.4.3 the same).  The optimizer leaves as
-it is each operation whose flags a reader can read (uplm80/flag_flow.py),
-in another module of the compilation too.
+`xor a', a loop it unrolled or a test it decided, and dropped a store the
+next statement overwrites, so that a flag read after one read the flags of
+what came before at some levels and the operation's own at -O0 (found
+checking 0.4.4; 0.4.3 the same).  The optimizer leaves as it is each
+operation whose flags a reader can read (uplm80/flag_flow.py), in another
+module of the compilation too.
 """
 
 import os
@@ -55,6 +56,13 @@ _CASES = [
     ("case", "do case z; c = 5; c = 6; end; e = carry;", "0000"),
     ("dec", "c = dec(34h + 21h); e = c;", "0055"),
     ("inline", "call p; e = carry;", "0000"),
+    # A store that the next statement overwrites, dropped at -O3 where its
+    # flags are read: in the module's block, in a DO block, in a procedure
+    # returned from, and in one that reads them itself.
+    ("store", "c = d and 1; c = 5; e = carry;", "0000"),
+    ("storedo", "do; c = d and 1; c = 5; end; e = carry;", "0000"),
+    ("storeproc", "call q; e = carry;", "0000"),
+    ("storein", "call r; e = e;", "0000"),
 ]
 
 
@@ -65,7 +73,10 @@ def _program() -> str:
                     f"b = shl(k, 1); {stmts} call ph(e);")
     return ("t: do;\n" + _PH
             + "declare (k, b, c, d, e, z, o, i) byte;\n"
-            + "p: procedure; c = d + z; end p;\n" + "\n".join(body) + "\nend t;\n")
+            + "p: procedure; c = d + z; end p;\n"
+            + "q: procedure; c = d and 1; c = 5; end q;\n"
+            + "r: procedure; b = shl(k, 1); c = d and 1; c = 5; e = carry; end r;\n"
+            + "\n".join(body) + "\nend t;\n")
 
 
 @pytest.mark.parametrize("opt", LEVELS)
@@ -81,6 +92,17 @@ def test_what_no_flag_reader_reads_is_still_folded(opt):
     assert asm is not None
     lines = [line.strip() for line in asm.splitlines()]
     assert ("or\t0" in lines or "or\ta" in lines) == (opt == 0), asm
+
+
+def test_a_store_no_flag_reader_reads_the_flags_of_is_still_dropped():
+    """At -O3 `c = d AND 1' before `c = 5' is dropped where nothing reads
+    its flags, and kept where CARRY does."""
+    for reader, kept in (("", False), ("e = carry;", True)):
+        src = ("t: do;\ndeclare (c, d, e) byte;\n"
+               f"p: procedure; c = d and 1; c = 5; {reader} end p;\ncall p;\nend t;\n")
+        asm = Compiler(opt_level=3).compile(src, "T.PLM")
+        assert asm is not None
+        assert ("and\t1" in [line.strip() for line in asm.splitlines()]) == kept, asm
 
 
 def test_a_reader_in_another_module_keeps_what_its_flags_are_of():

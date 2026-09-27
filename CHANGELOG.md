@@ -412,26 +412,29 @@ assembly it did.
 - **Every level reads the flags `-O0` reads** (found checking 0.4.4;
   0.4.3 the same).  The optimizer folded `d or 0`, `d xor 0`, `shl(3,
   2)` and `3 + 4` from `-O1` on, and at `-O3` an operation of a variable
-  whose value it knew, `c = z` of z = 0 to `xor a`, a loop it unrolled or
-  a test it decided, so that a flag read after one read, at some levels,
-  the flags of what came before it: `b = shl(k, 1); c = d or 0; e =
-  carry;` with k = 0FFH left e 0 at `-O0` and 0FFH at `-O1` to `-O3`, and
-  `do i = 1 to 2; c = 5; end; e = carry;` 0 at `-O0` to `-O2` and 0FFH at
-  `-O3`.  It leaves as it is each operation whose flags a reader can
+  whose value it knew, `c = z` of z = 0 to `xor a`, a loop it unrolled, a
+  test it decided, or, in a procedure or a DO block, a store the next
+  statement overwrites, which it dropped, so that a flag read after one
+  read, at some levels, the flags of what came before it: `b = shl(k, 1);
+  c = d or 0; e = carry;` with k = 0FFH left e 0 at `-O0` and 0FFH at
+  `-O1` to `-O3`, and `do i = 1 to 2; c = 5; end; e = carry;` and `c = d
+  and 1; c = 5; e = carry;` in a procedure 0 at `-O0` to `-O2` and 0FFH
+  at `-O3`.  It leaves as it is each operation whose flags a reader can
   read, by the rule of the entry before (uplm80/flag_flow.py), and each
-  reader: not folded, rewritten, unrolled or inlined, and of operands of
-  the same kind - `w + one` is `add hl,de`, where `w + 1` is `inc hl` -
-  but for an 8-bit +, -, AND, OR, XOR, PLUS or MINUS of BYTEs, whose flags
-  are the same with a constant for one operand, in the other modules of a
-  multi-file compile too.  The code of the 88 compiles of MP/M II's and
-  80un's PL/M, and of `sample_code`, is the same at every level; of the
-  suite's programs, three that read flags are longer: `test_dec_bcd.plm`
-  at `-O2` and `-O3`, whose `dec(34h + 21h)` is `ld a,34h / add a,21h /
-  daa` at every level, `test_byte_shifts.plm` at `-O2` and `-O3`, and
-  `test_plus_minus.plm` at `-O3`, where constants no longer go into the
-  shifts, sums and PLUS and MINUS the SCL, SCR, PLUS and MINUS after them
-  may read the flags of.  V3.1 folds some of these itself, and differs
-  from every level as from `-O0` (README, Known differences).
+  reader: not folded, rewritten, unrolled, inlined or dropped, and of
+  operands of the same kind - `w + one` is `add hl,de`, where `w + 1` is
+  `inc hl` - but for an 8-bit +, -, AND, OR, XOR, PLUS or MINUS of BYTEs,
+  whose flags are the same with a constant for one operand, in the other
+  modules of a multi-file compile too.  The code of the 88 compiles of
+  MP/M II's and 80un's PL/M, and of `sample_code`, is the same at every
+  level; of the suite's programs, three that read flags are longer:
+  `test_dec_bcd.plm` at `-O2` and `-O3`, whose `dec(34h + 21h)` is `ld
+  a,34h / add a,21h / daa` at every level, `test_byte_shifts.plm` at
+  `-O2` and `-O3`, and `test_plus_minus.plm` at `-O3`, where constants no
+  longer go into the shifts, sums and PLUS and MINUS the SCL, SCR, PLUS
+  and MINUS after them may read the flags of.  V3.1 folds some of these
+  itself, and differs from every level as from `-O0` (README, Known
+  differences).
 
 - **A test that assigns the variable it bounds no longer bounds it**:
   `k = 1; if k < 4 and (k := 200) > 0 then w = shl(k, 6);` was 3200H and

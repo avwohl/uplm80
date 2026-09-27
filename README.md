@@ -239,7 +239,8 @@ where:
   the optimizer leaves as it is any operation whose flags a reader can
   read, where it folded `x OR 0`, `x XOR 0` or `SHL(3, 2)` from `-O1` on,
   and at `-O3` an operation of a variable whose value it knew, a loop it
-  unrolled or a test it decided (0.4.4).
+  unrolled, a test it decided or a store the next statement overwrites
+  (0.4.4).
 
 ## Conditional Compilation
 
