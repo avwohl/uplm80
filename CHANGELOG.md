@@ -12,12 +12,13 @@ What 0.4.3's final release check found and left for a later release.
 What uplm80 compiled and Intel's PL/M-80 V3.1 rejects is refused as V3.1
 refuses it, with the number and text of each error V3.1 gives, at every
 `-O` level.  No program of MP/M II (DRI's tree and mpm2's overrides), of
-80un 0.3.3 or of `sample_code` has any of these, and the 88 compiles of
-their PL/M are unchanged; one test's program, which called through an
-array's element to have its address found in DE, calls through a BASED
-ADDRESS now.  V3.1 rejects each program of `tests/test_names.py` with the
-errors the message names (`tests/test_intel_oracle.py`), and builds the
-program of the calls it takes to print what uplm80's build prints.
+80un 0.3.3 or of `sample_code` has any of these, and none of the 88
+compiles of their PL/M gives a new message; one test's program, which
+called through an array's element to have its address found in DE, calls
+through a BASED ADDRESS now.  V3.1 rejects each program of
+`tests/test_names.py` with the errors the message names, and no other
+(`tests/test_intel_oracle.py`), and builds the programs of what it takes
+of the same forms to print what uplm80's builds print.
 
 - **More than one subscript** (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
   SUBSCRIPTS ILLEGAL), wherever a subscript goes: of an array, a BASED
@@ -55,6 +56,31 @@ program of the calls it takes to print what uplm80's build prints.
       Intel's PL/M-80 V3.1 rejects it (ERROR #118, INVALID INDIRECT CALL,
       IDENTIFIER NOT AN ADDRESS SCALAR, and #32, INVALID SYNTAX, TEXT
       IGNORED UNTIL ';')
+
+- **MEMORY without a subscript**, `b = memory`, `memory = b`, `w = memory
+  + 1` (ERROR #133, ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY), which
+  uplm80 took for `memory(0)`; `.memory` and LENGTH, LAST and SIZE of it
+  are taken, as V3.1 takes them.
+- **A procedure that calls itself**, not REENTRANT (ERROR #170, ILLEGAL
+  RECURSIVE CALL): `r: procedure; ... call r; end r;`, `return h` in a
+  typed H, and a call of R from a procedure declared in it (0.4.3's Known
+  issues).  Its locals are static and a second activation overwrote the
+  first's.  A REENTRANT procedure calls itself, and a CALL through the
+  address of the procedure it is in is taken, as V3.1 takes them.
+
+      R: procedure R is called from inside itself, and only a REENTRANT
+      procedure may be (Programming Manual 9800268B, 8.1.7); Intel's
+      PL/M-80 V3.1 rejects it (ERROR #170, ILLEGAL RECURSIVE CALL)
+
+- **A REENTRANT procedure not at the outer level of its module**, in a
+  procedure or in a DO block (ERROR #39, INVALID ATTRIBUTE OR
+  INITIALIZATION, NOT AT MODULE LEVEL), and **a procedure declared in a
+  REENTRANT one**, in it or in a DO block of it (ERROR #88, INVALID
+  PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE); both of a REENTRANT
+  procedure in a REENTRANT one (0.4.3's Known issues).
+- **An END that names the first of two labels on a DO**, `m: n: do; ...
+  end m;` (ERROR #20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes
+  only the label next to DO, `end n;` (0.4.3's Known issues).
 
 ### Changed
 
@@ -283,18 +309,9 @@ warning that names V3.1's error (Incompatible):
 
 And these, without a word, which checking 0.4.3 against V3.1 found:
 
-- A call of a procedure, not REENTRANT, from inside itself, `r:
-  procedure; ... call r; end r;` (#170, ILLEGAL RECURSIVE CALL).
-- A procedure declared in a REENTRANT one (#88, INVALID PROCEDURE
-  NESTING, ILLEGAL IN REENTRANT PROCEDURE), and a REENTRANT procedure
-  declared in another procedure (#39, INVALID ATTRIBUTE OR
-  INITIALIZATION, NOT AT MODULE LEVEL).
 - More INITIAL or DATA values than a scalar holds, `declare y byte
   initial (1, 2)`, which fill the bytes after it (#209, ILLEGAL
   INITIALIZATION OF MORE SPACE THAN DECLARED).
-- An END that names the first of two labels on a DO, `a: c: do; ... end
-  a;` (#20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes only the
-  label next to DO, `end c;`.
 - SHL and SHR in a DATA or INITIAL list or an AT address, `declare w
   address data (shl(0f0h, 4))` (#151, INVALID OPERAND IN RESTRICTED
   EXPRESSION), which `-O0` refuses, and `-O1` and up fold with the BYTE

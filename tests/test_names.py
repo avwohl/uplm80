@@ -1342,6 +1342,63 @@ V31_REJECTS = {
                                             "error: CALL SA(1).G: SA is an array"),
     "call-through-memory": ("call memory(1);\n", (118, 32),
                             "error: CALL MEMORY(1): MEMORY is an array"),
+    # 0.4.3's Known issues: MEMORY without a subscript, a procedure that
+    # calls itself, and a REENTRANT procedure where V3.1 refuses one (0.4.4).
+    "unsubscripted-memory": ("b = memory;\n", (133,),
+                             "T.PLM:8:5: error: MEMORY: MEMORY is an array, and an array is named "
+                             "without a subscript only as the operand of a dot or the argument "
+                             "of LENGTH, LAST or SIZE (Programming Manual 9800268B, 3.6.2); "
+                             "Intel's PL/M-80 V3.1 rejects it (ERROR #133, ILLEGAL REFERENCE TO "
+                             "UNSUBSCRIPTED ARRAY)"),
+    "unsubscripted-memory-stored-to": ("memory = b;\n", (133,),
+                                       "T.PLM:8:1: error: MEMORY: MEMORY is an array"),
+    "unsubscripted-memory-in-a-sum": ("w = memory + 1;\n", (133,),
+                                      "error: MEMORY: MEMORY is an array"),
+    "call-through-unsubscripted-memory": ("call memory;\n", (118,),
+                                          "T.PLM:8:6: error: CALL MEMORY: MEMORY is an array, "
+                                          "and a CALL calls a procedure"),
+    "recursive-call": ("r: procedure;\n  b = b + 1;\n  if b < 3 then call r;\nend r;\ncall r;\n",
+                       (170,),
+                       "T.PLM:10:22: error: R: procedure R is called from inside itself, and only "
+                       "a REENTRANT procedure may be (Programming Manual 9800268B, 8.1.7); "
+                       "Intel's PL/M-80 V3.1 rejects it (ERROR #170, ILLEGAL RECURSIVE CALL)"),
+    "recursive-typed-call": ("h: procedure byte;\n  b = b + 1;\n  if b < 3 then return h;\n"
+                             "  return b;\nend h;\nb = h;\n", (170,),
+                             "T.PLM:10:24: error: H: procedure H is called from inside itself"),
+    "recursive-call-from-a-nested-procedure": ("r: procedure;\n  q: procedure;\n    b = b + 1;\n"
+                                               "    if b < 3 then call r;\n  end q;\n  call q;\n"
+                                               "end r;\ncall r;\n", (170,),
+                                               "T.PLM:11:24: error: R: procedure R is called from "
+                                               "inside itself"),
+    "procedure-in-a-reentrant": ("r: procedure reentrant;\n  q: procedure;\n    b = 1;\n"
+                                 "  end q;\n  call q;\nend r;\ncall r;\n", (88,),
+                                 "T.PLM:9:3: error: Q: procedure Q is declared in R, and a "
+                                 "REENTRANT procedure has no procedure declared in it (Programming "
+                                 "Manual 9800268B, 8.1.7); Intel's PL/M-80 V3.1 rejects it (ERROR "
+                                 "#88, INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE)"),
+    "procedure-in-a-do-block-of-a-reentrant": ("r: procedure reentrant;\n  do;\n    q: procedure;"
+                                               "\n      b = 1;\n    end q;\n    call q;\n  end;\n"
+                                               "end r;\ncall r;\n", (88,),
+                                               "T.PLM:10:5: error: Q: procedure Q is declared in R"),
+    "reentrant-in-a-procedure": ("p: procedure;\n  r: procedure reentrant;\n    b = 1;\n"
+                                 "  end r;\n  call r;\nend p;\ncall p;\n", (39,),
+                                 "T.PLM:9:3: error: R: a REENTRANT procedure must be declared at "
+                                 "the outer level of the module, not in procedure P (Programming "
+                                 "Manual 9800268B, 8.1.7); Intel's PL/M-80 V3.1 rejects it (ERROR "
+                                 "#39, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL)"),
+    "reentrant-in-a-do-block": ("do;\n  r: procedure reentrant;\n    b = 1;\n  end r;\n"
+                                "  call r;\nend;\n", (39,),
+                                "T.PLM:9:3: error: R: a REENTRANT procedure must be declared at the "
+                                "outer level of the module, not in a DO block"),
+    "end-names-the-first-of-two-labels": ("m: n: do;\n  b = 1;\nend m;\n", (20,),
+                                          "T.PLM:10:5: error: END M: the END of a block "
+                                          "labelled N names M; Intel's PL/M-80 V3.1 rejects it "
+                                          "(ERROR #20, MISMATCHED IDENTIFIER AT END OF BLOCK)"),
+    "reentrant-in-a-reentrant": ("r: procedure reentrant;\n  s: procedure reentrant;\n    b = 1;"
+                                 "\n  end s;\n  call s;\nend r;\ncall r;\n", (39, 88),
+                                 "T.PLM:9:3: error: S: a REENTRANT procedure must be declared at "
+                                 "the outer level of the module, not in procedure R, and R, a "
+                                 "REENTRANT procedure, has no procedure declared in it"),
     "unsubscripted-array": ("declare a(4) byte;\na = 3;\n", (133,),
                             "T.PLM:9:1: error: A: A is an array, and an array is named without a "
                             "subscript only as the operand of a dot or the argument of LENGTH, "
@@ -1808,4 +1865,34 @@ def test_a_call_through_an_address_scalar_is_compiled_without_a_word(capsys):
     _check(V31_CALLS, [7, 8, 0xB])
     capsys.readouterr()
     assert Compiler(opt_level=0).compile(_PH_PRELUDE + V31_CALLS + "end t;\n", "T.PLM")
+    assert "warning" not in capsys.readouterr().err
+
+
+# What V3.1 takes of those: a REENTRANT procedure that calls itself, a CALL
+# through the address of the procedure it is in, and MEMORY after a dot
+# and in LENGTH, LAST and SIZE (tests/test_intel_oracle.py builds it again).
+V31_RECURSION = """
+declare (b, n) byte, (w, q) address;
+fact: procedure (x) address reentrant;
+  declare x byte;
+  if x < 2 then return 1;
+  return x * fact(x - 1);
+end fact;
+cnt: procedure;
+  n = n + 1;
+  if n < 3 then call q;
+end cnt;
+call ph(fact(5));
+n = 0; q = .cnt; call cnt; call ph(n);
+w = .memory - .memory; call ph(w);
+w = length(memory); call ph(w);
+w = last(memory); call ph(w);
+w = size(memory); call ph(w);
+"""
+
+
+def test_a_reentrant_procedure_calls_itself_without_a_word(capsys):
+    _check(V31_RECURSION, [0x78, 3, 0, 0, 0xFFFF, 0])
+    capsys.readouterr()
+    assert Compiler(opt_level=0).compile(_PH_PRELUDE + V31_RECURSION + "end t;\n", "T.PLM")
     assert "warning" not in capsys.readouterr().err

@@ -372,6 +372,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self._visit(x, block)
             return
         if isinstance(n, P.ProcDecl):
+            self._check_nesting(n, block)
             self._proc(n, block)
         elif isinstance(n, P.DeclareStmt):
             self._visit(n.declarations, block)
@@ -389,11 +390,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._declare(block, _key(n.name), "lit", (n, "name"), literal=literally_value(n))
         elif isinstance(n, P.LabeledStmt):
             self._label(n, block)
-            inner = n.stmt
-            while isinstance(inner, P.LabeledStmt):
-                inner = inner.stmt
-            # The labels of a DO block, which its END may name.
-            self._do_labels.setdefault(id(inner), set()).add(_key(n.label))
+            # The label of a DO block, which its END may name: the one next
+            # to the DO, as Intel's PL/M-80 V3.1 has it, of several.
+            if not isinstance(n.stmt, P.LabeledStmt):
+                self._do_labels.setdefault(id(n.stmt), set()).add(_key(n.label))
             self._visit(n.stmt, block)
         elif isinstance(n, P.GotoStmt):
             self.refs.append(_Ref(block, n, "label", goto=True))
@@ -550,6 +550,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
     INTEL_ERRORS = {
         20: "MISMATCHED IDENTIFIER AT END OF BLOCK",
         32: "INVALID SYNTAX, TEXT IGNORED UNTIL ';'",
+        39: "INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL",
+        88: "INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE",
         104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
         108: "MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
@@ -558,6 +560,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
         169: "ILLEGAL FORWARD CALL",
+        170: "ILLEGAL RECURSIVE CALL",
         174: "INVALID NULL PROCEDURE",
         201: "INVALID DO CASE BLOCK, AT LEAST ONE CASE REQUIRED",
     }
@@ -574,6 +577,26 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self.intel_warnings.append((source_location(node), f"{text}; {why}"))
             return
         raise CodeGenError(f"{text}; {why}", source_location(node))
+
+    def _check_nesting(self, p: P.ProcDecl, block: _Block) -> None:
+        """A REENTRANT procedure is declared at the outer level of the
+        module, not in a procedure or a DO block, and has no procedure
+        declared in it (8.1.7).  Intel's PL/M-80 V3.1: ERROR 39, INVALID
+        ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL; ERROR 88,
+        INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE."""
+        text = ident_text(p.name)
+        outer = block.kind != "module" and proc_attrs(p).is_reentrant
+        inner = block.proc is not None and block.proc.reentrant
+        if outer:
+            also = (f", and {block.proc.orig}, a REENTRANT procedure, has no procedure declared "
+                    "in it" if inner else "")
+            self.intel(p, f"{text}: a REENTRANT procedure must be declared at the outer level "
+                       f"of the module, not in {self._where(block)}{also} (Programming Manual "
+                       "9800268B, 8.1.7)", *((39, 88) if inner else (39,)))
+        elif inner:
+            self.intel(p, f"{text}: procedure {text} is declared in {block.proc.orig}, and a "
+                       "REENTRANT procedure has no procedure declared in it (Programming "
+                       "Manual 9800268B, 8.1.7)", 88)
 
     def _proc(self, p: P.ProcDecl, block: _Block) -> None:
         attrs = proc_attrs(p)
@@ -956,6 +979,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                            "operator takes the address of a procedure, not of a call of it "
                            "(Programming Manual 9800268B, 4.1.3)", 104)
             self._check_forward(r, d, text)
+            self._check_recursive(r, d, text)
         elif d.kind in ("var", "param"):
             self._check_variable(r, d, text)
 
@@ -975,20 +999,30 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self._check_unsubscripted(r, text)
 
     def _check_builtin_form(self, r: _Ref, text: str) -> None:
-        """MEMORY, an array, with one subscript, and not called; INPUT and
-        OUTPUT with one port.  Intel's PL/M-80 V3.1: ERROR 114, INVALID
-        SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL; 118, INVALID INDIRECT CALL,
-        IDENTIFIER NOT AN ADDRESS SCALAR; 108, MISSING ')' AFTER
-        INPUT/OUTPUT PORT NUMBER."""
+        """MEMORY, an array, with one subscript, but after a dot or in
+        LENGTH, LAST or SIZE, and not called; INPUT and OUTPUT with one
+        port.  Intel's PL/M-80 V3.1: ERROR 114, INVALID SUBSCRIPT,
+        MULTIPLE SUBSCRIPTS ILLEGAL; 118, INVALID INDIRECT CALL, IDENTIFIER
+        NOT AN ADDRESS SCALAR; 133, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+        ARRAY; 108, MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER."""
         name = _key(getattr(r.node, r.attr))
-        if r.in_at or r.args is None:
+        if r.in_at or r.in_list:
             return
-        what = expr_text(r.call)
         if name == "MEMORY" and r.called:
+            # And ERROR 32, INVALID SYNTAX, of what follows it in parentheses.
+            what = expr_text(r.call) if r.call is not None else text
             self.intel(r.node, f"CALL {what}: MEMORY is an array, and a CALL calls a "
                        "procedure, or through an ADDRESS scalar (Programming Manual "
-                       "9800268B, 8.2.1)", 118, 32)
-        elif name == "MEMORY" and r.args > 1 and not self._extent(r.extent):
+                       "9800268B, 8.2.1)", *((118, 32) if r.call is not None else (118,)))
+            return
+        if name == "MEMORY" and r.args is None and not r.dot and not self._extent(r.extent):
+            self.intel(r.node, f"{text}: MEMORY is an array, and an array is named without a "
+                       "subscript only as the operand of a dot or the argument of LENGTH, "
+                       "LAST or SIZE (Programming Manual 9800268B, 3.6.2)", 133)
+        if r.args is None:
+            return
+        what = expr_text(r.call)
+        if name == "MEMORY" and r.args > 1 and not self._extent(r.extent):
             self.intel(r.node, f"{what}: MEMORY is an array, and an array takes one "
                        "subscript", 114)
         elif name in ("INPUT", "OUTPUT") and r.args > 1:
@@ -1083,6 +1117,21 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
         d = self.lookup(_key(root.name), u.block) if isinstance(root, P.Identifier) else None
         return d, _key(u.node.member)
+
+    def _check_recursive(self, r: _Ref, d: _Decl, text: str) -> None:
+        """A procedure is called from inside itself, directly or through a
+        procedure declared in it, only if it is REENTRANT (8.1.7); a CALL
+        through its address is not seen.  Intel's PL/M-80 V3.1: ERROR 170,
+        ILLEGAL RECURSIVE CALL."""
+        if d.reentrant or r.dot:
+            return
+        proc = r.block.proc
+        while proc is not None and proc is not d:
+            proc = proc.block.proc
+        if proc is d:
+            self.intel(r.node, f"{text}: procedure {text} is called from inside itself, and "
+                       "only a REENTRANT procedure may be (Programming Manual 9800268B, "
+                       "8.1.7)", 170)
 
     def _check_member(self, u: _MemberUse) -> None:
         """A member array without a subscript, but after a dot or in LENGTH,
