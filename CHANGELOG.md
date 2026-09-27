@@ -26,7 +26,12 @@ called through an array's element to have its address found in DE, calls
 through a BASED ADDRESS now.  V3.1 rejects each program of
 `tests/test_names.py` with the errors the message names, and no other
 (`tests/test_intel_oracle.py`), and builds the programs of what it takes
-of the same forms to print what uplm80's builds print.
+of the same forms to print what uplm80's builds print.  Two of 0.4.3's
+messages name more of V3.1's errors: an EXTERNAL procedure in a procedure
+or a DO block #174, INVALID NULL PROCEDURE, besides #39, as V3.1 takes it
+for a procedure with no statements; and LENGTH and LAST of a reference
+with anything in parentheses in a subscript #125, ILLEGAL ARGUMENT FOR
+BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
 
 - **More than one subscript** (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
   SUBSCRIPTS ILLEGAL), wherever a subscript goes: of an array, a BASED
@@ -97,7 +102,8 @@ of the same forms to print what uplm80's builds print.
   INITIALIZATION, NOT AT MODULE LEVEL), and **a procedure declared in a
   REENTRANT one**, in it or in a DO block of it (ERROR #88, INVALID
   PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE); both of a REENTRANT
-  procedure in a REENTRANT one (0.4.3's Known issues).
+  procedure in a REENTRANT one (0.4.3's Known issues), and of an
+  INTERRUPT, PUBLIC or EXTERNAL one, which 0.4.3 refused with #39 alone.
 - **An END that names the first of two labels on a DO**, `m: n: do; ...
   end m;` (ERROR #20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes
   only the label next to DO, `end n;` (0.4.3's Known issues).

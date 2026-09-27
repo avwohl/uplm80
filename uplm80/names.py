@@ -561,6 +561,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         108: "MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
         118: "INVALID INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR",
+        125: "ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
         129: "ILLEGAL 'CALL' WITH TYPED PROCEDURE",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
@@ -571,14 +572,19 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         201: "INVALID DO CASE BLOCK, AT LEAST ONE CASE REQUIRED",
     }
 
+    @classmethod
+    def _rejects(cls, numbers) -> str:
+        """That Intel's PL/M-80 V3.1 rejects it, with the errors ``numbers``."""
+        return "Intel's PL/M-80 V3.1 rejects it (ERROR " + ", and ".join(
+            f"#{n}, {cls.INTEL_ERRORS[n]}" for n in numbers) + ")"
+
     def intel(self, node, text: str, *numbers: int, warn: bool = False) -> None:
         """What Intel's PL/M-80 V3.1 rejects, with the errors ``numbers``:
         an error, or, where programs written for uplm80 rely on it
         (``warn``), a warning; ``text`` then says how it is compiled."""
         if not self.checking:
             return
-        why = "Intel's PL/M-80 V3.1 rejects it (ERROR " + ", and ".join(
-            f"#{n}, {self.INTEL_ERRORS[n]}" for n in numbers) + ")"
+        why = self._rejects(numbers)
         if warn:
             self.intel_warnings.append((source_location(node), f"{text}; {why}"))
             return
@@ -591,7 +597,11 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL; ERROR 88,
         INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE."""
         text = ident_text(p.name)
-        outer = block.kind != "module" and proc_attrs(p).is_reentrant
+        attrs = proc_attrs(p)
+        if block.kind != "module" and (attrs.interrupt_num is not None or attrs.is_public
+                                       or attrs.is_external):
+            return                  # _below_module
+        outer = block.kind != "module" and attrs.is_reentrant
         inner = block.proc is not None and block.proc.reentrant
         if outer:
             also = (f", and {block.proc.orig}, a REENTRANT procedure, has no procedure declared "
@@ -604,27 +614,31 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                        "REENTRANT procedure has no procedure declared in it (Programming "
                        "Manual 9800268B, 8.1.7)", 88)
 
+    def _below_module(self, p: P.ProcDecl, attrs, block: _Block) -> None:
+        """An INTERRUPT, PUBLIC or EXTERNAL procedure in a procedure or a
+        DO block.  Intel's PL/M-80 V3.1: ERROR 39, INVALID
+        ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL, in a procedure
+        and in a DO block of the module alike; and ERROR 88, INVALID
+        PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE, in a REENTRANT
+        one, and ERROR 174, INVALID NULL PROCEDURE, of an EXTERNAL one,
+        which V3.1 then takes for a procedure with no statements."""
+        what = ("INTERRUPT" if attrs.interrupt_num is not None else
+                "PUBLIC" if attrs.is_public else "EXTERNAL")
+        inner = block.proc is not None and block.proc.reentrant
+        also = (f", and {block.proc.orig}, a REENTRANT procedure, has no procedure declared in "
+                "it" if inner else "")
+        manual = " (Programming Manual 9800268B, 8.1.6)" if what == "INTERRUPT" else ""
+        numbers = (39, *((88,) if inner else ()), *((174,) if what == "EXTERNAL" else ()))
+        raise CodeGenError(
+            f"{ident_text(p.name)}: a{'n' if what[0] in 'EI' else ''} {what} procedure must be "
+            f"declared at the outer level of the module, not in {self._where(block)}{also}"
+            f"{manual}; {self._rejects(numbers)}", source_location(p))
+
     def _proc(self, p: P.ProcDecl, block: _Block) -> None:
         attrs = proc_attrs(p)
-        if attrs.interrupt_num is not None and block.kind != "module":
-            # Intel's PL/M-80 V3.1: ERROR 39, INVALID ATTRIBUTE OR
-            # INITIALIZATION, NOT AT MODULE LEVEL, in a procedure and in a
-            # DO block of the module alike.
-            where = "a DO block" if block.kind == "do" else f"procedure {block.proc.orig}"
-            raise CodeGenError(
-                f"{ident_text(p.name)}: an INTERRUPT procedure must be declared at the "
-                f"outer level of the module, not in {where} (Programming Manual "
-                "9800268B, 8.1.6)", source_location(p))
-        if block.kind != "module" and (attrs.is_public or attrs.is_external):
-            # Intel's PL/M-80 V3.1: ERROR 39, INVALID ATTRIBUTE OR
-            # INITIALIZATION, NOT AT MODULE LEVEL, in a procedure and in a
-            # DO block of the module alike.
-            what = "PUBLIC" if attrs.is_public else "EXTERNAL"
-            raise CodeGenError(
-                f"{ident_text(p.name)}: a{'n' if what[0] == 'E' else ''} {what} procedure must be "
-                f"declared at the outer level of the module, not in {self._where(block)}; "
-                "Intel's PL/M-80 V3.1 rejects it (ERROR #39, INVALID ATTRIBUTE OR "
-                "INITIALIZATION, NOT AT MODULE LEVEL)", source_location(p))
+        if block.kind != "module" and (attrs.interrupt_num is not None or attrs.is_public
+                                       or attrs.is_external):
+            self._below_module(p, attrs, block)
         d = self._declare(block, _key(p.name), "proc", (p, "name"), public=attrs.is_public,
                           external=attrs.is_external, reentrant=attrs.is_reentrant, node=p)
         end = p.body.end_label
@@ -1189,7 +1203,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         """The subscripts of the argument of LENGTH, LAST or SIZE, which
         are not evaluated: Intel's PL/M-80 V3.1 takes none with anything in
         parentheses, a call, a subscript or a parenthesized expression
-        (ERROR 32, INVALID SYNTAX)."""
+        (ERROR 32, INVALID SYNTAX; and of LENGTH and LAST, ERROR 125,
+        ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE, before it)."""
         ref = unwrap_paren(call.args[0])
         while isinstance(ref, (P.Call, P.MemberAccess)):
             if isinstance(ref, P.Call):
@@ -1197,7 +1212,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     name = ident_text(unwrap_paren(call.callee).name)
                     self.intel(call, f"{expr_text(call)}: the subscripts of {name}'s "
                                "argument are not evaluated, and none has anything in "
-                               "parentheses in it, a call, a subscript or an expression", 32)
+                               "parentheses in it, a call, a subscript or an expression",
+                               *((32,) if name.upper() == "SIZE" else (125, 32)))
                     return
                 ref = unwrap_paren(ref.callee)
             else:

@@ -17,6 +17,7 @@ the skip itself - are checked always.
 
 import importlib.util
 import os
+import re
 import sys
 
 import pytest
@@ -97,14 +98,16 @@ def test_a_release_program_prints_what_intels_build_prints(tools, name):
 @pytest.mark.parametrize("name", sorted(V31_REJECTS) + sorted(V31_WARNS))
 def test_v31_rejects_what_uplm80_rejects_or_warns_of(tools, name):
     """Each program tests/test_names.py holds uplm80 to: V3.1 rejects it
-    with the errors uplm80's message names, and uplm80 rejects it too, or,
-    where programs written for it rely on it, compiles it."""
+    with the errors uplm80's message names, and no other, and uplm80
+    rejects it too, or, where programs written for it rely on it,
+    compiles it."""
     stmts, errors, _ = {**V31_REJECTS, **V31_WARNS}[name]
     text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + stmts + "end t;\n")
     res = oracle.check_text(tools, text, name, levels=(0,))
     assert res.verdict == "intel-rejects", oracle.format_result(res)
-    for n in errors:
-        assert f"ERROR #{n}," in res.detail, res.detail
+    intel = res.detail.split(" (uplm80 rejects it too")[0]
+    assert sorted({int(n) for n in re.findall(r"ERROR #(\d+),", intel)}) == sorted(errors), \
+        res.detail
     assert ("uplm80 rejects it too" in res.detail) == (name in V31_REJECTS), res.detail
 
 

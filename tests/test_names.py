@@ -1219,7 +1219,29 @@ V31_REJECTS = {
                                       "T.PLM:9:3: error: Q: a PUBLIC procedure " + _OUTER
                                       + "procedure P"),
     "external-procedure-in-do": ("do;\n  r: procedure external;\n  end r;\n  call r;\nend;\n",
-                                 (39,), "error: R: an EXTERNAL procedure " + _OUTER + "a DO block"),
+                                 (39, 174), "error: R: an EXTERNAL procedure " + _OUTER
+                                 + "a DO block; Intel's PL/M-80 V3.1 rejects it (ERROR #39, "
+                                 "INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL, and "
+                                 "#174, INVALID NULL PROCEDURE)"),
+    "external-procedure-in-a-reentrant": ("r: procedure reentrant;\n  x: procedure external;\n"
+                                          "  end x;\n  call x;\nend r;\ncall r;\n", (39, 88, 174),
+                                          "T.PLM:9:3: error: X: an EXTERNAL procedure " + _OUTER
+                                          + "procedure R, and R, a REENTRANT procedure, has no "
+                                          "procedure declared in it; Intel's PL/M-80 V3.1 rejects "
+                                          "it (ERROR #39, INVALID ATTRIBUTE OR INITIALIZATION, NOT "
+                                          "AT MODULE LEVEL, and #88, INVALID PROCEDURE NESTING, "
+                                          "ILLEGAL IN REENTRANT PROCEDURE, and #174, INVALID NULL "
+                                          "PROCEDURE)"),
+    "public-procedure-in-a-reentrant": ("r: procedure reentrant;\n  x: procedure public;\n"
+                                        "    b = 1;\n  end x;\n  call x;\nend r;\ncall r;\n",
+                                        (39, 88), "error: X: a PUBLIC procedure " + _OUTER
+                                        + "procedure R, and R, a REENTRANT procedure, has no "
+                                        "procedure declared in it"),
+    "interrupt-procedure-in-a-reentrant": ("r: procedure reentrant;\n  x: procedure interrupt 3;"
+                                           "\n    b = 1;\n  end x;\n  b = 2;\nend r;\ncall r;\n",
+                                           (39, 88), "error: X: an INTERRUPT procedure " + _OUTER
+                                           + "procedure R, and R, a REENTRANT procedure, has no "
+                                           "procedure declared in it"),
     # 0.4.2's Known issues, 0.4.3.
     "end-names-another-procedure": ("p: procedure;\n  b = 1;\nend q;\ncall p;\n", (20,),
                                     "T.PLM:10:5: error: END Q: the END of procedure P names Q; "
@@ -1249,9 +1271,17 @@ V31_REJECTS = {
                        "subscript or an expression; Intel's PL/M-80 V3.1 rejects it (ERROR #32, "
                        "INVALID SYNTAX, TEXT IGNORED UNTIL ';')"),
     "length-of-a-parenthesized-subscript": ("declare sa(3) structure (z(2) byte);\n"
-                                            "w = length(sa((b)).z);\n", (32,),
+                                            "w = length(sa((b)).z);\n", (125, 32),
                                             "error: LENGTH(SA((B)).Z): the subscripts of "
-                                            "LENGTH's argument are not evaluated"),
+                                            "LENGTH's argument are not evaluated, and none has "
+                                            "anything in parentheses in it, a call, a subscript "
+                                            "or an expression; Intel's PL/M-80 V3.1 rejects it "
+                                            "(ERROR #125, ILLEGAL ARGUMENT FOR BUILT-IN "
+                                            "PROCEDURE, and #32, INVALID SYNTAX, TEXT IGNORED "
+                                            "UNTIL ';')"),
+    "last-of-a-call": ("declare ab(4) byte;\nh: procedure (x) byte; declare x byte; return x; "
+                       "end h;\nw = last(ab(h(1)));\n", (125, 32),
+                       "error: LAST(AB(H(1))): the subscripts of LAST's argument"),
     "null-procedure": ("p: procedure;\n  declare k byte;\nend p;\ncall p;\n", (174,),
                        "T.PLM:8:1: error: P: a procedure has at least one statement, and P has "
                        "none; Intel's PL/M-80 V3.1 rejects it (ERROR #174, INVALID NULL "
