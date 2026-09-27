@@ -200,8 +200,9 @@ where:
   it are lost; `SHL(DOUBLE(b), n)` keeps them.  uplm80 before 0.4.3
   shifted a BYTE in 16 bits, and where a SHL of a BYTE can shift a set bit
   out and the bits above its low byte are used - stored to an ADDRESS,
-  compared, used as a subscript, ... - the compiler warns (CHANGELOG,
-  0.4.3).
+  compared, used as a subscript, ... - or the flags of an operation on it
+  are read - by PLUS, MINUS, CARRY, ZERO, ... - the compiler warns
+  (CHANGELOG, 0.4.3 and 0.4.4).
 
 ## Conditional Compilation
 

@@ -113,3 +113,113 @@ def test_each_shl_is_warned_of_once(capsys):
     got = _warnings("w = shl(shl(b, 2), 2) + w; v = shl(b, 3) + shl(b, 3);", 0, capsys)
     assert [line.split(": warning: ")[1].split(":")[0] for line in got] == [
         "SHL(B, 2)", "SHL(SHL(B, 2), 2)", "SHL(B, 3)", "SHL(B, 3)"], got
+
+
+# 0.4.3's final release check: the flags of an operation on a SHL of a BYTE
+# that can lose bits are those of an 8-bit operation, where 0.4.2's were a
+# 16-bit one's, and PLUS, MINUS, SCL, SCR, DEC, CARRY, ZERO, SIGN and PARITY
+# read them - `b = (shl(k, 4) + 10h) plus 0' with k = 0FFH was 00 and is
+# 01, `b = shl(k, 1); c = carry;' 00 and 0FFH; and a test that assigns the
+# variable it bounds, or calls what assigns it, bounded it all the same.
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("stmts, shl, reader", [
+    ("c = (shl(b, 4) + 10h) plus 0;", "SHL(B, 4)", "PLUS"),
+    ("c = shl(b, 4) plus 0;", "SHL(B, 4)", "PLUS"),
+    ("c = shl(b, 1); c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 4) - 10h; c = 0 minus 0;", "SHL(B, 4)", "MINUS"),
+    ("c = shl(b, 4); if zero then c = 1;", "SHL(B, 4)", "ZERO"),
+    ("c = shl(b, 1); if sign then c = 1;", "SHL(B, 1)", "SIGN"),
+    ("c = shl(b, 1) + 3; if parity then c = 1;", "SHL(B, 1)", "PARITY"),
+    ("c = shl(b, 1); c = scl(c, 1);", "SHL(B, 1)", "SCL"),
+    ("c = dec(shl(b, 4) + 1);", "SHL(B, 4)", "DEC"),
+    ("c = shl(b, 2) and 3; c = carry;", "SHL(B, 2)", "CARRY"),     # an AND of 8 bits
+    ("c = ror(shl(b, 2), 1); c = carry;", "SHL(B, 2)", "CARRY"),
+    # Across what ends: a branch, a pass of a loop, a procedure, a GOTO.
+    ("if n > 3 then c = shl(b, 1); else c = 1; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("do while b; c = carry; c = shl(b, 1); end;", "SHL(B, 1)", "CARRY"),
+    ("do c = 0 to n; c = shl(b, 1); end; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("sh: procedure byte; return shl(b, 1); end sh; c = sh plus 0;", "SHL(B, 1)", "PLUS"),
+    ("c = shl(b, 1); goto l1; l1: c = carry;", "SHL(B, 1)", "CARRY"),
+])
+def test_what_reads_the_flags_of_a_shl_of_a_byte_is_warned_of(stmts, shl, reader, opt,
+                                                              capsys):
+    got = _warnings(stmts, opt, capsys)
+    assert len(got) == 1 and f"warning: {shl}: SHL of a BYTE is a BYTE" in got[0] \
+        and f"{reader} reads the flags" in got[0], got
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("stmts, shl", [
+    ("c = 1; if c < 4 and (c := 200) > 0 then w = shl(c, 6);", "SHL(C, 6)"),
+    ("c = 1; if (c := 200) > 0 and c < 4 then w = shl(c, 6);", "SHL(C, 6)"),
+    ("gk: procedure byte; k = 200; return 1; end gk;\n"
+     "k = 1; if k < 4 and gk > 0 then w = shl(k, 6);", "SHL(K, 6)"),
+    ("c = 1; do while c < 4 and (c := 200) > 0; w = shl(c, 6); end;", "SHL(C, 6)"),
+])
+def test_a_test_that_assigns_what_it_bounds_does_not_bound_it(stmts, shl, opt, capsys):
+    got = _warnings(stmts, opt, capsys)
+    assert len(got) == 1 and f"warning: {shl}: SHL of a BYTE is a BYTE" in got[0], got
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("stmts", [
+    "c = shl(b and 1fh, 3) + 1; c = carry;",        # loses no bit: the limit
+    "c = shl(b, 1); c = c + 1; c = carry;",         # the flags of what follows
+    "if (b and 0e0h) <> 0 then return; c = shl(b, 3) + shl(b, 1); c = carry;",
+    "if (b and 0e0h) = 0 then c = shl(b, 3) plus 0;",
+    "c = 1; if c < 4 then w = shl(c, 6);",
+    "c = shl(b, 1); call g; c = carry;",            # G's own flags
+])
+def test_what_reads_other_flags_is_not(stmts, opt, capsys):
+    assert _warnings(stmts, opt, capsys) == []
+
+
+def test_the_flags_warning_says_what_reads_them(capsys):
+    got = _warnings("c = shl(b, 1); c = carry;", 2, capsys)
+    assert got == [
+        "T.PLM:10:5: warning: SHL(B, 1): SHL of a BYTE is a BYTE (Programming Manual "
+        "9800268B, 11.1.4), and CARRY reads the flags of an operation of eight bits on it; "
+        "SHL(DOUBLE(B), 1) is shifted in 16 bits, as uplm80 before 0.4.3 shifted a BYTE"]
+
+
+def test_a_variable_an_interrupt_procedure_assigns_has_no_bound(capsys):
+    """An INTERRUPT procedure may run between any two statements: what it
+    assigns, or what it calls does, can have any value anywhere."""
+    capsys.readouterr()
+    src = ("t: do;\ndeclare (k, j, n) byte, w address;\n"
+           "set: procedure; j = 3; end set;\n"
+           "i: procedure interrupt 1; k = 3; call set; end i;\n"
+           "k = 1; w = shl(k, 6);\nj = 1; w = shl(j, 6);\nn = 1; w = shl(n, 6);\nend t;\n")
+    assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
+    got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
+    assert [line.split(": warning: ")[1].split(":")[0] for line in got] == [
+        "SHL(K, 6)", "SHL(J, 6)"], got
+
+
+@pytest.mark.parametrize("function, warned", [
+    (0, ["SHL(B, 1)"]), (1, ["SHL(B, 3)", "SHL(B, 1)"])])
+def test_a_procedure_that_resets_the_system_does_not_return(function, warned, capsys):
+    """MP/M II's SHOW, MSCHD and TOD read a number with `if (b and 0e0h) <>
+    0 then call terminate; b = shl(b, 3) + shl(b, 1); if carry then ...':
+    TERMINATE calls MON1 with the function 0, system reset, and does not
+    return, so b is below 32 at the SHLs, which lose nothing.  With another
+    function, it returns, and b can be anything."""
+    capsys.readouterr()
+    src = ("t: do;\ndeclare (b, c) byte, w address;\n"
+           "mon1: procedure (f, a) external; declare f byte, a address; end mon1;\n"
+           f"terminate: procedure; call mon1({function}, 0); end terminate;\n"
+           "stop: procedure; call terminate; end stop;\n"
+           "b = 0; do while b < 100;\n"
+           "  if (b and 0e0h) <> 0 then call terminate;\n"
+           "  b = shl(b, 3) + shl(b, 1); if carry then call stop;\n"
+           "  b = b + input(1); w = shl(b, 1);\nend;\nend t;\n")
+    assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
+    got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
+    assert [line.split(": warning: ")[1].split(":")[0] for line in got] == warned, got
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_a_test_of_equality_still_bounds(opt, capsys):
+    """`if b = 0' holding leaves b 0, as before the mask tests."""
+    assert _warnings("if b = 0 then w = shl(b, 5);", opt, capsys) == []
+    assert _warnings("if not (b <> 3) then w = shl(b, 6);", opt, capsys) == []

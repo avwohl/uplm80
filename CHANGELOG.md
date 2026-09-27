@@ -101,6 +101,51 @@ of the same forms to print what uplm80's builds print.
 
 ### Fixed
 
+- **The SHL of a BYTE warning is given where only the flags tell the two
+  meanings apart** (0.4.3's release check).  An operation on a SHL of a
+  BYTE that can lose bits is one of eight bits where it was one of
+  sixteen: its carry comes out of bit 7, and it sets ZERO, SIGN and PARITY
+  where a 16-bit addition left them.  PLUS, MINUS, SCL, SCR and DEC read
+  the carry, and CARRY, ZERO, SIGN and PARITY the flags, of the operation
+  before them, and where that is one the SHL is part of, the compiler
+  warns: `b = (shl(k, 4) + 10h) plus 0` with k = 0FFH was 00 and is 01,
+  `b = shl(k, 1); c = carry;` 00 and 0FFH, `b = shl(k, 1); b = scl(1,
+  1);` 02 and 03.  The flags are followed through the statements after
+  the operation, through IF, DO CASE and loops, to a RETURN and from the
+  call, and from any GOTO to a label.
+
+      warning: SHL(K, 1): SHL of a BYTE is a BYTE (Programming Manual
+      9800268B, 11.1.4), and CARRY reads the flags of an operation of eight
+      bits on it; SHL(DOUBLE(K), 1) is shifted in 16 bits, as uplm80
+      before 0.4.3 shifted a BYTE
+
+- **A test that assigns the variable it bounds no longer bounds it**:
+  `k = 1; if k < 4 and (k := 200) > 0 then w = shl(k, 6);` was 3200H and
+  is 0, with no warning (0.4.3's release check).  What a condition
+  assigns, by an embedded assignment or in a procedure it calls, keeps no
+  bound from it.  **Nor does a variable an INTERRUPT procedure assigns**,
+  itself or in what it calls, which may change it between any two
+  statements.  A test `(n and 0e0h) <> 0` bounds n by what the mask leaves
+  (31), and a procedure that ends in a call of MON1 with the function 0,
+  BDOS's system reset, or of such a procedure, does not return: MP/M II's
+  SHOW, MSCHD and TOD read a number as `if (b and 1110$0000b) <> 0 then
+  call terminate; b = shl(b, 3) + shl(b, 1); if carry then ...`, and b is
+  below 32 at those SHLs, which lose nothing - though the sum carries out
+  of eight bits from b = 26 on, where 0.4.2's did not out of sixteen, as
+  V3.1's does: the last of the limits below.
+
+  What the warning does not see, of the places where the two meanings
+  can differ: a store that reaches the variable other than by its name -
+  past the end of an array, through MEMORY or a BASED variable whose base
+  is not its address (the layout is uplm80's, Known issues); the flags a
+  procedure is entered with, and those an EXTERNAL procedure, or one
+  called through an address, returns with; and arithmetic around a SHL
+  that loses nothing, which can overflow eight bits, in its value, as
+  0.4.3 has it, `shr(z, 4) - 1`, or in its flags - and ZERO, SIGN and
+  PARITY after such a SHL, which 0.4.2's 16-bit shift left as the
+  operation before it had.  Of the programs checked, the warnings are
+  0.4.3's: MP/M II's 7, none in 80un 0.3.3's sources.
+
 - **The columns after a LITERALLY's text are the source's.**  The text
   takes the place of the name, on one line however many it runs over,
   and every column after it on the line was the text's: with `lit` a
@@ -339,14 +384,6 @@ Found by 0.4.3's final release check, and left for a later release:
 
 - `declare p address initial (a)` of an array is refused, but the message
   names V3.1's #133, where V3.1 gives #151.
-- The SHL warning is not given where only these tell the two meanings
-  apart; 0.4.3 computes V3.1's value at each: PLUS, MINUS or CARRY after
-  an operation on a SHL of a BYTE (`b = (shl(k, 4) + 10h) plus 0` with k =
-  0FFH was 00 and is 01; `b = shl(k, 1); c = carry;` was 00 and is 0FFH),
-  the carry now coming from an 8-bit operation; a test that assigns the
-  variable it bounds, `if k < 4 and (k := 200) > 0 then w = shl(k, 6);`;
-  a store past an array's end into the variable shifted; and an INTERRUPT
-  procedure's assignments.
 
 ### Verified
 

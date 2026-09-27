@@ -17,20 +17,44 @@ RETURN value, a subscript, a relation, ``/`` and ``MOD``, SHR, SCL, SCR,
 HIGH and DOUBLE of it, a DO CASE's selector, the limits of an ADDRESS
 index.  Each SHL that reaches one is warned of, once.
 
+The flags differ too: an operation on a SHL of a BYTE that can lose bits
+is one of eight bits where it was one of sixteen, whose carry comes out of
+bit 7, and which sets ZERO, SIGN and PARITY where a 16-bit addition left
+them as they were.  PLUS, MINUS, SCL, SCR and DEC read the carry, and
+CARRY, ZERO, SIGN and PARITY the flags, of the operation before them: each
+SHL the flags may differ by there is warned of.  They are followed through
+the statements after the operation, to a RETURN and from the call, and
+from a GOTO to every label; a call of what is not known, an EXTERNAL
+procedure or through an address, leaves flags of its own.
+
 A SHL whose pattern's largest value, shifted by its constant count, fits in
 eight bits loses nothing: ``shl(dcnt and 11b, 5)``, ``shl(3, 4)``.  The
 largest value of a BYTE or ADDRESS variable is what the statements before
 the SHL have left it: what was last assigned to it, and a test it has
-passed - after ``if n > 32 then return;``, n is at most 32 - where nothing
-can have changed it in between.  That is followed only for a scalar whose
-address is never taken, nor AT, BASED, PUBLIC or EXTERNAL, and a call of a
-procedure forgets it, but for a local of the procedure the call is in
-where the procedure called is not nested in it.  A SHR of a BYTE has the
-same value either way.
+passed - after ``if n > 32 then return;``, n is at most 32, after ``if (n
+and 0e0h) <> 0 then return;`` 31 - where nothing can have changed it in
+between: not the test itself, by an embedded assignment or in a procedure
+it calls.  That is followed only for a scalar whose address is never
+taken, nor AT, BASED, PUBLIC or EXTERNAL, nor assigned by an INTERRUPT
+procedure or what it calls, and a call of a procedure forgets it, but for
+a local of the procedure the call is in where the procedure called is not
+nested in it.  A procedure that ends in a call of MON1 with the function
+0, BDOS's system reset, or of such a procedure, and has no RETURN, does
+not return.  A SHR of a BYTE has the same value either way.
+
+What is not seen: a store that reaches the variable other than by its
+name - past the end of an array, through MEMORY or a BASED variable whose
+base is not its address; the flags a procedure is entered with, and those
+an EXTERNAL procedure, or one called through an address, returns with;
+and arithmetic around a SHL that loses nothing, which can overflow eight
+bits, with its value, as ``shr(z, 4) - 1``, or its flags, where it was of
+sixteen - ZERO, SIGN and PARITY after such a SHL, too.
 
 It runs on the program as the parser gave it, before the optimizer rewrites
 anything, so every ``-O`` level warns of the same places.
 """
+
+# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -100,12 +124,15 @@ class _Sym:  # pylint: disable=too-many-instance-attributes
 
 @dataclass
 class _Val:
-    """An expression: its type, the largest value it can have, and the SHLs
-    of a BYTE whose lost bits make it differ, above its low byte, from what
-    uplm80 before 0.4.3 computed."""
+    """An expression: its type, the largest value it can have, the SHLs of
+    a BYTE whose lost bits make it differ, above its low byte, from what
+    uplm80 before 0.4.3 computed, and the SHLs of a BYTE that can lose bits
+    among its operands, through any operator (``narrow``), which make the
+    flags an operation on it sets differ too."""
     dtype: DataType | None = None
     top: int = 0xFFFF
     shifts: tuple = ()
+    narrow: tuple = ()
 
 
 def _item_syms(item, pinned: set[str]) -> dict[str, _Sym]:
@@ -210,6 +237,18 @@ def _const(expr) -> int | None:
     return None
 
 
+def _union(*parts: tuple) -> tuple:
+    """The SHLs of ``parts``, each once, in order."""
+    out: dict[int, object] = {}
+    for part in parts:
+        for call in part:
+            out.setdefault(id(call), call)
+    return tuple(out.values())
+
+
+_FLAG_READERS = frozenset({"CARRY", "ZERO", "SIGN", "PARITY"})
+
+
 class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-attributes
     """One walk over the modules of a compilation."""
 
@@ -229,6 +268,18 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         # The names each procedure, by its declaration, may assign, itself
         # or through what it calls (_modsets).
         self.modsets: dict[int, frozenset] = {}
+        # The SHLs of a BYTE the flags as they stand may differ by: those
+        # the last operation had among its operands, and, after an
+        # operation of sixteen bits, which sets the carry alone, those of
+        # the operations before it.  What the flags may differ by where
+        # each procedure returns, by its declaration, and at a GOTO, as
+        # this walk and the last found.
+        self.flags: tuple = ()
+        self.ret_flags: dict[int, tuple] = {}
+        self.jump_flags: tuple = ()
+        # The procedures that do not return, by their declarations
+        # (_no_return).
+        self.no_return: set[int] = set()
 
     # ---- names ---------------------------------------------------------
 
@@ -293,30 +344,63 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
             self.seen[sym.key] = max(self.seen.get(sym.key, sym.init), top)
 
     def refine(self, cond, holds: bool) -> None:
-        """What ``cond`` holding (or not, ``holds``) says of a variable."""
-        c = unwrap_paren(cond)
+        """What ``cond`` holding (or not, ``holds``) says of a variable: of
+        one the condition itself does not assign, by an embedded assignment
+        or in a procedure it calls, after or before the test of it."""
         if self.facts is None:
             return
+        changed = set(_assigned(cond))
+        for name, _ in _callees(cond):
+            sym = self.lookup(name)
+            if sym is not None and sym.kind == "proc":
+                names = self.modsets.get(id(sym.node))
+                if names is None:
+                    return          # not known: it may assign anything
+                changed |= names
+            elif sym is None and name.upper() not in _BUILTINS:
+                return
+        self._refine(cond, holds, changed)
+
+    def _refine(self, cond, holds: bool, changed: set[str]) -> None:
+        c = unwrap_paren(cond)
         if isinstance(c, P.UnaryOp) and unop_kind(c) == UnaryOpKind.NOT:
-            self.refine(c.operand, not holds)
+            self._refine(c.operand, not holds, changed)
             return
         if not isinstance(c, P.BinaryOp):
             return
         kind = binop_kind(c)
         if (kind == BinaryOpKind.OR and not holds) or (kind == BinaryOpKind.AND and holds):
-            self.refine(c.left, holds)
-            self.refine(c.right, holds)
+            self._refine(c.left, holds, changed)
+            self._refine(c.right, holds, changed)
             return
         if kind not in RELATIONS:
             return
         var, k = unwrap_paren(c.left), _const(c.right)
         if k is None:
             var, k, kind = unwrap_paren(c.right), _const(c.left), _MIRROR[kind]
-        sym = self.lookup(ident_text(var.name)) if isinstance(var, P.Identifier) else None
+        if isinstance(var, P.BinaryOp) and binop_kind(var) == BinaryOpKind.AND:
+            if k == 0 and (kind == BinaryOpKind.EQ) == holds and kind in (
+                    BinaryOpKind.EQ, BinaryOpKind.NE):
+                self._refine_mask(var, changed)
+            return
+        name = ident_text(var.name) if isinstance(var, P.Identifier) else None
+        sym = self.lookup(name) if name is not None and name not in changed else None
         delta = (_BOUND_IF_TRUE if holds else _BOUND_IF_FALSE).get(kind)
         if k is None or sym is None or not sym.plain or delta is None or k + delta < 0:
             return
         self.facts[sym] = min(self.top(sym), k + delta)
+
+    def _refine_mask(self, e: P.BinaryOp, changed: set[str]) -> None:
+        """`x AND m' is 0: x has no bit of m set."""
+        var, m = unwrap_paren(e.left), _const(e.right)
+        if m is None:
+            var, m = unwrap_paren(e.right), _const(e.left)
+        name = ident_text(var.name) if isinstance(var, P.Identifier) else None
+        sym = self.lookup(name) if name is not None and name not in changed else None
+        if m is None or sym is None or not sym.plain:
+            return
+        top = mask(sym.dtype) & ~m
+        self.facts[sym] = min(self.top(sym), top)
 
     def refine_case(self, s: P.DoCaseBlock) -> None:
         """A DO CASE on a variable: the variable is less than the number of
@@ -342,6 +426,31 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                 f"lost; SHL(DOUBLE({x}), {n}) keeps them. uplm80 before 0.4.3 shifted a "
                 "BYTE in 16 bits"))
 
+    def read_flags(self, reader: str, flags: tuple | None = None) -> None:
+        """``reader`` - PLUS, MINUS, SCL, SCR, DEC, CARRY, ZERO, SIGN or
+        PARITY - reads the flags: warn of the SHLs they may differ by."""
+        for call in self.flags if flags is None else flags:
+            if id(call) in self.warned:
+                continue
+            x, n = (expr_text(a) for a in call.args)
+            self.warned[id(call)] = (source_location(call), (
+                f"SHL({x}, {n}): SHL of a BYTE is a BYTE (Programming Manual 9800268B, "
+                f"11.1.4), and {reader} reads the flags of an operation of eight bits on it; "
+                f"SHL(DOUBLE({x}), {n}) is shifted in 16 bits, as uplm80 before 0.4.3 "
+                "shifted a BYTE"))
+
+    def set_flags(self, narrow: tuple, wide: bool) -> None:
+        """An operation sets the flags: of ``narrow`` operands, or, of
+        sixteen bits (``wide``), the carry alone."""
+        self.flags = narrow if narrow else self.flags if wide else ()
+
+    def returned_flags(self) -> None:
+        """The procedure being checked returns with the flags as they are."""
+        proc = self.procs[-1]
+        if proc is not None and proc.node is not None:
+            key = id(proc.node)
+            self.ret_flags[key] = _union(self.ret_flags.get(key, ()), self.flags)
+
     def value(self, expr, wide: bool | None) -> _Val:
         """Evaluate ``expr``, used where it is converted to an ADDRESS
         (``wide``), to a BYTE (False), or neither (None: its own type)."""
@@ -358,6 +467,7 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
             self.facts = {}         # reached only by a GOTO, if at all
         if isinstance(s, P.LabeledStmt):
             self.facts = {}         # a GOTO may come here with anything
+            self.flags = _union(self.flags, self.jump_flags)
             self.stmt(s.stmt)
         elif isinstance(s, P.ProcDecl):
             self.proc(s)
@@ -367,65 +477,94 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                     self.proc(d)
         elif isinstance(s, P.AssignStmt):
             v = self.expr(s.value)
+            flags = self.flags
             for t in s.targets:
                 if self.target(t) is not BYTE:
                     self.read(v)
                 self.assign(t, v)
+            self.flags = _union(flags, self.flags)
         elif isinstance(s, P.CallStmt):
-            self.expr(s.callee)
-            callee = unwrap_paren(s.callee)
-            callee = unwrap_paren(callee.callee) if isinstance(callee, P.Call) else callee
-            sym = self.lookup(ident_text(callee.name)) \
-                if isinstance(callee, P.Identifier) else None
-            if sym is not None and sym.kind != "proc":
-                self.called(None)           # a call through an address
-        elif isinstance(s, P.ReturnStmtValue):
+            self.call_stmt(s)
+        elif isinstance(s, (P.ReturnStmtValue, P.ReturnStmt, P.GotoStmt, P.HaltStmt)):
+            self.jump(s)
+        elif isinstance(s, (P.IfStmt, P.IfStmtElse)):
+            self.if_stmt(s)
+        elif isinstance(s, (P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
+            self.loop(s)
+        elif isinstance(s, P.DoCaseBlock):
+            self.case(s)
+        elif isinstance(s, P.DoBlock):
+            self.block(s.items)
+
+    def call_stmt(self, s: P.CallStmt) -> None:
+        """A CALL: of a procedure, which may not return, or through an
+        address."""
+        self.expr(s.callee)
+        callee = unwrap_paren(s.callee)
+        callee = unwrap_paren(callee.callee) if isinstance(callee, P.Call) else callee
+        sym = self.lookup(ident_text(callee.name)) if isinstance(callee, P.Identifier) else None
+        if sym is not None and sym.kind != "proc":
+            self.called(None)           # a call through an address
+            self.flags = ()
+        elif sym is not None and sym.node is not None and (
+                id(sym.node) in self.no_return
+                or (_system_reset(s) and proc_attrs(sym.node).is_external)):
+            self.facts = None           # it does not return
+
+    def jump(self, s) -> None:
+        """A RETURN, a GOTO or a HALT: nothing after it is reached from it."""
+        if isinstance(s, P.ReturnStmtValue):
             v = self.value(s.value, self.returns[-1] is not BYTE if self.returns else None)
             proc = self.procs[-1]
             if proc is not None and proc.node is not None and proc.dtype is not None:
                 key = ("return", id(proc.node))
                 top = min(v.top, mask(proc.dtype)) if v.dtype else mask(proc.dtype)
                 self.seen[key] = max(self.seen.get(key, 0), top)
-            self.facts = None
-        elif isinstance(s, (P.ReturnStmt, P.GotoStmt, P.HaltStmt)):
-            self.facts = None
-        elif isinstance(s, (P.IfStmt, P.IfStmtElse)):
-            self.if_stmt(s)
-        elif isinstance(s, (P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock)):
-            self.loop(s)
-        elif isinstance(s, P.DoCaseBlock):
-            self.read(self.expr(s.selector))
-            self.push(s.items)
-            # The selector picks one of the cases (7.3): it is less than
-            # their number.
-            self.refine_case(s)
-            start, out = self.facts, None
-            for it in s.items:
-                self.facts = dict(start) if start is not None else None
-                self.stmt(it)
-                out = _join(out, self.facts)
-            self.scopes.pop()
-            self.facts = out
-        elif isinstance(s, P.DoBlock):
-            self.block(s.items)
+        if isinstance(s, (P.ReturnStmtValue, P.ReturnStmt)):
+            self.returned_flags()
+        elif isinstance(s, P.GotoStmt):
+            self.jump_flags = _union(self.jump_flags, self.flags)
+        self.facts = None
+
+    def case(self, s: P.DoCaseBlock) -> None:
+        """A DO CASE: after it, what the cases that end leave."""
+        self.read(self.expr(s.selector))
+        self.push(s.items)
+        # The selector picks one of the cases (7.3): it is less than
+        # their number.
+        self.refine_case(s)
+        start, out = self.facts, None
+        flags, out_flags = self.flags, ()
+        for it in s.items:
+            self.facts = dict(start) if start is not None else None
+            self.flags = flags
+            self.stmt(it)
+            out = _join(out, self.facts)
+            out_flags = _union(out_flags, self.flags)
+        self.scopes.pop()
+        self.facts, self.flags = out, out_flags
 
     def if_stmt(self, s) -> None:
         """An IF: each branch knows what its condition says; after it, what
         both branches that end leave."""
         self.expr(s.condition)          # its bit 0 is its truth
         start = dict(self.facts) if self.facts is not None else None
+        flags = self.flags
         self.refine(s.condition, True)
         self.stmt(s.then_stmt)
-        then = self.facts
-        self.facts = start
+        then, then_flags = self.facts, self.flags
+        self.facts, self.flags = start, flags
         self.refine(s.condition, False)
         if isinstance(s, P.IfStmtElse):
             self.stmt(s.else_stmt)
         self.facts = _join(then, self.facts)
+        self.flags = _union(then_flags, self.flags)
 
     def loop(self, s) -> None:
         """A DO WHILE or an iterative DO: what is known at its head holds
-        at each pass, and after it."""
+        at each pass, and after it.  The flags at its head are those it is
+        entered with and those a pass leaves, and after it those of its
+        test."""
         changed = _assigned(s)
         if self.facts is not None:
             self.facts = {k: v for k, v in self.facts.items()
@@ -437,17 +576,36 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                 elif (sym is None and name.upper() not in _BUILTINS) or (
                         sym is not None and call):
                     self.called(None)       # through an address, or not known
-        head = dict(self.facts) if self.facts is not None else None
+        start = dict(self.facts) if self.facts is not None else None
+        flags = self.flags
+        while True:
+            self.facts = dict(start) if start is not None else None
+            self.flags = flags
+            head, test_flags = self.loop_pass(s)
+            more = _union(flags, self.flags)
+            if len(more) == len(flags):
+                break
+            flags = more
+        self.facts, self.flags = head, test_flags
+        if isinstance(s, P.DoWhileBlock):
+            self.refine(s.condition, False)
+
+    def loop_pass(self, s) -> tuple:
+        """One pass of a loop: what is known at its head, and the flags
+        after its test."""
         index_top = exit_top = None
         if isinstance(s, P.DoWhileBlock):
             self.expr(s.condition)
             head = dict(self.facts) if self.facts is not None else None
+            test_flags = self.flags
             self.refine(s.condition, True)
         else:
             index = self.target(P.Identifier(name=s.index, pos=s.pos))
-            tops = [self.value(getattr(s, f), index is not BYTE).top
+            vals = [self.value(getattr(s, f), index is not BYTE)
                     for f in ("start", "bound", "step") if getattr(s, f, None) is not None]
+            tops = [v.top for v in vals]
             head = dict(self.facts) if self.facts is not None else None
+            test_flags = self.flags = _union(self.flags, *(v.narrow for v in vals))
             index_top = max(tops[:2])
             # It ends a step past its limit.
             exit_top = tops[1] + (tops[2] if len(tops) > 2 else 1)
@@ -458,16 +616,16 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         for it in s.items:
             self.stmt(it)
         self.scopes.pop()
-        self.facts = head
-        if isinstance(s, P.DoWhileBlock):
-            self.refine(s.condition, False)
+        if not isinstance(s, P.DoWhileBlock):
+            test_flags = _union(test_flags, self.flags)
+        return head, test_flags
 
     def proc(self, p: P.ProcDecl) -> None:
         """A procedure's body, which knows nothing of its callers."""
         if proc_attrs(p).is_external:
             return
-        saved = self.facts
-        self.facts = {}
+        saved, flags = self.facts, self.flags
+        self.facts, self.flags = {}, ()
         self.procs.append(self.lookup(proc_name(p)))
         self.returns.append(proc_return_type(p))
         self.push(p.body.items)
@@ -476,10 +634,11 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                 self.scopes[-1][n].param = True
         for it in p.body.items:
             self.stmt(it)
+        self.returned_flags()           # at its END
         self.scopes.pop()
         self.returns.pop()
         self.procs.pop()
-        self.facts = saved
+        self.facts, self.flags = saved, flags
 
     def target(self, t) -> DataType | None:
         """The type of an assignment's target, its subscripts evaluated."""
@@ -519,7 +678,9 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
             return self.binary(e)
         if isinstance(e, P.UnaryOp):
             v = self.expr(e.operand)
-            return _Val(v.dtype, 0 if v.top == 0 else mask(v.dtype or ADDRESS), v.shifts)
+            self.set_flags(v.narrow, v.dtype is not BYTE)
+            return _Val(v.dtype, 0 if v.top == 0 else mask(v.dtype or ADDRESS), v.shifts,
+                        v.narrow)
         if isinstance(e, P.LocationOf):
             self.location(e.operand)
         elif isinstance(e, P.EmbeddedAssign):
@@ -547,11 +708,14 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         sym = self.lookup(name)
         if sym is None:
             upper = name.upper()
+            if upper in _FLAG_READERS:
+                self.read_flags(upper)
             if upper == "STACKPTR":
                 return _Val(ADDRESS)
             return _Val(BYTE, 0xFF) if upper in _BYTE_RESULT else _Val()
         if sym.kind == "proc":
             self.called(sym)
+            self.flags = self.ret_flags.get(id(sym.node), ())
         if sym.kind not in ("var", "proc") or sym.dtype is None:
             return _Val()
         if sym.kind == "proc":
@@ -586,6 +750,7 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
             for i, a in enumerate(e.args):
                 self.value(a, (sym.params[i] if i < len(sym.params) else None) is not BYTE)
             self.called(sym)
+            self.flags = self.ret_flags.get(id(sym.node), ())
             return _Val(sym.dtype, self.returned(sym)) if sym.dtype else _Val()
         for a in e.args:                    # a subscript
             self.value(a, True)
@@ -603,6 +768,13 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                            or (i == 0 and name in _READS_HIGH_BITS))
                 for i, a in enumerate(args)]
         first = vals[0] if vals else _Val()
+        if name in ("SCL", "SCR", "DEC"):
+            self.read_flags(name)       # the carry, and DEC's half carry
+        if name in ("MOVE", "TIME"):
+            self.flags = ()
+        elif name in ("ROL", "ROR", "SCL", "SCR", "DEC"):
+            # A rotation sets the carry alone.
+            self.flags = _union(self.flags, first.narrow)
         if name == "LOW":
             return _Val(BYTE, min(first.top, 0xFF))
         if name == "HIGH":
@@ -632,19 +804,38 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         c = _const(e.args[1])
         most = c & 0xFF if c is not None else min(count.top, 0xFF) if count.dtype else 0xFF
         if name == "SHR":
-            return _Val(pat.dtype, pat.top >> c if c is not None else pat.top)
+            self.set_flags(pat.narrow, pat.dtype is not BYTE)
+            return _Val(pat.dtype, pat.top >> c if c is not None else pat.top, (), pat.narrow)
         top = pat.top << most
         if pat.dtype is not BYTE:
-            return _Val(pat.dtype, min(top, 0xFFFF), pat.shifts)
+            self.set_flags(pat.narrow, True)
+            return _Val(pat.dtype, min(top, 0xFFFF), pat.shifts, pat.narrow)
         if top <= 0xFF:
-            return _Val(BYTE, top, pat.shifts)
-        return _Val(BYTE, 0xFF, pat.shifts + (e,))
+            self.set_flags(pat.narrow, False)
+            return _Val(BYTE, top, pat.shifts, pat.narrow)
+        # Of eight bits where it was of sixteen, which set the carry alone.
+        narrow = _union(pat.narrow, (e,))
+        self.flags = _union(self.flags, narrow)
+        return _Val(BYTE, 0xFF, pat.shifts + (e,), narrow)
 
-    def binary(self, e: P.BinaryOp) -> _Val:  # pylint: disable=too-many-return-statements
+    def binary(self, e: P.BinaryOp) -> _Val:
         """An operator of two operands: whether it uses the bits above their
-        low bytes, or passes them on (4.2 to 4.4)."""
+        low bytes, or passes them on (4.2 to 4.4); and the flags it reads,
+        PLUS and MINUS the carry, and sets."""
         kind = binop_kind(e)
-        left, right = self.expr(e.left), self.expr(e.right)
+        left = self.expr(e.left)
+        after_left = self.flags
+        right = self.expr(e.right)
+        if kind in (BinaryOpKind.PLUS, BinaryOpKind.MINUS):
+            self.read_flags(kind.name, _union(after_left, self.flags))
+        narrow = _union(left.narrow, right.narrow)
+        self.set_flags(narrow, left.dtype is not BYTE or right.dtype is not BYTE)
+        v = self.combine(e, kind, left, right)
+        v.narrow = () if kind in RELATIONS else narrow
+        return v
+
+    def combine(self, e: P.BinaryOp, kind, left: _Val, right: _Val) -> _Val:  # pylint: disable=too-many-return-statements
+        """The value of an operator of two operands, ``left`` and ``right``."""
         if kind in RELATIONS or kind in (BinaryOpKind.DIV, BinaryOpKind.MOD):
             self.read(left)
             self.read(right)
@@ -751,6 +942,50 @@ def _modsets(modules) -> dict[int, frozenset]:
         mod = new
 
 
+def _system_reset(s: P.CallStmt) -> bool:
+    """Whether ``s`` is `CALL MON1(0, ...)': BDOS's function 0, system
+    reset, which does not return."""
+    c = unwrap_paren(s.callee)
+    callee = unwrap_paren(c.callee) if isinstance(c, P.Call) else None
+    return (isinstance(callee, P.Identifier) and ident_text(callee.name).upper() == "MON1"
+            and bool(c.args) and _const(c.args[0]) == 0)
+
+
+def _no_return(modules) -> set[int]:
+    """The procedures, by id of their declarations, that do not return:
+    with no RETURN, whose last statement is a call of one that does not,
+    or of an EXTERNAL MON1 with the function 0, system reset."""
+    procs = [n for n in _nodes(modules) if isinstance(n, P.ProcDecl)]
+    by_name: dict[str, list] = {}
+    for p in procs:
+        by_name.setdefault(proc_name(p).upper(), []).append(p)
+    external_mon1 = all(proc_attrs(p).is_external for p in by_name.get("MON1", []))
+    last: dict[int, P.CallStmt] = {}
+    for p in procs:
+        stmts = [it for it in p.body.items
+                 if not isinstance(it, (P.DeclareStmt, P.ProcDecl)) and not is_end_of_block(it)]
+        s = stmts[-1] if stmts else None
+        while isinstance(s, P.LabeledStmt):
+            s = s.stmt
+        if isinstance(s, P.CallStmt) and not proc_attrs(p).is_external and not any(
+                isinstance(n, (P.ReturnStmt, P.ReturnStmtValue))
+                for n in _nodes(p.body.items, into_procs=False)):
+            last[id(p)] = s
+    out: set[int] = set()
+    while True:
+        new = set(out)
+        for key, s in last.items():
+            c = unwrap_paren(s.callee)
+            callee = unwrap_paren(c.callee) if isinstance(c, P.Call) else c
+            name = ident_text(callee.name).upper() if isinstance(callee, P.Identifier) else ""
+            if (_system_reset(s) and external_mon1) or (
+                    by_name.get(name) and all(id(q) in out for q in by_name[name])):
+                new.add(key)
+        if new == out:
+            return out
+        out = new
+
+
 def _module_body(m) -> list:
     items = [it for it in m.items if not isinstance(it, P.AddressLiteral)]
     if len(items) == 1 and isinstance(items[0], P.LabeledStmt) and isinstance(
@@ -759,9 +994,8 @@ def _module_body(m) -> list:
     return items
 
 
-def check_byte_shifts(modules: list) -> list[tuple]:
-    """(location, text) of each SHL of a BYTE in ``modules`` whose lost
-    bits are read (see the module docstring), in the order found."""
+def _shared(modules) -> dict[str, _Sym]:
+    """The PUBLIC names of ``modules``."""
     shared: dict[str, _Sym] = {}
     for m in modules:
         for d in _module_body(m):
@@ -771,20 +1005,41 @@ def check_byte_shifts(modules: list) -> list[tuple]:
                 elif isinstance(x, (P.DeclItem, P.DeclItemBasedGroup)) \
                         and decl_attrs(x).is_public:
                     shared.update(_item_syms(x, set()))
-    pinned = _pinned(modules)
+    return shared
+
+
+def check_byte_shifts(modules: list) -> list[tuple]:
+    """(location, text) of each SHL of a BYTE in ``modules`` whose lost
+    bits are read, or whose flags are (see the module docstring), in the
+    order found."""
+    shared = _shared(modules)
     modsets = _modsets(modules)
+    # What an INTERRUPT procedure assigns, or what it calls, may change at
+    # any time: no bound holds of it.
+    pinned = _pinned(modules).union(*(
+        modsets[id(p)] for p in _nodes(modules)
+        if isinstance(p, P.ProcDecl) and proc_attrs(p).interrupt_num is not None))
     bounds: dict[tuple, int] = {}
     changes: dict[tuple, int] = {}
+    last = _Checker(shared, pinned)     # what the flags may differ by, so far
+    no_return = _no_return(modules)
     while True:
         # Each walk finds what the variables are assigned, taking them to be
         # at most what the last one found; until it finds no more.  One
-        # that keeps growing, as `k = k + 1' does, can have any value.
+        # that keeps growing, as `k = k + 1' does, can have any value.  And
+        # what the flags may differ by where a procedure returns and at a
+        # GOTO, as the last walk found, until it finds no more.
         c = _Checker(shared, pinned)
         c.bounds, c.modsets = bounds, modsets
+        c.ret_flags, c.jump_flags = dict(last.ret_flags), last.jump_flags
+        c.no_return = no_return
         for m in modules:
             c.block(_module_body(m))
         grown = {k: v for k, v in c.seen.items() if v > bounds.get(k, 0)}
-        if not grown:
+        flags_grew = (len(c.jump_flags) > len(last.jump_flags) or any(
+            len(v) > len(last.ret_flags.get(k, ())) for k, v in c.ret_flags.items()))
+        last = c
+        if not grown and not flags_grew:
             return list(c.warned.values())
         for k, v in grown.items():
             changes[k] = changes.get(k, 0) + 1
