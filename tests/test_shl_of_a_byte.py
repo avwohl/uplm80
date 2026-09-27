@@ -115,14 +115,24 @@ def test_each_shl_is_warned_of_once(capsys):
         "SHL(B, 2)", "SHL(SHL(B, 2), 2)", "SHL(B, 3)", "SHL(B, 3)"], got
 
 
-# 0.4.3's final release check: the flags of an operation on a SHL of a BYTE
-# that can lose bits are those of an 8-bit operation, where 0.4.2's were a
-# 16-bit one's, and PLUS, MINUS, SCL, SCR, DEC, CARRY, ZERO, SIGN and PARITY
-# read them - `b = (shl(k, 4) + 10h) plus 0' with k = 0FFH was 00 and is
-# 01, `b = shl(k, 1); c = carry;' 00 and 0FFH; and a test that assigns the
-# variable it bounds, or calls what assigns it, bounded it all the same.
+def _flags(stmts: str, opt: int, capsys) -> list[str]:
+    """The flags warnings of the program of ``stmts``."""
+    capsys.readouterr()
+    src = _HEAD + stmts + "\n" + _TAIL
+    assert Compiler(opt_level=opt).compile(src, "T.PLM") is not None
+    return [line for line in capsys.readouterr().err.splitlines()
+            if " may read the flags of " in line]
+
+
+# The flags of a SHL or SHR of a BYTE, and of an operation of eight bits on
+# it, are those of an 8-bit operation since 0.4.3, where they were a 16-bit
+# one's (0.4.3's final release check, and checking 0.4.4): each reader they
+# may reach - PLUS, MINUS, SCL, SCR, DEC, CARRY, ZERO, SIGN and PARITY - is
+# warned of, whatever the shift loses, through what sets no flag or only
+# some, calls, loops and GOTOs: `b = shl(k, 1); c = carry;' with k = 0FFH
+# was 00 and is 0FFH, `c = shr(d, 7) plus 0' with d = 0FFH 01 and 02.
 @pytest.mark.parametrize("opt", LEVELS)
-@pytest.mark.parametrize("stmts, shl, reader", [
+@pytest.mark.parametrize("stmts, shift, reader", [
     ("c = (shl(b, 4) + 10h) plus 0;", "SHL(B, 4)", "PLUS"),
     ("c = shl(b, 4) plus 0;", "SHL(B, 4)", "PLUS"),
     ("c = shl(b, 1); c = carry;", "SHL(B, 1)", "CARRY"),
@@ -131,26 +141,43 @@ def test_each_shl_is_warned_of_once(capsys):
     ("c = shl(b, 1); if sign then c = 1;", "SHL(B, 1)", "SIGN"),
     ("c = shl(b, 1) + 3; if parity then c = 1;", "SHL(B, 1)", "PARITY"),
     ("c = shl(b, 1); c = scl(c, 1);", "SHL(B, 1)", "SCL"),
+    ("c = shl(b, 1); c = scr(c, 1);", "SHL(B, 1)", "SCR"),
     ("c = dec(shl(b, 4) + 1);", "SHL(B, 4)", "DEC"),
-    ("c = shl(b, 2) and 3; c = carry;", "SHL(B, 2)", "CARRY"),     # an AND of 8 bits
+    ("c = shl(b, 2) and 3; c = carry;", "SHL(B, 2)", "CARRY"),
     ("c = ror(shl(b, 2), 1); c = carry;", "SHL(B, 2)", "CARRY"),
+    # A SHR of a BYTE, and a shift that loses nothing (checking 0.4.4).
+    ("c = shr(n, 7) plus 0;", "SHR(N, 7)", "PLUS"),
+    ("c = shr(n, 8); c = zero;", "SHR(N, 8)", "ZERO"),
+    ("c = shl(b and 1fh, 3) + 1; c = carry;", "SHL(B AND 1fh, 3)", "CARRY"),
+    ("if (b and 0e0h) <> 0 then return; c = shl(b, 3) + shl(b, 1); c = carry;",
+     "SHL(B, 3)", "CARRY"),
+    ("if (b and 0e0h) = 0 then c = shl(b, 3) plus 0;", "SHL(B, 3)", "PLUS"),
     # Across what ends: a branch, a pass of a loop, a procedure, a GOTO.
     ("if n > 3 then c = shl(b, 1); else c = 1; c = carry;", "SHL(B, 1)", "CARRY"),
     ("do while b; c = carry; c = shl(b, 1); end;", "SHL(B, 1)", "CARRY"),
     ("do c = 0 to n; c = shl(b, 1); end; c = carry;", "SHL(B, 1)", "CARRY"),
     ("sh: procedure byte; return shl(b, 1); end sh; c = sh plus 0;", "SHL(B, 1)", "PLUS"),
     ("c = shl(b, 1); goto l1; l1: c = carry;", "SHL(B, 1)", "CARRY"),
-    # What sets no flag, or the carry alone, between (found checking
-    # 0.4.4): NOT of a BYTE, `cpl', its minus, `cpl / inc a', and a product
-    # of BYTEs, an ADDRESS, `add hl,hl'.
+    # What sets no flag, or only some: NOT, minus, a product, a load...
     ("c = shl(b, 1); c = not n; c = carry;", "SHL(B, 1)", "CARRY"),
     ("c = shl(b, 1) or n; c = not n; if sign then c = 1;", "SHL(B, 1)", "SIGN"),
     ("c = shl(b, 1); c = (not n) plus 0;", "SHL(B, 1)", "PLUS"),
     ("c = shl(b, 1); c = (-n) plus 0;", "SHL(B, 1)", "PLUS"),
     ("c = shl(b, 2) and 0f0h; w = n * 2; if zero then c = 1;", "SHL(B, 2)", "ZERO"),
-    # A procedure that sets no flag returns with its caller's (G, and a
-    # typed one), is entered with them, and one called through an address
-    # too.
+    ("c = shl(b, 1); w = w + 1; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 1); if n < 3 then c = 1; c = carry;", "SHL(B, 1)", "CARRY"),
+    # ...and what compiles to no instruction, at some level: a MOVE of a
+    # constant count, `ldir', a shift by 0, an operation of constants.
+    ("c = shl(b, 1); call move(2, .w, .v); c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 1); call move(n, .w, .v); if sign then c = 1;", "SHL(B, 1)", "SIGN"),
+    ("c = shl(b, 1); c = shr(n, 0); c = carry;", "SHR(N, 0)", "CARRY"),
+    ("c = -shl(b, 5); c = shl(n, 0); c = scl(n, 1);", "SHL(B, 5)", "SCL"),
+    ("c = shl(b, 1); c = low(3 + 4); c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 1); c = (1 < 2); c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 1); if 1 < 2 then c = 1; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 1); c = shl(3, 2); c = carry;", "SHL(3, 2)", "CARRY"),
+    # A procedure that may set no flag returns with its caller's, and is
+    # entered with them; one called through an address too.
     ("c = shl(b, 1); call g; c = carry;", "SHL(B, 1)", "CARRY"),
     ("r3: procedure byte; return 3; end r3; c = shl(b, 1); c = r3; if sign then c = 1;",
      "SHL(B, 1)", "SIGN"),
@@ -158,12 +185,16 @@ def test_each_shl_is_warned_of_once(capsys):
     ("en: procedure; call g; end en; c = shl(b, 1); call en; c = carry;", "SHL(B, 1)",
      "CARRY"),
     ("v = .h; c = shl(b, 1); call v; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("sv: procedure; c = shl(n, 1); end sv; v = .sv; call v; c = carry;", "SHL(N, 1)",
+     "CARRY"),
 ])
-def test_what_reads_the_flags_of_a_shl_of_a_byte_is_warned_of(stmts, shl, reader, opt,
-                                                              capsys):
-    got = _warnings(stmts, opt, capsys)
-    assert len(got) == 1 and f"warning: {shl}: SHL of a BYTE is a BYTE" in got[0] \
-        and f"{reader} reads the flags" in got[0], got
+def test_a_flag_reader_the_flags_of_a_shift_of_a_byte_reach_is_warned_of(stmts, shift, reader,
+                                                                         opt, capsys):
+    got = _flags(stmts, opt, capsys)
+    assert len(got) == 1 and f"warning: {reader} may read the flags of " in got[0] \
+        and shift in got[0], got
+    # The value warning is another's, and of a SHL whose lost bits are read.
+    assert all(" may read the flags of " not in w for w in _warnings(stmts, opt, capsys))
 
 
 @pytest.mark.parametrize("opt", LEVELS)
@@ -199,29 +230,66 @@ def test_a_test_that_assigns_what_it_bounds_does_not_bound_it(stmts, shl, opt, c
     assert len(got) == 1 and f"warning: {shl}: SHL of a BYTE is a BYTE" in got[0], got
 
 
+# An 8-bit addition, subtraction, AND, OR or XOR of BYTEs, the value of an
+# assignment, sets every flag, and a reader after it reads its: of a shift
+# of a BYTE, if it is of one, and none of what came before.  So does a
+# procedure every way through which ends in one; DEC of one, and a PLUS of
+# BYTEs whose left operand is one, read its flags, not those before.
 @pytest.mark.parametrize("opt", LEVELS)
 @pytest.mark.parametrize("stmts", [
-    "c = shl(b and 1fh, 3) + 1; c = carry;",        # loses no bit: the limit
-    "c = shl(b, 1); c = c + 1; c = carry;",         # the flags of what follows
-    "if (b and 0e0h) <> 0 then return; c = shl(b, 3) + shl(b, 1); c = carry;",
-    "if (b and 0e0h) = 0 then c = shl(b, 3) plus 0;",
+    "c = shl(b, 1); c = c + 1; c = carry;",
+    "c = shl(b, 1); c = b + n; if zero then c = 1;",
+    "c = shl(b, 1); c = n or 0; c = carry;",
+    "c = shl(b, 1); c = n xor 0; c = carry;",
+    "c = shl(b, 1); c = a(n) and 7; if parity then c = 1;",
+    "c = shl(b, 1); c = dec(n + 1); c = carry;",
+    "c = shl(b, 1); c = dec(34h + 21h);",
+    "c = shl(b, 1); c = (n + 1) plus 0;",
+    "c = shl(b, 1); c = dec(n + 1) plus 0;",
     "c = 1; if c < 4 then w = shl(c, 6);",
-    # A procedure's own flags, and those of the call before a procedure
-    # that sets none.
     "fl: procedure; k = k + 3; end fl; c = shl(b, 1); call fl; c = carry;",
+    "i0: procedure; k = k + 0; end i0; c = shl(b, 1); call i0; c = carry;",
+    # Each call of G, which sets none, returns with its own caller's.
     "c = shl(b, 1); call g; c = c + 1; call g; c = carry;",
     "pr: procedure; call v; end pr; v = .h; k = 1; call pr; w = shl(k, 6);",
+    # A shift of an ADDRESS is one of sixteen bits, as before.
+    "w = shl(w, 1); c = carry;",
+    "w = shr(double(b), 1); c = carry;",
 ])
 def test_what_reads_other_flags_is_not(stmts, opt, capsys):
-    assert _warnings(stmts, opt, capsys) == []
+    assert _flags(stmts, opt, capsys) == []
 
 
-def test_the_flags_warning_says_what_reads_them(capsys):
-    got = _warnings("c = shl(b, 1); c = carry;", 2, capsys)
+def test_the_flags_warning_says_what_differs(capsys):
+    got = _flags("c = shl(b, 1); c = carry;", 2, capsys)
     assert got == [
-        "T.PLM:10:5: warning: SHL(B, 1): SHL of a BYTE is a BYTE (Programming Manual "
-        "9800268B, 11.1.4), and CARRY reads the flags of an operation of eight bits on it; "
-        "SHL(DOUBLE(B), 1) is shifted in 16 bits, as uplm80 before 0.4.3 shifted a BYTE"]
+        "T.PLM:10:20: warning: CARRY may read the flags of SHL(B, 1) (line 10): since uplm80 "
+        "0.4.3 a shift of a BYTE is one of 8 bits (Programming Manual 9800268B, 11.1.4), and "
+        "it, and an operation on it, set the flags of an 8-bit operation, where it was one of "
+        "16 bits; SHL(DOUBLE(B), 1) shifts in 16 bits"]
+
+
+def test_the_flags_warning_names_each_shift_the_nearest_first(capsys):
+    got = _flags("c = shl(n, 1); c = shl(n, 2); c = shr(n, 3); c = shl(n, 4); c = carry;",
+                 0, capsys)
+    assert len(got) == 1 and got[0].split(": warning: ")[1].startswith(
+        "CARRY may read the flags of SHL(N, 1) (line 10), SHL(N, 2) (line 10), SHR(N, 3) "
+        "(line 10) or 1 other: "), got
+
+
+def test_a_reader_in_an_interrupt_procedure_may_read_any_shift(capsys):
+    """An INTERRUPT procedure is entered with the flags of whatever it
+    interrupts: a reader before anything sets them may read those of any
+    shift of a BYTE."""
+    capsys.readouterr()
+    src = ("t: do;\ndeclare (b, c) byte;\n"
+           "i: procedure interrupt 1; c = carry; end i;\n"
+           "s: procedure; b = shr(b, 1); end s;\n"
+           "b = shl(b, 2); call s;\nend t;\n")
+    assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
+    got = [line for line in capsys.readouterr().err.splitlines() if "may read the flags" in line]
+    assert len(got) == 1 and "CARRY may read the flags of SHR(B, 1) (line 4) or SHL(B, 2) " \
+        "(line 5)" in got[0], got
 
 
 def test_a_variable_an_interrupt_procedure_assigns_has_no_bound(capsys):
@@ -280,7 +348,8 @@ def test_a_procedure_that_resets_the_system_does_not_return(function, warned, ca
     0 then call terminate; b = shl(b, 3) + shl(b, 1); if carry then ...':
     TERMINATE calls MON1 with the function 0, system reset, and does not
     return, so b is below 32 at the SHLs, which lose nothing.  With another
-    function, it returns, and b can be anything."""
+    function, it returns, and b can be anything.  The carry of the sum is
+    of eight bits either way, and CARRY is warned of."""
     capsys.readouterr()
     src = ("t: do;\ndeclare (b, c) byte, w address;\n"
            "mon1: procedure (f, a) external; declare f byte, a address; end mon1;\n"
@@ -288,11 +357,15 @@ def test_a_procedure_that_resets_the_system_does_not_return(function, warned, ca
            "stop: procedure; call terminate; end stop;\n"
            "b = 0; do while b < 100;\n"
            "  if (b and 0e0h) <> 0 then call terminate;\n"
-           "  b = shl(b, 3) + shl(b, 1); if carry then call stop;\n"
+           "  w = shl(b, 3) + shl(b, 1); if carry then call stop;\n"
            "  b = b + input(1); w = shl(b, 1);\nend;\nend t;\n")
     assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
-    got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
+    err = capsys.readouterr().err.splitlines()
+    got = [line for line in err if "SHL of a BYTE" in line]
     assert [line.split(": warning: ")[1].split(":")[0] for line in got] == warned, got
+    flags = [line for line in err if "may read the flags" in line]
+    assert len(flags) == 1 and "T.PLM:8:33: warning: CARRY may read the flags of SHL(B, 3) " \
+        "(line 8) or SHL(B, 1) (line 8)" in flags[0], flags
 
 
 @pytest.mark.parametrize("end", ["out: end term;", "out:end term;"])
