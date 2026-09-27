@@ -262,11 +262,15 @@ Found checking 0.4.4, and left for a later release (0.4.3 the same):
   `size(a(1, 2))`, `size(s(1, 2).n)`, `length(s(1, 2).m)`, which V3.1
   takes, not evaluating the subscripts, are refused, with uplm80's own
   message (`SIZE() needs a variable, ...`), not V3.1's value.
-- At `-O3`, a flag read after a SHL the optimizer folds to a constant -
-  `k = 0c0h; b = shl(k, 1); if sign then ...`, `b = scl(1, 1)` after
-  `shl(k, 1)` of k = 0FFH - reads the flags of what came before the
-  shift, where V3.1 and `-O0` to `-O2` read the shift's; the manual
-  warns that the flags are not to be relied on (12.1).
+- At `-O3`, a flag read after an operation the optimizer folds to a
+  constant reads the flags of what came before it, where V3.1 and `-O0`
+  to `-O2` read the operation's: after a SHL, `k = 0c0h; b = shl(k, 1);
+  if sign then ...`, `b = scl(1, 1)` after `shl(k, 1)` of k = 0FFH; and
+  after a comparison, which then reads the SHL's before it with no
+  warning: `k = input(0) or 0ffh; i = 1; b = shl(k, 1); if i = 1 then c
+  = carry;` leaves c 0 at `-O0` to `-O2`, as V3.1's build and 0.4.2's
+  do, and 0FFH at `-O3`.  The manual warns that the flags are not to be
+  relied on (12.1).
 
 ## 0.4.3 — 2026-09-26
 
