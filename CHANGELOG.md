@@ -56,6 +56,23 @@ program of the calls it takes to print what uplm80's build prints.
       IDENTIFIER NOT AN ADDRESS SCALAR, and #32, INVALID SYNTAX, TEXT
       IGNORED UNTIL ';')
 
+### Changed
+
+- **Smaller code after an 8-bit operation.**  A structure's BYTE member,
+  and ROL and ROR of a BYTE, were left in HL as well as in A, `ld l,a /
+  ld h,0`, before the 8-bit operation that reads A - a SHR of a BYTE, since
+  0.4.3, and AND, OR, a comparison (0.4.3's Known issues: MP/M II's DA.PLM,
+  `shr(b3.hbyte, 3)` and `ror(b3.hbyte, 3) and 11100000b`); and a SHL of
+  an ADDRESS by a constant set DE to 0 after it, which nothing reads (80un's
+  `lbr.plm`), as uplm80 0.2 made it do to look like the multiply routine a
+  product by a power of 2 stands for.  What wants a BYTE in HL widens it,
+  as before.  Of the 88 MP/M II
+  and 80un compiles, those that have either are smaller and the rest the
+  same: at `-O0` 39 (34 of MP/M II's, 822 bytes in all; 5 of 80un's, 210),
+  at `-O2` 37 (32, 786; 5, 213), at `-O3` 38 (33, 955; 5, 213).  80un's
+  two programs built with it extract and detokenize its test files as
+  0.4.3's builds do.
+
 ### Fixed
 
 - **The columns after a LITERALLY's text are the source's.**  The text
@@ -313,8 +330,6 @@ Found by 0.4.3's final release check, and left for a later release:
   variable it bounds, `if k < 4 and (k := 200) > 0 then w = shl(k, 6);`;
   a store past an array's end into the variable shifted; and an INTERRUPT
   procedure's assignments.
-- An 8-bit SHR can leave a `ld l,a / ld h,0` before it that nothing reads
-  (DA.PLM): bytes, not wrong code.
 
 ### Verified
 

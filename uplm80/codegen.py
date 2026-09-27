@@ -7704,8 +7704,6 @@ class CodeGenerator:
             return DataType.ADDRESS
         else:
             self._emit("ld", "a,(hl)")
-            self._emit("ld", "l,a")
-            self._emit("ld", "h,0")
             return DataType.BYTE
 
     def _gen_member_addr(self, expr) -> None:
@@ -7962,10 +7960,6 @@ class CodeGenerator:
                     # Inline add hl,HL for shifts 1-7 (1 byte each, no loop overhead)
                     for _ in range(shift_count):
                         self._emit("add", "hl,hl")  # HL *= 2
-                # TODO: Investigate root cause. MUL16 zeroes DE as side effect,
-                # and some code path relies on this. Without this ld de,0,
-                # strength-reduced multiplications fail. See tests/bug_80un.plm.
-                self._emit("ld", "de,0")
                 return DataType.ADDRESS
 
             # Variable shift - use loop
@@ -8299,11 +8293,7 @@ class CodeGenerator:
             self._gen_count_to_b(args[1])
             self._emit("pop", "hl" if wide else "af")
             self._emit_counted_loop(name, ops)
-        if wide:
-            return DataType.ADDRESS
-        self._emit("ld", "l,a")
-        self._emit("ld", "h,0")
-        return DataType.BYTE
+        return DataType.ADDRESS if wide else DataType.BYTE
 
     def _gen_byte_shift(self, name: str, args) -> DataType:
         """SHL or SHR of a BYTE pattern: a BYTE, shifted in A (11.1.4).

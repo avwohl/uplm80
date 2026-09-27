@@ -973,6 +973,67 @@ def test_shl_and_shr_of_a_byte_are_bytes():
     _check(BYTE_SHIFTS, BYTE_SHIFTS_PRINT)
 
 
+# A BYTE is left in A, and a structure's BYTE member, ROL and ROR of a
+# BYTE left it in HL too, before an 8-bit operation that reads A (MP/M
+# II's DA.PLM: `shr(b3.hbyte, 3)', `ror(b3.hbyte, 3) and 0e0h'); and a SHL
+# of an ADDRESS by a constant set DE to 0 after it, which nothing reads
+# (80un's lbr.plm).  What each is part of reads its value where it is:
+# widened where an ADDRESS is wanted, `b * 32' in a sum, a subscript, a
+# relation and an argument.  Intel's PL/M-80 V3.1 compiles the program to
+# print what is expected (tests/test_intel_oracle.py).
+BYTE_OPERANDS = """
+declare (b, c) byte, (w, v) address, a(40) address;
+declare s structure (k byte, w address), t(3) structure (lo address, hi byte);
+shr3: procedure (pa);
+  declare pa address, b3 based pa structure (lo address, hi byte),
+    lo based pa (2) byte, x byte;
+  x = ror(b3.hi, 3) and 11100000b;
+  b3.hi = shr(b3.hi, 3);
+  b3.lo = shr(b3.lo, 3);
+  lo(1) = lo(1) or x;
+end shr3;
+sum: procedure (x, y) address;
+  declare (x, y) address;
+  return x - y;
+end sum;
+s.k = 0f5h; s.w = 1234h;
+b = shr(s.k, 3); call ph(b);
+c = ror(s.k, 3) and 0e0h; call ph(c);
+c = rol(s.k, 1) + s.k; call ph(c);
+w = s.k; call ph(w);
+w = s.w - s.k; call ph(w);
+call ph(s.k);
+t(1).lo = 0fff8h; t(1).hi = 5; call shr3(.t(1)); call ph(t(1).lo); call ph(t(1).hi);
+b = 3; c = 7; v = 5;
+w = b * 32 + v; call ph(w);
+w = v - c * 16; call ph(w);
+a(b * 4) = 99h; call ph(a(12));
+if b * 32 > v then call ph(1);
+call ph(sum(b * 32, c * 4));
+w = shl(double(c), 3); v = w + b; call ph(v);
+"""
+BYTE_OPERANDS_PRINT = [0x1E, 0xA0, 0xE0, 0xF5, 0x113F, 0xF5, 0xBFFF, 0, 0x65, 0xFF95, 0x99,
+                       1, 0x44, 0x3B]
+
+
+def test_a_byte_operand_is_left_in_a():
+    _check(BYTE_OPERANDS, BYTE_OPERANDS_PRINT)
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_no_widening_before_an_8_bit_operation_and_no_de_after_a_shl(opt):
+    """`ld l,a / ld h,0' before `srl a' or `rrca', or after `rrca' before
+    the AND that reads A, and `ld de,0' after `add hl,hl', were dead."""
+    src = _PRELUDE + BYTE_OPERANDS + "end t;\n"
+    lines = [l.strip() for l in Compiler(opt_level=opt).compile(src, "<t>").splitlines()]
+    for i, line in enumerate(lines):
+        if line in ("srl\ta", "rrca", "rlca"):
+            assert lines[i - 1] != "ld\th,0", lines[i - 4:i + 1]
+        if line == "rrca" and lines[i + 1] == "ld\tl,a":
+            assert not lines[i + 3].startswith("and"), lines[i:i + 4]
+    assert "ld\tde,0" not in lines
+
+
 # ---- a name the program declares hides the built-in ------------------------
 
 def test_a_procedure_named_like_a_built_in_is_the_programs():
