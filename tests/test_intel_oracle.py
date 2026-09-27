@@ -29,7 +29,10 @@ from tests.test_expression_types import (_PRELUDE, BYTE_OPERANDS, BYTE_SHIFTS, E
                                          QUALIFIED_SIZES)
 from tests.test_names import V31_CALLS, V31_RECURSION
 from tests.test_names import PRELUDE as NAMES_PRELUDE
-from tests.test_names import V31_ALLOWS, V31_DECLS, V31_REJECTS, V31_WARNS
+from tests.test_names import (NO_FIXED_ADDRESS, PAST_THE_SPACE, V31_ALLOWS, V31_BASES,
+                              V31_BLOCK_LOCATIONS, V31_DECLARED_BUILTINS, V31_DECLS,
+                              V31_FACTORED_BASED, V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED,
+                              V31_WARNS)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -55,6 +58,12 @@ RELEASE_PROGRAMS = {
     "byte-operands": BYTE_OPERANDS,              # 0.4.4, shr(s.k, 3), b * 32 + v
     "v31-recursion": V31_RECURSION,              # 0.4.4, fact(5) REENTRANT, length(memory)
     "v31-allows": V31_ALLOWS,                    # 0.4.3, size(ab(b + 1)), forward REENTRANT
+    "v31-restricted": V31_RESTRICTED,            # 0.4.4, data (.memory), .(1 + 2)
+    "v31-locations": V31_LOCATIONS,              # 0.4.4, data (.arr(2)), data (.s.k)
+    **{f"declared-builtins-{k}": v[0] for k, v in V31_DECLARED_BUILTINS.items()},
+    **{f"block-locations-{k}": v[0] for k, v in V31_BLOCK_LOCATIONS.items()},
+    "factored-based": V31_FACTORED_BASED,        # 0.4.4, (a based s.p) byte
+    **{f"bases-{k}": v[0] for k, v in V31_BASES.items()},     # 0.4.4, a based q in p
 }
 # V3.1's bugs the README's Known differences has and the generator does not
 # leave out: a program, after _PRELUDE; how the README writes it; what
@@ -98,17 +107,50 @@ def test_a_release_program_prints_what_intels_build_prints(tools, name):
 @pytest.mark.parametrize("name", sorted(V31_REJECTS) + sorted(V31_WARNS))
 def test_v31_rejects_what_uplm80_rejects_or_warns_of(tools, name):
     """Each program tests/test_names.py holds uplm80 to: V3.1 rejects it
-    with the errors uplm80's message names, and no other, and uplm80
-    rejects it too, or, where programs written for it rely on it,
+    with the errors uplm80's message names, those and no other, and
+    uplm80 rejects it too, or, where programs written for it rely on it,
     compiles it."""
     stmts, errors, _ = {**V31_REJECTS, **V31_WARNS}[name]
     text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + stmts + "end t;\n")
     res = oracle.check_text(tools, text, name, levels=(0,))
     assert res.verdict == "intel-rejects", oracle.format_result(res)
-    intel = res.detail.split(" (uplm80 rejects it too")[0]
-    assert sorted({int(n) for n in re.findall(r"ERROR #(\d+),", intel)}) == sorted(errors), \
-        res.detail
+    given = {int(n) for e in res.intel_errors for n in re.findall(r"ERROR #(\d+),", e)}
+    assert given == set(errors), res.intel_errors
     assert ("uplm80 rejects it too" in res.detail) == (name in V31_REJECTS), res.detail
+
+
+@pytest.mark.parametrize("name", sorted(PAST_THE_SPACE))
+def test_v31_gives_209_alone_past_a_declarations_space(tools, name):
+    """0.4.3's and 0.4.4's Known issues: V3.1 rejects more values than a
+    declaration holds (#209), and a number past its space it does not
+    hold to a byte (no #210); uplm80 lays the values out after it."""
+    text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + PAST_THE_SPACE[name] + "end t;\n")
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "intel-rejects", oracle.format_result(res)
+    given = {int(n) for e in res.intel_errors for n in re.findall(r"ERROR #(\d+),", e)}
+    assert given == {209}, res.intel_errors
+    assert "uplm80 rejects it too" not in res.detail, res.detail
+
+
+@pytest.mark.parametrize("name", ["stackptr", "shl", "double"])
+def test_v31_takes_the_location_of_a_built_in_in_a_list(tools, name):
+    """0.4.4's Known issues: V3.1 takes `data (.stackptr)' for an address
+    of its own, which uplm80 has none to give, and refuses."""
+    text = _PRELUDE + f"declare d address data (.{name});\ncall ph(d);\nend t;\n"
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "uplm80-rejects", oracle.format_result(res)
+
+
+@pytest.mark.parametrize("name", sorted(k for k, v in NO_FIXED_ADDRESS.items() if v[3]))
+def test_v31_takes_a_location_uplm80_gives_no_fixed_address(tools, name):
+    """0.4.4's Known issues: V3.1 takes the location of a REENTRANT
+    procedure's local, and of a BASED variable in a list, for an address;
+    uplm80, which has the local on the stack and no address of a BASED
+    variable to give, refuses both."""
+    stmts = NO_FIXED_ADDRESS[name][0]
+    text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + stmts + "end t;\n")
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "uplm80-rejects", oracle.format_result(res)
 
 
 def test_corpus_program_prints_what_intels_build_prints(tools):

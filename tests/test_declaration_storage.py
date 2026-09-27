@@ -12,6 +12,9 @@ import pytest
 
 from uplm80.codegen import Mode
 from uplm80.compiler import Compiler
+from uplm80.errors import CodeGenError
+from uplm80.frontend import parse_source
+from uplm80.names import check_names
 
 from ._toolchain import run_plm
 
@@ -510,7 +513,6 @@ end t;
 @pytest.mark.parametrize("expr,want", [
     (".buf+128", "X: EQU BUF+128"),
     (".buf(2)+3-1", "X: EQU BUF+4"),
-    ("3+.buf(1)", "X: EQU BUF+4"),
     ("5CH+1", "X: EQU 5DH"),
     (".w(1)", "X: EQU W+2"),
 ])
@@ -817,14 +819,17 @@ def test_an_expression_in_data_fills_one_scalar_at_its_width(opt):
     where nothing folds it first, `x (4) BYTE DATA (68H+80H, k+1, 6)' came
     out `dw / dw / db / ds 1', six bytes, and moved everything declared
     after it; a unary minus was not accepted at all, and UTIL4/SET.PLM did
-    not compile at -O0.  A folded -1 in a BYTE is 0FFH, not `db 0FFFFH'."""
+    not compile at -O0.  A folded -1 in a BYTE is 0FFH, not `db 0FFFFH'.
+    (NOT and AND, and a location in a BYTE, which this had too, are Intel's
+    PL/M-80 V3.1's errors there, and uplm80's since 0.4.4:
+    tests/test_names.py.)"""
     asm = _asm("""
 t: do;
 declare k literally '5';
 declare x (4) byte data (68h+80h, k+1, 6);
-declare n (2) byte data (-1, not 0);
-declare s structure (a byte, b address, c byte) initial (2+3, k-1, 0ffh and 7);
-declare z byte data (.x-1);
+declare n (2) byte data (-1, 0 - 1);
+declare s structure (a byte, b address, c byte) initial (2+3, k-1, 0ffh - 0f8h);
+declare z address data (.x-1);
 declare after byte data (0eeh);
 declare q address; q = .after;
 end t;
@@ -838,36 +843,27 @@ end t;
     assert body("X", 4) == ["db 0E8H", "db 6", "db 6", "ds 1"], lines
     assert body("N", 2) == ["db 0FFH", "db 0FFH"], lines
     assert body("S", 3) == ["db 5", "dw 4", "db 7"], lines
-    assert body("Z", 1) == ["db (X-1)"], lines
-
-
-CONSTANT_LIST_SRC = """
-0100H:
-t: do;
-mon1: procedure (f, a) external; declare f byte, a address; end mon1;
-declare msgs (3) address data (.('one$'), .('two$'), .'three$');
-declare tbl structure (p address, b byte) initial (.(1, 2, 'XY'), 0AAH);
-declare after byte data (0EEH);
-declare pb address, b based pb byte;
-putc: procedure (ch); declare ch byte; call mon1(2, ch); end putc;
-call mon1(9, msgs(1));
-call mon1(9, msgs(2));
-pb = tbl.p; call putc('0' + b); pb = pb + 1; call putc('0' + b);
-pb = pb + 1; call putc(b); pb = pb + 1; call putc(b);
-call putc('0' + (tbl.b = 0AAH) + 1);
-call putc('0' + (after = 0EEH) + 1);
-end t;
-"""
+    assert body("Z", 1) == ["dw (X-1)"], lines
 
 
 @pytest.mark.parametrize("opt", [0, 2])
-def test_a_constant_list_in_data_is_its_address(opt):
+@pytest.mark.parametrize("decl", [
+    "msgs (3) address data (.('one$'), .('two$'), .('three$'))",
+    "msgs (3) address data (.'one$', .'two$', .'three$')",
+    "tbl structure (p address, b byte) initial (.(1, 2, 'XY'), 0AAH)",
+])
+def test_a_constant_list_in_a_data_list_is_v31s_error(opt, decl):
     """PL/M-80 manual, 4.1.3: `.(constant, ...)' is the location of the
-    constants, stored somewhere.  In DATA and INITIAL the constants were laid
-    out in place of it, so `msgs (3) ADDRESS DATA (.('one$'), ...)' held the
-    characters, and `CALL mon1(9, msgs(2))' printed whatever they pointed
-    at.  `.'string'' was not accepted at all."""
-    assert run_plm(CONSTANT_LIST_SRC, opt).strip() == "twothree12XY00", opt
+    constants, stored somewhere, in an expression.  In a DATA or INITIAL
+    list Intel's PL/M-80 V3.1 takes none (ERROR #147, MISSING IDENTIFIER
+    FOLLOWING DOT OPERATOR), nor `.'text'', and since 0.4.4 uplm80 takes
+    none either; it took each for one ADDRESS in the list (bd85e55), and
+    no program of MP/M II, 80un or sample_code has one."""
+    src = f"t: do;\ndeclare {decl};\ndeclare after byte data (0EEH);\nend t;\n"
+    with pytest.raises(CodeGenError, match=r"does not take the location of constants; Intel's "
+                       r"PL/M-80 V3.1 rejects it \(ERROR #147,"):
+        check_names([parse_source(src, "T.PLM")])
+    assert Compiler(opt_level=opt).compile(src, "<test>") is None
 
 
 @pytest.mark.parametrize("kind", ["initial", "data"])

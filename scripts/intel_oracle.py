@@ -310,6 +310,7 @@ class Build:
     """A build of the program: the .COM, or why there is none."""
     com: bytes | None = None
     error: str | None = None        # set when the build failed
+    errors: list[str] = field(default_factory=list)     # PL/M-80's, every one
     timeout: bool = False
     warnings: list[str] = field(default_factory=list)
     note: str = ""
@@ -457,7 +458,7 @@ def _intel_native(tools: Tools, work: str, stack: int,
         errors = ["PLM80 wrote no listing: " + r.stdout.decode("latin-1")[-300:]]
     if errors or not os.path.exists(os.path.join(work, "T.OBJ")):
         return Build(error="PL/M-80: " + _some(errors or ["no object"]),
-                     warnings=warnings), None, 0
+                     errors=errors, warnings=warnings), None, 0
     r = _run([isis, "LINK", "T.OBJ,X0100,PLM80.LIB", "TO", "T.MOD"], work, timeout)
     out = r.stdout.decode("latin-1")
     if re.search(r"UNRESOLVED|ERROR", out) or not os.path.exists(os.path.join(work, "T.MOD")):
@@ -523,7 +524,8 @@ def _intel_romwbw(tools: Tools, work: str, stack: int,
     com = _read(os.path.join(out, "T.COM"))
     if errors or com is None:
         why = _some(errors) or " ".join(r.stderr.decode("latin-1").split())[-300:]
-        return Build(error="PL/M-80 (romwbw-plm80): " + why, warnings=warnings), None, 0
+        return Build(error="PL/M-80 (romwbw-plm80): " + why, errors=errors,
+                     warnings=warnings), None, 0
     tra = (_read(os.path.join(out, "T.TRA")) or b"").decode("latin-1")
     m = re.search(r"MODULE START ADDRESS\s+([0-9A-F]+)H", tra)
     if "NOT A MAIN MODULE" in tra:
@@ -657,6 +659,7 @@ class Result:  # pylint: disable=too-many-instance-attributes
     verdict: str = "same"
     note: str = ""                      # how the source was changed
     intel_error: str | None = None
+    intel_errors: list = field(default_factory=list)   # every error PL/M-80 listed
     intel_note: str = ""
     intel_out: str | None = None
     intel_status: str | None = None
@@ -698,6 +701,7 @@ def check_text(tools: Tools, text: str, name: str = "T", levels=LEVELS, timeout:
         intel_run = None
         if ib.com is None:
             res.intel_error = ib.error
+            res.intel_errors = list(ib.errors)
         else:
             intel_run = run_com(tools, ib.com, os.path.join(top, "intel-run"), timeout)
             res.intel_out = _show(intel_run.out)

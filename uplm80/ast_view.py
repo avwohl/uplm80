@@ -511,17 +511,25 @@ def dotted_ident_parts(node) -> list[str]:
         return list(reversed(parts))
 
 
-def decl_item_based(item) -> tuple[Optional[str], Optional[str]]:
+def decl_item_based(item, name: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """Return ``(base_name, member_name)`` for a ``BASED`` declaration's
     base reference, or ``(None, None)`` if the item is not based.
 
-    ``base.member`` chains become ``("base", "member")``; deeper chains
-    collapse the trailing members into a dotted string, since codegen
-    currently expects a single member name."""
-    based = getattr(item, "based", None)
-    if based is None:
+    ``item`` is a DeclItem, or a factored BASED declaration, a
+    ``DeclItemBasedGroup`` `(a based p, b based s.q) byte', whose names
+    each have a base of their own: that of ``name``.  ``base.member``
+    chains become ``("base", "member")``; deeper chains collapse the
+    trailing members into a dotted string, since codegen currently
+    expects a single member name."""
+    if isinstance(item, P.DeclItemBasedGroup):
+        base = next((bd.base for bd in item.based_decls or []
+                     if ident_text(bd.name) == name), None)
+    else:
+        based = getattr(item, "based", None)
+        base = based.base if based is not None else None
+    if base is None:
         return None, None
-    parts = dotted_ident_parts(based.base)
+    parts = dotted_ident_parts(base)
     if not parts:
         return None, None
     if len(parts) == 1:
@@ -587,6 +595,10 @@ def expr_text(expr) -> str:  # pylint: disable=too-many-return-statements
         return f"{op}{expr_text(e.operand)}"
     if isinstance(e, P.LocationOf):
         return f".{expr_text(e.operand)}"
+    if isinstance(e, P.LocationOfList):
+        return f".({', '.join(expr_text(v) for v in e.values)})"
+    if isinstance(e, P.LocationOfString):
+        return f".{e.value.text}"
     return "..."
 
 

@@ -335,29 +335,28 @@ def test_the_address_of_every_kind_of_procedure_and_a_call_through_it(opt):
     `CALL q' was `call Q', which ran the bytes of Q itself, and `CALL s.p'
     a `jp (hl)' with no return address.  Here every kind of procedure -
     nested, outer, PUBLIC, REENTRANT, EXTERNAL - has its address taken in
-    an expression, a DATA and an INITIAL list and an AT, and is called
-    through it, with an argument where it takes one."""
+    an expression and a DATA and an INITIAL list, and is called through
+    it, with an argument where it takes one.  (An AT, which this had too,
+    V3.1 does not take of a procedure, #211, nor uplm80 since 0.4.4:
+    V31_REJECTS.)"""
     src = PRELUDE + """
 extp: procedure external; end extp;
 declare q address;
 declare s structure (p address);
 declare mt (3) address data (.top, .extp, .pub);
 declare mi address initial (.top);
-declare atop byte at (.top);
 top: procedure; call pc('T'); end top;
 pub: procedure (w) public; declare w address; call pc(low(w)); end pub;
 re: procedure (c) reentrant; declare c byte; call pc(c); end re;
 outer: procedure;
   declare t (2) address data (.show, .inner2);
   declare r address initial (.show);
-  declare atx byte at (.show);
   show: procedure; call pc('S'); end show;
   inner2: procedure (c); declare c byte; call pc(c); end inner2;
   q = .show; call q;
   q = t(0); call q;
   q = t(1); call q('I');
   q = r; call q;
-  if .atx = .show then call pc('=');
   s.p = .show; call s.p;
 end outer;
 call outer;
@@ -370,12 +369,11 @@ q = mi; call q;
 q = .pub; call q('p');
 q = .re; call q('R');
 q = .extp; call q;
-if .atop = .top then call pc('=');
 s.p = .extp; call s.p;
 call pc('.');
 end t;
 """
-    assert run_plm(src, opt, extra_asm=EXTP) == "SSIS=S/TTEPTpRE=E."
+    assert run_plm(src, opt, extra_asm=EXTP) == "SSISS/TTEPTpREE."
 
 
 def test_a_call_through_an_address_with_two_arguments_does_not_warn():
@@ -1556,6 +1554,548 @@ V31_REJECTS = {
     "assign-to-a-procedure": ("g = b;\n", (131, 128), "T.PLM:8:1: error: G: G is a procedure"),
     "embedded-assign-to-input": ("w = (input(2) := b);\n", (128,),
                                  "T.PLM:8:6: error: INPUT(2): INPUT is a built-in procedure"),
+    # 0.4.3's Known issues: a built-in in a restricted expression, which
+    # -O1 and up folded (SHL and SHR of a BYTE in 16 bits) and -O0 refused
+    # with a message of its own, or took `.a + low(3)' and `at (double(12h))'
+    # for something else.
+    "shl-in-data": ("declare d address data (shl(0f0h, 4));\nw = d;\n", (151, 152),
+                    "T.PLM:8:25: error: SHL(0f0h, 4): SHL is a built-in, and a DATA or INITIAL "
+                    "value is a restricted expression, of constants and locations only; Intel's "
+                    "PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                    "EXPRESSION, and #152, MISSING ')' AFTER CONSTANT LIST)"),
+    "shr-in-initial": ("declare d address initial (shr(0f00h, 4));\nw = d;\n", (151, 152),
+                       "T.PLM:8:28: error: SHR(0f00h, 4): SHR is a built-in, and a DATA or "
+                       "INITIAL value is a restricted expression"),
+    "rol-in-data": ("declare d byte data (rol(81h, 1));\nb = d;\n", (151, 152),
+                    "T.PLM:8:22: error: ROL(81h, 1): ROL is a built-in"),
+    "ror-in-a-sum-in-data": ("declare d byte data (1 + ror(81h, 1));\nb = d;\n", (151, 152),
+                             "T.PLM:8:26: error: ROR(81h, 1): ROR is a built-in"),
+    "low-in-data": ("declare d(2) byte data (low(1234h), 5);\nb = d(1);\n", (151, 152),
+                    "T.PLM:8:25: error: LOW(1234h): LOW is a built-in"),
+    "high-in-initial": ("declare d byte initial (high(1234h));\nb = d;\n", (151, 152),
+                        "T.PLM:8:25: error: HIGH(1234h): HIGH is a built-in"),
+    "double-in-data": ("declare d address data (double(12h));\nw = d;\n", (151, 152),
+                       "T.PLM:8:25: error: DOUBLE(12h): DOUBLE is a built-in"),
+    "size-in-data": ("declare a(5) byte, d address data (.a + size(a));\nw = d;\n", (151, 152),
+                     "T.PLM:8:41: error: SIZE(A): SIZE is a built-in"),
+    "length-in-initial": ("declare a(5) byte;\ndeclare d address initial (length(a) - last(a));\n"
+                          "w = d;\n", (151, 152),
+                          "T.PLM:9:28: error: LENGTH(A): LENGTH is a built-in"),
+    "shl-in-at": ("declare d byte at (shl(1, 12));\nb = d;\n", (151, 146),
+                  "T.PLM:8:20: error: SHL(1, 12): SHL is a built-in, and an AT address is a "
+                  "restricted expression, a constant or a location plus or minus constants; "
+                  "Intel's PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                  "EXPRESSION, and #146, MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION)"),
+    "double-in-at": ("declare d byte at (double(12h));\nb = d;\n", (151, 146),
+                     "T.PLM:8:20: error: DOUBLE(12h): DOUBLE is a built-in, and an AT address"),
+    "size-in-at": ("declare a(5) byte, d byte at (.a + size(a));\nb = d;\n", (151, 146),
+                   "T.PLM:8:36: error: SIZE(A): SIZE is a built-in, and an AT address"),
+    "low-in-a-subscript-in-data": ("declare a(5) byte, d address data (.a(low(1)));\nw = d;\n",
+                                   (151, 150),
+                                   "T.PLM:8:39: error: LOW(1): LOW is a built-in, and a DATA or "
+                                   "INITIAL value is a restricted expression, of constants and "
+                                   "locations only; Intel's PL/M-80 V3.1 rejects it (ERROR #151, "
+                                   "INVALID OPERAND IN RESTRICTED EXPRESSION, and #150, MISSING "
+                                   "')' AT END OF RESTRICTED SUBSCRIPT)"),
+    "shl-in-a-subscript-in-at": ("declare a(5) byte, d byte at (.a(shl(1, 1)));\nb = d;\n",
+                                 (151, 150), "T.PLM:8:34: error: SHL(1, 1): SHL is a built-in, "
+                                 "and an AT address"),
+    "memory-in-data": ("declare d address data (memory);\nw = d;\n", (151,),
+                       "T.PLM:8:25: error: MEMORY: MEMORY is a built-in, and a DATA or INITIAL "
+                       "value is a restricted expression, of constants and locations only; "
+                       "Intel's PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN "
+                       "RESTRICTED EXPRESSION)\n"),
+    "stackptr-in-at": ("declare d byte at (stackptr);\nb = d;\n", (151,),
+                       "T.PLM:8:20: error: STACKPTR: STACKPTR is a built-in, and an AT address"),
+    "dot-stackptr-in-at": ("declare d byte at (.stackptr);\nb = d;\n", (211,),
+                           "T.PLM:8:21: error: .STACKPTR: STACKPTR is a built-in, and the "
+                           "location in an AT address is a variable's, or MEMORY's; Intel's "
+                           "PL/M-80 V3.1 rejects it (ERROR #211, INVALID IDENTIFIER IN 'AT' "
+                           "RESTRICTED REFERENCE)"),
+    "shl-in-a-constant-list": ("w = .(shl(1, 2), 3);\n", (151, 152, 32, 172),
+                               "T.PLM:8:7: error: SHL(1, 2): SHL is a built-in, and a constant "
+                               "list holds constants only; Intel's PL/M-80 V3.1 rejects it "
+                               "(ERROR #151, INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, "
+                               "MISSING ')' AFTER CONSTANT LIST, and #32, INVALID SYNTAX, TEXT "
+                               "IGNORED UNTIL ';', and #172, INVALID LABEL: UNDEFINED)"),
+    "memory-in-a-constant-list": ("w = .(memory, 7);\n", (151, 209),
+                                  "T.PLM:8:7: error: MEMORY: MEMORY is a built-in, and a "
+                                  "constant list holds constants only; Intel's PL/M-80 V3.1 "
+                                  "rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                                  "EXPRESSION, and #209, ILLEGAL INITIALIZATION OF MORE SPACE "
+                                  "THAN DECLARED)"),
+    # 0.4.4: what else a restricted expression does not take, which 0.4.3
+    # compiled - a name, as its address in a DATA list and as its
+    # value in a constant list at -O3, where -O0 to -O2 refused it; a byte
+    # of a larger number; parentheses, a product, NOT, a string in a sum -
+    # at every level, or at some.  In a constant list V3.1 gives more
+    # errors than the one: #209 for a value taken for a word, #32 at a
+    # parenthesis, #172 after a built-in's call.
+    "low-in-a-constant-list": ("w = .(low(1234h), 3);\n", (151, 152, 32, 172),
+                               "T.PLM:8:7: error: LOW(1234h): LOW is a built-in, and a constant "
+                               "list holds constants only"),
+    "size-in-a-constant-list": ("declare ar (5) byte;\nw = .(size(ar), 7);\n",
+                                (151, 152, 32, 172),
+                                "T.PLM:9:7: error: SIZE(AR): SIZE is a built-in, and a constant "
+                                "list holds constants only"),
+    "stackptr-in-a-constant-list": ("w = .(stackptr, 7);\n", (151, 209),
+                                    "T.PLM:8:7: error: STACKPTR: STACKPTR is a built-in, and a "
+                                    "constant list holds constants only"),
+    "carry-in-a-constant-list": ("w = .(carry, 7);\n", (151, 209),
+                                 "T.PLM:8:7: error: CARRY: CARRY is a built-in, and a constant "
+                                 "list holds constants only"),
+    "variable-in-a-constant-list": ("w = .(b, 7);\n", (151, 209),
+                                    "T.PLM:8:7: error: B: B is a variable, and a constant list "
+                                    "holds constants only; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                                    "#151, INVALID OPERAND IN RESTRICTED EXPRESSION, and #209, "
+                                    "ILLEGAL INITIALIZATION OF MORE SPACE THAN DECLARED)"),
+    "sum-with-a-variable-in-a-constant-list": ("b = 3; w = .(b + 1, 7);\n", (151, 209),
+                                               "T.PLM:8:14: error: B: B is a variable, and a "
+                                               "constant list holds constants only"),
+    "memory-variable-in-a-constant-list": ("declare memory byte;\nmemory = 3; w = .(memory, 7);\n",
+                                           (151, 209),
+                                           "T.PLM:9:19: error: MEMORY: MEMORY is a variable, and "
+                                           "a constant list holds constants only"),
+    "element-in-a-constant-list": ("declare ar (5) byte;\nw = .(7, ar(1));\n", (151, 152, 32, 209),
+                                   "T.PLM:9:10: error: AR(1): AR is an array, and a constant list "
+                                   "holds constants only"),
+    "member-in-a-constant-list": ("declare s structure (m (2) byte, k address);\nw = .(s.k, 7);\n",
+                                  (151, 152),
+                                  "T.PLM:9:7: error: S.K: S.K is a member of structure S, and a "
+                                  "constant list holds constants only"),
+    "location-in-a-constant-list": ("w = .(.w, 7);\n", (210, 209),
+                                    "T.PLM:8:7: error: .W: a constant list holds constants only, "
+                                    "and .W is a location; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                                    "#210, ILLEGAL INITIALIZATION OF A BYTE TO A VALUE > 255, and "
+                                    "#209, ILLEGAL INITIALIZATION OF MORE SPACE THAN DECLARED)"),
+    "parenthesis-in-a-constant-list": ("w = .((1 + 2), 7);\n", (151, 152, 32),
+                                       "T.PLM:8:7: error: (1 + 2): a constant list has nothing in "
+                                       "parentheses; Intel's PL/M-80 V3.1 rejects it (ERROR #151, "
+                                       "INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, "
+                                       "MISSING ')' AFTER CONSTANT LIST, and #32, INVALID SYNTAX, "
+                                       "TEXT IGNORED UNTIL ';')"),
+    "negated-parenthesis-in-a-constant-list": ("w = .(-(1), 7);\n", (151, 152, 32),
+                                               "T.PLM:8:8: error: (1): a constant list has "
+                                               "nothing in parentheses"),
+    "300-in-a-constant-list": ("w = .(300, 7);\n", (210,),
+                               "T.PLM:8:7: error: 300: a constant list holds bytes, and 300 is "
+                               "12CH, more than 0FFH; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                               "#210, ILLEGAL INITIALIZATION OF A BYTE TO A VALUE > 255)"),
+    "0ffffh-in-a-constant-list": ("w = .(0ffffh, 7);\n", (210,),
+                                  "T.PLM:8:7: error: 0ffffh: a constant list holds bytes, and "
+                                  "0ffffh is 0FFFFH, more than 0FFH"),
+    "sum-over-255-in-a-constant-list": ("w = .(299 + 1, 7);\n", (210,),
+                                        "T.PLM:8:7: error: 299 + 1: a constant list holds bytes, "
+                                        "and 299 + 1 is 12CH, more than 0FFH"),
+    "product-in-a-constant-list": ("w = .(2 * 3);\n", (152,),
+                                   "T.PLM:8:7: error: 2 * 3: of the operators, a constant list "
+                                   "takes + and - only; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                                   "#152, MISSING ')' AFTER CONSTANT LIST)"),
+    "not-in-a-constant-list": ("w = .(not 0f0h);\n", (151, 152),
+                               "T.PLM:8:7: error: NOT 0f0h: of the operators, a constant list "
+                               "takes + and - only; Intel's PL/M-80 V3.1 rejects it (ERROR #151, "
+                               "INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, MISSING ')' "
+                               "AFTER CONSTANT LIST)"),
+    "constant-list-in-a-constant-list": ("w = .(.(5), 7);\n", (147, 32),
+                                         "T.PLM:8:7: error: .(5): a constant list does not take "
+                                         "the location of constants"),
+    # V3.1 lays a constant list out as an untyped DATA list: a value with a
+    # name in it, or a location first, is a word, and a string after the
+    # last such value makes the list bytes again; where it does not, the
+    # list has room for its first value only, and every value after it is
+    # #209 and not checked further.  A value laid out that is more than
+    # 255 is #210 - a name there is a BYTE 0 - and a list of one value
+    # whose last name is a built-in's but MEMORY's #172.  The messages
+    # named #209 for a value that starts with a name or a location and
+    # not otherwise, #210 only with no name in the value, and #172 only
+    # after a built-in's call.
+    "variable-then-string-in-a-constant-list": ("w = .(b, '$');\n", (151,),
+                                                "T.PLM:8:7: error: B: B is a variable, and a "
+                                                "constant list holds constants only; Intel's "
+                                                "PL/M-80 V3.1 rejects it (ERROR #151, INVALID "
+                                                "OPERAND IN RESTRICTED EXPRESSION)\n"),
+    "memory-then-string-in-a-constant-list": ("w = .(memory, '$');\n", (151,),
+                                              "T.PLM:8:7: error: MEMORY: MEMORY is a built-in"),
+    "location-then-string-in-a-constant-list": ("w = .(.w, '$');\n", (210,),
+                                                "T.PLM:8:7: error: .W: a constant list holds "
+                                                "constants only, and .W is a location"),
+    "variable-after-a-string-in-a-constant-list": ("w = .(b, '$', b);\n", (151, 209),
+                                                   "T.PLM:8:7: error: B: B is a variable"),
+    "sum-with-a-variable-second-in-a-constant-list": ("w = .(1 + b, 7);\n", (151, 209),
+                                                      "T.PLM:8:11: error: B: B is a variable"),
+    "negated-variable-second-in-a-constant-list": ("w = .(7, -b);\n", (151, 209),
+                                                   "T.PLM:8:11: error: B: B is a variable"),
+    "difference-after-a-string-in-a-constant-list": ("w = .('$', 1 - b);\n", (151, 209),
+                                                     "T.PLM:8:16: error: B: B is a variable"),
+    "stackptr-alone-in-a-constant-list": ("w = .(stackptr);\n", (151, 172),
+                                          "T.PLM:8:7: error: STACKPTR: STACKPTR is a built-in, "
+                                          "and a constant list holds constants only; Intel's "
+                                          "PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND "
+                                          "IN RESTRICTED EXPRESSION, and #172, INVALID LABEL: "
+                                          "UNDEFINED)"),
+    "sum-ending-in-a-built-in-in-a-constant-list": ("w = .(1 + time);\n", (151, 172),
+                                                    "T.PLM:8:11: error: TIME: TIME is a "
+                                                    "built-in"),
+    "location-of-a-built-in-in-a-constant-list": ("w = .(.shl);\n", (210, 172),
+                                                  "T.PLM:8:7: error: .SHL: a constant list holds "
+                                                  "constants only, and .SHL is a location"),
+    "sum-over-255-with-a-variable-in-a-constant-list": ("w = .(300 + b);\n", (151, 210),
+                                                        "T.PLM:8:13: error: B: B is a variable"),
+    "number-after-a-variable-in-a-constant-list": ("w = .(7, 300, b);\n", (151, 209),
+                                                   "T.PLM:8:15: error: B: B is a variable"),
+    "number-after-a-string-in-a-constant-list": ("w = .(b, '$', 300);\n", (151, 210),
+                                                 "T.PLM:8:7: error: B: B is a variable"),
+    "location-before-a-string-in-a-constant-list": ("w = .(7, .w, 'AB');\n", (210,),
+                                                    "T.PLM:8:10: error: .W: a constant list holds "
+                                                    "constants only, and .W is a location"),
+    "product-after-a-variable-in-a-constant-list": ("w = .(b, 2 * 3);\n", (151, 152, 209),
+                                                    "T.PLM:8:7: error: B: B is a variable"),
+    "string-sum-after-a-variable-in-a-constant-list": ("w = .(b, 'A' + 1);\n", (151, 152),
+                                                       "T.PLM:8:7: error: B: B is a variable"),
+    "parenthesis-after-300-in-a-constant-list": ("w = .(300 + (1));\n", (151, 152, 32, 210),
+                                                 "T.PLM:8:13: error: (1): a constant list has "
+                                                 "nothing in parentheses"),
+    # After what it does not take V3.1 looks for the list's `)', and one
+    # of a parenthesis further on leaves the rest of the statement #32.
+    "parenthesis-after-a-negated-location-in-a-constant-list": ("w = .(-.w, (1));\n",
+                                                                (151, 152, 32),
+                                                                "T.PLM:8:7: error: -.W: a "
+                                                                "constant list holds constants "
+                                                                "only, and a location is none"),
+    "variable-in-data": ("declare d address data (b);\nw = d;\n", (151,),
+                         "T.PLM:8:25: error: B: B is a variable, and a DATA or INITIAL value is a "
+                         "restricted expression, of constants and locations only; Intel's "
+                         "PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                         "EXPRESSION)"),
+    "variable-in-initial": ("declare d address initial (w);\nw = d;\n", (151,),
+                            "T.PLM:8:28: error: W: W is a variable, and a DATA or INITIAL value"),
+    "procedure-in-data": ("declare d address data (g);\nw = d;\n", (151,),
+                          "T.PLM:8:25: error: G: G is a procedure, and a DATA or INITIAL value"),
+    "variable-in-at": ("declare d byte at (w);\nb = d;\n", (151,),
+                       "T.PLM:8:20: error: W: W is a variable, and an AT address is a restricted "
+                       "expression"),
+    "string-sum-in-data": ("declare d byte data ('A' + 1);\nb = d;\n", (152,),
+                           "T.PLM:8:22: error: 'A': a string in a DATA or INITIAL value is a "
+                           "value of its own, not added to or subtracted from; Intel's PL/M-80 "
+                           "V3.1 rejects it (ERROR #152, MISSING ')' AFTER CONSTANT LIST)"),
+    "product-in-data": ("declare d byte data (2 * 3);\nb = d;\n", (152,),
+                        "T.PLM:8:22: error: 2 * 3: of the operators, a DATA or INITIAL value "
+                        "takes + and - only"),
+    "not-in-initial": ("declare d byte initial (not 0f0h);\nb = d;\n", (151, 152),
+                       "T.PLM:8:25: error: NOT 0f0h: of the operators, a DATA or INITIAL value "
+                       "takes + and - only"),
+    "parenthesis-in-data": ("declare d byte data ((1 + 2));\nb = d;\n", (151, 152),
+                            "T.PLM:8:22: error: (1 + 2): a DATA or INITIAL value has nothing in "
+                            "parentheses"),
+    "negated-negation-in-data": ("declare d byte data (- -1);\nb = d;\n", (151,),
+                                 "T.PLM:8:22: error: --1: in a DATA or INITIAL value a minus sign "
+                                 "goes before a number only"),
+    "location-second-in-data": ("declare d address data (1 + .w);\nw = d;\n", (151, 152),
+                                "T.PLM:8:29: error: .W: a DATA or INITIAL value is a location "
+                                "plus or minus constants, the location first, or constants "
+                                "alone"),
+    "constant-list-in-data": ("declare d address data (.(5));\nw = d;\n", (147,),
+                              "T.PLM:8:25: error: .(5): a DATA or INITIAL value does not take the "
+                              "location of constants; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                              "#147, MISSING IDENTIFIER FOLLOWING DOT OPERATOR)"),
+    "text-location-in-data": ("declare d address data (.'AB');\nw = d;\n", (147,),
+                              "T.PLM:8:25: error: .'AB': a DATA or INITIAL value does not take the "
+                              "location of constants"),
+    "string-location-in-initial": ("declare d address initial (.('AB'));\nw = d;\n", (147,),
+                                   "T.PLM:8:28: error: .('AB'): a DATA or INITIAL value does not "
+                                   "take the location of constants"),
+    "300-in-byte-data": ("declare d (2) byte data (7, 300);\nb = d(1);\n", (210,),
+                         "T.PLM:8:29: error: 300: this value fills a BYTE, and 300 is 12CH, more "
+                         "than 0FFH; Intel's PL/M-80 V3.1 rejects it (ERROR #210, ILLEGAL "
+                         "INITIALIZATION OF A BYTE TO A VALUE > 255)"),
+    "location-in-byte-initial": ("declare d byte initial (.w);\nb = d;\n", (210,),
+                                 "T.PLM:8:25: error: .W: a location is an address, and this value "
+                                 "fills a BYTE"),
+    "location-in-a-structures-byte": ("declare d structure (p byte, q address) data (.w, 7);\n"
+                                      "b = d.p;\n", (210,),
+                                      "T.PLM:8:47: error: .W: a location is an address, and this "
+                                      "value fills a BYTE"),
+    # A value that fills a BYTE with a name in it is more than 255 as V3.1
+    # computes it, a name a BYTE 0 (#210, besides the name's #151); and a
+    # list with more values than its declaration holds is #209 besides
+    # the errors of what else it has.  The messages named neither.
+    "sum-over-255-with-a-variable-in-byte-data": ("declare d byte data (300 + b);\nc = d;\n",
+                                                  (151, 210),
+                                                  "T.PLM:8:28: error: B: B is a variable, and a "
+                                                  "DATA or INITIAL value is a restricted "
+                                                  "expression"),
+    "subscript-variable-in-byte-data": ("declare ar (5) byte, d byte data (.ar(b));\nc = d;\n",
+                                        (151, 210),
+                                        "T.PLM:8:39: error: B: B is a variable, and a DATA or "
+                                        "INITIAL value is a restricted expression"),
+    "variable-past-an-arrays-end-in-data": ("declare d (2) byte data (1, 2, b);\nc = d(0);\n",
+                                            (151, 209),
+                                            "T.PLM:8:32: error: B: B is a variable, and a DATA or "
+                                            "INITIAL value is a restricted expression, of "
+                                            "constants and locations only; Intel's PL/M-80 V3.1 "
+                                            "rejects it (ERROR #151, INVALID OPERAND IN "
+                                            "RESTRICTED EXPRESSION, and #209, ILLEGAL "
+                                            "INITIALIZATION OF MORE SPACE THAN DECLARED)"),
+    "variable-before-a-value-past-a-scalar": ("declare d byte data (b, 1);\nc = d;\n", (151, 209),
+                                              "T.PLM:8:22: error: B: B is a variable"),
+    # V3.1 reads a DATA or INITIAL list to the first value it does not
+    # read to the end, and gives the errors of each value it reads; the
+    # message named those of the first value wrong only.
+    "variable-then-300-in-byte-data": ("declare d (3) byte data (b, 300, 7);\nc = d(0);\n",
+                                       (151, 210), "T.PLM:8:26: error: B: B is a variable"),
+    "300-then-variable-in-byte-initial": ("declare d (3) byte initial (7, 300, b);\nc = d(0);\n",
+                                          (151, 210),
+                                          "T.PLM:8:32: error: 300: this value fills a BYTE, and "
+                                          "300 is 12CH, more than 0FFH; Intel's PL/M-80 V3.1 "
+                                          "rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                                          "EXPRESSION, and #210, ILLEGAL INITIALIZATION OF A BYTE "
+                                          "TO A VALUE > 255)"),
+    "300-past-a-string-in-byte-data": ("declare d (2) byte data (b, 'AB', 300);\nc = d(0);\n",
+                                       (151, 209), "T.PLM:8:26: error: B: B is a variable"),
+    "variable-after-a-product-in-byte-data": ("declare d (3) byte data (300, 2 * 3, b);\n"
+                                              "c = d(0);\n", (152, 210),
+                                              "T.PLM:8:26: error: 300: this value fills a BYTE"),
+    "parenthesis-in-a-subscript-in-data": ("declare ar (5) byte;\n"
+                                           "declare d address data (.ar((1)));\nw = d;\n",
+                                           (151, 150),
+                                           "T.PLM:9:29: error: (1): the subscript of a location "
+                                           "in a DATA or INITIAL value has nothing in parentheses; "
+                                           "Intel's PL/M-80 V3.1 rejects it (ERROR #151, INVALID "
+                                           "OPERAND IN RESTRICTED EXPRESSION, and #150, MISSING ')' "
+                                           "AT END OF RESTRICTED SUBSCRIPT)"),
+    "constant-list-in-a-subscript-in-data": ("declare ar (5) byte;\n"
+                                             "declare d address data (.ar(.(1)));\nw = d;\n",
+                                             (151, 150),
+                                             "T.PLM:9:29: error: .(1): the subscript of a "
+                                             "location in a DATA or INITIAL value is numbers "
+                                             "only"),
+    "built-in-in-a-subscript-in-a-constant-list": ("declare ar (5) byte;\n"
+                                                   "w = .(.ar(low(1)), 7);\n",
+                                                   (151, 150, 32, 210, 172),
+                                                   "T.PLM:9:11: error: LOW(1): LOW is a built-in, "
+                                                   "and a constant list holds constants only"),
+    "variable-in-a-subscript-in-at": ("declare ar (5) byte;\ndeclare d byte at (.ar(b));\n"
+                                      "c = d;\n", (151,),
+                                      "T.PLM:9:24: error: B: B is a variable, and an AT address is "
+                                      "a restricted expression"),
+    "product-in-at": ("declare d byte at (2 * 3);\nb = d;\n", (146,),
+                      "T.PLM:8:20: error: 2 * 3: of the operators, an AT address takes + and - "
+                      "only; Intel's PL/M-80 V3.1 rejects it (ERROR #146, MISSING ')' AFTER 'AT' "
+                      "RESTRICTED EXPRESSION)"),
+    "location-second-in-at": ("declare ar (4) byte;\ndeclare d byte at (3 + .ar(1));\nb = d;\n",
+                              (151, 146),
+                              "T.PLM:9:24: error: .AR(1): an AT address is a location plus or "
+                              "minus constants, the location first, or constants alone; Intel's "
+                              "PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                              "EXPRESSION, and #146, MISSING ')' AFTER 'AT' RESTRICTED "
+                              "EXPRESSION)"),
+    "string-in-at": ("declare d byte at ('AB');\nb = d;\n", (151, 146),
+                     "T.PLM:8:20: error: 'AB': an AT address has no string in it"),
+    # A location with two subscripts, which 0.4.3 took for an element
+    # further on, `.ar(1)(1)' of an ADDRESS array AR+2 in a DATA list, AR+3
+    # in an INITIAL one, AR+4 in an AT, and refused of a member in a DATA or
+    # INITIAL list, `.s.m(1)(1)', in its own words.  V3.1 reads the location
+    # to its first subscript and stops at the second as at an operator it
+    # does not take (#152, in an AT #146), and gives that error too after
+    # one in a subscript.
+    "two-subscripts-in-data": ("declare ar (3) address;\ndeclare d address data (.ar(1)(1));\n"
+                               "w = d;\n", (152,),
+                               "T.PLM:9:26: error: AR(1)(1): a location takes one subscript, "
+                               "not two; Intel's PL/M-80 V3.1 rejects it (ERROR #152, MISSING "
+                               "')' AFTER CONSTANT LIST)"),
+    "two-subscripts-in-initial": ("declare ar (3) address;\n"
+                                  "declare d address initial (.ar(1)(1));\nw = d;\n", (152,),
+                                  "T.PLM:9:29: error: AR(1)(1): a location takes one subscript"),
+    "two-subscripts-in-at": ("declare ar (3) address;\ndeclare d byte at (.ar(1)(1));\nb = d;\n",
+                             (146,),
+                             "T.PLM:9:21: error: AR(1)(1): a location takes one subscript, not "
+                             "two; Intel's PL/M-80 V3.1 rejects it (ERROR #146, MISSING ')' "
+                             "AFTER 'AT' RESTRICTED EXPRESSION)"),
+    "two-subscripts-on-a-member-in-data": ("declare s structure (m (3) address);\n"
+                                           "declare d address data (.s.m(1)(1));\nw = d;\n",
+                                           (152,),
+                                           "T.PLM:9:26: error: S.M(1)(1): a location takes one "
+                                           "subscript, not two"),
+    "two-subscripts-in-a-constant-list": ("declare ar (3) address;\nw = .(7, .ar(1)(1));\n",
+                                          (152, 32, 209),
+                                          "T.PLM:9:11: error: AR(1)(1): a location takes one "
+                                          "subscript, not two"),
+    "two-subscripts-in-a-subscript-in-data": ("declare ar (3) address;\n"
+                                              "declare d address data (.ar(.ar(1)(1)));\n"
+                                              "w = d;\n", (151, 150, 152),
+                                              "T.PLM:9:29: error: .AR(1)(1): the subscript of a "
+                                              "location in a DATA or INITIAL value is numbers "
+                                              "only; Intel's PL/M-80 V3.1 rejects it (ERROR #151, "
+                                              "INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, "
+                                              "MISSING ')' AFTER CONSTANT LIST, and #150, MISSING "
+                                              "')' AT END OF RESTRICTED SUBSCRIPT)"),
+    # A subscript on the location of what is not an array - a scalar, a
+    # structure, a member, a procedure, a label - which 0.4.3 took for the
+    # element that far past it, of a scalar or a structure with a warning
+    # that named #127, V3.1's error in an expression (`.w(1)' of an ADDRESS
+    # W+1 in a DATA list, W+2 in an INITIAL list or an AT), of a member in
+    # an AT or a label without a word; or refused, a member in a DATA list
+    # in its own words, a procedure naming #104.
+    "subscripted-scalar-in-data": ("declare d address data (.w(1));\nw = d;\n", (149,),
+                                   "T.PLM:8:26: error: W(1): W is not an array, and only an "
+                                   "array's location takes a subscript; Intel's PL/M-80 V3.1 "
+                                   "rejects it (ERROR #149, INVALID SUBSCRIPTING IN RESTRICTED "
+                                   "REFERENCE)"),
+    "subscripted-scalar-in-initial": ("declare d address initial (.w(1));\nw = d;\n", (149,),
+                                      "T.PLM:8:29: error: W(1): W is not an array"),
+    "subscripted-scalar-in-at": ("declare d byte at (.w(1));\nb = d;\n", (149,),
+                                 "T.PLM:8:21: error: W(1): W is not an array"),
+    "subscripted-structure-in-data": ("declare s structure (k byte, m address);\n"
+                                      "declare d address data (.s(1));\nw = d;\n", (149,),
+                                      "T.PLM:9:26: error: S(1): S is not an array"),
+    "subscripted-member-in-at": ("declare s structure (k byte, m address);\n"
+                                 "declare d byte at (.s.k(1));\nb = d;\n", (149,),
+                                 "T.PLM:9:21: error: S.K(1): S.K is not an array"),
+    "subscripted-scalar-then-a-variable-in-data": ("declare d (2) address data (.w(1), b);\n"
+                                                   "w = d(0);\n", (149, 151),
+                                                   "T.PLM:8:30: error: W(1): W is not an array"),
+    "subscripted-scalar-in-a-constant-list": ("w = .(7, .w(1));\n", (149, 209),
+                                              "T.PLM:8:11: error: W(1): W is not an array"),
+    "twice-subscripted-scalar-in-data": ("declare d address data (.w(1)(1));\nw = d;\n",
+                                         (149, 152),
+                                         "T.PLM:8:26: error: W(1): W is not an array"),
+    "subscripted-procedure-in-data": ("declare d address data (.g(1));\nw = d;\n", (149,),
+                                      "T.PLM:8:26: error: G(1): G is a procedure, and only an "
+                                      "array's location takes a subscript; Intel's PL/M-80 V3.1 "
+                                      "rejects it (ERROR #149,"),
+    "subscripted-procedure-in-at": ("declare d byte at (.g(1));\nb = d;\n", (149, 211),
+                                    "T.PLM:8:21: error: .G: G is a procedure, and the location "
+                                    "in an AT address is a variable's, or MEMORY's; Intel's "
+                                    "PL/M-80 V3.1 rejects it (ERROR #149, INVALID SUBSCRIPTING IN "
+                                    "RESTRICTED REFERENCE, and #211,"),
+    "subscripted-label-in-data": ("declare d address data (.lb(1));\nlb: w = d;\n", (149,),
+                                  "T.PLM:8:26: error: LB(1): LB is a label, and only an array's "
+                                  "location takes a subscript"),
+    # The location in an AT of a procedure, which uplm80 took for its
+    # address, of a label and of a BASED variable, which it refused in
+    # words of its own.
+    "procedure-in-at": ("declare d byte at (.f);\nb = d;\n", (211,),
+                        "T.PLM:8:21: error: .F: F is a procedure, and the location in an AT "
+                        "address is a variable's, or MEMORY's; Intel's PL/M-80 V3.1 rejects it "
+                        "(ERROR #211, INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE)"),
+    "procedure-plus-a-variable-in-at": ("declare d byte at (.f + b);\nc = d;\n", (211, 151),
+                                        "T.PLM:8:21: error: .F: F is a procedure"),
+    "label-in-at": ("declare d byte at (.lb);\nlb: b = d;\n", (211,),
+                    "T.PLM:8:21: error: .LB: LB is a label, and the location in an AT address "
+                    "is a variable's, or MEMORY's"),
+    "based-in-at": ("declare bb based w byte;\ndeclare d byte at (.bb);\nb = d;\n", (212,),
+                    "T.PLM:9:21: error: .BB: BB is BASED, and has no fixed address for an AT "
+                    "address to name; Intel's PL/M-80 V3.1 rejects it (ERROR #212, INVALID "
+                    "RESTRICTED REFERENCE IN 'AT', BASE ILLEGAL)"),
+    "subscripted-based-in-at": ("declare bb based w byte;\ndeclare d byte at (.bb(1));\nb = d;\n",
+                                (149, 212), "T.PLM:9:21: error: .BB: BB is BASED"),
+    "based-member-in-at": ("declare bs based w structure (k byte, m address);\n"
+                           "declare d byte at (.bs.m);\nb = d;\n", (212,),
+                           "T.PLM:9:21: error: .BS: BS is BASED"),
+    # A base that is not an ADDRESS scalar, a variable or a parameter, nor an
+    # ADDRESS scalar member of a structure that is neither BASED nor an
+    # array, declared before the variable BASED on it.  0.4.3 failed in um80
+    # on one BASED, or a member of what is ("Undefined symbol 'BS'"), and so
+    # did 0.4.4's b9c4a36 on the factored `(a based bs.p) byte', which 0.4.3
+    # took for a variable of its own; `a based a' recursed until Python gave
+    # up; a member of an array of structures, or an array, it refused naming
+    # #133, V3.1's error in an expression; the rest it compiled.
+    "base-a-member-of-a-based-structure": (
+        "declare bs based w structure (k byte, p address);\ndeclare a based bs.p byte;\n"
+        "a = 1;\n", (52,),
+        "T.PLM:9:17: error: A BASED BS.P: BS is BASED, and a base is not a member of what is "
+        "BASED; Intel's PL/M-80 V3.1 rejects it (ERROR #52, INVALID BASE, MEMBER OF BASED "
+        "STRUCTURE OR ARRAY OF STRUCTURES)"),
+    "factored-base-a-member-of-a-based-structure": (
+        "declare bs based w structure (k byte, p address);\n"
+        "declare (a based bs.p, a2 based bs.p) (2) address;\na(1) = 1;\n", (52,),
+        "T.PLM:9:18: error: A BASED BS.P: BS is BASED, and a base is not a member of what is "
+        "BASED"),
+    "base-a-member-of-a-based-structure-in-a-procedure": (
+        "declare bs based w structure (k byte, p address);\np: procedure;\n"
+        "  declare a based bs.p byte;\n  a = 1;\nend p;\ncall p;\n", (52,),
+        "T.PLM:10:19: error: A BASED BS.P: BS is BASED"),
+    "base-a-byte-member-of-a-based-structure": (
+        "declare bs based w structure (k byte, p address);\ndeclare a based bs.k byte;\n"
+        "a = 1;\n", (50,),
+        "T.PLM:9:17: error: A BASED BS.K: BS.K is a BYTE, and a base is an ADDRESS; Intel's "
+        "PL/M-80 V3.1 rejects it (ERROR #50, INVALID ATTRIBUTES FOR BASE)"),
+    "base-a-member-of-an-array-of-structures": (
+        "declare sa (2) structure (k byte, p address);\ndeclare a based sa.p byte;\na = 1;\n",
+        (52,), "T.PLM:9:17: error: A BASED SA.P: SA is an array, and a base is not a member of "
+        "an array of structures; Intel's PL/M-80 V3.1 rejects it (ERROR #52"),
+    "base-a-based-variable": (
+        "declare q based w address;\ndeclare a based q byte;\na = 1;\n", (50,),
+        "T.PLM:9:17: error: A BASED Q: Q is BASED, and a base is not; Intel's PL/M-80 V3.1 "
+        "rejects it (ERROR #50, INVALID ATTRIBUTES FOR BASE)"),
+    "factored-base-a-based-variable": (
+        "declare q based w address;\ndeclare (a based q, a2 based w) byte;\na = 1;\n", (50,),
+        "T.PLM:9:18: error: A BASED Q: Q is BASED, and a base is not"),
+    "base-itself": ("declare a based a address;\na = 1;\n", (54,),
+                    "T.PLM:8:17: error: A BASED A: a variable is not its own base; Intel's "
+                    "PL/M-80 V3.1 rejects it (ERROR #54, UNDECLARED BASE)"),
+    "base-memory": ("declare a based memory byte;\na = 1;\n", (50,),
+                    "T.PLM:8:17: error: A BASED MEMORY: MEMORY is a built-in, and a base is a "
+                    "variable"),
+    "base-an-array": ("declare q (2) address;\ndeclare a based q byte;\na = 1;\n", (50,),
+                      "T.PLM:9:17: error: A BASED Q: Q is an array, and a base is a scalar"),
+    "base-a-byte": ("declare a based b byte;\na = 1;\n", (50,),
+                    "T.PLM:8:17: error: A BASED B: B is a BYTE, and a base is an ADDRESS"),
+    "base-a-structure": ("declare q structure (p address);\ndeclare a based q byte;\na = 1;\n",
+                         (50,), "T.PLM:9:17: error: A BASED Q: Q is a structure, and a base is "
+                         "an ADDRESS scalar"),
+    "base-a-member-array": ("declare q structure (p (2) address);\ndeclare a based q.p byte;\n"
+                            "a = 1;\n", (50,),
+                            "T.PLM:9:17: error: A BASED Q.P: Q.P is an array, and a base is a "
+                            "scalar"),
+    "base-a-member-it-does-not-have": (
+        "declare q structure (p address);\ndeclare a based q.zz byte;\na = 1;\n", (55,),
+        "T.PLM:9:17: error: A BASED Q.ZZ: Q has no member ZZ; Intel's PL/M-80 V3.1 rejects it "
+        "(ERROR #55, UNDECLARED STRUCTURE MEMBER IN BASE)"),
+    "base-a-member-of-a-scalar": ("declare a based w.p byte;\na = 1;\n", (55,),
+                                  "T.PLM:8:17: error: A BASED W.P: W is not a structure"),
+    "base-a-procedure": ("declare a based f byte;\na = 1;\n", (50,),
+                         "T.PLM:8:17: error: A BASED F: F is a procedure, and a base is a "
+                         "variable"),
+    "base-a-label": ("declare lb label;\ndeclare a based lb byte;\nlb: a = 1;\n", (50,),
+                     "T.PLM:9:17: error: A BASED LB: LB is a label, and a base is a variable"),
+    "base-declared-after": (
+        "declare a based q byte;\ndeclare q address;\na = 1;\n", (54,),
+        "T.PLM:8:17: error: A BASED Q: Q is declared after A, and a base is declared before "
+        "the variable BASED on it; Intel's PL/M-80 V3.1 rejects it (ERROR #54, UNDECLARED "
+        "BASE)"),
+    "factored-bases-declared-after": (
+        "declare (a based a2, a2 based w) byte;\na = 1;\n", (54,),
+        "T.PLM:8:18: error: A BASED A2: A2 is declared after A"),
+    "base-a-parameter-declared-after": (
+        "p: procedure (q);\n  declare a based q byte;\n  declare q address;\n  a = 1;\n"
+        "end p;\ncall p(0);\n", (50,),
+        "T.PLM:9:19: error: A BASED Q: Q is declared a BYTE or an ADDRESS only after A"),
+    "base-a-byte-parameter": (
+        "p: procedure (q);\n  declare q byte;\n  declare a based q byte;\n  a = 1;\nend p;\n"
+        "call p(0);\n", (50,), "T.PLM:10:19: error: A BASED Q: Q is a BYTE"),
+    # A LABEL that labels no statement of its block, which 0.4.3 took
+    # without a word, in a DATA list for an address um80 did not know
+    # ("Undefined symbol 'LB'"); a GOTO to it it refused at -O0, in words of
+    # its own, and took at -O2 where the GOTO was dead code.  Where a DO
+    # block in it labels a statement LB:, that is another label, the
+    # block's.
+    "label-that-labels-no-statement": ("declare lb label;\nw = 1;\n", (172,),
+                                       "T.PLM:8:9: error: LB is declared a LABEL but labels no "
+                                       "statement; Intel's PL/M-80 V3.1 rejects it (ERROR #172, "
+                                       "INVALID LABEL: UNDEFINED)"),
+    "label-that-labels-no-statement-in-data": (
+        "declare lb label;\ndeclare d address data (.lb);\nw = d;\n", (105, 172),
+        "T.PLM:9:26: error: .LB: LB is declared a LABEL but labels no statement; Intel's PL/M-80 "
+        "V3.1 rejects it (ERROR #105, UNDECLARED IDENTIFIER, and #172, INVALID LABEL: "
+        "UNDEFINED)"),
+    "goto-a-label-that-labels-no-statement": (
+        "declare lb label;\nif w = 7 then goto lb;\n", (105, 172),
+        "T.PLM:9:15: error: GOTO LB: LB is declared a LABEL but labels no statement; Intel's"),
+    "label-that-a-do-block-labels": (
+        "declare lb label;\ndo;\n  declare d address data (.lb);\n  lb: w = d;\nend;\n", (172,),
+        "T.PLM:8:9: error: LB is declared a LABEL but labels no statement (the LB: in a DO "
+        "block is another label, that block's); Intel's PL/M-80 V3.1 rejects it (ERROR #172"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
@@ -1598,9 +2138,14 @@ def test_what_v31_rejects_is_an_error(opt, name):
     parentheses in a subscript of LENGTH, LAST or SIZE's argument; a
     procedure with no statements; `shl(w, 3)' of a scalar SHL; an array
     or a member array without a subscript; a procedure called before its
-    declaration (0.4.2's).  uplm80 compiled each; Intel's PL/M-80 V3.1
-    rejects each, with the error the message names.  No program of MP/M
-    II, 80un, sample_code or tests/ has one (as tests/ now)."""
+    declaration (0.4.2's).  uplm80 compiled each.  A built-in in a DATA or
+    INITIAL list, an AT address or a constant list (0.4.3's), which -O1
+    and up folded and -O0 refused, or took for something else; there a
+    location with two subscripts, or one on what is not an array, and in
+    an AT the location of a procedure, a label or a BASED variable.
+    Intel's PL/M-80 V3.1 rejects each, with the errors the message names.
+    No program of MP/M II, 80un, sample_code or tests/ has one (as tests/
+    now)."""
     stmts, _, message = V31_REJECTS[name]
     err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
     assert message in err, err
@@ -1680,6 +2225,411 @@ def test_what_v31_takes_of_those_forms_is_compiled_without_a_word(capsys):
     assert "warning" not in capsys.readouterr().err
 
 
+# What Intel's PL/M-80 V3.1 takes in a restricted expression, which has no
+# built-in in it (V31_REJECTS): MEMORY's location, in a DATA or an INITIAL
+# list as in an AT, and a constant list of sums and differences.  V3.1
+# compiles the program to print what is expected (tests/test_intel_oracle.py
+# builds it again).
+V31_RESTRICTED = """
+declare a(5) byte;
+declare dm address data (.memory), dm3 address data (.memory(3));
+declare im(3) address initial (.a, .memory - 1, .memory + 2);
+declare atm byte at (.memory);
+declare p address, c based p (4) byte;
+call ph(dm - .memory); call ph(dm3 - .memory);
+call ph(im(0) - .a); call ph(im(1) - .memory); call ph(im(2) - .memory);
+call ph(.atm - .memory);
+p = .(1 + 2, -1, 'a', 9 - 2);
+call ph(c(0)); call ph(c(1)); call ph(c(2)); call ph(c(3));
+"""
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_what_v31_takes_in_a_restricted_expression_is_laid_out(opt):
+    """`.memory' in a DATA or INITIAL list is the linker's end of the
+    program, as in an expression; it was `dw MEMORY', which um80 did not
+    know.  And an expression in a constant list is its value at -O0 too,
+    where nothing has folded it; it was left out, and `.(1 + 2, 7)' was
+    `.(7)'."""
+    asm = Compiler(opt_level=opt).compile(_PH_PRELUDE + V31_RESTRICTED + "end t;\n", "T.PLM")
+    lines = [" ".join(line.split()) for line in asm.splitlines()]
+    for want in ("dw __END__", "dw __END__+3", "dw (__END__-1)", "dw (__END__+2)"):
+        assert want in lines, want
+    at = lines.index("db 3")
+    assert lines[at:at + 4] == ["db 3", "db 0FFH", "db 'a'", "db 7"], lines[at - 1:at + 4]
+
+
+def test_what_v31_takes_in_a_restricted_expression_prints_what_it_prints():
+    _check(V31_RESTRICTED, [0, 3, 0, 0xFFFF, 2, 0, 3, 0xFF, 0x61, 7])
+
+
+@pytest.mark.parametrize("name", sorted(V31_REJECTS) + sorted(V31_WARNS))
+def test_the_message_names_every_error_v31_gives(name):
+    """A message that names Intel's PL/M-80 V3.1's errors names each
+    error V3.1 gives for the program, and no other: in a constant list
+    V3.1 gives #209, #32 or #172 besides #151 and #152, and after a
+    parenthesis in a subscript of LENGTH's argument #125 besides #32.
+    tests/test_intel_oracle.py checks that V3.1 gives those and no
+    other."""
+    stmts, errors, _ = {**V31_REJECTS, **V31_WARNS}[name]
+    r = _compile(PRELUDE + V31_DECLS + stmts + "end t;\n", 0)
+    line = next((l for l in r.stderr.splitlines() if "Intel's PL/M-80 V3.1 rejects it (" in l),
+                None)
+    if line is None:
+        pytest.skip("the message names none of V3.1's errors")
+    named = [int(n) for n in re.findall(r"#(\d+), ", line.split("rejects it (", 1)[1])]
+    assert sorted(named) == sorted(errors), line
+
+
+# Locations in a DATA or INITIAL list that Intel's PL/M-80 V3.1 takes, and
+# code generation laid out wrongly or refused: an element of an ADDRESS
+# array, a member, an element of an array of structures and a member of
+# one, a variable declared further down, a subscript that is a sum at -O0;
+# and in a constant list what a byte holds of V3.1's arithmetic.  V3.1
+# compiles the program to print what is expected (tests/test_intel_oracle.py
+# builds it again).
+V31_LOCATIONS = """
+declare arr (3) address, s structure (m (3) byte, k address);
+declare sa (3) structure (x byte, y address);
+declare da address data (.arr(2)), dk address data (.s.k), dm address data (.s.m(1));
+declare dy address data (.sa(1).y), dsa address data (.sa(2)), dx address data (.sa(2).x + 1);
+declare ia (2) address initial (.later(2), .arr(1 + 1));
+declare later (3) address;
+declare p address, c based p (3) byte;
+call ph(da - .arr); call ph(dk - .s); call ph(dm - .s);
+call ph(dy - .sa); call ph(dsa - .sa); call ph(dx - .sa);
+call ph(ia(0) - .later); call ph(ia(1) - .arr);
+p = .(0ffffh + 1, 300 - 100, -1 - 1);
+call ph(c(0)); call ph(c(1)); call ph(c(2));
+"""
+
+
+def test_a_location_in_a_list_is_where_v31_puts_it():
+    """The module's DATA is laid out before its other variables, and an
+    INITIAL list may name a variable declared further down: the element
+    of an array not yet laid out was taken for a byte, `.arr(2)' of an
+    ADDRESS array ARR+2, and an array of structures' for a word; a
+    member, `.s.k', was refused, and so was `.arr(1 + 1)' at -O0, where
+    nothing had folded the subscript."""
+    _check(V31_LOCATIONS, [4, 3, 1, 4, 6, 7, 4, 4, 0, 0xC8, 0xFE])
+
+
+# A name the program declares that is also a built-in's, MEMORY or SIZE, in
+# a DATA list at module level: the program's variable.  It was taken for
+# the built-in's while the module's DATA was laid out, before the variable
+# was: `.memory' for the end of the program, and `.size(2)' of a BYTE array
+# for SIZE+4, as if SIZE were an ADDRESS one.  V3.1 prints what is expected
+# (tests/test_intel_oracle.py).
+V31_DECLARED_BUILTINS = {
+    "arrays": ("""
+declare memory (4) byte, size (3) byte;
+declare dm address data (.memory), dm1 address data (.memory(1));
+declare ds address data (.size(2)), ds1 address data (.size(2) + 1);
+call ph(dm - .memory); call ph(dm1 - .memory); call ph(ds - .size); call ph(ds1 - .size);
+""", [0, 1, 2, 3]),
+    "scalar": ("""
+declare memory address;
+declare dm address data (.memory);
+call ph(dm - .memory);
+""", [0]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(V31_DECLARED_BUILTINS))
+def test_a_declared_memory_or_size_in_a_data_list_is_the_programs(name):
+    body, expect = V31_DECLARED_BUILTINS[name]
+    _check(body, expect)
+
+
+# A location in a DATA list or an AT address of a procedure or a DO block
+# that names a variable the block declares further down: that variable,
+# as PL/M-80 scopes a name to its whole block (9.1), and as V3.1 prints
+# what is expected (tests/test_intel_oracle.py).  Code generation looked
+# the name up among what it had laid out so far, and at module level
+# only after that: the block's MEMORY was the end of the program
+# (`dw __END__', 0004), `.arr(2)' and `.size(2)' the module's arrays of
+# the other type, `buf' in an AT the module's, a structure's member not
+# found, and a name the module does not declare um80's undefined symbol;
+# at module level an AT's `.memory(3)' was the end of the program too.
+V31_BLOCK_LOCATIONS = {
+    "procedure": ("""
+declare arr (3) byte, size (3) address, buf (4) address;
+p: procedure;
+  declare dm address data (.memory), dm1 address data (.memory(1));
+  declare da address data (.arr(2)), ds address data (.size(2)), dl address data (.later(1));
+  declare dk address data (.s.k), dy address data (.sa(2).y);
+  declare z byte at (.buf(3)), zm byte at (.memory(3));
+  declare memory (4) byte, arr (3) address, size (3) byte, buf (4) byte, later (2) address;
+  declare s structure (m (3) byte, k address), sa (3) structure (x byte, y address);
+  call ph(dm - .memory); call ph(dm1 - .memory); call ph(da - .arr); call ph(ds - .size);
+  call ph(dl - .later); call ph(dk - .s); call ph(dy - .sa); call ph(.z - .buf);
+  call ph(.zm - .memory);
+end p;
+call p;
+""", [0, 1, 4, 2, 2, 3, 7, 3, 3]),
+    "do-block": ("""
+declare arr (3) byte;
+do;
+  declare w address data (.arr(2)), wl address data (.later(1));
+  declare z byte at (.later(3));
+  declare arr (3) address, later (4) address;
+  call ph(w - .arr); call ph(wl - .later); call ph(.z - .later);
+end;
+""", [4, 2, 6]),
+    "module-at": ("""
+declare z byte at (.memory(3));
+declare memory (4) byte;
+call ph(.z - .memory);
+""", [3]),
+    # A parameter and a procedure, over the module's variables of their
+    # names: code generation finds them through their declarations too.
+    "parameter-and-procedure": ("""
+declare a (4) byte, f (4) byte;
+p: procedure (a);
+  declare w address data (.a), wf address data (.f);
+  declare a address;
+  f: procedure; call ph(0f1h); end f;
+  call ph(w - .a); call ph(wf - .f); call wf;
+end p;
+call p(1);
+""", [0, 0, 0xF1]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(V31_BLOCK_LOCATIONS))
+def test_a_location_names_its_blocks_declaration_further_down(name):
+    body, expect = V31_BLOCK_LOCATIONS[name]
+    _check(body, expect)
+
+
+# A factored BASED declaration, `(a based s.p, b based s.p) byte': each
+# name at the address its base holds, a member's too.  A name BASED on a
+# member was taken for no base at all, a variable of its own that `a = 5'
+# stored in (0.4.3 the same).  V3.1 prints what is expected
+# (tests/test_intel_oracle.py).
+V31_FACTORED_BASED = """
+declare s structure (k byte, p address), buf (4) byte, bp address;
+declare (a based s.p, b based s.p) byte, (c based s.p) (2) byte;
+declare (d based bp, e based bp) address;
+s.p = .buf(1);
+a = 5; c(1) = 6;
+call ph(buf(1)); call ph(buf(2)); call ph(.b - .buf);
+bp = .buf(2); d = 0708h;
+call ph(buf(3)); call ph(.e - .buf);
+"""
+
+
+def test_a_factored_based_variable_is_at_the_address_its_base_holds():
+    _check(V31_FACTORED_BASED, [5, 6, 1, 7, 2])
+
+
+# A base is the declaration of its name made before the variable BASED on
+# it, in its block or one around it, as Intel's PL/M-80 V3.1 reads it, and
+# prints what is expected (tests/test_intel_oracle.py).  Code generation
+# looked the base up by its name where the variable was used: in a
+# procedure that declares a variable of the name, `a = 77h' stored through
+# that one (0.4.3 the same).  And where the block declares the name
+# further down, V3.1 takes the outer block's for the base, and uplm80 took
+# the later one (0.4.3 the same, but that it took `(c based s.p) byte' for
+# a variable of its own).
+V31_BASES = {
+    "used-in-a-procedure": ("""
+declare buf (4) byte, q address, s structure (k byte, p address);
+declare a based q byte, (c based s.p) byte;
+p: procedure;
+  declare q address, s structure (k byte, p address);
+  q = .buf(2); s.p = .buf(3);
+  a = 77h; c = 66h;
+end p;
+q = .buf(0); s.p = .buf(1);
+call p;
+call ph(buf(0)); call ph(buf(1)); call ph(buf(2)); call ph(buf(3));
+""", [0x77, 0x66, 0, 0]),
+    "declared-again-further-down": ("""
+declare buf (4) byte, q address, s structure (k byte, p address);
+p: procedure;
+  declare a based q byte, (c based s.p) byte;
+  declare q address, s structure (j address, p address);
+  q = .buf(2); s.p = .buf(3);
+  a = 77h; c = 66h;
+end p;
+q = .buf(0); s.p = .buf(1);
+call p;
+do;
+  declare (d based q) byte;
+  declare q address;
+  q = .buf(2);
+  d = 55h;
+end;
+call ph(buf(0)); call ph(buf(1)); call ph(buf(2)); call ph(buf(3));
+""", [0x55, 0x66, 0, 0]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(V31_BASES))
+def test_a_base_is_the_declaration_before_the_based_variable(name):
+    body, expect = V31_BASES[name]
+    _check(body, expect)
+
+
+def test_an_initial_location_names_its_procedures_memory_further_down(capsys):
+    """INITIAL in a procedure, which V3.1 rejects (#73) and uplm80 takes
+    with a warning, resolves a location as DATA does: the procedure's own
+    MEMORY, declared after it."""
+    _check("""
+p: procedure;
+  declare w address initial (.memory(1));
+  declare memory (4) byte;
+  call ph(w - .memory);
+end p;
+call p;
+""", [1])
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_memory_in_a_list_of_a_module_that_does_not_declare_it(opt):
+    """In a multi-file compile a module that does not declare MEMORY means
+    the built-in in a DATA list too, as in an expression and an AT, when
+    another module declares a MEMORY PUBLIC: its DATA had `dw MEMORY',
+    the other module's variable, and its code the end of the program."""
+    user = _BUILTINS_USER.replace(
+        "declare w address, b byte;",
+        "declare dm address data (.memory(2)), am byte at (.memory(2));\n"
+        "declare w address, b byte;").replace(
+        "call ph(own);", "call ph(own);\ncall ph(dm - .memory); call ph(.am - .memory);") % ""
+    assert _run_modules([user, _BUILTINS_LIB], opt).endswith("79BC 0002 0002 ")
+
+
+# More values than the declaration holds, each past its space a number a
+# byte does not hold: Intel's PL/M-80 V3.1 gives #209 alone, checking
+# nothing past the space (tests/test_intel_oracle.py).
+PAST_THE_SPACE = {
+    "structure": "declare d structure (p byte, q address, r byte) data ('ABCD', 300);\n"
+                 "c = d.p;\n",
+    "scalar": "declare d byte data (1, 300);\nc = d;\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(PAST_THE_SPACE))
+def test_a_value_past_a_declarations_space_is_not_held_to_a_byte(name):
+    """uplm80 lays such a value out after the declaration, as 0.4.3's and
+    0.4.4's Known issues have it (#209); the message said V3.1 rejects it
+    for a BYTE's value over 255 (#210), which V3.1 does not give there."""
+    r = _compile(PRELUDE + V31_DECLS + PAST_THE_SPACE[name] + "end t;\n", 0)
+    assert r.returncode == 0, r.stderr
+    assert "#210" not in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("name", ["stackptr", "shl", "double"])
+def test_the_location_of_a_built_in_in_a_list_is_uplm80s_own_refusal(name):
+    """Intel's PL/M-80 V3.1 takes `data (.stackptr)' for an address of its
+    own (tests/test_intel_oracle.py), and uplm80, which has none to give,
+    refuses it, as it did; the message said V3.1 rejects it (#123), which
+    V3.1 does in an expression only."""
+    err = _compile_error(PRELUDE + f"declare d address data (.{name});\nend t;\n", 0)
+    assert f"uplm80 has none to give {name.upper()} in a DATA or INITIAL list" in err, err
+    assert "rejects" not in err, err
+
+
+# The location of what has no fixed address in uplm80, in a DATA or INITIAL
+# list or an AT: a REENTRANT procedure's local or parameter, on the stack
+# at each call, and a BASED variable, at the address its base holds.  V3.1
+# takes each for an address (tests/test_intel_oracle.py, the CHANGELOG's
+# Known issues); uplm80 refuses each, a scalar in an AT as it did, and in a
+# list since 0.4.4, where it was `dw X', which um80 did not know
+# ("Undefined symbol").  Each: the statements, after PRELUDE and V31_DECLS;
+# the name; why; and whether V3.1 compiles it (INITIAL in a procedure it
+# does not, #73).
+NO_FIXED_ADDRESS = {
+    "reentrant-local": ("p: procedure reentrant;\n  declare x address;\n"
+                        "  declare d address data (.x);\n  x = d;\nend p;\ncall p;\n",
+                        "X", "a REENTRANT local", True),
+    "reentrant-local-further-down": ("p: procedure reentrant;\n  declare d address data (.x);\n"
+                                     "  declare x address;\n  x = d;\nend p;\ncall p;\n",
+                                     "X", "a REENTRANT local", True),
+    "reentrant-element": ("p: procedure reentrant;\n  declare x (3) address;\n"
+                          "  declare d address data (.x(1));\n  x(0) = d;\nend p;\ncall p;\n",
+                          "X", "a REENTRANT local", True),
+    "reentrant-parameter": ("p: procedure (x) reentrant;\n  declare x address;\n"
+                            "  declare d address data (.x);\n  x = d;\nend p;\ncall p(1);\n",
+                            "X", "a REENTRANT local", True),
+    "reentrant-local-in-a-do-block": ("p: procedure reentrant;\n  declare x address;\n  do;\n"
+                                      "    declare d address data (.x);\n    x = d;\n  end;\n"
+                                      "end p;\ncall p;\n", "X", "a REENTRANT local", True),
+    "reentrant-initial": ("p: procedure reentrant;\n  declare x address;\n"
+                          "  declare d address initial (.x);\n  x = d;\nend p;\ncall p;\n",
+                          "X", "a REENTRANT local", False),
+    "reentrant-at": ("p: procedure reentrant;\n  declare x address;\n"
+                     "  declare z address at (.x);\n  x = z;\nend p;\ncall p;\n",
+                     "X", "a REENTRANT local", True),
+    "reentrant-element-at": ("p: procedure reentrant;\n  declare x (3) address;\n"
+                             "  declare z address at (.x(1));\n  x(0) = z;\nend p;\ncall p;\n",
+                             "X", "a REENTRANT local", True),
+    "based-data": ("declare bb based w byte;\ndeclare d address data (.bb);\nw = d;\n",
+                   "BB", "BASED", True),
+    "based-initial": ("declare bb based w byte;\ndeclare d address initial (.bb);\nw = d;\n",
+                      "BB", "BASED", True),
+    "based-element": ("declare ba based w (3) byte;\ndeclare d address data (.ba(1));\nw = d;\n",
+                      "BA", "BASED", True),
+    # A factored BASED declaration's name, which code generation was not
+    # told the declaration of (0.4.4 before this): MEMORY was the end of
+    # the program, `dw __END__', where 0.4.3 had `dw MEMORY', which um80
+    # did not know, and at module level, where the module's DATA is laid
+    # out first, the others were um80's "Undefined symbol" (0.4.3 the
+    # same), a structure's member "no member M", and in a procedure or a
+    # DO block, declared further down, the module's variable of the name.
+    "factored-based-memory": ("declare (memory based w) byte;\n"
+                              "declare d address data (.memory);\nw = d;\n",
+                              "MEMORY", "BASED", True),
+    "factored-based-memory-initial": ("declare d address initial (.memory);\n"
+                                      "declare (memory based w) byte;\nw = d;\n",
+                                      "MEMORY", "BASED", True),
+    "factored-based-memory-further-down": ("p: procedure;\n"
+                                           "  declare d address data (.memory(2));\n"
+                                           "  declare (memory based w) (4) byte;\n  w = d;\n"
+                                           "end p;\ncall p;\n", "MEMORY", "BASED", True),
+    "factored-based": ("declare (b1 based w, b2 based w) byte;\n"
+                       "declare d address data (.b2);\nw = d;\n", "B2", "BASED", True),
+    "factored-based-further-down": ("declare d address data (.b2);\n"
+                                    "declare (b1 based w, b2 based w) byte;\nw = d;\n",
+                                    "B2", "BASED", True),
+    "factored-based-element": ("declare (b1 based w, b2 based w) (4) byte;\n"
+                               "declare d address data (.b2(1));\nw = d;\n", "B2", "BASED", True),
+    "factored-based-member": ("declare (s1 based w, s2 based w) structure (k byte, m address);\n"
+                              "declare d address data (.s2.m);\nw = d;\n", "S2", "BASED", True),
+    "factored-based-over-a-module-variable": ("declare b2 (4) byte;\np: procedure;\n"
+                                              "  declare d address data (.b2);\n"
+                                              "  declare (b1 based w, b2 based w) byte;\n"
+                                              "  w = d;\nend p;\ncall p;\n", "B2", "BASED", True),
+    "factored-based-over-a-module-variable-in-a-do-block": ("declare b2 (4) byte;\ndo;\n"
+                                                            "  declare d address data (.b2);\n"
+                                                            "  declare (b2 based w) byte;\n"
+                                                            "  w = d;\nend;\n", "B2", "BASED",
+                                                            True),
+    # One BASED on a member was not BASED at all (_gen_var_decl_names).
+    "factored-based-on-a-member": ("declare s structure (k byte, p address);\n"
+                                   "declare (b1 based s.p) byte;\n"
+                                   "declare d address data (.b1);\nw = d;\n", "B1", "BASED", True),
+}
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("name", sorted(NO_FIXED_ADDRESS))
+def test_a_location_with_no_fixed_address_is_uplm80s_own_refusal(opt, name):
+    """uplm80 refuses, at every level, the location of what it gives no
+    fixed address, a REENTRANT procedure's local or a BASED variable, in a
+    list as in an AT; in a list it compiled to `dw X', and um80 failed, and
+    in an AT so did an array or a structure, `at (.x(1))', `EQU X+2'."""
+    stmts, var, why, _ = NO_FIXED_ADDRESS[name]
+    err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
+    line = next(l for l in err.splitlines() if ": error: " in l)
+    assert line.endswith(f"{var} has no fixed address ({why})"), err
+    # The list it is in: an INITIAL one was called DATA.
+    where = "AT" if " at (" in stmts else "INITIAL" if " initial (" in stmts else "DATA"
+    assert f": error: {where}(.{var}): " in line, err
+
+
 def test_an_untyped_data_string_is_an_array():
     """uplm80 takes `declare hx data ('0123')', which V3.1 does not (ERROR
     #61), for an array of the string's bytes, as 80un's bas.plm has it:
@@ -1703,6 +2653,11 @@ def test_the_address_of_memory_is_no_error():
     ("y = .nowhere;", "NOWHERE", 6),
     ("if 0 then y = gone;", "GONE", 15),
     ("y = n;", "NN", 5),
+    # In a restricted expression too, which named the errors of the rest of
+    # the list, and in a constant list #210 of the location (0.4.4 before).
+    ("y = .(.nolist(1));", "NOLIST", 8),
+    ("y = .(.nolist2, 300);", "NOLIST2", 8),
+    ("declare d (2) byte data (.nodata, 300);", "NODATA", 27),
 ])
 def test_a_name_declared_nowhere_is_an_error(opt, stmt, name, col):
     """`y = nosuch + 1' compiled to `ld hl,(NOSUCH)', and only um80
@@ -1728,6 +2683,10 @@ p: procedure; declare n byte; n = 1; end p;
      "declare lit literally '5';\ncall p;", 9, 9),
     ("p: procedure;\n  q: procedure;\n    y = lit;\n  end q;\n"
      "  declare lit literally '5';\n  call q;\nend p;\ncall p;", 8, 9),
+    # In a restricted expression too (test_a_name_declared_nowhere_is_an_error).
+    ("p: procedure;\n  y = .(.lit(1));\nend p;\ndeclare lit literally 'y';\ncall p;", 7, 10),
+    ("p: procedure;\n  declare d (2) byte data (.lit, 300);\n  y = d(0);\nend p;\n"
+     "declare lit literally 'y';\ncall p;", 7, 29),
 ])
 def test_a_literally_used_before_its_declaration_is_an_error(opt, src, line, col):
     """A LITERALLY's text is "substituted for each occurrence of the

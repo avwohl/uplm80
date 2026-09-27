@@ -386,22 +386,9 @@ def _compile_time_cases(tables, decls, body, check, expect) -> None:
                 body.extend(_probe_stmts(expr))
                 check("constants", expr, v)
 
-    # DATA and INITIAL values are constant expressions too.
-    dk = [(7, "mod", 3), (7, "/", 0), (7, "mod", 0), (0, "/", 0), (0, "mod", 0),
-          (0xFFFF, "mod", 0), (1000, "mod", 7), (1000, "/", 7), (256, "/", 256)]
-    bk = [(7, "mod", 3), (7, "mod", 0), (0, "mod", 0), (250, "/", 7),
-          (200, "mod", 0), (255, "mod", 16)]
-
-    def text(items):
-        return ", ".join(f"{_hex(p)} {op} {_hex(q)}" for p, op, q in items)
-
-    decls.append(f"declare dk(*) address data ({text(dk)});")
-    decls.append(f"declare bk(*) byte data ({text(bk)});")
-    decls.append(f"declare ik({len(dk)}) address initial ({text(dk)});")
-    for name, items in (("dk", dk), ("bk", bk), ("ik", dk)):
-        body.append(f"do i = 0 to last({name}); call ph({name}(i)); end;")
-        for p, op, q in items:
-            expect.append((f"{name}: {p} {op} {q}", dri_divide(p, q)[op != "/"]))
+    # A DATA or INITIAL value divides nothing: of the operators a restricted
+    # expression takes + and - only, as Intel's PL/M-80 V3.1 has it (ERROR
+    # #152), and uplm80 since 0.4.4 (tests/test_names.py).
 
 
 @pytest.mark.parametrize("opt", [0, 1, 2, 3])
