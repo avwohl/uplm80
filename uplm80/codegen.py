@@ -2757,15 +2757,16 @@ class CodeGenerator:
     def _gen_var_decl_names(self, decl, skip: frozenset = frozenset()) -> None:
         """The storage of each name :meth:`_gen_var_decl` declares."""
         if isinstance(decl, P.DeclItemBasedGroup):
+            # `(a based p, b based s.q) byte': each name on its own base.
+            # One on a member, `s.q', was taken for no base at all, a
+            # variable of its own that `a = 5' stored in.
             for bd in decl.based_decls or []:
-                base_name = (
-                    ident_text(bd.base.name)
-                    if isinstance(bd.base, P.DottedIdent) else None
-                )
+                name = ident_text(bd.name)
+                based_on, based_member = decl_item_based(decl, name)
                 self._gen_one_var(
-                    name=ident_text(bd.name),
-                    based_on=base_name,
-                    based_member=None,
+                    name=name,
+                    based_on=based_on,
+                    based_member=based_member,
                     item=decl,
                 )
             return

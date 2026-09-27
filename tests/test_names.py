@@ -2031,6 +2031,27 @@ def test_a_location_names_its_blocks_declaration_further_down(name):
     _check(body, expect)
 
 
+# A factored BASED declaration, `(a based s.p, b based s.p) byte': each
+# name at the address its base holds, a member's too.  A name BASED on a
+# member was taken for no base at all, a variable of its own that `a = 5'
+# stored in (0.4.3 the same).  V3.1 prints what is expected
+# (tests/test_intel_oracle.py).
+V31_FACTORED_BASED = """
+declare s structure (k byte, p address), buf (4) byte, bp address;
+declare (a based s.p, b based s.p) byte, (c based s.p) (2) byte;
+declare (d based bp, e based bp) address;
+s.p = .buf(1);
+a = 5; c(1) = 6;
+call ph(buf(1)); call ph(buf(2)); call ph(.b - .buf);
+bp = .buf(2); d = 0708h;
+call ph(buf(3)); call ph(.e - .buf);
+"""
+
+
+def test_a_factored_based_variable_is_at_the_address_its_base_holds():
+    _check(V31_FACTORED_BASED, [5, 6, 1, 7, 2])
+
+
 def test_an_initial_location_names_its_procedures_memory_further_down(capsys):
     """INITIAL in a procedure, which V3.1 rejects (#73) and uplm80 takes
     with a warning, resolves a location as DATA does: the procedure's own

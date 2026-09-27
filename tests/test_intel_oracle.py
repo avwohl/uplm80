@@ -29,7 +29,8 @@ from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, 
 from tests.test_names import PRELUDE as NAMES_PRELUDE
 from tests.test_names import (NO_FIXED_ADDRESS, PAST_THE_SPACE, V31_ALLOWS,
                               V31_BLOCK_LOCATIONS, V31_DECLARED_BUILTINS, V31_DECLS,
-                              V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED, V31_WARNS)
+                              V31_FACTORED_BASED, V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED,
+                              V31_WARNS)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -56,6 +57,7 @@ RELEASE_PROGRAMS = {
     "v31-locations": V31_LOCATIONS,              # 0.4.4, data (.arr(2)), data (.s.k)
     **{f"declared-builtins-{k}": v[0] for k, v in V31_DECLARED_BUILTINS.items()},
     **{f"block-locations-{k}": v[0] for k, v in V31_BLOCK_LOCATIONS.items()},
+    "factored-based": V31_FACTORED_BASED,        # 0.4.4, (a based s.p) byte
 }
 # V3.1's bugs the README's Known differences has and the generator does not
 # leave out: a program, after _PRELUDE; how the README writes it; what
