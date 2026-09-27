@@ -204,13 +204,17 @@ PROCEDURE, besides #32 (SIZE only #32).
   read, by the rule of the entry before (uplm80/flag_flow.py), and each
   reader: not folded, rewritten, unrolled or inlined, and of operands of
   the same kind - `w + one` is `add hl,de`, where `w + 1` is `inc hl` -
-  in the other modules of a multi-file compile too.  Where no reader can
-  read them, the code is as it was: of the 88 compiles of MP/M II's and
-  80un's PL/M, and of `sample_code`, none changes; of the suite's
-  programs, `test_dec_bcd.plm` and `test_byte_shifts.plm`, where
-  `dec(34h + 21h)` is `ld a,34h / add a,21h / daa` at every level.  V3.1
-  folds some of these itself, and differs from every level as from `-O0`
-  (README, Known differences).
+  but for an 8-bit +, -, AND, OR, XOR, PLUS or MINUS of BYTEs, whose flags
+  are the same with a constant for one operand, in the other modules of a
+  multi-file compile too.  The code of the 88 compiles of MP/M II's and
+  80un's PL/M, and of `sample_code`, is the same at every level; of the
+  suite's programs, three that read flags are longer: `test_dec_bcd.plm`
+  at `-O2` and `-O3`, whose `dec(34h + 21h)` is `ld a,34h / add a,21h /
+  daa` at every level, `test_byte_shifts.plm` at `-O2` and `-O3`, and
+  `test_plus_minus.plm` at `-O3`, where constants no longer go into the
+  shifts, sums and PLUS and MINUS the SCL, SCR, PLUS and MINUS after them
+  may read the flags of.  V3.1 folds some of these itself, and differs
+  from every level as from `-O0` (README, Known differences).
 
 - **A test that assigns the variable it bounds no longer bounds it**:
   `k = 1; if k < 4 and (k := 200) > 0 then w = shl(k, 6);` was 3200H and
@@ -270,52 +274,55 @@ PROCEDURE, besides #32 (SIZE only #32).
 
 ### Verified
 
-On 7a063e9, with upeepz80 0.2.7 and um80 0.3.52, against 0.4.3 (4afe3c7).
+On 5ff45b5, with upeepz80 0.2.7 and um80 0.3.52, against 0.4.3 (4afe3c7)
+and c1bc8e9, 0.4.4 before its fourth round of checking.
 
-- The suite: 1963 tests pass, where 0.4.3 had 1462.  Without Intel's
-  binaries 126 of the oracle's tests that need them skip, as does
-  `tests/test_divmod_dri.py`'s check of `PLM80.LIB`'s divide, and 1836
-  pass.  pylint rates the package 9.76 (0.4.3: 9.75), with no message
+- The suite: 2141 tests pass, where 0.4.3 had 1462.  Without Intel's
+  binaries 135 of the oracle's tests that need them skip, as does
+  `tests/test_divmod_dri.py`'s check of `PLM80.LIB`'s divide, and 2005
+  pass.  pylint rates the package 9.77 (0.4.3: 9.75), with no message
   kind 0.4.3 did not have; `fixme` is gone with the TODO over `ld de,0`.
 - `tests/run_tests.sh`: all 22 programs pass.
 - `scripts/difftest.py`, `scripts/abifuzz.py` and `scripts/namestest.py`,
-  200 seeds each (130000-130199, 131000-131199, 132000-132199; and
-  namestest's `--modules`, 40, 132500-132539): every program prints what
+  200 seeds each (160000-160199, 161000-161199, 162000-162199; and
+  namestest's `--modules`, 40, 162500-162539): every program prints what
   the model, its `-O0` build or its scopes say.
-- `scripts/intel_oracle.py --random 300` (seeds 133001-133300), leaving
+- `scripts/intel_oracle.py --random 300` (seeds 163001-163300), leaving
   out `shift9`, `wide-limit`, `sub-zero`, `zero-dividend` and
-  `neg-widened`: 297 programs print at `-O0` to `-O3` what Intel's PL/M-80
-  V3.1 build prints.  The three others are V3.1's `INX SP` bug (README,
-  Known differences), in the pattern of a ROL, which V3.1 makes from a
-  register with `MOV A,L` or `MOV A,C` and `INX SP`: `rol((-(0ffffh)),
-  2)` in a DO's start (seed 133098), `rol((63928 / 61567), (b3 and 7) +
-  1)` in another (seed 133014), and `rol(0100h, 3)` in an argument (seed
-  133218), where SP one off stores over b1.  0.4.3's builds differ from
-  V3.1's the same way.
+  `neg-widened`: 298 programs print at `-O0` to `-O3` what Intel's PL/M-80
+  V3.1 build prints.  The two others are V3.1's (README, Known
+  differences): its `DCX SP` bug in the pattern of a ROL in a DO's start,
+  `rol(65535, 1)` (seed 163195), and its count of the stack gone below
+  zero, a run of `POP PSW`, in `bw = double(((32767 or sa(1).z((shr(255,
+  8)) and 1)) xor (00h and bb)));` (seed 163150); 0.4.3's builds and
+  c1bc8e9's differ from V3.1's the same way.
 - `scripts/intel_oracle.py --corpus --normalize`: of the 67 programs of
   `tests/` and `sample_code/`, 38 print what V3.1's build prints, V3.1
   rejects 28, and `tests/test_move_builtin.plm` differs where V3.1's MOVE
   of 0 bytes moves 65536, as with 0.4.3.
 - The 88 compiles of MP/M II's and 80un's PL/M (0.4.3's 87, and 80un
-  0.3.3's `names.plm`, one at a time): the assembly of those with a
-  widened BYTE or an `ld de,0` dead after it is smaller (Changed), and
-  DP.PLM's at `-O2` and `-O3` spells two instructions otherwise; the rest
-  is 0.4.3's.  The 11 that stop, 0.4.3's ten and `names.plm`, a module
-  of 80un's that names the others', stop with 0.4.3's errors, and every
-  compile gives the messages it gave: no new error and no new warning.
-  The code at `-O2` is 165,092 bytes (0.4.3: 166,091), the data 45,264.
-- `sample_code/` and the programs of `tests/`, 67: the same messages, and
-  18 of them smaller.  The suite's own programs warn of a SHL of a BYTE as
-  0.4.3's did, but in the tests of the new warnings
-  (`tests/test_shl_of_a_byte.py`, and a column in
-  `tests/test_diagnostics.py`).
-- The flags warning, against 0.4.2's builds: of 100 generated programs of
-  12 cases each - a SHL of a BYTE, what may come between, a flag reader -
-  and 90 more with procedures between that set the flags or not, calls
-  through an address and readers in a procedure, built at `-O0` and
-  `-O2`, every case that prints one value with 0.4.2 and another with
-  0.4.4 is warned of, but PARITY after a SHL that loses nothing (the
-  limits, Fixed).
+  0.3.3's `names.plm`, one at a time), at `-O0`, `-O2` and `-O3`: the
+  assembly is c1bc8e9's, byte for byte.  Against 0.4.3's, that of those
+  with a widened BYTE or an `ld de,0` dead after it is smaller (Changed),
+  and DP.PLM's at `-O2` and `-O3` spells two instructions otherwise; the
+  rest is 0.4.3's.  The 11 that stop, 0.4.3's ten and `names.plm`, a
+  module of 80un's that names the others', stop with 0.4.3's errors: no
+  new error.  The warnings are 0.4.3's but for the CARRY of SHOW (DRI's
+  and mpm2's), MSCHD and TOD (Fixed).  The code at `-O2` is 165,092 bytes
+  (0.4.3: 166,091), the data 45,264.
+- `sample_code/` and the programs of `tests/`, 67, against c1bc8e9: the
+  same messages but the six warnings of `tests/test_byte_shifts.plm`
+  (Fixed); the same code at `-O0`, and at `-O2` and `-O3` but for the
+  three programs that read flags the entry before names.
+- The flags warning and every level's flags: of 200 generated programs of
+  12 cases each (seeds 164000-164199; and 120 more, 150000-150119, before
+  the last change to the optimizer) - a SHL or SHR of a BYTE, what may come
+  between, calls through an address and readers in a procedure among it,
+  and a flag reader - built at `-O0` to `-O3`, every case that prints one
+  value with 0.4.2's `-O0` build and another with 0.4.4's is warned of, of
+  its value or at its reader, and every level prints what `-O0` prints.
+  c1bc8e9's builds of 6 of the first 12 have unwarned differences, or
+  levels that differ.
 - 80un's two programs, built from 80un 0.3.3 at `-O0`, `-O2` and `-O3`,
   extract the 130 files of 80un's 21 test archives and compressed files,
   detokenize `PALLOPS.BAS` and MBASIC 5.21's tokenized copies of its four
