@@ -821,7 +821,7 @@ def test_an_expression_in_data_fills_one_scalar_at_its_width(opt):
     after it; a unary minus was not accepted at all, and UTIL4/SET.PLM did
     not compile at -O0.  A folded -1 in a BYTE is 0FFH, not `db 0FFFFH'.
     (NOT and AND, and a location in a BYTE, which this had too, are Intel's
-    PL/M-80 V3.1's errors there, and uplm80's since 0.4.3:
+    PL/M-80 V3.1's errors there, and uplm80's since 0.4.4:
     tests/test_names.py.)"""
     asm = _asm("""
 t: do;
@@ -856,7 +856,7 @@ def test_a_constant_list_in_a_data_list_is_v31s_error(opt, decl):
     """PL/M-80 manual, 4.1.3: `.(constant, ...)' is the location of the
     constants, stored somewhere, in an expression.  In a DATA or INITIAL
     list Intel's PL/M-80 V3.1 takes none (ERROR #147, MISSING IDENTIFIER
-    FOLLOWING DOT OPERATOR), nor `.'text'', and since 0.4.3 uplm80 takes
+    FOLLOWING DOT OPERATOR), nor `.'text'', and since 0.4.4 uplm80 takes
     none either; it took each for one ADDRESS in the list (bd85e55), and
     no program of MP/M II, 80un or sample_code has one."""
     src = f"t: do;\ndeclare {decl};\ndeclare after byte data (0EEH);\nend t;\n"

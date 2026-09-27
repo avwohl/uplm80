@@ -388,7 +388,7 @@ def _compile_time_cases(tables, decls, body, check, expect) -> None:
 
     # A DATA or INITIAL value divides nothing: of the operators a restricted
     # expression takes + and - only, as Intel's PL/M-80 V3.1 has it (ERROR
-    # #152), and uplm80 since 0.4.3 (tests/test_names.py).
+    # #152), and uplm80 since 0.4.4 (tests/test_names.py).
 
 
 @pytest.mark.parametrize("opt", [0, 1, 2, 3])

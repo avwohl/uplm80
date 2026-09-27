@@ -1156,9 +1156,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         in the space its declaration has is #209, ILLEGAL INITIALIZATION OF
         MORE SPACE THAN DECLARED, and V3.1 does not check it further - a
         list uplm80 lays out after the declaration where nothing else in
-        it is wrong (0.4.3's Known issues): `declare b (2) byte data (1, 2,
-        x)' is #151 and #209, `declare b (3) byte data (x, 300, 7)' #151 and
-        #210, `declare b byte data (1, 300)' #209 alone."""
+        it is wrong (0.4.3's and 0.4.4's Known issues): `declare b (2)
+        byte data (1, 2, x)' is #151 and #209, `declare b (3) byte data (x,
+        300, 7)' #151 and #210, `declare b byte data (1, 300)' #209
+        alone."""
         every: list = []
         errors: set[int] = set()
         for v in values:
@@ -1485,7 +1486,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         if r.dot and _key(getattr(r.node, r.attr)) != "MEMORY" and r.in_list:
             # Intel's PL/M-80 V3.1 takes it there, for an address of its own
             # (057CH, 0103H in the programs checked), which uplm80 has no
-            # counterpart of (0.4.3's Known issues).
+            # counterpart of (0.4.4's Known issues).
             raise CodeGenError(
                 f".{text}: {text} is a built-in, and of the built-ins only MEMORY has an "
                 f"address; uplm80 has none to give {text} in a DATA or INITIAL list, where "
@@ -1742,12 +1743,12 @@ def _value_slots(item) -> tuple[dict[int, str], set[int]]:
     """What each value of the DATA or INITIAL list of ``item`` fills, by
     id - "byte", "word", or "past" the space the declaration has - and the
     values that do not fit in it, which Intel's PL/M-80 V3.1 rejects (ERROR
-    209) and uplm80 lays out after it (0.4.3's Known issues).  Each value
-    fills the next of the scalars declared, in order: of a BYTE every one,
-    of an ADDRESS none, of a STRUCTURE those that fill its BYTE members; a
-    string fills one scalar to a character, or to two of an ADDRESS.  An
-    untyped DATA, or an array of (*), is as long as its list, as uplm80
-    takes it (_dimension)."""
+    209) and uplm80 lays out after it (0.4.3's and 0.4.4's Known issues).
+    Each value fills the next of the scalars declared, in order: of a BYTE
+    every one, of an ADDRESS none, of a STRUCTURE those that fill its BYTE
+    members; a string fills one scalar to a character, or to two of an
+    ADDRESS.  An untyped DATA, or an array of (*), is as long as its list,
+    as uplm80 takes it (_dimension)."""
     attrs = decl_attrs(item)
     values = attrs.data_values or attrs.initial_values or []
     members = decl_item_struct_members(item)

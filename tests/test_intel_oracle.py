@@ -52,8 +52,8 @@ RELEASE_PROGRAMS = {
     "end-labels": END_LABELS,                    # 0.4.2, out: end p;
     "byte-shifts": BYTE_SHIFTS,                  # 0.4.3, shl(b, 4) of a BYTE
     "v31-allows": V31_ALLOWS,                    # 0.4.3, size(ab(b + 1)), forward REENTRANT
-    "v31-restricted": V31_RESTRICTED,            # 0.4.3, data (.memory), .(1 + 2)
-    "v31-locations": V31_LOCATIONS,              # 0.4.3, data (.arr(2)), data (.s.k)
+    "v31-restricted": V31_RESTRICTED,            # 0.4.4, data (.memory), .(1 + 2)
+    "v31-locations": V31_LOCATIONS,              # 0.4.4, data (.arr(2)), data (.s.k)
     **{f"declared-builtins-{k}": v[0] for k, v in V31_DECLARED_BUILTINS.items()},
     **{f"block-locations-{k}": v[0] for k, v in V31_BLOCK_LOCATIONS.items()},
 }
@@ -113,9 +113,9 @@ def test_v31_rejects_what_uplm80_rejects_or_warns_of(tools, name):
 
 @pytest.mark.parametrize("name", sorted(PAST_THE_SPACE))
 def test_v31_gives_209_alone_past_a_declarations_space(tools, name):
-    """0.4.3's Known issues: V3.1 rejects more values than a declaration
-    holds (#209), and a number past its space it does not hold to a byte
-    (no #210); uplm80 lays the values out after it."""
+    """0.4.3's and 0.4.4's Known issues: V3.1 rejects more values than a
+    declaration holds (#209), and a number past its space it does not
+    hold to a byte (no #210); uplm80 lays the values out after it."""
     text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + PAST_THE_SPACE[name] + "end t;\n")
     res = oracle.check_text(tools, text, name, levels=(0,))
     assert res.verdict == "intel-rejects", oracle.format_result(res)
@@ -126,7 +126,7 @@ def test_v31_gives_209_alone_past_a_declarations_space(tools, name):
 
 @pytest.mark.parametrize("name", ["stackptr", "shl", "double"])
 def test_v31_takes_the_location_of_a_built_in_in_a_list(tools, name):
-    """0.4.3's Known issues: V3.1 takes `data (.stackptr)' for an address
+    """0.4.4's Known issues: V3.1 takes `data (.stackptr)' for an address
     of its own, which uplm80 has none to give, and refuses."""
     text = _PRELUDE + f"declare d address data (.{name});\ncall ph(d);\nend t;\n"
     res = oracle.check_text(tools, text, name, levels=(0,))

@@ -2072,9 +2072,9 @@ PAST_THE_SPACE = {
 
 @pytest.mark.parametrize("name", sorted(PAST_THE_SPACE))
 def test_a_value_past_a_declarations_space_is_not_held_to_a_byte(name):
-    """uplm80 lays such a value out after the declaration, as 0.4.3's
-    Known issues have it (#209); the message said V3.1 rejects it for a
-    BYTE's value over 255 (#210), which V3.1 does not give there."""
+    """uplm80 lays such a value out after the declaration, as 0.4.3's and
+    0.4.4's Known issues have it (#209); the message said V3.1 rejects it
+    for a BYTE's value over 255 (#210), which V3.1 does not give there."""
     r = _compile(PRELUDE + V31_DECLS + PAST_THE_SPACE[name] + "end t;\n", 0)
     assert r.returncode == 0, r.stderr
     assert "#210" not in r.stderr, r.stderr
