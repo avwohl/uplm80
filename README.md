@@ -691,11 +691,12 @@ call of a procedure declared further on (169) (since 0.4.3); and more than
 one subscript (114), a subscript on a scalar member (127) or after a
 subscript (32), a second port of INPUT or OUTPUT (108), a CALL through
 what is not an ADDRESS scalar (118) or of a built-in with a type, `CALL
-STACKPTR` (129), MEMORY without a subscript (133), a non-REENTRANT
-procedure's call of itself (170), a procedure nested in a REENTRANT one
-or a REENTRANT one nested in another (88, 39), and an `END` that names
-the first of two labels on a DO, `a: c: do; ... end a;` (20) (since
-0.4.4).
+STACKPTR` (129), a built-in with too few or too many arguments (154,
+153, 124, 126) and INPUT or OUTPUT without a port (109), MEMORY without
+a subscript (133), a non-REENTRANT procedure's call of itself (170), a
+procedure nested in a REENTRANT one or a REENTRANT one nested in another
+(88, 39), and an `END` that names the first of two labels on a DO, `a:
+c: do; ... end a;` (20) (since 0.4.4).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),

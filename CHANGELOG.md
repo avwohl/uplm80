@@ -9,7 +9,8 @@ What 0.4.3's final release check found and left for a later release, and
 what 0.4.3's Known issues listed as compiled without a word: more of the
 errors Intel's PL/M-80 V3.1 gives, V3.1's numbers and texts, at every
 level - more than one subscript, a CALL through what is not an ADDRESS
-scalar or of a built-in with a type, MEMORY without a subscript, a procedure that calls itself, a
+scalar or of a built-in with a type, a built-in with too few or too many
+arguments, MEMORY without a subscript, a procedure that calls itself, a
 REENTRANT procedure where V3.1 refuses one.  The SHL of a BYTE warning
 follows the flags, and what it does not see is stated.  Smaller code
 after an 8-bit operation, and the columns after a LITERALLY's text are
@@ -69,19 +70,28 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   structures, BASED or not, named without a subscript, `call sa.g`, which
   calls through `sa(0).g`: V3.1 takes it in a CALL, and rejects it in an
   expression (ERROR #133, of which uplm80 warns: 0.4.3).
-- **A CALL of a built-in with a type** (ERROR #129, ILLEGAL 'CALL' WITH
-  TYPED PROCEDURE, and #32 where parentheses follow): `call stackptr`,
-  which uplm80 compiled to a call through the value of SP, `call carry`,
-  to a call of an undefined CARRY, and `call rol(b, 1)` and the like, to
-  the built-in's value, unused.  A CALL of a typed procedure the program
-  declares is still taken (README).
-
       CALL AA(1): AA is an array, and a CALL calls a procedure, or
       through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1);
       Intel's PL/M-80 V3.1 rejects it (ERROR #118, INVALID INDIRECT CALL,
       IDENTIFIER NOT AN ADDRESS SCALAR, and #32, INVALID SYNTAX, TEXT
       IGNORED UNTIL ';')
 
+- **A CALL of a built-in with a type** (ERROR #129, ILLEGAL 'CALL' WITH
+  TYPED PROCEDURE, and #32 where parentheses follow): `call stackptr`,
+  which uplm80 compiled to a call through the value of SP, `call carry`,
+  to a call of an undefined CARRY, and `call rol(b, 1)` and the like, to
+  the built-in's value, unused.  A CALL of a typed procedure the program
+  declares is still taken (README).
+- **A built-in with too few or too many arguments** (ERROR #154, INVALID
+  NUMBER OF ARGUMENTS IN CALL, TOO FEW, and #153, TOO MANY): `call time;`,
+  `call move(1, .b);`, `b = rol(b);` and `w = stackptr(1);`, which stopped
+  uplm80 with a traceback, and `b = high;`, `b = low(b, 1)`, `b =
+  carry(1)` and `call time(1, 2)`, which it compiled (found checking
+  0.4.4; 0.4.3 the same); LENGTH, LAST or SIZE with no argument or more
+  than one (#124, MISSING ARGUMENTS FOR BUILT-IN PROCEDURE; #126, MISSING
+  ')' AFTER BUILT-IN PROCEDURE ARGUMENT LIST); and INPUT or OUTPUT without
+  a port, `b = input;` and `output = b;` (#109, MISSING INPUT/OUTPUT PORT
+  NUMBER).
 - **MEMORY without a subscript**, `b = memory`, `memory = b`, `w = memory
   + 1` (ERROR #133, ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY), which
   uplm80 took for `memory(0)`; `.memory` and LENGTH, LAST and SIZE of it

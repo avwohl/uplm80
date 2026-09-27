@@ -1392,6 +1392,41 @@ V31_REJECTS = {
     "call-of-carry": ("call carry;\n", (129,), "error: CALL CARRY: CARRY is a built-in with"),
     "call-of-a-typed-built-in": ("call rol(b, 1);\n", (129, 32),
                                  "error: CALL ROL(B, 1): ROL is a built-in with a type"),
+    # A built-in with too few or too many arguments, which uplm80 stopped
+    # on with a traceback, `call time;', `call move(1, 2);', `b = rol(b);',
+    # `w = stackptr(1);', or compiled (found checking 0.4.4).
+    "time-without-an-argument": ("call time;\n", (154,),
+                                 "T.PLM:8:6: error: TIME: TIME takes one argument; Intel's PL/M-80 "
+                                 "V3.1 rejects it (ERROR #154, INVALID NUMBER OF ARGUMENTS IN "
+                                 "CALL, TOO FEW)"),
+    "move-with-two-arguments": ("call move(1, .b);\n", (154,),
+                                "error: MOVE(1, .B): MOVE takes three arguments"),
+    "rol-with-one-argument": ("b = rol(b);\n", (154,), "error: ROL(B): ROL takes two arguments"),
+    "high-without-an-argument": ("b = high;\n", (154,), "error: HIGH: HIGH takes one argument"),
+    "time-with-two-arguments": ("call time(1, 2);\n", (153,),
+                                "T.PLM:8:6: error: TIME(1, 2): TIME takes one argument; Intel's "
+                                "PL/M-80 V3.1 rejects it (ERROR #153, INVALID NUMBER OF ARGUMENTS "
+                                "IN CALL, TOO MANY)"),
+    "low-with-two-arguments": ("b = low(b, 1);\n", (153,),
+                               "error: LOW(B, 1): LOW takes one argument"),
+    "carry-with-an-argument": ("b = carry(1);\n", (153,),
+                               "error: CARRY(1): CARRY takes no argument"),
+    "stackptr-with-an-argument": ("w = stackptr(1);\n", (153,),
+                                  "error: STACKPTR(1): STACKPTR takes no argument"),
+    "length-without-an-argument": ("w = length;\n", (124,),
+                                   "T.PLM:8:5: error: LENGTH: LENGTH takes one argument, a "
+                                   "variable; Intel's PL/M-80 V3.1 rejects it (ERROR #124, MISSING "
+                                   "ARGUMENTS FOR BUILT-IN PROCEDURE)"),
+    "length-with-two-arguments": ("declare a(3) byte;\nw = length(a, 1);\n", (126,),
+                                  "error: LENGTH(A, 1): LENGTH takes one argument, a variable; "
+                                  "Intel's PL/M-80 V3.1 rejects it (ERROR #126, MISSING ')' AFTER "
+                                  "BUILT-IN PROCEDURE ARGUMENT LIST)"),
+    "input-without-a-port": ("b = input;\n", (109,),
+                             "T.PLM:8:5: error: INPUT: INPUT takes a port number, in parentheses; "
+                             "Intel's PL/M-80 V3.1 rejects it (ERROR #109, MISSING INPUT/OUTPUT "
+                             "PORT NUMBER)"),
+    "output-without-a-port": ("output = b;\n", (109,),
+                              "error: OUTPUT: OUTPUT takes a port number, in parentheses"),
     "call-through-memory": ("call memory(1);\n", (118, 32),
                             "error: CALL MEMORY(1): MEMORY is an array"),
     # 0.4.3's Known issues: MEMORY without a subscript, a procedure that

@@ -188,6 +188,13 @@ _BUILTINS = frozenset(
 _TYPED_BUILTINS = frozenset(
     {"INPUT", "LOW", "HIGH", "DOUBLE", "LENGTH", "LAST", "SIZE", "SHL", "SHR", "ROL", "ROR",
      "SCL", "SCR", "CARRY", "SIGN", "ZERO", "PARITY", "DEC", "STACKPTR"})
+# How many arguments each built-in procedure takes (Intel's PL/M-80 V3.1:
+# ERROR 154, INVALID NUMBER OF ARGUMENTS IN CALL, TOO FEW, and 153, TOO
+# MANY); LENGTH, LAST and SIZE take a variable, and INPUT and OUTPUT a port.
+_BUILTIN_ARGS = {"CARRY": 0, "ZERO": 0, "SIGN": 0, "PARITY": 0, "STACKPTR": 0, "LOW": 1,
+                 "HIGH": 1, "DOUBLE": 1, "DEC": 1, "TIME": 1, "ROL": 2, "ROR": 2, "SHL": 2,
+                 "SHR": 2, "SCL": 2, "SCR": 2, "MOVE": 3}
+_HOW_MANY = ("no argument", "one argument", "two arguments", "three arguments")
 
 _DO_BLOCKS = (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock)
 
@@ -559,13 +566,18 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         88: "INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE",
         104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
         108: "MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER",
+        109: "MISSING INPUT/OUTPUT PORT NUMBER",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
         118: "INVALID INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR",
+        124: "MISSING ARGUMENTS FOR BUILT-IN PROCEDURE",
         125: "ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE",
+        126: "MISSING ')' AFTER BUILT-IN PROCEDURE ARGUMENT LIST",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
         129: "ILLEGAL 'CALL' WITH TYPED PROCEDURE",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
+        153: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO MANY",
+        154: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO FEW",
         169: "ILLEGAL FORWARD CALL",
         170: "ILLEGAL RECURSIVE CALL",
         174: "INVALID NULL PROCEDURE",
@@ -1051,6 +1063,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             self.intel(r.node, f"{text}: MEMORY is an array, and an array is named without a "
                        "subscript only as the operand of a dot or the argument of LENGTH, "
                        "LAST or SIZE (Programming Manual 9800268B, 3.6.2)", 133)
+        if not r.dot:
+            self._check_builtin_args(r, name, text)
         if r.args is None:
             return
         what = expr_text(r.call)
@@ -1059,6 +1073,26 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                        "subscript", 114)
         elif name in ("INPUT", "OUTPUT") and r.args > 1:
             self.intel(r.node, f"{what}: {text} takes one port number", 108)
+
+    def _check_builtin_args(self, r: _Ref, name: str, text: str) -> None:
+        """A built-in procedure with as many arguments as it takes, LENGTH,
+        LAST and SIZE with a variable, INPUT and OUTPUT with a port; where
+        uplm80 stopped with a traceback, `call time;', `b = rol(b);', or
+        compiled what it did not take.  Intel's PL/M-80 V3.1: ERROR 154,
+        INVALID NUMBER OF ARGUMENTS IN CALL, TOO FEW, and 153, TOO MANY;
+        124, MISSING ARGUMENTS FOR BUILT-IN PROCEDURE, and 126, MISSING ')'
+        AFTER BUILT-IN PROCEDURE ARGUMENT LIST; 109, MISSING INPUT/OUTPUT
+        PORT NUMBER."""
+        n = r.args or 0
+        what = expr_text(r.call) if r.call is not None else text
+        if name in _BUILTIN_ARGS and n != _BUILTIN_ARGS[name]:
+            self.intel(r.node, f"{what}: {text} takes {_HOW_MANY[_BUILTIN_ARGS[name]]}",
+                       154 if n < _BUILTIN_ARGS[name] else 153)
+        elif name in ("LENGTH", "LAST", "SIZE") and n != 1:
+            self.intel(r.node, f"{what}: {text} takes one argument, a variable",
+                       124 if n == 0 else 126)
+        elif name in ("INPUT", "OUTPUT") and r.args is None:
+            self.intel(r.node, f"{text}: {text} takes a port number, in parentheses", 109)
 
     def _check_called(self, r: _Ref, d: _Decl, text: str) -> None:
         """What a CALL statement calls through: an ADDRESS scalar, not an
