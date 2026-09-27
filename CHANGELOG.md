@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## 0.4.4 — unreleased
+## 0.4.4 — 2026-09-27
 
 What 0.4.3's final release check found and left for a later release, what
 0.4.3's Known issues listed as compiled without a word, and what checking
@@ -715,6 +715,22 @@ a later release (0.4.3 the same):
   shift; and after some comparisons and IF tests, a MOVE, TIME, a DO
   CASE's dispatch, subscript arithmetic, `x * 0`, `x / 1` and NOT of a
   comparison the flags are other ones too (README, Known differences).
+- Found by 0.4.4's release check: some programs V3.1 rejects on two
+  counts get a message that names fewer of V3.1's errors, or another one:
+  `declare lb label; w = .lb;` names #158 (V3.1: #105, #158, #172);
+  `lb: b = 1; w = .lb(1);` #158 (V3.1 adds #127); a typed procedure that
+  assigns to its own name, `h = 1`, #128 (V3.1 adds #170); `data (.a((1),
+  2))` #150 and #151 (V3.1 adds #209); `at (.stackptr(1, 2))` #211 (V3.1:
+  #150, #211) and `at (.input(1, 2))` #211 (V3.1: #149, #150, #211); an
+  empty procedure two levels inside a REENTRANT one, #88 (V3.1 adds #174),
+  and of errors in two procedures, only the first's; a BASED variable on a
+  base V3.1 refuses, named in an AT, #212 (V3.1: #50 only), and a list's
+  #209, #210 or #211 without the base's #50, #52, #54 or #55, or without
+  #105 and #172 of a LABEL that labels nothing. Each program is refused.
+- `data (.stackptr(1, 2))` and `data (.input(1, 2))` are refused in
+  uplm80's own words, whose message says V3.1 takes `.STACKPTR` (`.INPUT`)
+  for an address of its own; V3.1 does of `.stackptr`, but rejects these
+  subscripted forms (#150; #149 and #150).
 
 ### Verified
 
@@ -722,7 +738,48 @@ a later release (0.4.3 the same):
 own: fix/0.4.4 - more of V3.1's errors (the first Incompatible section),
 the flags, the smaller code and the LITERALLY columns - on 5ff45b5, and
 fix/datafold - restricted expressions, bases and labels - on 91c282a, as
-below.  The merge of the two is verified by the release check to follow.
+below; and then merged (ceb649e), and the merge checked as one release,
+on 5afe194, by a release check whose second round found nothing to hold
+it (the first found a store at `-O3` whose flags a reader read dropped as
+dead, and 0.4.3's section of this file edited; 61d49cd and 6b5d9bf):
+
+- The suite: 3411 tests pass with Intel's binaries, 3 skipping; without
+  them 3074 pass and 340 skip. pylint 9.78, with no message kind 0.4.3
+  did not have. `tests/run_tests.sh`: 22 of 22.
+- `scripts/difftest.py` and `scripts/abifuzz.py`, 300 seeds each,
+  `scripts/namestest.py` 200 and 40 `--modules`, and the storage fuzzer
+  200: none fails.
+- The flags: structural fuzzers of a shift of a BYTE and a reader, 4500
+  cases and 200 programs at `-O0` to `-O3`, and 600 programs aimed at the
+  `-O1` to `-O3` transforms: no program prints another value at another
+  level, and none a value other than 0.4.2's without a warning. 190
+  programs of a shift and a reader against V3.1: 169 print V3.1's values;
+  the 21 others are a SHL by 6 or 7, or a SHR, of a BYTE read by ZERO,
+  SIGN or PARITY, which V3.1 codes with `ANI` and `RAR` (Known issues).
+- Restricted expressions, names in lists, bases and labels: the 4869
+  programs of the fix/datafold matrix, 2783 earlier probes and 900 new
+  ones, at `-O0` to `-O3`: the same at every level, no um80 failure and no
+  wrong value; each either prints V3.1's value, is refused with V3.1's
+  errors, or is one of the Known issues.
+- `scripts/intel_oracle.py --random 600` (seeds 305001-305600, the
+  documented quirks left out): 593 print what V3.1's build prints; the
+  7 others are V3.1's `INX SP`/`DCX SP` bug (6) and its multiple
+  assignment of an embedded target. `--random 100` with nothing left
+  out: every difference is a documented one. `--corpus --normalize`: 38
+  the same, 28 rejected by V3.1, `test_move_builtin.plm` as before.
+- The 88 compiles of MP/M II's and 80un's PL/M at `-O0`, `-O2` and `-O3`:
+  against 0.4.3, 39 files at `-O0` lose the dead `ld l,a / ld h,0` and
+  `ld de,0` (Changed), and at `-O2` and `-O3` those and what the peephole
+  optimizer then makes of them, and nothing else; the code at `-O2` is
+  165,092 bytes, the data 45,264; the same 11 stop, with the same errors.
+  The only new warnings are the flags warnings at SHOW (DRI's and
+  mpm2's), MSCHD and TOD, each a CARRY read after `b = shl(b, 3) + shl(b,
+  1)`, which from b = 26 is 1 under V3.1 and 0.4.4 and 2 under 0.4.2.
+- 80un 0.3.3 built at `-O0`, `-O2` and `-O3` writes all 205 files of its
+  tests byte for byte as 0.4.3's build does. MP/M II V2.0 and V2.1 built
+  from source with 0.4.3 and with 0.4.4 (`tools/build.py`, `build_all.sh
+  --tree=src`), `run_tests.sh all` and `src` passing with the same results
+  under both, and `verify_dri.py` the same.
 
 #### fix/0.4.4
 
