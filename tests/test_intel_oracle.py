@@ -27,8 +27,9 @@ from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
-from tests.test_names import (V31_ALLOWS, V31_BLOCK_LOCATIONS, V31_DECLARED_BUILTINS, V31_DECLS,
-                              V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED, V31_WARNS)
+from tests.test_names import (PAST_THE_SPACE, V31_ALLOWS, V31_BLOCK_LOCATIONS,
+                              V31_DECLARED_BUILTINS, V31_DECLS, V31_LOCATIONS, V31_REJECTS,
+                              V31_RESTRICTED, V31_WARNS)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -108,6 +109,19 @@ def test_v31_rejects_what_uplm80_rejects_or_warns_of(tools, name):
     given = {int(n) for e in res.intel_errors for n in re.findall(r"ERROR #(\d+),", e)}
     assert given == set(errors), res.intel_errors
     assert ("uplm80 rejects it too" in res.detail) == (name in V31_REJECTS), res.detail
+
+
+@pytest.mark.parametrize("name", sorted(PAST_THE_SPACE))
+def test_v31_gives_209_alone_past_a_declarations_space(tools, name):
+    """0.4.3's Known issues: V3.1 rejects more values than a declaration
+    holds (#209), and a number past its space it does not hold to a byte
+    (no #210); uplm80 lays the values out after it."""
+    text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + PAST_THE_SPACE[name] + "end t;\n")
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "intel-rejects", oracle.format_result(res)
+    given = {int(n) for e in res.intel_errors for n in re.findall(r"ERROR #(\d+),", e)}
+    assert given == {209}, res.intel_errors
+    assert "uplm80 rejects it too" not in res.detail, res.detail
 
 
 @pytest.mark.parametrize("name", ["stackptr", "shl", "double"])

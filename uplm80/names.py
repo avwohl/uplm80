@@ -299,11 +299,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.used: set[str] = set()     # every name a declaration has
         self._lists = 0                 # DATA and INITIAL lists being visited
         self._at = 0                    # AT clauses being visited
-        # The restricted expressions (check_restricted): (where, value,
-        # its index in its list, how many the list has), where is "list"
-        # (a DATA or INITIAL list), "at" or "consts" (a constant list).
+        # The restricted expressions (check_restricted): ("list", the
+        # values of a DATA or INITIAL list), ("at", an AT address) or
+        # ("consts", a constant list).
         self.restricted: list[tuple] = []
-        self._byte_values: set[int] = set()     # the values in them that fill a BYTE, by id
+        # What each DATA or INITIAL value fills, by id: "byte", "word", or
+        # "past" the space its declaration has; and the values that do not
+        # fit in it (_value_slots).
+        self._slots: dict[int, str] = {}
+        self._past: set[int] = set()
         # Structure members used, as (member access, block, the reference's
         # _Ref-like flags): dot, the LENGTH/LAST/SIZE call, subscripted.
         self.member_uses: list[tuple] = []
@@ -447,13 +451,12 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             # `.a', `.a(i)', `.output(3)', `.s.m': the dot is the reference's.
             self._reference(unwrap_paren(n.operand), block, dot=True)
         elif isinstance(n, P.AttrAt):
-            self.restricted.append(("at", n.address, 0, 1))
+            self.restricted.append(("at", n.address))
             self._at += 1
             self._visit(n.address, block)
             self._at -= 1
         elif isinstance(n, P.LocationOfList):
-            values = list(n.values or [])
-            self.restricted.extend(("consts", v, i, len(values)) for i, v in enumerate(values))
+            self.restricted.append(("consts", n))
             self._visit(n.values, block)
         elif isinstance(n, P.AttrInitial) or hasattr(n, "data_values"):
             # A DATA or an INITIAL list, where the address of a label may be.
@@ -462,9 +465,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     continue
                 inside = f in ("values", "data_values")
                 if inside:
-                    values = list(getattr(n, f) or [])
-                    self.restricted.extend(("list", v, i, len(values))
-                                           for i, v in enumerate(values))
+                    self.restricted.append(("list", list(getattr(n, f) or [])))
                 self._lists += inside
                 self._visit(getattr(n, f), block)
                 self._lists -= inside
@@ -661,7 +662,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                           dim=_dimension(item), members=_members(item), item=item)
         if item.based is not None:
             self._visit(item.based.base, block)
-        self._byte_values.update(_byte_values(item))
+        slots, past = _value_slots(item)
+        self._slots.update(slots)
+        self._past |= past
         self._visit([item.array_size, item.tail], block)
 
     @staticmethod
@@ -1051,29 +1054,28 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
     # of a location in one of them - does not take, and the errors Intel's
     # PL/M-80 V3.1 gives for it there, in the order of _CONTEXTS (each form
     # checked with scripts/intel_oracle.py, in each place and first, second
-    # and alone in a constant list):
+    # and alone in a constant list); what V3.1 gives of the list it is in,
+    # #209, #210, #32 and #172, _check_value_list and _check_constant_list
+    # add:
     _RESTRICTED = {
         "operator": ((152,), (146,), (152,), (150,)),           # 2 * 3, 1 < 2
         "not": ((151, 152), (146, 151), (151, 152), (150, 151)),
-        "paren": ((151, 152), (146, 151), (32, 151, 152), (150, 151)),     # (1), -(1)
-        "call": ((151, 152), (146, 151), (32, 151, 152), (150, 151)),      # a(1), shl(1, 2)
+        "paren": ((151, 152), (146, 151), (151, 152), (150, 151)),         # (1), -(1)
+        "call": ((151, 152), (146, 151), (151, 152), (150, 151)),          # a(1), shl(1, 2)
         "member": ((151, 152), (146, 151), (151, 152), (150, 151)),        # s.k
         "string": ((151, 152), (146, 151), (151, 152), (150, 151)),        # 1 + 'A'
         "string-first": ((152,), (146, 151), (152,), (150, 151)),          # 'A' + 1
         "location": ((151, 152), (146, 151), (151, 152), (150, 151)),      # 1 + .a, -.a
         "name": ((151,), (151,), (151,), (151,)),                          # x, memory
         "negation": ((151,), (151,), (151,), (151,)),                      # - -1
-        "constants": ((147,), (147,), (32, 147), (147,)),                  # .(5)
+        "constants": ((147,), (147,), (147,), (147,)),                     # .(5)
         "text": ((147,), (147,), (147,), (147,)),                          # .'AB'
         "at-builtin": ((), (211,), (), ()),                                # at (.stackptr)
         "constant-location": ((), (), (), ()),                             # .(.a)
-        "byte-location": ((), (), (), ()),                                 # byte data (.a)
-        "range": ((210,), (), (210,), ()),                                 # .(300)
     }
     _CONTEXTS = ("list", "at", "consts", "subscript")
     # What V3.1 reads past, going on to the rest of the value.
-    _READ_PAST = frozenset({"name", "negation", "range", "constant-location", "byte-location",
-                            "at-builtin"})
+    _READ_PAST = frozenset({"name", "negation", "constant-location", "at-builtin"})
     # The order V3.1 lists its errors in.
     _V31_ORDER = (151, 152, 146, 150, 147, 32, 210, 209, 211, 172)
     _RULES = {
@@ -1101,19 +1103,142 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         that fills a BYTE, a location or what a byte does not hold,
         `.(300)', `byte data (300)'.  uplm80 took most of them, for
         the address of a name, the low byte of a number, or, at -O1 and
-        up, a built-in folded (0.4.3's Known issues).  A name the program
-        does not declare is left to check_uses."""
+        up, a built-in folded (0.4.3's Known issues).  The message names
+        every error V3.1 gives for the list the value is in, as V3.1 reads
+        it (:meth:`_check_value_list`, :meth:`_check_constant_list`).  A
+        name the program does not declare is left to check_uses."""
         refs = {id(r.node): r for r in self.refs if r.attr == "name" and not r.goto}
-        for where, expr, index, count in self.restricted:
-            faults: list = []
-            self._restricted(expr, where, "top", refs, faults)
-            byte = where == "consts" or id(expr) in self._byte_values
-            if byte and not faults:
-                self._restricted_range(expr, where, faults)
-            if byte and not faults and where == "list" and isinstance(_lead(expr), P.LocationOf):
-                faults.append(("byte-location", expr, where))
-            if faults:
-                self._restricted_error(faults, where, expr, (index, count, byte), refs)
+        for where, node in self.restricted:
+            if where == "consts":
+                self._check_constant_list(node, refs)
+            elif where == "list":
+                self._check_value_list(node, refs)
+            else:
+                faults, numbers, _ = self._walk(node, "at", refs)
+                if faults:
+                    self._restricted_error(faults, "at", numbers, refs)
+
+    def _walk(self, expr, where: str, refs: dict) -> tuple[list, set[int], object]:
+        """The faults of the restricted expression ``expr`` in ``where``
+        (:meth:`_restricted`), the errors V3.1 gives for them - those of
+        each fault it reads, up to the first it does not read past - and
+        the node it stops at there, None where it reads all of ``expr``."""
+        faults: list = []
+        self._restricted(expr, where, "top", refs, faults)
+        numbers: set[int] = set()
+        for kind, node, ctx in faults:
+            numbers.update(self._RESTRICTED[kind][self._CONTEXTS.index(ctx)])
+            if kind not in self._READ_PAST:
+                return faults, numbers, node
+        return faults, numbers, None
+
+    def _check_value_list(self, values: list, refs: dict) -> None:
+        """A DATA or INITIAL list, the errors of its values together, as
+        Intel's PL/M-80 V3.1 reads them, up to the first it does not read
+        to the end (:meth:`_walk`).  A value that fills a BYTE is #210 if
+        it is more than 255 (:func:`_over_a_byte`); one that does not fit
+        in the space its declaration has is #209, ILLEGAL INITIALIZATION OF
+        MORE SPACE THAN DECLARED, and V3.1 does not check it further - a
+        list uplm80 lays out after the declaration where nothing else in
+        it is wrong (0.4.3's Known issues): `declare b (2) byte data (1, 2,
+        x)' is #151 and #209, `declare b (3) byte data (x, 300, 7)' #151 and
+        #210, `declare b byte data (1, 300)' #209 alone."""
+        every: list = []
+        errors: set[int] = set()
+        for v in values:
+            faults, numbers, stop = self._walk(v, "list", refs)
+            errors |= numbers
+            if self._slots.get(id(v)) == "byte" and _over_a_byte(v, stop):
+                errors.add(210)
+                if not faults:
+                    faults = [("byte-location" if isinstance(_lead(v), P.LocationOf)
+                               else "range", v, "list")]
+            if id(v) in self._past:
+                errors.add(209)
+            every.extend(faults)
+            if stop is not None:
+                break
+        if every:
+            self._restricted_error(every, "list", errors, refs)
+
+    # What makes a value of a constant list a word to V3.1: a name, or a
+    # location first.
+    _WORDS = frozenset({"name", "call", "member", "constant-location"})
+
+    def _check_constant_list(self, node, refs: dict) -> None:
+        """A constant list, `.(1, 'a')', which Intel's PL/M-80 V3.1 lays
+        out as it lays out an untyped DATA list: the errors of its values
+        and of the list together, as V3.1 gives them (each rule checked
+        with scripts/intel_oracle.py).  V3.1 reads the values up to the
+        first it does not read to the end (:meth:`_walk`), and from there
+        looks for the list's `)': a `(' on the way is #32, INVALID SYNTAX,
+        TEXT IGNORED UNTIL ';', `.((1), 7)', `.(-.a, (1))'.  A value with a
+        name in it, or a location first, is a word to it, and a string, or
+        a value that starts with one, after the last such value makes the
+        list a list of bytes again.  Where it does not, the list has room
+        for one byte: the first value is laid out, and the second and each
+        after it is #209, ILLEGAL INITIALIZATION OF MORE SPACE THAN
+        DECLARED, and not checked further, `.(x, 7)', `.(7, x)', `.(7, 300,
+        x)'.  A value laid out that is more than 255 (:func:`_over_a_byte`)
+        is #210, `.(.a)', `.(300 + x)', `.(x, '$', 300)'; and a list of one
+        value, or cut short after its first, whose last name is a
+        built-in's but MEMORY's, #172, INVALID LABEL: UNDEFINED,
+        `.(stackptr)', `.(1 + time)', `.(.shl)', `.(shl(1, 2), 3)'."""
+        values = list(node.values or [])
+        read = []
+        for v in values:
+            faults, numbers, stop = self._walk(v, "consts", refs)
+            read.append((v, faults, numbers, stop))
+            if stop is not None:
+                # V3.1 looks for the list's `)' from there, and a `(' on the
+                # way makes it take another's: the rest of the statement is
+                # #32, INVALID SYNTAX, TEXT IGNORED UNTIL ';'.
+                skipped = [stop.right if isinstance(stop, P.BinaryOp) else stop]
+                if _has_parentheses(skipped + values[len(read):]):
+                    numbers.add(32)
+                break
+        bytes_only = True
+        for v, faults, _, _ in read:
+            if any(kind in self._WORDS for kind, _, _ in faults):
+                bytes_only = False
+            elif isinstance(_lead(v), P.StringLiteral):
+                bytes_only = True
+        every: list = []
+        errors: set[int] = set()
+        for i, (v, faults, numbers, stop) in enumerate(read):
+            errors |= numbers
+            if (bytes_only or i == 0) and _over_a_byte(v, stop):
+                errors.add(210)
+                if not faults:
+                    faults = [("range", v, "consts")]
+            every.extend(faults)
+        if not bytes_only and len(read) > 1:
+            errors.add(209)
+        if len(read) == 1 and self._last_name_builtin(read[0][1], refs):
+            errors.add(172)
+        if every:
+            self._restricted_error(every, "consts", errors, refs)
+
+    @staticmethod
+    def _last_name_builtin(faults: list, refs: dict) -> bool:
+        """Whether the last name V3.1 reads of the faults ``faults``, up to
+        the first it does not read past, is a built-in's but MEMORY's."""
+        roots = []
+        for kind, node, _ in faults:
+            if kind in _Resolver._WORDS:
+                root = node.operand if kind == "constant-location" else node
+                root = unwrap_paren(root)
+                while isinstance(root, (P.Call, P.MemberAccess)):
+                    root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
+                if isinstance(root, P.Identifier):
+                    roots.append(root)
+            if kind not in _Resolver._READ_PAST:
+                break
+        if not roots:
+            return False
+        last = max(roots, key=lambda n: (n.pos.start_line, n.pos.start_column))
+        r = refs.get(id(last))
+        return r is not None and r.decl is None and _key(last.name) in _BUILTINS - {"MEMORY"}
 
     def _restricted(self, e, ctx: str, role: str, refs: dict, faults: list) -> None:  # pylint: disable=too-many-return-statements,too-many-branches
         """The faults of ``e``, part of a restricted expression in ``ctx``,
@@ -1204,52 +1329,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             return _key(getattr(r.node, r.attr)) in _BUILTINS
         return r.decl.kind != "lit"
 
-    @staticmethod
-    def _restricted_range(expr, where: str, faults: list) -> None:
-        """A constant of a constant list is a byte, and so is a value of a
-        DATA or INITIAL list that fills a BYTE: V3.1 computes it as it
-        computes a constant, a number below 256 a BYTE and the rest an
-        ADDRESS, BYTE arithmetic in eight bits (`-1', `1 - 2' are 0FFH), and
-        rejects what is more than 255 (ERROR 210): `.(300)', `.(-256)',
-        `.(299 + 1)', `.(0ffffh)', `declare b byte data (300)'; uplm80 kept
-        the low byte."""
-        value = _v31_constant(expr)
-        if value is not None and value[0] > 0xFF:
-            faults.append(("range", expr, where))
-
-    def _restricted_error(self, faults: list, where: str, expr, place: tuple,
+    def _restricted_error(self, faults: list, where: str, numbers: set[int],
                           refs: dict) -> None:
-        """Refuse the restricted expression ``expr`` for its first fault,
-        with the errors V3.1 gives for it: those of each fault it reads, up
-        to the first it does not read past; #210 for a location that fills
-        a BYTE; and in a constant list, where a value that starts with a
-        name or a location is taken for a word, #209 for the second byte
-        after the first value or past the list's end, #210 for a location
-        first, and #172 for a built-in's call first.  ``place``: the
-        value's index in its list, how many the list has, and whether it
-        fills a BYTE."""
-        index, count, byte = place
-        numbers: set[int] = set()
-        for kind, node, ctx in faults:
-            numbers.update(self._RESTRICTED[kind][self._CONTEXTS.index(ctx)])
-            if where == "consts" and ctx == "subscript" and kind in ("paren", "call", "constants"):
-                numbers.add(32)
-            if kind not in self._READ_PAST:
-                break
-        lead = _lead(expr)
-        if where == "list" and byte and isinstance(lead, P.LocationOf):
-            numbers.add(210)
-        if where == "consts":
-            if isinstance(lead, P.LocationOf) and index == 0:
-                numbers.add(210)
-            if isinstance(lead, (P.Identifier, P.Call, P.MemberAccess, P.LocationOf)) and (
-                    index > 0 or (count > 1 and not numbers & {32, 152})):
-                numbers.add(209)
-            kind, node, _ = faults[0]
-            if index == 0 and kind == "call":
-                r = refs.get(id(unwrap_paren(node.callee)))
-                if r is not None and r.decl is None:
-                    numbers.add(172)
+        """Refuse a restricted expression in ``where`` for the first of its
+        ``faults``, naming the errors V3.1 gives for it, ``numbers``."""
         kind, node, ctx = faults[0]
         self.intel(node, self._restricted_text(kind, node, ctx, where, refs),
                    *sorted(numbers, key=self._V31_ORDER.index))
@@ -1297,7 +1380,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     "variable's, or MEMORY's")
         if kind == "byte-location":
             return f"{what}: a location is an address, and this value fills a BYTE"
-        value = f"{_v31_constant(node)[0]:X}H"
+        value = f"{_v31_read(node, None)[0][0]:X}H"
         value = "0" + value if value[0] in "ABCDEF" else value
         if where == "consts":
             return f"{what}: {subject} holds bytes, and {what} is {value}, more than 0FFH"
@@ -1579,69 +1662,104 @@ def _lead(expr):
     return expr
 
 
-def _byte_values(item) -> set[int]:
-    """The values of the DATA or INITIAL list of ``item`` that fill a
-    BYTE, by id.  Each value fills the next of the scalars declared, in
-    order, and past them one of the declaration's own type, as
-    codegen._emit_value_list lays them out: of a BYTE or an untyped DATA
-    every value, of an ADDRESS none, of a STRUCTURE those that fill its
-    BYTE members, a string one member to a character, or to two of an
-    ADDRESS."""
+def _value_slots(item) -> tuple[dict[int, str], set[int]]:
+    """What each value of the DATA or INITIAL list of ``item`` fills, by
+    id - "byte", "word", or "past" the space the declaration has - and the
+    values that do not fit in it, which Intel's PL/M-80 V3.1 rejects (ERROR
+    209) and uplm80 lays out after it (0.4.3's Known issues).  Each value
+    fills the next of the scalars declared, in order: of a BYTE every one,
+    of an ADDRESS none, of a STRUCTURE those that fill its BYTE members; a
+    string fills one scalar to a character, or to two of an ADDRESS.  An
+    untyped DATA, or an array of (*), is as long as its list, as uplm80
+    takes it (_dimension)."""
     attrs = decl_attrs(item)
     values = attrs.data_values or attrs.initial_values or []
     members = decl_item_struct_members(item)
+    dtype, dim = decl_item_type(item)
+    if members is None and (dtype is None or dim == -1):
+        return {id(v): "byte" if dtype in (None, DataType.BYTE) else "word"
+                for v in values}, set()
     if members is None:
-        dtype, _ = decl_item_type(item)
-        return {id(v) for v in values} if dtype in (None, DataType.BYTE) else set()
-    one = []
-    for m in members:
-        width = 1 if struct_member_type(m) == DataType.BYTE else 2
-        one.extend([width] * ((struct_member_dim(m) or 1) * len(struct_member_names(m))))
-    _, dim = decl_item_type(item)
+        one = [1 if dtype == DataType.BYTE else 2]
+    else:
+        one = []
+        for m in members:
+            width = 1 if struct_member_type(m) == DataType.BYTE else 2
+            one.extend([width] * ((struct_member_dim(m) or 1) * len(struct_member_names(m))))
     names = item.names
     count = 1 if isinstance(names, P.DeclName) else len(names.names or [])
-    widths = one * max(dim or 1, 1) * count
-    out, slot = set(), 0
+    widths = one * (len(values) + 1 if dim == -1 else max(dim or 1, 1)) * count
+    slots: dict[int, str] = {}
+    past: set[int] = set()
+    slot = 0
     for v in values:
         inner = unwrap_paren(v)
+        slots[id(v)] = ("past" if slot >= len(widths) else
+                        "byte" if widths[slot] == 1 else "word")
         if isinstance(inner, P.StringLiteral):
             used = 0
             while used < max(len(string_value(inner)), 1):
                 used += widths[slot] if slot < len(widths) else 1
                 slot += 1
-            continue
-        if (widths[slot] if slot < len(widths) else 1) == 1:
-            out.add(id(v))
-        slot += 1
-    return out
+        else:
+            slot += 1
+        if slot > len(widths):
+            past.add(id(v))
+    return slots, past
 
 
-def _v31_constant(expr) -> tuple[int, bool] | None:
-    """The value of ``expr``, numbers added and subtracted, as Intel's
-    PL/M-80 V3.1 computes it in a restricted expression, and whether it is
-    a BYTE: a number below 256 is a BYTE, and BYTE arithmetic is in eight
-    bits, `-1' 0FFH, `-1 - 1' 0FEH; ADDRESS arithmetic in sixteen, `0ffffh +
-    1' 0.  None for anything else."""
+def _over_a_byte(expr, stop) -> bool:
+    """Whether Intel's PL/M-80 V3.1 finds the restricted expression
+    ``expr``, where a byte goes, more than 255 (ERROR 210, ILLEGAL
+    INITIALIZATION OF A BYTE TO A VALUE > 255): a location first, which is
+    an address, `.a(1) - 1', or a number above 0FFH of what it computes
+    before it stops at ``stop`` (:func:`_v31_read`): `300', `299 + 1',
+    `300 + x', `300 + (1)'."""
+    if isinstance(_lead(expr), P.LocationOf):
+        return True
+    value, _ = _v31_read(expr, stop)
+    return value is not None and value[0] > 0xFF
+
+
+def _v31_read(expr, stop) -> tuple[tuple[int, bool] | None, bool]:  # pylint: disable=too-many-return-statements
+    """What Intel's PL/M-80 V3.1 computes of the restricted expression
+    ``expr``, numbers added and subtracted, before it stops at the node
+    ``stop`` (None: it reads all of it), and whether it stopped: (value,
+    whether a BYTE) or None where it has computed nothing.  A number below
+    256 is a BYTE, and BYTE arithmetic is in eight bits, `-1' 0FFH, `-1 -
+    1' 0FEH; ADDRESS arithmetic in sixteen, `0ffffh + 1' 0.  A name it reads
+    past (ERROR 151) is a BYTE 0 to it, `300 + x' 300 and `x - 1' 0FFH; at
+    an operator it does not take it has the operand before it, `300 * 2'
+    300."""
+    if isinstance(expr, P.BinaryOp) and expr is stop:
+        return _v31_read(expr.left, None)[0], True
+    if expr is stop:
+        return None, True
     if isinstance(expr, P.NumberLiteral):
         value = parse_plm_number(expr.value.text)
-        return value & 0xFFFF, value < 0x100
+        return (value & 0xFFFF, value < 0x100), False
     if isinstance(expr, P.StringLiteral):
         text = string_value(expr)
-        return (ord(text) & 0xFF, True) if len(text) == 1 else None
+        return ((ord(text) & 0xFF, True) if len(text) == 1 else None), False
+    if isinstance(expr, P.Identifier):
+        return (0, True), False
     if isinstance(expr, P.UnaryOp) and unop_kind(expr) == UnaryOpKind.NEG:
-        inner = _v31_constant(expr.operand)
+        inner, stopped = _v31_read(expr.operand, stop)
         if inner is None:
-            return None
+            return None, stopped
         value, byte = inner
-        return -value & (0xFF if byte else 0xFFFF), byte
+        return (-value & (0xFF if byte else 0xFFFF), byte), stopped
     if isinstance(expr, P.BinaryOp) and binop_kind(expr) in (BinaryOpKind.ADD, BinaryOpKind.SUB):
-        left, right = _v31_constant(expr.left), _v31_constant(expr.right)
-        if left is None or right is None:
-            return None
+        left, stopped = _v31_read(expr.left, stop)
+        if stopped or left is None:
+            return left, True
+        right, stopped = _v31_read(expr.right, stop)
+        if right is None:
+            return left, stopped
         byte = left[1] and right[1]
         value = left[0] + right[0] if binop_kind(expr) == BinaryOpKind.ADD else left[0] - right[0]
-        return value & (0xFF if byte else 0xFFFF), byte
-    return None
+        return (value & (0xFF if byte else 0xFFFF), byte), stopped
+    return None, True
 
 
 def _has_parentheses(expr) -> bool:

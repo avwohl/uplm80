@@ -1449,6 +1449,69 @@ V31_REJECTS = {
     "constant-list-in-a-constant-list": ("w = .(.(5), 7);\n", (147, 32),
                                          "T.PLM:8:7: error: .(5): a constant list does not take "
                                          "the location of constants"),
+    # V3.1 lays a constant list out as an untyped DATA list: a value with a
+    # name in it, or a location first, is a word, and a string after the
+    # last such value makes the list bytes again; where it does not, the
+    # list has room for its first value only, and every value after it is
+    # #209 and not checked further.  A value laid out that is more than
+    # 255 is #210 - a name there is a BYTE 0 - and a list of one value
+    # whose last name is a built-in's but MEMORY's #172.  The messages
+    # named #209 for a value that starts with a name or a location and
+    # not otherwise, #210 only with no name in the value, and #172 only
+    # after a built-in's call.
+    "variable-then-string-in-a-constant-list": ("w = .(b, '$');\n", (151,),
+                                                "T.PLM:8:7: error: B: B is a variable, and a "
+                                                "constant list holds constants only; Intel's "
+                                                "PL/M-80 V3.1 rejects it (ERROR #151, INVALID "
+                                                "OPERAND IN RESTRICTED EXPRESSION)\n"),
+    "memory-then-string-in-a-constant-list": ("w = .(memory, '$');\n", (151,),
+                                              "T.PLM:8:7: error: MEMORY: MEMORY is a built-in"),
+    "location-then-string-in-a-constant-list": ("w = .(.w, '$');\n", (210,),
+                                                "T.PLM:8:7: error: .W: a constant list holds "
+                                                "constants only, and .W is a location"),
+    "variable-after-a-string-in-a-constant-list": ("w = .(b, '$', b);\n", (151, 209),
+                                                   "T.PLM:8:7: error: B: B is a variable"),
+    "sum-with-a-variable-second-in-a-constant-list": ("w = .(1 + b, 7);\n", (151, 209),
+                                                      "T.PLM:8:11: error: B: B is a variable"),
+    "negated-variable-second-in-a-constant-list": ("w = .(7, -b);\n", (151, 209),
+                                                   "T.PLM:8:11: error: B: B is a variable"),
+    "difference-after-a-string-in-a-constant-list": ("w = .('$', 1 - b);\n", (151, 209),
+                                                     "T.PLM:8:16: error: B: B is a variable"),
+    "stackptr-alone-in-a-constant-list": ("w = .(stackptr);\n", (151, 172),
+                                          "T.PLM:8:7: error: STACKPTR: STACKPTR is a built-in, "
+                                          "and a constant list holds constants only; Intel's "
+                                          "PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND "
+                                          "IN RESTRICTED EXPRESSION, and #172, INVALID LABEL: "
+                                          "UNDEFINED)"),
+    "sum-ending-in-a-built-in-in-a-constant-list": ("w = .(1 + time);\n", (151, 172),
+                                                    "T.PLM:8:11: error: TIME: TIME is a "
+                                                    "built-in"),
+    "location-of-a-built-in-in-a-constant-list": ("w = .(.shl);\n", (210, 172),
+                                                  "T.PLM:8:7: error: .SHL: a constant list holds "
+                                                  "constants only, and .SHL is a location"),
+    "sum-over-255-with-a-variable-in-a-constant-list": ("w = .(300 + b);\n", (151, 210),
+                                                        "T.PLM:8:13: error: B: B is a variable"),
+    "number-after-a-variable-in-a-constant-list": ("w = .(7, 300, b);\n", (151, 209),
+                                                   "T.PLM:8:15: error: B: B is a variable"),
+    "number-after-a-string-in-a-constant-list": ("w = .(b, '$', 300);\n", (151, 210),
+                                                 "T.PLM:8:7: error: B: B is a variable"),
+    "location-before-a-string-in-a-constant-list": ("w = .(7, .w, 'AB');\n", (210,),
+                                                    "T.PLM:8:10: error: .W: a constant list holds "
+                                                    "constants only, and .W is a location"),
+    "product-after-a-variable-in-a-constant-list": ("w = .(b, 2 * 3);\n", (151, 152, 209),
+                                                    "T.PLM:8:7: error: B: B is a variable"),
+    "string-sum-after-a-variable-in-a-constant-list": ("w = .(b, 'A' + 1);\n", (151, 152),
+                                                       "T.PLM:8:7: error: B: B is a variable"),
+    "parenthesis-after-300-in-a-constant-list": ("w = .(300 + (1));\n", (151, 152, 32, 210),
+                                                 "T.PLM:8:13: error: (1): a constant list has "
+                                                 "nothing in parentheses"),
+    # After what it does not take V3.1 looks for the list's `)', and one
+    # of a parenthesis further on leaves the rest of the statement #32.
+    "parenthesis-after-a-negated-location-in-a-constant-list": ("w = .(-.w, (1));\n",
+                                                                (151, 152, 32),
+                                                                "T.PLM:8:7: error: -.W: a "
+                                                                "constant list holds constants "
+                                                                "only, and a location is none"),
     "variable-in-data": ("declare d address data (b);\nw = d;\n", (151,),
                          "T.PLM:8:25: error: B: B is a variable, and a DATA or INITIAL value is a "
                          "restricted expression, of constants and locations only; Intel's "
@@ -1502,6 +1565,46 @@ V31_REJECTS = {
                                       "b = d.p;\n", (210,),
                                       "T.PLM:8:47: error: .W: a location is an address, and this "
                                       "value fills a BYTE"),
+    # A value that fills a BYTE with a name in it is more than 255 as V3.1
+    # computes it, a name a BYTE 0 (#210, besides the name's #151); and a
+    # list with more values than its declaration holds is #209 besides
+    # the errors of what else it has.  The messages named neither.
+    "sum-over-255-with-a-variable-in-byte-data": ("declare d byte data (300 + b);\nc = d;\n",
+                                                  (151, 210),
+                                                  "T.PLM:8:28: error: B: B is a variable, and a "
+                                                  "DATA or INITIAL value is a restricted "
+                                                  "expression"),
+    "subscript-variable-in-byte-data": ("declare ar (5) byte, d byte data (.ar(b));\nc = d;\n",
+                                        (151, 210),
+                                        "T.PLM:8:39: error: B: B is a variable, and a DATA or "
+                                        "INITIAL value is a restricted expression"),
+    "variable-past-an-arrays-end-in-data": ("declare d (2) byte data (1, 2, b);\nc = d(0);\n",
+                                            (151, 209),
+                                            "T.PLM:8:32: error: B: B is a variable, and a DATA or "
+                                            "INITIAL value is a restricted expression, of "
+                                            "constants and locations only; Intel's PL/M-80 V3.1 "
+                                            "rejects it (ERROR #151, INVALID OPERAND IN "
+                                            "RESTRICTED EXPRESSION, and #209, ILLEGAL "
+                                            "INITIALIZATION OF MORE SPACE THAN DECLARED)"),
+    "variable-before-a-value-past-a-scalar": ("declare d byte data (b, 1);\nc = d;\n", (151, 209),
+                                              "T.PLM:8:22: error: B: B is a variable"),
+    # V3.1 reads a DATA or INITIAL list to the first value it does not
+    # read to the end, and gives the errors of each value it reads; the
+    # message named those of the first value wrong only.
+    "variable-then-300-in-byte-data": ("declare d (3) byte data (b, 300, 7);\nc = d(0);\n",
+                                       (151, 210), "T.PLM:8:26: error: B: B is a variable"),
+    "300-then-variable-in-byte-initial": ("declare d (3) byte initial (7, 300, b);\nc = d(0);\n",
+                                          (151, 210),
+                                          "T.PLM:8:32: error: 300: this value fills a BYTE, and "
+                                          "300 is 12CH, more than 0FFH; Intel's PL/M-80 V3.1 "
+                                          "rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
+                                          "EXPRESSION, and #210, ILLEGAL INITIALIZATION OF A BYTE "
+                                          "TO A VALUE > 255)"),
+    "300-past-a-string-in-byte-data": ("declare d (2) byte data (b, 'AB', 300);\nc = d(0);\n",
+                                       (151, 209), "T.PLM:8:26: error: B: B is a variable"),
+    "variable-after-a-product-in-byte-data": ("declare d (3) byte data (300, 2 * 3, b);\n"
+                                              "c = d(0);\n", (152, 210),
+                                              "T.PLM:8:26: error: 300: this value fills a BYTE"),
     "parenthesis-in-a-subscript-in-data": ("declare ar (5) byte;\n"
                                            "declare d address data (.ar((1)));\nw = d;\n",
                                            (151, 150),
@@ -1857,6 +1960,26 @@ def test_memory_in_a_list_of_a_module_that_does_not_declare_it(opt):
         "declare w address, b byte;").replace(
         "call ph(own);", "call ph(own);\ncall ph(dm - .memory); call ph(.am - .memory);") % ""
     assert _run_modules([user, _BUILTINS_LIB], opt).endswith("79BC 0002 0002 ")
+
+
+# More values than the declaration holds, each past its space a number a
+# byte does not hold: Intel's PL/M-80 V3.1 gives #209 alone, checking
+# nothing past the space (tests/test_intel_oracle.py).
+PAST_THE_SPACE = {
+    "structure": "declare d structure (p byte, q address, r byte) data ('ABCD', 300);\n"
+                 "c = d.p;\n",
+    "scalar": "declare d byte data (1, 300);\nc = d;\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(PAST_THE_SPACE))
+def test_a_value_past_a_declarations_space_is_not_held_to_a_byte(name):
+    """uplm80 lays such a value out after the declaration, as 0.4.3's
+    Known issues have it (#209); the message said V3.1 rejects it for a
+    BYTE's value over 255 (#210), which V3.1 does not give there."""
+    r = _compile(PRELUDE + V31_DECLS + PAST_THE_SPACE[name] + "end t;\n", 0)
+    assert r.returncode == 0, r.stderr
+    assert "#210" not in r.stderr, r.stderr
 
 
 @pytest.mark.parametrize("name", ["stackptr", "shl", "double"])

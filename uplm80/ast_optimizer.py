@@ -2638,7 +2638,7 @@ class ASTOptimizer:
         """The optimizer's own DOUBLE of a constant in a restricted
         expression: the constant.  A built-in the program writes there is
         an error, as Intel's PL/M-80 V3.1 has it (names.py,
-        _check_restricted); this folded SHL, SHR, ROL, ROR, LOW, HIGH and
+        check_restricted); this folded SHL, SHR, ROL, ROR, LOW, HIGH and
         DOUBLE of constants at -O1 and up, SHL and SHR of a BYTE in 16
         bits, which -O0 refused."""
         if name != DOUBLE_MARK or len(args) != 1 or not _is_number(args[0]):
