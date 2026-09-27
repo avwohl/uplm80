@@ -714,7 +714,7 @@ which programs written for it rely, and a subscript on a scalar, `x(1)`
 member of an array of structures without its subscript, `s2.m(1)` (133),
 which its own tests test.  It rejects, as V3.1 does, a name declared
 nowhere, empty parentheses after a variable or a built-in, `.label` in an
-expression, an `INTERRUPT` procedure below module level, a parameter no
+expression (158), an `INTERRUPT` procedure below module level, a parameter no
 `DECLARE` declares, and a `LITERALLY` used before its declaration (since
 0.4.1); a dimension of 0, the address of a built-in but MEMORY, and a
 PUBLIC or EXTERNAL procedure or variable below module level (since
@@ -731,9 +731,11 @@ STACKPTR` (129), a built-in with too few or too many arguments (154, 153,
 124, 126) and INPUT or OUTPUT without a port (109), MEMORY without a
 subscript (133), a non-REENTRANT procedure's call of itself (170), a
 procedure nested in a REENTRANT one or a REENTRANT one nested in another
-(88, 39), an `END` that names the first of two labels on a DO, `a: c: do;
-... end a;` (20), and an assignment to a built-in or a procedure,
-`INPUT(1) = b` (128, and 131 of one without a type) (since 0.4.4); and in
+(88, 39, and 174 of one with no statements), an `END` that names the
+first of two labels on a DO, `a: c: do; ... end a;` (20), and an
+assignment to a built-in or a procedure, `INPUT(1) = b` (128, 131 of one
+without a type, and 154, 153, 109, 108, 124 or 126 where its arguments
+are not as many as it takes, `TIME = 1`) (since 0.4.4); and in
 a DATA or INITIAL list, an AT address or a constant list what a
 restricted expression does not take, with the errors V3.1 gives for the
 list (since 0.4.4): a built-in or a name, `data (shl(0f0h, 4))`, `data

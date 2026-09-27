@@ -632,6 +632,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         153: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO MANY",
         154: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO FEW",
         156: "MISSING RETURN STATEMENT IN TYPED PROCEDURE",
+        158: "INVALID DOT OPERAND, LABEL ILLEGAL",
         169: "ILLEGAL FORWARD CALL",
         170: "ILLEGAL RECURSIVE CALL",
         172: "INVALID LABEL: UNDEFINED",
@@ -666,7 +667,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         module, not in a procedure or a DO block, and has no procedure
         declared in it (8.1.7).  Intel's PL/M-80 V3.1: ERROR 39, INVALID
         ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL; ERROR 88,
-        INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE."""
+        INVALID PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE; and of
+        one with no statements 174, INVALID NULL PROCEDURE, and of a typed
+        one 156 besides (_null), which the message names too (found
+        checking 0.4.4)."""
         text = ident_text(p.name)
         attrs = proc_attrs(p)
         if block.kind != "module" and (attrs.interrupt_num is not None or attrs.is_public
@@ -674,16 +678,17 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             return                  # _below_module
         outer = block.kind != "module" and attrs.is_reentrant
         inner = block.proc is not None and block.proc.reentrant
+        null = () if _has_statements(p) else _null(p)
         if outer:
             also = (f", and {block.proc.orig}, a REENTRANT procedure, has no procedure declared "
                     "in it" if inner else "")
             self.intel(p, f"{text}: a REENTRANT procedure must be declared at the outer level "
                        f"of the module, not in {self._where(block)}{also} (Programming Manual "
-                       "9800268B, 8.1.7)", *((39, 88) if inner else (39,)))
+                       "9800268B, 8.1.7)", *((39, 88) if inner else (39,)), *null)
         elif inner:
             self.intel(p, f"{text}: procedure {text} is declared in {block.proc.orig}, and a "
                        "REENTRANT procedure has no procedure declared in it (Programming "
-                       "Manual 9800268B, 8.1.7)", 88)
+                       "Manual 9800268B, 8.1.7)", 88, *null)
 
     def _below_module(self, p: P.ProcDecl, attrs, block: _Block) -> None:
         """An INTERRUPT, PUBLIC or EXTERNAL procedure in a procedure or a
@@ -1055,12 +1060,12 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     "ARGUMENTS IN CALL)")))
             if r.dot and d.kind == "label" and not r.in_list:
                 # Intel's PL/M-80 V3.1: ERROR 158, INVALID DOT OPERAND,
-                # LABEL ILLEGAL, whether or not the label is declared LABEL.
-                raise CodeGenError(
-                    f".{text}: {text} is a label, and the dot operator takes a variable "
-                    "or a procedure (Programming Manual 9800268B, 4.1.3); the address "
-                    "of a label may be given only in a DATA or an INITIAL list",
-                    source_location(r.node))
+                # LABEL ILLEGAL, whether or not the label is declared LABEL;
+                # the message names it since 0.4.4.
+                self.intel(r.node, f".{text}: {text} is a label, and the dot operator takes "
+                           "a variable or a procedure (Programming Manual 9800268B, 4.1.3); "
+                           "the address of a label may be given only in a DATA or an "
+                           "INITIAL list", 158)
 
     def check_declarations(self) -> None:
         """The base of each BASED variable, and each LABEL declared, as
@@ -1245,7 +1250,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         only the link found undefined (`input(1) = b', found checking
         0.4.4).  Intel's PL/M-80 V3.1: ERROR 128, INVALID LEFT-HAND OPERAND
         OF ASSIGNMENT, and 131, ILLEGAL REFERENCE TO UNTYPED PROCEDURE, of
-        one without a type."""
+        one without a type, and the error of its arguments where they are
+        not as many as it takes (_arguments)."""
         name = _key(getattr(r.node, r.attr))
         if d is None and name in _BUILTINS and name not in ("MEMORY", "OUTPUT", "STACKPTR",
                                                              "CPUTIME"):
@@ -1257,7 +1263,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         what = expr_text(r.call) if r.call is not None else text
         self.intel(r.node, f"{what}: {text} is {kind}, and an assignment stores to a variable, "
                    "an element of an array or a structure's member, or to MEMORY, OUTPUT or "
-                   "STACKPTR", *((131, 128) if untyped else (128,)))
+                   "STACKPTR", *((131,) if untyped else ()), *_arguments(r, d, name), 128)
 
     def _check_variable(self, r: _Ref, d: _Decl, text: str) -> None:
         """A variable or a parameter called through, subscripted, or named
@@ -2245,6 +2251,29 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 continue
             for node, attr in d.sites + [(r.node, r.attr) for r in self.refs_of.get(id(d), [])]:
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
+
+
+def _arguments(r: _Ref, d: _Decl | None, name: str) -> tuple:
+    """The error Intel's PL/M-80 V3.1 gives of the arguments of ``r``, a
+    reference to the procedure ``d`` or the built-in ``name``, where they
+    are not as many as it takes, as it gives it of an assignment's target,
+    `time = 1', `mon1 = 1' (found checking 0.4.4): ERROR 154, INVALID NUMBER
+    OF ARGUMENTS IN CALL, TOO FEW, and 153, TOO MANY; of INPUT 109, MISSING
+    INPUT/OUTPUT PORT NUMBER, and 108, MISSING ')' AFTER INPUT/OUTPUT PORT
+    NUMBER; of LENGTH, LAST and SIZE 124, MISSING ARGUMENTS FOR BUILT-IN
+    PROCEDURE, and 126, MISSING ')' AFTER BUILT-IN PROCEDURE ARGUMENT
+    LIST."""
+    n = r.args or 0
+    if d is not None:
+        params = d.node.signature.params
+        want = len(params.names or []) if params is not None else 0
+    elif name == "INPUT":
+        return (109,) if n == 0 else (108,) if n > 1 else ()
+    elif name in ("LENGTH", "LAST", "SIZE"):
+        return (124,) if n == 0 else (126,) if n > 1 else ()
+    else:
+        want = _BUILTIN_ARGS.get(name, n)
+    return (154,) if n < want else (153,) if n > want else ()
 
 
 def _null(p: P.ProcDecl) -> tuple:

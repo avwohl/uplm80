@@ -52,7 +52,9 @@ own, and an EXTERNAL one has none, and a typed one #156, MISSING RETURN
 STATEMENT IN TYPED PROCEDURE, too; a typed procedure with no statements
 #156 besides #174; and LENGTH and LAST of a reference with anything in
 parentheses in a subscript #125, ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE,
-besides #32 (SIZE only #32).
+besides #32 (SIZE only #32).  And the message of `.lb` of a label in an
+expression, which uplm80 refuses since 0.4.1, names V3.1's #158, INVALID
+DOT OPERAND, LABEL ILLEGAL.
 
 - **More than one subscript** (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
   SUBSCRIPTS ILLEGAL), wherever a subscript goes: of an array, a BASED
@@ -136,15 +138,20 @@ besides #32 (SIZE only #32).
   REENTRANT one**, in it or in a DO block of it (ERROR #88, INVALID
   PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE); both of a REENTRANT
   procedure in a REENTRANT one (0.4.3's Known issues), and of an
-  INTERRUPT, PUBLIC or EXTERNAL one, which 0.4.3 refused with #39 alone.
+  INTERRUPT, PUBLIC or EXTERNAL one, which 0.4.3 refused with #39 alone;
+  and of one with no statements #174, INVALID NULL PROCEDURE, besides,
+  and of a typed one #156 too (found checking 0.4.4).
 - **An assignment to a built-in or a procedure** (ERROR #128, INVALID
   LEFT-HAND OPERAND OF ASSIGNMENT, and #131, ILLEGAL REFERENCE TO UNTYPED
   PROCEDURE, of one without a type), as a statement's target or an
   embedded assignment's: `input(1) = b`, `low(w) = b`, `b, carry = 1`,
   `time(1) = b`, `f = b` of a procedure F, which uplm80 compiled to a
   store to a symbol of the name that only the link found undefined (found
-  checking 0.4.4; 0.4.3 the same).  MEMORY, OUTPUT and STACKPTR are
-  assigned as before.
+  checking 0.4.4; 0.4.3 the same).  Of one without as many arguments as
+  it takes, V3.1's error of its arguments besides: `time = 1`, `mon1 =
+  1`, #154, INVALID NUMBER OF ARGUMENTS IN CALL, TOO FEW, `low(w, 2) =
+  b` #153, TOO MANY, `input = b` #109 and `last = b` #124.  MEMORY,
+  OUTPUT and STACKPTR are assigned as before.
 - **An END that names the first of two labels on a DO**, `m: n: do; ...
   end m;` (ERROR #20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes
   only the label next to DO, `end n;` (0.4.3's Known issues).

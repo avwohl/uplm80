@@ -1519,6 +1519,32 @@ V31_REJECTS = {
                                  "T.PLM:9:3: error: S: a REENTRANT procedure must be declared at "
                                  "the outer level of the module, not in procedure R, and R, a "
                                  "REENTRANT procedure, has no procedure declared in it"),
+    # And of one with no statements, V3.1's #174, and of a typed one #156
+    # (found checking 0.4.4).
+    # The address of a label in an expression, which uplm80 refuses since
+    # 0.4.1; the message names V3.1's error since 0.4.4.
+    "dot-label": ("lb: b = 1;\nw = .lb;\n", (158,),
+                  "T.PLM:9:6: error: .LB: LB is a label, and the dot operator takes a variable or "
+                  "a procedure (Programming Manual 9800268B, 4.1.3); the address of a label may "
+                  "be given only in a DATA or an INITIAL list; Intel's PL/M-80 V3.1 rejects it "
+                  "(ERROR #158, INVALID DOT OPERAND, LABEL ILLEGAL)"),
+    "dot-declared-label": ("declare xv label;\nw = .xv;\nxv: b = 1;\n", (158,),
+                           "T.PLM:9:6: error: .XV: XV is a label"),
+    "empty-procedure-in-a-reentrant": ("r: procedure reentrant;\n  q: procedure;\n  end q;\n"
+                                       "  call q;\nend r;\ncall r;\n", (88, 174),
+                                       "rejects it (ERROR #88, INVALID PROCEDURE NESTING, "
+                                       "ILLEGAL IN REENTRANT PROCEDURE, and #174, INVALID NULL "
+                                       "PROCEDURE)"),
+    "empty-typed-procedure-in-a-reentrant": ("r: procedure reentrant;\n  h: procedure byte;\n"
+                                             "  end h;\n  b = h;\nend r;\ncall r;\n",
+                                             (88, 174, 156),
+                                             "T.PLM:9:3: error: H: procedure H is declared in R"),
+    "empty-reentrant-in-a-procedure": ("p: procedure;\n  r: procedure reentrant;\n  end r;\n"
+                                       "  call r;\nend p;\ncall p;\n", (39, 174),
+                                       "T.PLM:9:3: error: R: a REENTRANT procedure " + _OUTER),
+    "empty-reentrant-in-a-reentrant": ("r: procedure reentrant;\n  s: procedure reentrant;\n"
+                                       "  end s;\n  call s;\nend r;\ncall r;\n", (39, 88, 174),
+                                       "T.PLM:9:3: error: S: a REENTRANT procedure " + _OUTER),
     "unsubscripted-array": ("declare a(4) byte;\na = 3;\n", (133,),
                             "T.PLM:9:1: error: A: A is an array, and an array is named without a "
                             "subscript only as the operand of a dot or the argument of LENGTH, "
@@ -1573,6 +1599,27 @@ V31_REJECTS = {
     "assign-to-a-procedure": ("g = b;\n", (131, 128), "T.PLM:8:1: error: G: G is a procedure"),
     "embedded-assign-to-input": ("w = (input(2) := b);\n", (128,),
                                  "T.PLM:8:6: error: INPUT(2): INPUT is a built-in procedure"),
+    # Of a target without as many arguments as it takes, V3.1 gives the
+    # error of its arguments too (found checking 0.4.4).
+    "assign-to-time-without-its-argument": ("time = 1;\n", (131, 154, 128),
+                                            "rejects it (ERROR #131, ILLEGAL REFERENCE TO "
+                                            "UNTYPED PROCEDURE, and #154, INVALID NUMBER OF "
+                                            "ARGUMENTS IN CALL, TOO FEW, and #128, INVALID "
+                                            "LEFT-HAND OPERAND OF ASSIGNMENT)"),
+    "assign-to-a-procedure-without-its-arguments": ("mon1 = 1;\n", (131, 154, 128),
+                                                    "T.PLM:8:1: error: MON1: MON1 is a "
+                                                    "procedure"),
+    "embedded-assign-to-a-procedure-without-its-argument": (
+        "b = (pc := 1);\n", (131, 154, 128), "T.PLM:8:6: error: PC: PC is a procedure"),
+    "assign-to-a-procedure-with-too-many-arguments": ("g(1) = b;\n", (131, 153, 128),
+                                                      "T.PLM:8:1: error: G(1): G is a "
+                                                      "procedure"),
+    "assign-to-low-with-two-arguments": ("low(w, 2) = b;\n", (153, 128),
+                                         "T.PLM:8:1: error: LOW(W, 2): LOW is a built-in"),
+    "assign-to-input-without-a-port": ("input = b;\n", (109, 128),
+                                       "T.PLM:8:1: error: INPUT: INPUT is a built-in"),
+    "assign-to-last-without-its-argument": ("last = b;\n", (124, 128),
+                                            "T.PLM:8:1: error: LAST: LAST is a built-in"),
     # 0.4.3's Known issues: a built-in in a restricted expression, which
     # -O1 and up folded (SHL and SHR of a BYTE in 16 bits) and -O0 refused
     # with a message of its own, or took `.a + low(3)' and `at (double(12h))'
