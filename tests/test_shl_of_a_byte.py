@@ -155,6 +155,13 @@ def test_what_reads_the_flags_of_a_shl_of_a_byte_is_warned_of(stmts, shl, reader
     ("gk: procedure byte; k = 200; return 1; end gk;\n"
      "k = 1; if k < 4 and gk > 0 then w = shl(k, 6);", "SHL(K, 6)"),
     ("c = 1; do while c < 4 and (c := 200) > 0; w = shl(c, 6); end;", "SHL(C, 6)"),
+    # What a procedure calls through an address may assign what any
+    # procedure whose address is taken assigns (found checking 0.4.4).
+    ("fq: procedure byte; call v; return 1; end fq;\n"
+     "v = .g; k = 1; if k < 4 and fq > 0 then w = shl(k, 6);", "SHL(K, 6)"),
+    ("pr: procedure; call v; end pr; v = .g; k = 1; call pr; w = shl(k, 6);", "SHL(K, 6)"),
+    ("declare sg structure (g address); sg.g = .g; k = 1; call sg.g; w = shl(k, 6);",
+     "SHL(K, 6)"),
 ])
 def test_a_test_that_assigns_what_it_bounds_does_not_bound_it(stmts, shl, opt, capsys):
     got = _warnings(stmts, opt, capsys)
@@ -169,6 +176,8 @@ def test_a_test_that_assigns_what_it_bounds_does_not_bound_it(stmts, shl, opt, c
     "if (b and 0e0h) = 0 then c = shl(b, 3) plus 0;",
     "c = 1; if c < 4 then w = shl(c, 6);",
     "c = shl(b, 1); call g; c = carry;",            # G's own flags
+    # What a CALL through an address may call: H, which does not set K.
+    "pr: procedure; call v; end pr; v = .h; k = 1; call pr; w = shl(k, 6);",
 ])
 def test_what_reads_other_flags_is_not(stmts, opt, capsys):
     assert _warnings(stmts, opt, capsys) == []
@@ -184,16 +193,19 @@ def test_the_flags_warning_says_what_reads_them(capsys):
 
 def test_a_variable_an_interrupt_procedure_assigns_has_no_bound(capsys):
     """An INTERRUPT procedure may run between any two statements: what it
-    assigns, or what it calls does, can have any value anywhere."""
+    assigns, or what it calls does, through an address too (found
+    checking 0.4.4), can have any value anywhere."""
     capsys.readouterr()
-    src = ("t: do;\ndeclare (k, j, n) byte, w address;\n"
+    src = ("t: do;\ndeclare (k, j, n, m) byte, (w, q) address;\n"
            "set: procedure; j = 3; end set;\n"
-           "i: procedure interrupt 1; k = 3; call set; end i;\n"
-           "k = 1; w = shl(k, 6);\nj = 1; w = shl(j, 6);\nn = 1; w = shl(n, 6);\nend t;\n")
+           "setn: procedure; n = 3; end setn;\n"
+           "i: procedure interrupt 1; k = 3; call set; call q; end i;\n"
+           "k = 1; w = shl(k, 6);\nj = 1; w = shl(j, 6);\nq = .setn; n = 1; w = shl(n, 6);\n"
+           "m = 1; w = shl(m, 6);\nend t;\n")
     assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
     got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
     assert [line.split(": warning: ")[1].split(":")[0] for line in got] == [
-        "SHL(K, 6)", "SHL(J, 6)"], got
+        "SHL(K, 6)", "SHL(J, 6)", "SHL(N, 6)"], got
 
 
 @pytest.mark.parametrize("function, warned", [
@@ -221,8 +233,8 @@ def test_a_procedure_that_resets_the_system_does_not_return(function, warned, ca
 @pytest.mark.parametrize("end", ["out: end term;", "out:end term;"])
 def test_a_procedure_whose_end_a_goto_reaches_returns(end, capsys):
     """A label on a procedure's END, which a GOTO reaches past its last
-    statement, a call of MON1 with the function 0: it returns (0.4.4's
-    release check), and k, which it does not bound, can be anything."""
+    statement, a call of MON1 with the function 0: it returns (found
+    checking 0.4.4), and k, which it does not bound, can be anything."""
     capsys.readouterr()
     src = ("t: do;\ndeclare (b, k) byte, w address;\n"
            "mon1: procedure (f, a) external; declare f byte, a address; end mon1;\n"

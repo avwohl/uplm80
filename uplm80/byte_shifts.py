@@ -38,7 +38,10 @@ it calls.  That is followed only for a scalar whose address is never
 taken, nor AT, BASED, PUBLIC or EXTERNAL, nor assigned by an INTERRUPT
 procedure or what it calls, and a call of a procedure forgets it, but for
 a local of the procedure the call is in where the procedure called is not
-nested in it.  A procedure that ends in a call of MON1 with the function
+nested in it.  A CALL through an address, a variable's or a member's,
+forgets everything, and in a procedure it may call any procedure whose
+address the program takes, and an EXTERNAL one's code, which may call back
+a PUBLIC one.  A procedure that ends in a call of MON1 with the function
 0, BDOS's system reset, or of such a procedure, and has no RETURN nor a
 label on its END, does not return.  A SHR of a BYTE has the same value
 either way.
@@ -501,12 +504,12 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
 
     def call_stmt(self, s: P.CallStmt) -> None:
         """A CALL: of a procedure, which may not return, or through an
-        address."""
+        address - a variable's or a member's."""
         self.expr(s.callee)
         callee = unwrap_paren(s.callee)
         callee = unwrap_paren(callee.callee) if isinstance(callee, P.Call) else callee
         sym = self.lookup(ident_text(callee.name)) if isinstance(callee, P.Identifier) else None
-        if sym is not None and sym.kind != "proc":
+        if _through_member(s) or (sym is not None and sym.kind != "proc"):
             self.called(None)           # a call through an address
             self.flags = ()
         elif sym is not None and sym.node is not None and (
@@ -884,20 +887,45 @@ def _nodes(tree, into_procs: bool = True):
             yield from _nodes(getattr(tree, f, None), into_procs)
 
 
+def _called_name(s: P.CallStmt) -> str:
+    """The name a CALL calls, or calls through: of a member, `call s.g',
+    the structure's."""
+    callee = unwrap_paren(s.callee)
+    callee = unwrap_paren(callee.callee) if isinstance(callee, P.Call) else callee
+    while isinstance(callee, (P.MemberAccess, P.Call)):
+        callee = unwrap_paren(callee.base if isinstance(callee, P.MemberAccess)
+                              else callee.callee)
+    return ident_text(callee.name) if isinstance(callee, P.Identifier) else ""
+
+
+def _through_member(s: P.CallStmt) -> bool:
+    """Whether a CALL calls through a structure's member, `call s.g'."""
+    callee = unwrap_paren(s.callee)
+    callee = unwrap_paren(callee.callee) if isinstance(callee, P.Call) else callee
+    return isinstance(callee, P.MemberAccess)
+
+
 def _callees(tree) -> set[tuple[str, bool]]:
     """(name, CALLed) of what ``tree`` calls, or may: the names of CALLs and
     calls, and every name it uses without arguments, which may be a typed
-    procedure's.  Not in the procedures it declares, which it does not run."""
+    procedure's; of a CALL through a member, the structure's.  Not in the
+    procedures it declares, which it does not run."""
     out: set[tuple[str, bool]] = set()
     for n in _nodes(tree, into_procs=False):
         if isinstance(n, P.Identifier):
             out.add((ident_text(n.name), False))
-        elif isinstance(n, P.CallStmt):
-            callee = unwrap_paren(n.callee)
-            callee = unwrap_paren(callee.callee) if isinstance(callee, P.Call) else callee
-            if isinstance(callee, P.Identifier):
-                out.add((ident_text(callee.name), True))
+        elif isinstance(n, P.CallStmt) and _called_name(n):
+            out.add((_called_name(n), True))
     return out
+
+
+def _calls_through(items, procs: dict) -> bool:
+    """Whether ``items`` CALL through an address: through a member, or a
+    name no procedure of ``procs`` has and no built-in."""
+    return any(isinstance(n, P.CallStmt) and (
+        _through_member(n) or (_called_name(n) not in procs
+                               and _called_name(n).upper() not in _BUILTINS))
+        for n in _nodes(items, into_procs=False))
 
 
 def _declared(items) -> set[str]:
@@ -915,10 +943,19 @@ def _declared(items) -> set[str]:
     return out
 
 
+def _addressed(modules) -> list:
+    """The procedures whose address the program takes, `.p', which a CALL
+    through an address may call."""
+    names = _pinned(modules)
+    return [n for n in _nodes(modules) if isinstance(n, P.ProcDecl) and proc_name(n) in names]
+
+
 def _modsets(modules) -> dict[int, frozenset]:
     """The names each procedure (by id of its declaration) may assign that
     it does not declare, itself or through the procedures it calls, by
-    name.  An EXTERNAL procedure may call back any PUBLIC one."""
+    name.  An EXTERNAL procedure may call back any PUBLIC one, and a CALL
+    through an address may call any procedure whose address is taken, or
+    an EXTERNAL one's code."""
     procs = [n for n in _nodes(modules) if isinstance(n, P.ProcDecl)]
     by_name: dict[str, list] = {}
     for p in procs:
@@ -927,7 +964,9 @@ def _modsets(modules) -> dict[int, frozenset]:
     direct = {id(p): _assigned(p.body.items, into_procs=False) - local[id(p)]
               for p in procs}
     calls = {id(p): {n for n, _ in _callees(p.body.items) if n in by_name} for p in procs}
+    through = {id(p) for p in procs if _calls_through(p.body.items, by_name)}
     public = [p for p in procs if proc_attrs(p).is_public]
+    addressed = _addressed(modules)
     mod: dict[int, frozenset] = {id(p): frozenset(direct[id(p)]) for p in procs}
     while True:
         new = {}
@@ -936,7 +975,10 @@ def _modsets(modules) -> dict[int, frozenset]:
             for c in calls[id(p)]:
                 for q in by_name[c]:
                     got |= mod[id(q)] - local[id(p)]
-            if proc_attrs(p).is_external:
+            if id(p) in through:
+                for q in addressed:
+                    got |= mod[id(q)] - local[id(p)]
+            if proc_attrs(p).is_external or id(p) in through:
                 for q in public:
                     got |= mod[id(q)]
             new[id(p)] = frozenset(got)

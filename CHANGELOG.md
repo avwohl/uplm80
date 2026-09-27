@@ -150,15 +150,22 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   assigns, by an embedded assignment or in a procedure it calls, keeps no
   bound from it.  **Nor does a variable an INTERRUPT procedure assigns**,
   itself or in what it calls, which may change it between any two
-  statements.  A test `(n and 0e0h) <> 0` bounds n by what the mask leaves
-  (31), and a procedure that ends in a call of MON1 with the function 0,
-  BDOS's system reset, or of such a procedure, and has no RETURN nor a
-  label on its END, which a GOTO reaches past the call, does not return:
-  MP/M II's SHOW, MSCHD and TOD read a number as `if (b and 1110$0000b) <>
-  0 then call terminate; b = shl(b, 3) + shl(b, 1); if carry then ...`,
-  and b is below 32 at those SHLs, which lose nothing - though the sum
-  carries out of eight bits from b = 26 on, where 0.4.2's did not out of
-  sixteen, as V3.1's does: the last of the limits below.
+  statements.  **A procedure that CALLs through an address may assign**
+  what any procedure whose address is taken assigns (found checking
+  0.4.4): with p's `call q` and q = .setk, `k = 1; call p; w = shl(k,
+  6);` was 3200H and is 0, with no warning, as in 0.4.3, and so was `k =
+  1; if k < 4 and f > 0 then w = shl(k, 6);` of an f that calls through
+  q; and after a CALL through a structure's member, `call s.g`, what the
+  statements before it had left still held.  A test `(n and 0e0h) <> 0`
+  bounds n by what the mask leaves (31), and a procedure that ends in a
+  call of MON1 with the function 0, BDOS's system reset, or of such a
+  procedure, and has no RETURN nor a label on its END, which a GOTO
+  reaches past the call, does not return: MP/M II's SHOW, MSCHD and TOD
+  read a number as `if (b and 1110$0000b) <> 0 then call terminate; b =
+  shl(b, 3) + shl(b, 1); if carry then ...`, and b is below 32 at those
+  SHLs, which lose nothing - though the sum carries out of eight bits from
+  b = 26 on, where 0.4.2's did not out of sixteen, as V3.1's does: the
+  last of the limits below.
 
   What the warning does not see, of the places where the two meanings
   can differ: a store that reaches the variable other than by its name -
