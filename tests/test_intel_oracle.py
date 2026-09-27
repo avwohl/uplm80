@@ -25,6 +25,7 @@ from tests.plm_difftest import Bin, Num, Var
 from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, QUALIFIED_SIZES
+from tests.test_names import V31_CALLS
 from tests.test_names import PRELUDE as NAMES_PRELUDE
 from tests.test_names import V31_ALLOWS, V31_DECLS, V31_REJECTS, V31_WARNS
 
@@ -48,6 +49,7 @@ RELEASE_PROGRAMS = {
     **{f"memory-runs-back-{k}": v for k, v in MEMORY_RUNS_BACK.items()},
     "end-labels": END_LABELS,                    # 0.4.2, out: end p;
     "byte-shifts": BYTE_SHIFTS,                  # 0.4.3, shl(b, 4) of a BYTE
+    "v31-calls": V31_CALLS,                      # 0.4.4, call sg.g(3, 4), call qb(5, 6)
     "v31-allows": V31_ALLOWS,                    # 0.4.3, size(ab(b + 1)), forward REENTRANT
 }
 # V3.1's bugs the README's Known differences has and the generator does not

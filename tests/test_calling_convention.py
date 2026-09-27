@@ -384,10 +384,11 @@ def test_a_call_through_an_address_places_the_arguments_as_any_call(args, code):
 
 def test_a_call_through_an_address_keeps_bc_and_de_while_the_address_is_found():
     """The address is evaluated after the arguments.  A variable's is loaded
-    straight into HL; one that writes B, C, D or E has them saved round it."""
+    straight into HL; one that writes B, C, D or E, a BASED one's, has them
+    saved round it."""
     assert "push\tbc" not in _main("call q(a1, a2);")
-    decls = DECLS + "declare t (4) address;\n"
-    code = _main("call t(b1)(a1, a2);", decls=decls)
+    decls = DECLS + "declare pq address, qb based pq address;\n"
+    code = _main("call qb(a1, a2);", decls=decls)
     i = code.index("ld\thl,(A2)")
     assert code[i + 1:i + 4] == ["ex\tde,hl", "push\tbc", "push\tde"], code
     assert code[-3:] == ["pop\tde", "pop\tbc", "call\t??jphl"], code

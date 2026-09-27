@@ -49,6 +49,7 @@ import dataclasses
 import os
 import re
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from . import _plm_parser as P
 from .ast_view import (
@@ -208,6 +209,8 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     dim: int | None = None      # a variable's: None for a scalar
     members: dict | None = None     # a structure's: member -> its dimension
     node: object = None         # a procedure's declaration
+    address: bool = False       # a variable's or a parameter's type is ADDRESS
+    address_members: frozenset = frozenset()    # a structure's ADDRESS members
 
     def __post_init__(self) -> None:
         self.orig = self.name
@@ -266,6 +269,18 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     member: object = None       # the member of what it names, `s.m', if any
 
 
+class _MemberUse(NamedTuple):
+    """A structure's member used, `s.m', and how, as a _Ref has it."""
+
+    node: object                # the member access
+    block: _Block
+    dot: bool
+    extent: object
+    args: int | None            # how many subscripts or arguments follow it
+    call: object                # the subscripted reference or call it names
+    called: bool                # what a CALL statement calls
+
+
 def _key(tok) -> str:
     return ident_text(tok).upper()
 
@@ -300,6 +315,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         # declare the name), by id: (call, the _Ref of its name).
         self.extent_calls: dict[int, tuple] = {}
         self._do_labels: dict[int, set[str]] = {}   # a DO block's labels, by id
+        # Subscripts or arguments after subscripts or arguments, `a(1)(2)'.
+        self.chains: list = []
         # Whether to hold the program to what Intel's PL/M-80 V3.1 takes
         # (intel): check_names does, on the parser's tree; resolve_names,
         # on the optimizer's, which may have emptied a procedure, does not.
@@ -363,7 +380,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         elif isinstance(n, P.DeclItemBasedGroup):
             for bd in n.based_decls or []:
                 self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False,
-                              dim=_dimension(n), members=_members(n))
+                              dim=_dimension(n), members=_members(n),
+                              address=decl_item_type(n)[0] == DataType.ADDRESS,
+                              address_members=_address_members(n))
                 self._visit(bd.base, block)
             self._visit([n.array_size, n.tail], block)
         elif isinstance(n, P.LiterallyDecl):
@@ -387,7 +406,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self._visit(getattr(n, f, None), inner)
         elif self._visit_use(n, block):
             pass
-        elif isinstance(n, P.CallStmt) and isinstance(unwrap_paren(n.callee), P.Call):
+        elif isinstance(n, P.CallStmt):
             self._reference(unwrap_paren(n.callee), block, called=True)
         elif isinstance(n, (P.Call, P.MemberAccess)):
             self._reference(n, block)
@@ -490,6 +509,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         elif isinstance(n, P.Call):
             callee = unwrap_paren(n.callee)
             name = _key(callee.name) if isinstance(callee, P.Identifier) else ""
+            if isinstance(callee, P.Call):
+                self.chains.append(n)
             start = len(self.refs)
             self._reference(callee, block, dot, extent=extent, args=len(n.args), call=n,
                             called=called)
@@ -499,7 +520,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 return
             self._visit(n.args, block)
         elif isinstance(n, P.MemberAccess):
-            self.member_uses.append((n, block, dot, extent, args))
+            self.member_uses.append(_MemberUse(n, block, dot, extent, args, call, called))
             start = len(self.refs)
             self._reference(n.base, block, dot, extent=extent)
             if len(self.refs) > start and self.refs[start].member is None \
@@ -530,7 +551,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         20: "MISMATCHED IDENTIFIER AT END OF BLOCK",
         32: "INVALID SYNTAX, TEXT IGNORED UNTIL ';'",
         104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
+        108: "MISSING ')' AFTER INPUT/OUTPUT PORT NUMBER",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
+        118: "INVALID INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR",
         127: "INVALID SUBSCRIPT ON NON-ARRAY",
         133: "ILLEGAL REFERENCE TO UNSUBSCRIPTED ARRAY",
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
@@ -626,7 +649,9 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             kind = "label" if dtype == DataType.LABEL else "var"
             self._declare(block, name, kind, (node, "name"), public=attrs.is_public,
                           external=attrs.is_external, storage=storage and kind == "var",
-                          dim=_dimension(item), members=_members(item))
+                          dim=_dimension(item), members=_members(item),
+                          address=dtype == DataType.ADDRESS,
+                          address_members=_address_members(item))
         if item.based is not None:
             self._visit(item.based.base, block)
         self._visit([item.array_size, item.tail], block)
@@ -681,6 +706,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 "no other attribute (Programming Manual 9800268B, 8.1.1)",
                 source_location(node))
         d.sites.append((node, "name"))
+        d.address = dtype == DataType.ADDRESS
 
     def _label(self, s: P.LabeledStmt, block: _Block) -> None:
         name = _key(s.label)
@@ -895,33 +921,109 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
 
     def check_forms(self) -> None:
         """How each name is used, as Intel's PL/M-80 V3.1 allows (0.4.2's
-        Known issues): no subscript on a scalar, nor more than one; an
-        array, or a member array, without one only after a dot or in
-        LENGTH, LAST and SIZE; not `.p(1)' of a procedure; no procedure
-        used before its declaration; nothing in parentheses in a subscript
-        of LENGTH, LAST or SIZE's argument."""
+        Known issues): no subscript on a scalar, and never more than one;
+        an array, or a member array, without one only after a dot or in
+        LENGTH, LAST and SIZE; a CALL of a procedure or through an ADDRESS
+        scalar; not `.p(1)' of a procedure; no procedure used before its
+        declaration; nothing in parentheses in a subscript of LENGTH, LAST
+        or SIZE's argument."""
+        for u in self.member_uses:
+            if u.called:
+                self._check_called_member(u)
         for r in self.refs:
-            d = r.decl
-            if r.goto or d is None or r.empty or r.after is not None:
-                continue
-            text = ident_text(getattr(r.node, r.attr))
-            if d.kind == "proc":
-                if r.dot and r.args is not None:
-                    self.intel(r.node, f".{expr_text(r.call)}: {text} is a procedure, and "
-                               "the dot operator takes the address of a procedure, not of a "
-                               "call of it (Programming Manual 9800268B, 4.1.3)", 104)
-                self._check_forward(r, d, text)
-            elif d.kind in ("var", "param") and r.args is not None and d.dim is None \
-                    and not r.called:
-                self._check_scalar(r, text)
-            elif d.kind == "var" and r.args is None and d.dim is not None and not r.dot \
-                    and not self._extent(r.extent):
-                self._check_unsubscripted(r, text)
-        for n, block, dot, extent, args in self.member_uses:
-            self._check_member(n, block, dot or args is not None or self._extent(extent))
+            if not (r.goto or r.empty or r.after is not None):
+                self._check_ref(r)
+        for u in self.member_uses:
+            if not u.called:
+                self._check_member(u)
+        for n in self.chains:
+            # Intel's PL/M-80 V3.1: ERROR 32, INVALID SYNTAX.
+            self.intel(n, f"{expr_text(n)}: a subscript or an argument list follows a name or "
+                       "a member, not another", 32)
         for call, ref in self.extent_calls.values():
             if ref.decl is None:
                 self._check_extent(call)
+
+    def _check_ref(self, r: _Ref) -> None:
+        """How a name is used, for what it names."""
+        d = r.decl
+        text = ident_text(getattr(r.node, r.attr))
+        if d is None:
+            self._check_builtin_form(r, text)
+        elif d.kind == "proc":
+            if r.dot and r.args is not None:
+                self.intel(r.node, f".{expr_text(r.call)}: {text} is a procedure, and the dot "
+                           "operator takes the address of a procedure, not of a call of it "
+                           "(Programming Manual 9800268B, 4.1.3)", 104)
+            self._check_forward(r, d, text)
+        elif d.kind in ("var", "param"):
+            self._check_variable(r, d, text)
+
+    def _check_variable(self, r: _Ref, d: _Decl, text: str) -> None:
+        """A variable or a parameter called through, subscripted, or named
+        without a subscript.  Intel's PL/M-80 V3.1: ERROR 114, INVALID
+        SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL, of an array."""
+        if r.called:
+            self._check_called(r, d, text)
+        elif r.args is not None and d.dim is None:
+            self._check_scalar(r, text)
+        elif r.args is not None and r.args > 1 and not self._extent(r.extent):
+            self.intel(r.node, f"{expr_text(r.call)}: {text} is an array, and an array takes "
+                       "one subscript", 114)
+        elif r.args is None and d.dim is not None and not r.dot \
+                and not self._extent(r.extent):
+            self._check_unsubscripted(r, text)
+
+    def _check_builtin_form(self, r: _Ref, text: str) -> None:
+        """MEMORY, an array, with one subscript, and not called; INPUT and
+        OUTPUT with one port.  Intel's PL/M-80 V3.1: ERROR 114, INVALID
+        SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL; 118, INVALID INDIRECT CALL,
+        IDENTIFIER NOT AN ADDRESS SCALAR; 108, MISSING ')' AFTER
+        INPUT/OUTPUT PORT NUMBER."""
+        name = _key(getattr(r.node, r.attr))
+        if r.in_at or r.args is None:
+            return
+        what = expr_text(r.call)
+        if name == "MEMORY" and r.called:
+            self.intel(r.node, f"CALL {what}: MEMORY is an array, and a CALL calls a "
+                       "procedure, or through an ADDRESS scalar (Programming Manual "
+                       "9800268B, 8.2.1)", 118, 32)
+        elif name == "MEMORY" and r.args > 1 and not self._extent(r.extent):
+            self.intel(r.node, f"{what}: MEMORY is an array, and an array takes one "
+                       "subscript", 114)
+        elif name in ("INPUT", "OUTPUT") and r.args > 1:
+            self.intel(r.node, f"{what}: {text} takes one port number", 108)
+
+    def _check_called(self, r: _Ref, d: _Decl, text: str) -> None:
+        """What a CALL statement calls through: an ADDRESS scalar, not an
+        array, a structure or a BYTE, with a subscript or without.  Intel's
+        PL/M-80 V3.1: ERROR 118, INVALID INDIRECT CALL, IDENTIFIER NOT AN
+        ADDRESS SCALAR."""
+        if d.address and d.dim is None and d.members is None:
+            return
+        kind = ("an array" if d.dim is not None else "a structure" if d.members is not None
+                else "a BYTE")
+        what = expr_text(r.call) if r.call is not None else text
+        # And ERROR 32, INVALID SYNTAX, of what follows it in parentheses.
+        self.intel(r.node, f"CALL {what}: {text} is {kind}, and a CALL calls a procedure, "
+                   "or through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1)",
+                   *((118, 32) if r.call is not None else (118,)))
+
+    def _check_called_member(self, u: _MemberUse) -> None:
+        """A CALL through a structure's member: an ADDRESS scalar member of
+        a structure that is not an array (ERROR 118)."""
+        d, member = self._member_decl(u)
+        if d is None or member not in (d.members or {}):
+            return
+        if d.dim is None and d.members[member] is None and member in d.address_members:
+            return
+        kind = (f"{ident_text(u.node.member)} is an array" if d.members[member] is not None
+                else f"{d.orig} is an array" if d.dim is not None
+                else f"{ident_text(u.node.member)} is a BYTE")
+        callee = u.call if u.call is not None else u.node
+        self.intel(u.node, f"CALL {expr_text(callee)}: {kind}, and a CALL calls a procedure, "
+                   "or through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1)",
+                   *((118, 32) if _has_parentheses(callee) else (118,)))
 
     def _check_scalar(self, r: _Ref, text: str) -> None:
         """A scalar with a subscript.  `x(1)' is taken for the element of
@@ -973,23 +1075,38 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                        "it, and a procedure is called only after its declaration, but by a "
                        "REENTRANT procedure if it is REENTRANT too", 169)
 
-    def _check_member(self, n: P.MemberAccess, block: _Block, placed: bool) -> None:
-        """A member array without a subscript, where it is not ``placed``
-        after a dot or in LENGTH, LAST or SIZE.  Intel's PL/M-80 V3.1:
-        ERROR 134, ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY."""
-        if placed:
-            return
-        root = unwrap_paren(n.base)
+    def _member_decl(self, u: _MemberUse) -> tuple:
+        """The declaration of the structure a member use is of, if the
+        program declares it, and the member's name."""
+        root = unwrap_paren(u.node.base)
         while isinstance(root, (P.Call, P.MemberAccess)):
             root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
-        d = self.lookup(_key(root.name), block) if isinstance(root, P.Identifier) else None
-        member = _key(n.member)
-        if d is None or not d.members or d.members.get(member) is None:
+        d = self.lookup(_key(root.name), u.block) if isinstance(root, P.Identifier) else None
+        return d, _key(u.node.member)
+
+    def _check_member(self, u: _MemberUse) -> None:
+        """A member array without a subscript, but after a dot or in LENGTH,
+        LAST or SIZE, or with more than one; a scalar member with any.
+        Intel's PL/M-80 V3.1: ERROR 134, ILLEGAL REFERENCE TO UNSUBSCRIPTED
+        MEMBER ARRAY; 114, INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL;
+        127, INVALID SUBSCRIPT ON NON-ARRAY."""
+        d, member = self._member_decl(u)
+        if d is None or member not in (d.members or {}):
             return
-        text = expr_text(n)
-        self.intel(n, f"{text}: {ident_text(n.member)} is an array, and a member array is named "
-                   "without a subscript only as the operand of a dot or the argument of LENGTH, "
-                   "LAST or SIZE (Programming Manual 9800268B, 3.6.2)", 134)
+        n, extent = u.node, self._extent(u.extent)
+        name = ident_text(n.member)
+        if d.members[member] is None and u.args is not None:
+            # And ERROR 32, INVALID SYNTAX, of the subscript.
+            self.intel(n, f"{expr_text(u.call)}: {name} is not an array, and only an array "
+                       "takes a subscript", 127, 32)
+        elif d.members[member] is not None and u.args is not None and u.args > 1 \
+                and not extent:
+            self.intel(n, f"{expr_text(u.call)}: {name} is an array, and an array takes one "
+                       "subscript", 114)
+        elif d.members[member] is not None and u.args is None and not (u.dot or extent):
+            self.intel(n, f"{expr_text(n)}: {name} is an array, and a member array is named "
+                       "without a subscript only as the operand of a dot or the argument of "
+                       "LENGTH, LAST or SIZE (Programming Manual 9800268B, 3.6.2)", 134)
 
     def _check_extent(self, call: P.Call) -> None:
         """The subscripts of the argument of LENGTH, LAST or SIZE, which
@@ -1254,6 +1371,14 @@ def _dimension(item) -> int | None:
                                and len(string_value(values[0])) > 1):
             return -1
     return dim
+
+
+def _address_members(item) -> frozenset:
+    """The names of a structure's members of type ADDRESS."""
+    nodes = decl_item_struct_members(item) or []
+    return frozenset(n.upper() for m in nodes
+                     if isinstance(getattr(m, "type", None), (P.TypeAddress, P.TypeAddressSized))
+                     for n in struct_member_names(m))
 
 
 def _members(item) -> dict | None:

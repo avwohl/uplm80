@@ -180,15 +180,19 @@ where:
 - A direct call passes as many arguments as the procedure has parameters,
   and follows the procedure's declaration, but a call by a REENTRANT
   procedure of one that is REENTRANT too; `.p(1)` of a procedure is no
-  address.  `CALL q(1, 2)` of an ADDRESS q calls through it (8.2.1).
+  address.  `CALL q(1, 2)` of an ADDRESS q calls through it (8.2.1), as
+  a CALL does through a structure's ADDRESS member or a BASED ADDRESS, and
+  not through an array, an element, a structure or a BYTE.
 - An END that names a block names its own, the procedure or a label of
   the DO block; a DO CASE has a case, and a procedure a statement.
 - An array, or a member array, is named without a subscript only after a
   dot or as the argument of LENGTH, LAST or SIZE (3.6.2), whose
-  subscripts have nothing in parentheses in them.  A scalar takes no
-  subscript: `x(1)`, the element that far past x, and `s2.m(1)` of an
-  array of structures, `s2(0).m(1)`, are compiled with a warning, as
-  before, since uplm80's own tests test them.
+  subscripts have nothing in parentheses in them.  An array takes one
+  subscript, and a scalar none: `x(1)`, the element that far past x, and
+  `s2.m(1)` of an array of structures, `s2(0).m(1)`, are compiled with a
+  warning, as before, since uplm80's own tests test them; `s.k(1)` of a
+  scalar member is an error.  Nothing follows a subscript but a member,
+  `a(1)(2)` is an error, and INPUT and OUTPUT take one port.
 - SHL and SHR of a BYTE are a BYTE (11.1.4), and the bits shifted out of
   it are lost; `SHL(DOUBLE(b), n)` keeps them.  uplm80 before 0.4.3
   shifted a BYTE in 16 bits, and where a SHL of a BYTE can shift a set bit

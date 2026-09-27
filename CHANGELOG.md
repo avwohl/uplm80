@@ -3,6 +3,59 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.4.4 — unreleased
+
+What 0.4.3's final release check found and left for a later release.
+
+### Incompatible: more errors Intel's PL/M-80 gives
+
+What uplm80 compiled and Intel's PL/M-80 V3.1 rejects is refused as V3.1
+refuses it, with the number and text of each error V3.1 gives, at every
+`-O` level.  No program of MP/M II (DRI's tree and mpm2's overrides), of
+80un 0.3.3 or of `sample_code` has any of these, and the 88 compiles of
+their PL/M are unchanged; one test's program, which called through an
+array's element to have its address found in DE, calls through a BASED
+ADDRESS now.  V3.1 rejects each program of `tests/test_names.py` with the
+errors the message names (`tests/test_intel_oracle.py`), and builds the
+program of the calls it takes to print what uplm80's build prints.
+
+- **More than one subscript** (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
+  SUBSCRIPTS ILLEGAL), wherever a subscript goes: of an array, a BASED
+  one, a member array, an array of structures and MEMORY, in an
+  expression, as a target and after a dot - `b = a(1, 2)`, `a(1, 2) =
+  w`, `.a(1, 2)`, `s.m(1, 2)`, `sa(1, 2).m(0)`, `sa(1).m(0, 1)`,
+  `memory(1, 2)`.  uplm80 took the subscripts for arguments and called,
+  at every level, through the value of `a(0)` (0.4.3's release check);
+  0.4.3 made the same of a scalar an error.
+
+      A(1, 2): A is an array, and an array takes one subscript; Intel's
+      PL/M-80 V3.1 rejects it (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
+      SUBSCRIPTS ILLEGAL)
+
+- **A subscript on a scalar member**, `s.k(1)`, which uplm80 took for
+  the element that far past `s.k` (ERROR #127, INVALID SUBSCRIPT ON
+  NON-ARRAY, and #32, INVALID SYNTAX, TEXT IGNORED UNTIL ';'); a
+  subscript or an argument list after another, `a(1)(2)` and `h(1)(2)`,
+  which uplm80 took for a call through the element or through what `h`
+  returns (#32); and a second port, `input(1, 2)` and `output(1, 2) =
+  b`, which uplm80 left out (ERROR #108, MISSING ')' AFTER INPUT/OUTPUT
+  PORT NUMBER).
+- **A CALL through what is not an ADDRESS scalar** (ERROR #118, INVALID
+  INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR, and #32 where
+  parentheses follow): an array, `call aa(1)` and `call aa(1)(b, c)`,
+  which uplm80 took for a call through `aa(0)`, with 1, and through
+  `aa(1)`; a member array, a member of an element of an array of
+  structures, `call sa(1).g`, MEMORY, a structure, and a BYTE - a
+  variable, a parameter or a member - whose value uplm80 called.  A CALL
+  through an ADDRESS, a structure's ADDRESS member or a BASED ADDRESS,
+  with arguments or without, is compiled as before, as V3.1 compiles it.
+
+      CALL AA(1): AA is an array, and a CALL calls a procedure, or
+      through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1);
+      Intel's PL/M-80 V3.1 rejects it (ERROR #118, INVALID INDIRECT CALL,
+      IDENTIFIER NOT AN ADDRESS SCALAR, and #32, INVALID SYNTAX, TEXT
+      IGNORED UNTIL ';')
+
 ## 0.4.3 — 2026-09-26
 
 SHL and SHR of a BYTE are a BYTE, as the manual and Intel's PL/M-80 V3.1
@@ -239,9 +292,6 @@ And this V3.1 compiles to other code (0.4.2 the same):
 
 Found by 0.4.3's final release check, and left for a later release:
 
-- `b = a(1, 2)` of an array (#114, INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS
-  ILLEGAL) compiles, to a call through the value of `a(0)`; 0.4.3 makes
-  the same of a scalar an error, not of an array (0.4.2 the same).
 - `declare p address initial (a)` of an array is refused, but the message
   names V3.1's #133, where V3.1 gives #151.
 - The SHL warning is not given where only these tell the two meanings

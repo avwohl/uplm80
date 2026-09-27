@@ -1263,6 +1263,85 @@ V31_REJECTS = {
                                    "array takes a subscript, and only one; Intel's PL/M-80 V3.1 "
                                    "rejects it (ERROR #127, INVALID SUBSCRIPT ON NON-ARRAY, and "
                                    "#114, INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL)"),
+    # 0.4.3's final release check: more than one subscript, wherever a
+    # subscript goes, which uplm80 took for a call through the element's
+    # value; a subscript on a scalar member, after a subscript, or of two
+    # ports; and a CALL through what is not an ADDRESS scalar (0.4.4).
+    "two-subscripts-on-an-array": ("declare a(4) byte;\nb = a(1, 2);\n", (114,),
+                                   "T.PLM:9:5: error: A(1, 2): A is an array, and an array takes "
+                                   "one subscript; Intel's PL/M-80 V3.1 rejects it (ERROR #114, "
+                                   "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL)"),
+    "two-subscripts-stored-to": ("declare a(4) address;\na(1, 2) = w;\n", (114,),
+                                 "T.PLM:9:1: error: A(1, 2): A is an array"),
+    "two-subscripts-after-a-dot": ("declare a(4) byte;\nw = .a(1, 2);\n", (114,),
+                                   "T.PLM:9:6: error: A(1, 2): A is an array"),
+    "three-subscripts": ("declare a(4) byte;\nb = a(1, 2, 3);\n", (114,),
+                         "error: A(1, 2, 3): A is an array, and an array takes one subscript"),
+    "two-subscripts-on-a-based-array": ("declare pa address, ba based pa (4) byte;\n"
+                                        "b = ba(1, 2);\n", (114,),
+                                        "T.PLM:9:5: error: BA(1, 2): BA is an array"),
+    "two-subscripts-on-a-member-array": ("declare s structure (m(3) byte, k byte);\n"
+                                         "b = s.m(1, 2);\n", (114,),
+                                         "T.PLM:9:5: error: S.M(1, 2): M is an array, and an "
+                                         "array takes one subscript"),
+    "two-subscripts-on-an-array-of-structures": ("declare sa(3) structure (m(2) byte);\n"
+                                                 "b = sa(1, 2).m(0);\n", (114,),
+                                                 "error: SA(1, 2): SA is an array"),
+    "two-subscripts-on-a-member-of-an-element": ("declare sa(3) structure (m(2) byte);\n"
+                                                 "b = sa(1).m(0, 1);\n", (114,),
+                                                 "error: SA(1).M(0, 1): M is an array"),
+    "two-subscripts-on-memory": ("b = memory(1, 2);\n", (114,),
+                                 "T.PLM:8:5: error: MEMORY(1, 2): MEMORY is an array"),
+    "subscripted-scalar-member": ("declare s structure (m(3) byte, k byte);\nb = s.k(1);\n",
+                                  (127, 32),
+                                  "T.PLM:9:5: error: S.K(1): K is not an array, and only an array "
+                                  "takes a subscript; Intel's PL/M-80 V3.1 rejects it (ERROR "
+                                  "#127, INVALID SUBSCRIPT ON NON-ARRAY, and #32, INVALID SYNTAX, "
+                                  "TEXT IGNORED UNTIL ';')"),
+    "two-subscripts-on-a-scalar-member": ("declare s structure (m(3) byte, k byte);\n"
+                                          "b = s.k(1, 2);\n", (127, 32),
+                                          "error: S.K(1, 2): K is not an array"),
+    "subscript-after-a-subscript": ("declare a(4) byte;\nb = a(1)(2);\n", (32,),
+                                    "T.PLM:9:5: error: A(1)(2): a subscript or an argument list "
+                                    "follows a name or a member, not another; Intel's PL/M-80 "
+                                    "V3.1 rejects it (ERROR #32, INVALID SYNTAX, TEXT IGNORED "
+                                    "UNTIL ';')"),
+    "arguments-after-arguments": ("h: procedure (x) byte;\n  declare x byte;\n  return x;\n"
+                                  "end h;\nb = h(1)(2);\n", (32,),
+                                  "T.PLM:12:5: error: H(1)(2): a subscript or an argument list"),
+    "two-port-numbers": ("output(1, 2) = b;\n", (108,),
+                         "T.PLM:8:1: error: OUTPUT(1, 2): OUTPUT takes one port number; Intel's "
+                         "PL/M-80 V3.1 rejects it (ERROR #108, MISSING ')' AFTER INPUT/OUTPUT "
+                         "PORT NUMBER)"),
+    "two-port-numbers-in": ("b = input(1, 2);\n", (108,),
+                            "error: INPUT(1, 2): INPUT takes one port number"),
+    "call-through-an-array": ("declare aa(2) address;\ncall aa(1);\n", (118, 32),
+                              "T.PLM:9:6: error: CALL AA(1): AA is an array, and a CALL calls a "
+                              "procedure, or through an ADDRESS scalar (Programming Manual "
+                              "9800268B, 8.2.1); Intel's PL/M-80 V3.1 rejects it (ERROR #118, "
+                              "INVALID INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR, and #32, "
+                              "INVALID SYNTAX, TEXT IGNORED UNTIL ';')"),
+    "call-through-an-element-with-arguments": ("declare aa(2) address;\ncall aa(1)(b, c);\n",
+                                               (118, 32), "error: CALL AA(1): AA is an array"),
+    "call-through-an-unsubscripted-array": ("declare aa(2) address;\ncall aa;\n", (118,),
+                                            "error: CALL AA: AA is an array"),
+    "call-through-a-byte": ("call b;\n", (118,), "T.PLM:8:6: error: CALL B: B is a BYTE"),
+    "call-through-a-byte-with-arguments": ("call c(1, 2);\n", (118, 32),
+                                           "error: CALL C(1, 2): C is a BYTE"),
+    "call-through-a-byte-parameter": ("p: procedure (x);\n  declare x byte;\n  call x;\nend p;\n"
+                                      "call p(1);\n", (118,),
+                                      "T.PLM:10:8: error: CALL X: X is a BYTE"),
+    "call-through-a-structure": ("declare s structure (g address);\ncall s;\n", (118,),
+                                 "error: CALL S: S is a structure"),
+    "call-through-a-byte-member": ("declare s structure (k byte, g address);\ncall s.k;\n",
+                                   (118,), "T.PLM:9:6: error: CALL S.K: K is a BYTE"),
+    "call-through-a-member-array": ("declare s structure (m(2) address);\ncall s.m(1);\n",
+                                    (118, 32), "error: CALL S.M(1): M is an array"),
+    "call-through-a-member-of-an-element": ("declare sa(2) structure (g address);\n"
+                                            "call sa(1).g;\n", (118, 32),
+                                            "error: CALL SA(1).G: SA is an array"),
+    "call-through-memory": ("call memory(1);\n", (118, 32),
+                            "error: CALL MEMORY(1): MEMORY is an array"),
     "unsubscripted-array": ("declare a(4) byte;\na = 3;\n", (133,),
                             "T.PLM:9:1: error: A: A is an array, and an array is named without a "
                             "subscript only as the operand of a dot or the argument of LENGTH, "
@@ -1700,3 +1779,33 @@ end t;
     assert asm is not None
     assert re.search(r"^\s*extrn\s+LDMON1\s*$", asm, re.I | re.M), asm
     assert re.search(r"^\s*call\s+LDMON1\s*$", asm, re.I | re.M), asm
+
+
+# What V3.1 takes of a CALL through an address (8.2.1): an ADDRESS scalar,
+# a structure's ADDRESS member or a BASED one, with arguments or without
+# (tests/test_intel_oracle.py builds it again).
+V31_CALLS = """
+declare n byte, q address;
+declare sg structure (k byte, g address);
+declare pq address, qb based pq address;
+add2: procedure (x, y);
+  declare (x, y) byte;
+  n = x + y;
+end add2;
+seven: procedure;
+  n = 7;
+end seven;
+q = .seven; call q; call ph(n);
+sg.g = .add2; call sg.g(3, 4); call ph(n + 1);
+pq = .sg.g; call qb(5, 6); call ph(n);
+"""
+
+
+def test_a_call_through_an_address_scalar_is_compiled_without_a_word(capsys):
+    """V3.1 calls through an ADDRESS scalar, a member of a structure that
+    is not an array, and a BASED one; not through an array, an element, a
+    structure or a BYTE (V31_REJECTS)."""
+    _check(V31_CALLS, [7, 8, 0xB])
+    capsys.readouterr()
+    assert Compiler(opt_level=0).compile(_PH_PRELUDE + V31_CALLS + "end t;\n", "T.PLM")
+    assert "warning" not in capsys.readouterr().err

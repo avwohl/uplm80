@@ -911,7 +911,8 @@ def test_length_last_and_size_of_a_qualified_reference():
 def test_length_last_and_size_of_what_is_not_an_array_or_a_variable(expr):
     """What V3.1 rejects - LENGTH of an element or a scalar (ERROR #125,
     #157), a subscript on a scalar (#127), a member no structure has
-    (#112) - uplm80 rejects too."""
+    (#112) - uplm80 rejects too; a subscript on a scalar member with V3.1's
+    error (0.4.4)."""
     src = _PRELUDE + (
         "declare st structure (x byte, y address, z(4) byte);\n"
         "declare sa(3) structure (x byte, y address, z(2) byte, w(5) address);\n"
@@ -920,7 +921,8 @@ def test_length_last_and_size_of_what_is_not_an_array_or_a_variable(expr):
     compiler = Compiler(opt_level=2)
     assert compiler.compile(src, "<test>") is None
     errors = [str(e) for e in compiler.errors.errors]
-    assert any("needs an array" in e or "SIZE() needs" in e for e in errors), errors
+    assert any("needs an array" in e or "SIZE() needs" in e or "ERROR #127" in e
+               for e in errors), errors
 
 
 # SHL and SHR of a BYTE are a BYTE (11.1.4), shifted in eight bits: the bits
