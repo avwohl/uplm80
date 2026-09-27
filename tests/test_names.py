@@ -2245,6 +2245,11 @@ def test_the_address_of_memory_is_no_error():
     ("y = .nowhere;", "NOWHERE", 6),
     ("if 0 then y = gone;", "GONE", 15),
     ("y = n;", "NN", 5),
+    # In a restricted expression too, which named the errors of the rest of
+    # the list, and in a constant list #210 of the location (0.4.4 before).
+    ("y = .(.nolist(1));", "NOLIST", 8),
+    ("y = .(.nolist2, 300);", "NOLIST2", 8),
+    ("declare d (2) byte data (.nodata, 300);", "NODATA", 27),
 ])
 def test_a_name_declared_nowhere_is_an_error(opt, stmt, name, col):
     """`y = nosuch + 1' compiled to `ld hl,(NOSUCH)', and only um80
@@ -2270,6 +2275,10 @@ p: procedure; declare n byte; n = 1; end p;
      "declare lit literally '5';\ncall p;", 9, 9),
     ("p: procedure;\n  q: procedure;\n    y = lit;\n  end q;\n"
      "  declare lit literally '5';\n  call q;\nend p;\ncall p;", 8, 9),
+    # In a restricted expression too (test_a_name_declared_nowhere_is_an_error).
+    ("p: procedure;\n  y = .(.lit(1));\nend p;\ndeclare lit literally 'y';\ncall p;", 7, 10),
+    ("p: procedure;\n  declare d (2) byte data (.lit, 300);\n  y = d(0);\nend p;\n"
+     "declare lit literally 'y';\ncall p;", 7, 29),
 ])
 def test_a_literally_used_before_its_declaration_is_an_error(opt, src, line, col):
     """A LITERALLY's text is "substituted for each occurrence of the

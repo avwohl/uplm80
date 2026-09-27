@@ -1116,10 +1116,16 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         address of a name, the low byte of a number, or, at -O1 and up, a
         built-in folded (0.4.3's Known issues).  The message names every
         error V3.1 gives for the list the value is in, as V3.1 reads it
-        (:meth:`_check_value_list`, :meth:`_check_constant_list`).  A name
-        the program does not declare is left to check_uses."""
+        (:meth:`_check_value_list`, :meth:`_check_constant_list`).  A list
+        that names what the program does not declare, or a LITERALLY
+        declared further on, is left to check_uses, which refuses it in its
+        own words (0.4.4's Known issues): the message named the errors of
+        the rest of the list, and in a constant list #210 of `.zz(1)' as of
+        a location, where V3.1 gives #105 besides."""
         refs = {id(r.node): r for r in self.refs if r.attr == "name" and not r.goto}
         for where, node in self.restricted:
+            if _names_undeclared(node, refs):
+                continue
             if where == "consts":
                 self._check_constant_list(node, refs)
             elif where == "list":
@@ -1860,6 +1866,21 @@ def _v31_read(expr, stop) -> tuple[tuple[int, bool] | None, bool]:  # pylint: di
         value = left[0] + right[0] if binop_kind(expr) == BinaryOpKind.ADD else left[0] - right[0]
         return (value & (0xFF if byte else 0xFFFF), byte), stopped
     return None, True
+
+
+def _names_undeclared(expr, refs: dict) -> bool:
+    """Whether ``expr`` names what is declared nowhere, a built-in's name
+    aside, or a LITERALLY declared further on, whose name the macro pass
+    has left in place (check_uses)."""
+    if isinstance(expr, (list, tuple)):
+        return any(_names_undeclared(x, refs) for x in expr)
+    if isinstance(expr, P.Identifier):
+        r = refs.get(id(expr))
+        if r is None:
+            return False
+        return r.decl.kind == "lit" if r.decl is not None else _key(expr.name) not in _BUILTINS
+    return any(_names_undeclared(getattr(expr, f), refs)
+               for f in getattr(expr, "__dataclass_fields__", ()) if f != "pos")
 
 
 def _two_subscripts(expr) -> bool:
