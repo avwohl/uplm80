@@ -218,6 +218,21 @@ def test_a_procedure_that_resets_the_system_does_not_return(function, warned, ca
     assert [line.split(": warning: ")[1].split(":")[0] for line in got] == warned, got
 
 
+@pytest.mark.parametrize("end", ["out: end term;", "out:end term;"])
+def test_a_procedure_whose_end_a_goto_reaches_returns(end, capsys):
+    """A label on a procedure's END, which a GOTO reaches past its last
+    statement, a call of MON1 with the function 0: it returns (0.4.4's
+    release check), and k, which it does not bound, can be anything."""
+    capsys.readouterr()
+    src = ("t: do;\ndeclare (b, k) byte, w address;\n"
+           "mon1: procedure (f, a) external; declare f byte, a address; end mon1;\n"
+           f"term: procedure; if b = 0 then goto out; call mon1(0, 0); {end}\n"
+           "b = 0; k = 200; if k > 3 then call term; w = shl(k, 6);\nend t;\n")
+    assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
+    got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
+    assert [line.split(": warning: ")[1].split(":")[0] for line in got] == ["SHL(K, 6)"], got
+
+
 @pytest.mark.parametrize("opt", LEVELS)
 def test_a_test_of_equality_still_bounds(opt, capsys):
     """`if b = 0' holding leaves b 0, as before the mask tests."""

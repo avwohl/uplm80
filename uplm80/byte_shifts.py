@@ -39,14 +39,17 @@ taken, nor AT, BASED, PUBLIC or EXTERNAL, nor assigned by an INTERRUPT
 procedure or what it calls, and a call of a procedure forgets it, but for
 a local of the procedure the call is in where the procedure called is not
 nested in it.  A procedure that ends in a call of MON1 with the function
-0, BDOS's system reset, or of such a procedure, and has no RETURN, does
-not return.  A SHR of a BYTE has the same value either way.
+0, BDOS's system reset, or of such a procedure, and has no RETURN nor a
+label on its END, does not return.  A SHR of a BYTE has the same value
+either way.
 
 What is not seen: a store that reaches the variable other than by its
 name - past the end of an array, through MEMORY or a BASED variable whose
 base is not its address; the flags a procedure is entered with, and those
 an EXTERNAL procedure, or one called through an address, returns with;
-and arithmetic around a SHL that loses nothing, which can overflow eight
+an EXTERNAL MON1 that is not BDOS's entry, whose function 0 returns - MON1
+is the name DRI's programs give BDOS's entry, in every mode; and
+arithmetic around a SHL that loses nothing, which can overflow eight
 bits, with its value, as ``shr(z, 4) - 1``, or its flags, where it was of
 sixteen - ZERO, SIGN and PARITY after such a SHL, too.
 
@@ -953,7 +956,8 @@ def _system_reset(s: P.CallStmt) -> bool:
 
 def _no_return(modules) -> set[int]:
     """The procedures, by id of their declarations, that do not return:
-    with no RETURN, whose last statement is a call of one that does not,
+    with no RETURN and no label on the END, which a GOTO reaches past the
+    last statement, whose last statement is a call of one that does not,
     or of an EXTERNAL MON1 with the function 0, system reset."""
     procs = [n for n in _nodes(modules) if isinstance(n, P.ProcDecl)]
     by_name: dict[str, list] = {}
@@ -969,7 +973,8 @@ def _no_return(modules) -> set[int]:
             s = s.stmt
         if isinstance(s, P.CallStmt) and not proc_attrs(p).is_external and not any(
                 isinstance(n, (P.ReturnStmt, P.ReturnStmtValue))
-                for n in _nodes(p.body.items, into_procs=False)):
+                for n in _nodes(p.body.items, into_procs=False)) and not any(
+                    is_end_of_block(it) for it in p.body.items):
             last[id(p)] = s
     out: set[int] = set()
     while True:

@@ -152,25 +152,29 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   itself or in what it calls, which may change it between any two
   statements.  A test `(n and 0e0h) <> 0` bounds n by what the mask leaves
   (31), and a procedure that ends in a call of MON1 with the function 0,
-  BDOS's system reset, or of such a procedure, does not return: MP/M II's
-  SHOW, MSCHD and TOD read a number as `if (b and 1110$0000b) <> 0 then
-  call terminate; b = shl(b, 3) + shl(b, 1); if carry then ...`, and b is
-  below 32 at those SHLs, which lose nothing - though the sum carries out
-  of eight bits from b = 26 on, where 0.4.2's did not out of sixteen, as
-  V3.1's does: the last of the limits below.
+  BDOS's system reset, or of such a procedure, and has no RETURN nor a
+  label on its END, which a GOTO reaches past the call, does not return:
+  MP/M II's SHOW, MSCHD and TOD read a number as `if (b and 1110$0000b) <>
+  0 then call terminate; b = shl(b, 3) + shl(b, 1); if carry then ...`,
+  and b is below 32 at those SHLs, which lose nothing - though the sum
+  carries out of eight bits from b = 26 on, where 0.4.2's did not out of
+  sixteen, as V3.1's does: the last of the limits below.
 
   What the warning does not see, of the places where the two meanings
   can differ: a store that reaches the variable other than by its name -
   past the end of an array, through MEMORY or a BASED variable whose base
   is not its address (the layout is uplm80's, Known issues); the flags a
   procedure is entered with, and those an EXTERNAL procedure, or one
-  called through an address, returns with; and arithmetic around a SHL
-  that loses nothing, which can overflow eight bits, in its value, as
-  0.4.3 has it, `shr(z, 4) - 1`, or in its flags - and ZERO, SIGN and
-  PARITY after such a SHL, which 0.4.2's 16-bit shift left as the
-  operation before it had.  Of the programs checked, the warnings are
-  0.4.3's: MP/M II's 7, and of 80un 0.3.3 none but the 20 of the old
-  single-file source it keeps, `src/plm/archive/80un.plm`.
+  called through an address, returns with; an EXTERNAL MON1 that is not
+  BDOS's entry, and returns from the function 0 - MON1 is the name DRI's
+  programs give BDOS's entry, and it is taken for that in every mode,
+  `-m bare` too, where DRI's programs call BDOS through it as well; and
+  arithmetic around a SHL that loses nothing, which can overflow eight
+  bits, in its value, as 0.4.3 has it, `shr(z, 4) - 1`, or in its flags -
+  and ZERO, SIGN and PARITY after such a SHL, which 0.4.2's 16-bit shift
+  left as the operation before it had.  Of the programs checked, the
+  warnings are 0.4.3's: MP/M II's 7, and of 80un 0.3.3 none but the 20 of
+  the old single-file source it keeps, `src/plm/archive/80un.plm`.
 
 - **The columns after a LITERALLY's text are the source's.**  The text
   takes the place of the name, on one line however many it runs over,
