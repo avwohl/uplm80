@@ -70,6 +70,7 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   structures, BASED or not, named without a subscript, `call sa.g`, which
   calls through `sa(0).g`: V3.1 takes it in a CALL, and rejects it in an
   expression (ERROR #133, of which uplm80 warns: 0.4.3).
+
       CALL AA(1): AA is an array, and a CALL calls a procedure, or
       through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1);
       Intel's PL/M-80 V3.1 rejects it (ERROR #118, INVALID INDIRECT CALL,
@@ -129,10 +130,11 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   `lbr.plm`), as uplm80 0.2 made it do to look like the multiply routine a
   product by a power of 2 stands for.  What wants a BYTE in HL widens it,
   as before.  Of the 88 MP/M II and 80un compiles, those that have either
-  are smaller and the rest the same: at `-O0` 39 (34 of MP/M II's, 822
-  bytes in all; 5 of 80un's, 210), at `-O2` 37 (32, 786; 5, 213), at
-  `-O3` 38 (33, 955; 5, 213).  80un's two programs built with it extract
-  and detokenize its test files as 0.4.3's builds do.
+  are smaller: at `-O0` 39 (34 of MP/M II's, 822 bytes in all; 5 of
+  80un's, 210), at `-O2` 36 (31, 786; 5, 213), at `-O3` 37 (32, 955; 5,
+  213).  DP.PLM's at `-O2` and `-O3` spells two instructions otherwise,
+  at the same size, and the rest is 0.4.3's.  80un's two programs built
+  with it extract and detokenize its test files as 0.4.3's builds do.
 
 ### Fixed
 
@@ -210,26 +212,28 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
 
 ### Verified
 
-On c38d2f5, with upeepz80 0.2.7 and um80 0.3.52, against 0.4.3 (4afe3c7).
+On 7a063e9, with upeepz80 0.2.7 and um80 0.3.52, against 0.4.3 (4afe3c7).
 
-- The suite: 1781 tests pass, where 0.4.3 had 1462.  Without Intel's
-  binaries 102 of the oracle's tests that need them skip, as does
-  `tests/test_divmod_dri.py`'s check of `PLM80.LIB`'s divide, and 1678
+- The suite: 1963 tests pass, where 0.4.3 had 1462.  Without Intel's
+  binaries 126 of the oracle's tests that need them skip, as does
+  `tests/test_divmod_dri.py`'s check of `PLM80.LIB`'s divide, and 1836
   pass.  pylint rates the package 9.76 (0.4.3: 9.75), with no message
   kind 0.4.3 did not have; `fixme` is gone with the TODO over `ld de,0`.
 - `tests/run_tests.sh`: all 22 programs pass.
 - `scripts/difftest.py`, `scripts/abifuzz.py` and `scripts/namestest.py`,
-  200 seeds each (110000-110199, 111000-111199, 112000-112199; and
-  namestest's `--modules`, 40, 112500-112539): every program prints what
+  200 seeds each (130000-130199, 131000-131199, 132000-132199; and
+  namestest's `--modules`, 40, 132500-132539): every program prints what
   the model, its `-O0` build or its scopes say.
-- `scripts/intel_oracle.py --random 300` (seeds 113001-113300), leaving
+- `scripts/intel_oracle.py --random 300` (seeds 133001-133300), leaving
   out `shift9`, `wide-limit`, `sub-zero`, `zero-dividend` and
-  `neg-widened`: 298 programs print at `-O0` to `-O3` what Intel's PL/M-80
-  V3.1 build prints.  The two others are V3.1's `INX SP` bug (README,
-  Known differences): seed 113053's `INX SP` in `else b4 = (ew := b4);`,
-  and seed 113246's `DCX SP` in a DO's limit, `((length(ab) = 08001h) mod
-  0ech) and 0fh`; with those statements written so that V3.1 codes
-  neither, each prints what V3.1's build prints.
+  `neg-widened`: 297 programs print at `-O0` to `-O3` what Intel's PL/M-80
+  V3.1 build prints.  The three others are V3.1's `INX SP` bug (README,
+  Known differences), in the pattern of a ROL, which V3.1 makes from a
+  register with `MOV A,L` or `MOV A,C` and `INX SP`: `rol((-(0ffffh)),
+  2)` in a DO's start (seed 133098), `rol((63928 / 61567), (b3 and 7) +
+  1)` in another (seed 133014), and `rol(0100h, 3)` in an argument (seed
+  133218), where SP one off stores over b1.  0.4.3's builds differ from
+  V3.1's the same way.
 - `scripts/intel_oracle.py --corpus --normalize`: of the 67 programs of
   `tests/` and `sample_code/`, 38 print what V3.1's build prints, V3.1
   rejects 28, and `tests/test_move_builtin.plm` differs where V3.1's MOVE
@@ -240,13 +244,20 @@ On c38d2f5, with upeepz80 0.2.7 and um80 0.3.52, against 0.4.3 (4afe3c7).
   DP.PLM's at `-O2` and `-O3` spells two instructions otherwise; the rest
   is 0.4.3's.  The 11 that stop, 0.4.3's ten and `names.plm`, a module
   of 80un's that names the others', stop with 0.4.3's errors, and every
-  compile gives the messages it gave: no new error and no new warning.  The code at `-O2`
-  is 165,092 bytes (0.4.3: 166,091), the data 45,264.
+  compile gives the messages it gave: no new error and no new warning.
+  The code at `-O2` is 165,092 bytes (0.4.3: 166,091), the data 45,264.
 - `sample_code/` and the programs of `tests/`, 67: the same messages, and
   18 of them smaller.  The suite's own programs warn of a SHL of a BYTE as
   0.4.3's did, but in the tests of the new warnings
   (`tests/test_shl_of_a_byte.py`, and a column in
   `tests/test_diagnostics.py`).
+- The flags warning, against 0.4.2's builds: of 100 generated programs of
+  12 cases each - a SHL of a BYTE, what may come between, a flag reader -
+  and 90 more with procedures between that set the flags or not, calls
+  through an address and readers in a procedure, built at `-O0` and
+  `-O2`, every case that prints one value with 0.4.2 and another with
+  0.4.4 is warned of, but PARITY after a SHL that loses nothing (the
+  limits, Fixed).
 - 80un's two programs, built from 80un 0.3.3 at `-O0`, `-O2` and `-O3`,
   extract the 130 files of 80un's 21 test archives and compressed files,
   detokenize `PALLOPS.BAS` and MBASIC 5.21's tokenized copies of its four
