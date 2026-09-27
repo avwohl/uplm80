@@ -1232,6 +1232,15 @@ V31_REJECTS = {
                                           "AT MODULE LEVEL, and #88, INVALID PROCEDURE NESTING, "
                                           "ILLEGAL IN REENTRANT PROCEDURE, and #174, INVALID NULL "
                                           "PROCEDURE)"),
+    "typed-external-procedure-in-procedure": ("p: procedure;\n  e: procedure byte external;\n"
+                                              "  end e;\n  b = e;\nend p;\ncall p;\n",
+                                              (39, 174, 156),
+                                              "T.PLM:9:3: error: E: an EXTERNAL procedure "
+                                              + _OUTER + "procedure P; Intel's PL/M-80 V3.1 "
+                                              "rejects it (ERROR #39, INVALID ATTRIBUTE OR "
+                                              "INITIALIZATION, NOT AT MODULE LEVEL, and #174, "
+                                              "INVALID NULL PROCEDURE, and #156, MISSING RETURN "
+                                              "STATEMENT IN TYPED PROCEDURE)"),
     "public-procedure-in-a-reentrant": ("r: procedure reentrant;\n  x: procedure public;\n"
                                         "    b = 1;\n  end x;\n  call x;\nend r;\ncall r;\n",
                                         (39, 88), "error: X: a PUBLIC procedure " + _OUTER
@@ -1288,6 +1297,13 @@ V31_REJECTS = {
                        "PROCEDURE)"),
     "null-procedure-labelled-end": ("p: procedure;\nl: end p;\ncall p;\n", (174,),
                                     "error: P: a procedure has at least one statement"),
+    # A typed one has no RETURN either (found checking 0.4.4).
+    "null-typed-procedure": ("h: procedure byte;\n  declare k byte;\nend h;\nb = h;\n",
+                             (174, 156),
+                             "T.PLM:8:1: error: H: a procedure has at least one statement, and "
+                             "H has none; Intel's PL/M-80 V3.1 rejects it (ERROR #174, INVALID "
+                             "NULL PROCEDURE, and #156, MISSING RETURN STATEMENT IN TYPED "
+                             "PROCEDURE)"),
     "two-subscripts-on-a-scalar": ("declare shl address;\nw = shl(w, 3);\n", (127, 114),
                                    "T.PLM:9:5: error: SHL(W, 3): SHL is not an array, and only an "
                                    "array takes a subscript, and only one; Intel's PL/M-80 V3.1 "

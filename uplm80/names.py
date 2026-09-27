@@ -63,6 +63,7 @@ from .ast_view import (
     literally_value,
     parse_plm_number,
     proc_attrs,
+    proc_return_type,
     string_value,
     struct_member_dim,
     struct_member_names,
@@ -578,6 +579,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
         153: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO MANY",
         154: "INVALID NUMBER OF ARGUMENTS IN CALL, TOO FEW",
+        156: "MISSING RETURN STATEMENT IN TYPED PROCEDURE",
         169: "ILLEGAL FORWARD CALL",
         170: "ILLEGAL RECURSIVE CALL",
         174: "INVALID NULL PROCEDURE",
@@ -633,14 +635,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         and in a DO block of the module alike; and ERROR 88, INVALID
         PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE, in a REENTRANT
         one, and ERROR 174, INVALID NULL PROCEDURE, of an EXTERNAL one,
-        which V3.1 then takes for a procedure with no statements."""
+        which V3.1 then takes for a procedure with no statements, and of a
+        typed one ERROR 156, MISSING RETURN STATEMENT IN TYPED PROCEDURE."""
         what = ("INTERRUPT" if attrs.interrupt_num is not None else
                 "PUBLIC" if attrs.is_public else "EXTERNAL")
         inner = block.proc is not None and block.proc.reentrant
         also = (f", and {block.proc.orig}, a REENTRANT procedure, has no procedure declared in "
                 "it" if inner else "")
         manual = " (Programming Manual 9800268B, 8.1.6)" if what == "INTERRUPT" else ""
-        numbers = (39, *((88,) if inner else ()), *((174,) if what == "EXTERNAL" else ()))
+        numbers = (39, *((88,) if inner else ()), *(_null(p) if what == "EXTERNAL" else ()))
         raise CodeGenError(
             f"{ident_text(p.name)}: a{'n' if what[0] in 'EI' else ''} {what} procedure must be "
             f"declared at the outer level of the module, not in {self._where(block)}{also}"
@@ -665,7 +668,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 for it in p.body.items):
             # Intel's PL/M-80 V3.1: ERROR 174, a label on its END or not.
             self.intel(p, f"{d.orig}: a procedure has at least one statement, and {d.orig} "
-                       "has none", 174)
+                       "has none", *_null(p))
         body = _Block("proc", block, block.module, d)
         params = p.signature.params
         for n in (params.names or []) if params is not None else []:
@@ -1472,6 +1475,14 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 continue
             for node, attr in d.sites + [(r.node, r.attr) for r in self.refs_of.get(id(d), [])]:
                 setattr(node, attr, _retext(getattr(node, attr), d.name))
+
+
+def _null(p: P.ProcDecl) -> tuple:
+    """The errors Intel's PL/M-80 V3.1 gives of a procedure with no
+    statements: ERROR 174, INVALID NULL PROCEDURE, and of a typed one, which
+    has no RETURN either, 156, MISSING RETURN STATEMENT IN TYPED
+    PROCEDURE."""
+    return (174, 156) if proc_return_type(p) is not None else (174,)
 
 
 def _has_parentheses(expr) -> bool:
