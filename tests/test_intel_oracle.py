@@ -27,8 +27,8 @@ from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
-from tests.test_names import (V31_ALLOWS, V31_DECLARED_BUILTINS, V31_DECLS, V31_LOCATIONS,
-                              V31_REJECTS, V31_RESTRICTED, V31_WARNS)
+from tests.test_names import (V31_ALLOWS, V31_BLOCK_LOCATIONS, V31_DECLARED_BUILTINS, V31_DECLS,
+                              V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED, V31_WARNS)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -54,6 +54,7 @@ RELEASE_PROGRAMS = {
     "v31-restricted": V31_RESTRICTED,            # 0.4.3, data (.memory), .(1 + 2)
     "v31-locations": V31_LOCATIONS,              # 0.4.3, data (.arr(2)), data (.s.k)
     **{f"declared-builtins-{k}": v[0] for k, v in V31_DECLARED_BUILTINS.items()},
+    **{f"block-locations-{k}": v[0] for k, v in V31_BLOCK_LOCATIONS.items()},
 }
 # V3.1's bugs the README's Known differences has and the generator does not
 # leave out: a program, after _PRELUDE; how the README writes it; what

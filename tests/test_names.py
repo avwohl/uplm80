@@ -1781,6 +1781,84 @@ def test_a_declared_memory_or_size_in_a_data_list_is_the_programs(name):
     _check(body, expect)
 
 
+# A location in a DATA list or an AT address of a procedure or a DO block
+# that names a variable the block declares further down: that variable,
+# as PL/M-80 scopes a name to its whole block (9.1), and as V3.1 prints
+# what is expected (tests/test_intel_oracle.py).  Code generation looked
+# the name up among what it had laid out so far, and at module level
+# only after that: the block's MEMORY was the end of the program
+# (`dw __END__', 0004), `.arr(2)' and `.size(2)' the module's arrays of
+# the other type, `buf' in an AT the module's, a structure's member not
+# found, and a name the module does not declare um80's undefined symbol;
+# at module level an AT's `.memory(3)' was the end of the program too.
+V31_BLOCK_LOCATIONS = {
+    "procedure": ("""
+declare arr (3) byte, size (3) address, buf (4) address;
+p: procedure;
+  declare dm address data (.memory), dm1 address data (.memory(1));
+  declare da address data (.arr(2)), ds address data (.size(2)), dl address data (.later(1));
+  declare dk address data (.s.k), dy address data (.sa(2).y);
+  declare z byte at (.buf(3)), zm byte at (.memory(3));
+  declare memory (4) byte, arr (3) address, size (3) byte, buf (4) byte, later (2) address;
+  declare s structure (m (3) byte, k address), sa (3) structure (x byte, y address);
+  call ph(dm - .memory); call ph(dm1 - .memory); call ph(da - .arr); call ph(ds - .size);
+  call ph(dl - .later); call ph(dk - .s); call ph(dy - .sa); call ph(.z - .buf);
+  call ph(.zm - .memory);
+end p;
+call p;
+""", [0, 1, 4, 2, 2, 3, 7, 3, 3]),
+    "do-block": ("""
+declare arr (3) byte;
+do;
+  declare w address data (.arr(2)), wl address data (.later(1));
+  declare z byte at (.later(3));
+  declare arr (3) address, later (4) address;
+  call ph(w - .arr); call ph(wl - .later); call ph(.z - .later);
+end;
+""", [4, 2, 6]),
+    "module-at": ("""
+declare z byte at (.memory(3));
+declare memory (4) byte;
+call ph(.z - .memory);
+""", [3]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(V31_BLOCK_LOCATIONS))
+def test_a_location_names_its_blocks_declaration_further_down(name):
+    body, expect = V31_BLOCK_LOCATIONS[name]
+    _check(body, expect)
+
+
+def test_an_initial_location_names_its_procedures_memory_further_down(capsys):
+    """INITIAL in a procedure, which V3.1 rejects (#73) and uplm80 takes
+    with a warning, resolves a location as DATA does: the procedure's own
+    MEMORY, declared after it."""
+    _check("""
+p: procedure;
+  declare w address initial (.memory(1));
+  declare memory (4) byte;
+  call ph(w - .memory);
+end p;
+call p;
+""", [1])
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+def test_memory_in_a_list_of_a_module_that_does_not_declare_it(opt):
+    """In a multi-file compile a module that does not declare MEMORY means
+    the built-in in a DATA list too, as in an expression and an AT, when
+    another module declares a MEMORY PUBLIC: its DATA had `dw MEMORY',
+    the other module's variable, and its code the end of the program."""
+    user = _BUILTINS_USER.replace(
+        "declare w address, b byte;",
+        "declare dm address data (.memory(2)), am byte at (.memory(2));\n"
+        "declare w address, b byte;").replace(
+        "call ph(own);", "call ph(own);\ncall ph(dm - .memory); call ph(.am - .memory);") % ""
+    assert _run_modules([user, _BUILTINS_LIB], opt).endswith("79BC 0002 0002 ")
+
+
 @pytest.mark.parametrize("name", ["stackptr", "shl", "double"])
 def test_the_location_of_a_built_in_in_a_list_is_uplm80s_own_refusal(name):
     """Intel's PL/M-80 V3.1 takes `data (.stackptr)' for an address of its

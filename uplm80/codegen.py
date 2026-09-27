@@ -743,11 +743,13 @@ class CodeGenerator:
         # EXTRN for another module's, so `jr' to a PUBLIC label from the
         # peephole is "JR to 'AGAIN': its target is the external symbol".
         self._compile_publics: set[str] = set()
-        # Every module-level DeclItem, for an AT that names a variable declared
-        # further down (see _declared_later).
-        self._module_decl_items: list = []
-        # Names whose AT _declared_later is resolving, to stop a circle.
-        self._resolving_at: set[str] = set()
+        # The symbol _gen_one_var made of each variable, by (id of its
+        # DeclItem, name): what names.resolve_names binds a name in a DATA
+        # or INITIAL list or an AT to (see _declaration_symbol).
+        self._declared_symbols: dict[tuple[int, str], Symbol] = {}
+        # The variables whose AT _declared_later is resolving, by the same
+        # key, to stop a circle.
+        self._resolving_at: set[tuple[int, str]] = set()
         # Names whose address is taken, or which are placed AT something
         # (see _survey_aliases).
         self._aliased: set[str] = set()
@@ -2206,7 +2208,6 @@ class CodeGenerator:
         self._survey_layout([module])
 
         shape = module_shape(module)
-        self._module_decl_items = [d for d in shape.decls if isinstance(d, P.DeclItem)]
 
         # Header
         self._emit(comment=f"PL/M-80 Compiler Output - {shape.name}")
@@ -2426,8 +2427,6 @@ class CodeGenerator:
 
         # Compute the shape view for each module once.
         shapes = [module_shape(m) for m in modules]
-        self._module_decl_items = [d for sh in shapes for d in sh.decls
-                                   if isinstance(d, P.DeclItem)]
         kept = self._kept_builtins(shapes)
         module_kept = {id(m): k for m, k in zip(modules, kept)}
 
@@ -2846,34 +2845,8 @@ class CodeGenerator:
 
         # Mangle name if it conflicts with register names
         base_name = self._mangle_name(name)
-        asm_name: str | None = base_name  # Default, may be overridden below
-
-        # Check if we're in a reentrant procedure - locals go on stack
-        in_reentrant = (self.current_proc_attrs is not None and
-                        self.current_proc_attrs.is_reentrant and
-                        not is_public and not is_external and
-                        not based_on and not at_location and
-                        not data_values_nodes and not initial_values_nodes)
-
-        # Check if this is a procedure local that can use shared storage
-        use_shared = False
-        if (not in_reentrant and self.current_proc and not is_public and not is_external
-            and not based_on and not at_location and not data_values_nodes
-            and not initial_values_nodes):
-            if (hasattr(self, 'storage_labels')
-                and self.current_proc in self.storage_labels
-                and name in self.storage_labels[self.current_proc]):
-                asm_name = self.storage_labels[self.current_proc][name]
-                use_shared = True
-
-        if not use_shared and not in_reentrant:
-            # For non-public local variables in procedures, prefix with scope name to avoid conflicts
-            if self.current_proc and not is_public and not is_external:
-                asm_name = f"@{self.current_proc}${base_name}"
-            else:
-                asm_name = base_name
-        elif in_reentrant:
-            asm_name = None  # Will use stack_offset instead
+        asm_name, use_shared, in_reentrant = self._var_storage(
+            name, attrs, based_on, self.current_proc, self.current_proc_attrs)
 
         # Calculate size
         if struct_members:
@@ -2944,6 +2917,7 @@ class CodeGenerator:
             stack_offset=stack_offset,  # Stack offset for reentrant locals
         )
         self.symbols.define(sym)
+        self._declared_symbols[(id(item), name)] = sym
         if defer_to_frame_end:
             self._reentrant_deferred.append(sym)
 
@@ -3012,45 +2986,69 @@ class CodeGenerator:
                 AsmLine(label=asm_name, opcode="ds", operands=str(size))
             )
 
-    def _module_declaration(self, name: str) -> tuple[Symbol, object, list] | None:
-        """The symbol a module-level DECLARE makes of ``name``, read from the
-        declaration itself, whether or not code generation has reached it:
-        the symbol, the DeclItem and the names it declares, or None.
+    def _var_storage(self, name: str, attrs, based_on, proc: str | None,
+                     procedure) -> tuple[str | None, bool, bool]:
+        """Where :meth:`_gen_one_var` puts the variable ``name``, declared
+        with ``attrs`` in procedure (or DO block) ``proc``, None at module
+        level, whose procedure's attributes are ``procedure``: its assembly
+        name, whether that is a slot of the shared automatic storage, and
+        whether it is in a REENTRANT procedure's frame instead, with no
+        name."""
+        plain = not (attrs.is_public or attrs.is_external or based_on or attrs.at_location
+                     or attrs.data_values or attrs.initial_values)
+        if plain and procedure is not None and procedure.is_reentrant:
+            return None, False, True        # at IX-offset
+        if plain and proc and name in getattr(self, "storage_labels", {}).get(proc, {}):
+            return self.storage_labels[proc][name], True, False
+        if proc and not attrs.is_public and not attrs.is_external:
+            # A procedure's or a block's own, prefixed with its scope.
+            return f"@{proc}${self._mangle_name(name)}", False, False
+        return self._mangle_name(name), False, False
 
-        A subscript or a member needs the variable's shape, so it is read
-        from the declaration rather than guessed; the assembly name is the
-        one :meth:`_gen_one_var` gives a module-level variable.
+    def _declaration_symbol(self, item, name: str, module_level: bool) -> Symbol:
+        """The symbol of the variable ``name`` the DeclItem ``item``
+        declares, as names.resolve_names binds a name in a DATA or INITIAL
+        list or an AT to it (``uplm80_decl``): the one :meth:`_gen_one_var`
+        made, or, where code generation has not reached the declaration,
+        one read from it - its shape, which a subscript or a member needs,
+        and the assembly name _gen_one_var will give it.  PL/M-80 scopes a
+        name to its whole block (9.1), and the only declarations not yet
+        reached that a list or an AT can name are further down its own
+        block, the one being generated, or at module level: a module's DATA
+        is laid out before its other variables.  A REENTRANT procedure's
+        local, which has no name, has a stack offset (0: not yet known).
         """
-        for item in self._module_decl_items:
-            names = decl_item_names(item)
-            if name not in names:
-                continue
-            attrs = decl_attrs(item)
-            data_type, dimension = _decl_item_type(item)
-            members = decl_item_struct_members(item)
-            struct_members = None
-            if members is not None:
-                struct_members = [
-                    _ast_nodes.StructMember(name=sn, data_type=_legacy_dt(struct_member_type(m)),
-                                            dimension=struct_member_dim(m))
-                    for m in members for sn in struct_member_names(m)
-                ]
-            based_on, _ = decl_item_based(item)
-            sym = Symbol(name=name, kind=SymbolKind.VARIABLE, data_type=data_type,
-                         dimension=dimension, struct_members=struct_members,
-                         based_on=based_on, is_external=attrs.is_external,
-                         asm_name=self._mangle_name(name))
-            return sym, item, names
-        return None
+        sym = self._declared_symbols.get((id(item), name))
+        if sym is not None:
+            return sym
+        attrs = decl_attrs(item)
+        data_type, dimension = _decl_item_type(item)
+        members = decl_item_struct_members(item)
+        struct_members = None
+        if members is not None:
+            struct_members = [
+                _ast_nodes.StructMember(name=sn, data_type=_legacy_dt(struct_member_type(m)),
+                                        dimension=struct_member_dim(m))
+                for m in members for sn in struct_member_names(m)
+            ]
+        based_on, _ = decl_item_based(item)
+        proc, procedure = ((None, None) if module_level
+                           else (self.current_proc, self.current_proc_attrs))
+        asm_name, _, in_frame = self._var_storage(name, attrs, based_on, proc, procedure)
+        return Symbol(name=name, kind=SymbolKind.VARIABLE, data_type=data_type,
+                      dimension=dimension, struct_members=struct_members,
+                      based_on=based_on, is_external=attrs.is_external,
+                      asm_name=asm_name, stack_offset=0 if in_frame else None)
 
-    def _declared_later(self, name: str) -> tuple[Symbol, tuple[str | None, int] | None] | None:
-        """A module-level variable an AT names before the DECLARE that makes it.
+    def _declared_later(self, item, name: str,
+                        module_level: bool) -> tuple[Symbol, tuple[str | None, int] | None]:
+        """A variable an AT names before the DECLARE that makes it, which
+        code generation has not reached (:meth:`_declaration_symbol`).
 
         PL/M-80 asks for the variable to be declared first, and DRI's compiler
         did not insist: UTIL5/SUB.PLM declares `rbuff(1) byte at
         (.minimum$buffer)' two hundred lines above minimum$buffer, and
-        UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.  Its shape is
-        read from the declaration (:meth:`_module_declaration`).
+        UTIL4/STAT.PLM's `.fcb(6dh-5ch)' comes before fcb.
 
         Returns the symbol, and where it is if it is itself AT: the (root,
         offset) of :meth:`_at_address`.  An AT is defined by an EQU, and the
@@ -3059,25 +3057,23 @@ class CodeGenerator:
         EXTERNAL further down is entered in `_extern_names' now, so a
         variable AT it is aliased to it (see :meth:`_emit_at_decl`).
         """
-        found = self._module_declaration(name)
-        if found is None:
-            return None
-        sym, item, names = found
+        sym = self._declaration_symbol(item, name, module_level)
         attrs = decl_attrs(item)
         if attrs.is_external and sym.asm_name not in self._compile_publics:
             self._extern_names.add(sym.asm_name)
         if attrs.at_location is None or sym.based_on:
             return sym, None
-        if name in self._resolving_at:
+        key = (id(item), name)
+        if key in self._resolving_at:
             raise CodeGenError(f"AT(.{name}): the AT addresses name each other in a circle")
-        self._resolving_at.add(name)
+        self._resolving_at.add(key)
         try:
             root, offset = self._at_address(attrs.at_location)
         finally:
-            self._resolving_at.discard(name)
+            self._resolving_at.discard(key)
         # A factored AT places each name after the last (6.2.8).
         size = self._element_width(sym) * max(sym.dimension or 1, 1)
-        return sym, (root, offset + names.index(name) * size)
+        return sym, (root, offset + decl_item_names(item).index(name) * size)
 
     @staticmethod
     def _element_width(sym: Symbol) -> int:
@@ -3098,19 +3094,34 @@ class CodeGenerator:
         """
         return self._designator(expr, self._at_root, "AT(...)")
 
+    def _location_builtin(self, expr) -> str | None:
+        """The built-in the name ``expr`` in a DATA or INITIAL list or an
+        AT means, upper case, or None: names.resolve_names has said
+        (``uplm80_builtin``), as a declaration further down the block hides
+        the built-in there too, and another module's PUBLIC one does not; a
+        name it said nothing of is looked up here (:meth:`_builtin_name`)."""
+        if getattr(expr, "uplm80_builtin", False):
+            return ident_text(expr.name).upper()
+        if getattr(expr, "uplm80_decl", None) is not None:
+            return None
+        return self._builtin_name(expr)
+
     def _at_root(self, expr) -> tuple[Symbol | None, str, int, int]:
         """The name a location in an AT starts from, as :meth:`_designator`
-        takes it."""
+        takes it: the declaration names.resolve_names binds it to
+        (``uplm80_decl``), which may be further down its block, or MEMORY,
+        the end of the program."""
         name = ident_text(expr.name)
-        if self._builtin_name(expr) == "MEMORY":
+        if self._location_builtin(expr) == "MEMORY":
             self._use_end_symbol()
             return None, "__END__", 0, 1
-        base_sym = self._lookup_scoped(name)
+        bound = getattr(expr, "uplm80_decl", None)
+        base_sym = (self._declared_symbols.get((id(bound[0]), name)) if bound is not None
+                    else self._lookup_scoped(name))
         if base_sym is None:
-            later = self._declared_later(name)
-            if later is None:
+            if bound is None:
                 raise CodeGenError(f"AT(.{name}): {name} is not declared")
-            base_sym, at = later
+            base_sym, at = self._declared_later(bound[0], name, bound[1])
             if at is not None:
                 # Itself AT, further down: where it is, not its name.
                 root, offset = at
@@ -3326,17 +3337,20 @@ class CodeGenerator:
         """The name a location in a DATA or INITIAL list starts from, as
         :meth:`_designator` takes it.
 
-        It is resolved against the module's declarations, not against what
-        code generation has laid out so far: the module's own DATA is laid
-        out before its other variables, and an INITIAL list may name a
-        variable declared further down, so a variable not yet in the symbol
-        table was taken for a byte, and `.arr(2)' of an ADDRESS array was
-        ARR+2 - and a name the program declares that is also a built-in's,
-        MEMORY or SIZE, for the built-in: `declare memory (4) byte; declare
-        w address data (.memory)' was the end of the program, and `.size(2)'
-        of `size (3) byte' SIZE+4.  MEMORY is the linker's end of the
-        program only where the program does not declare it (Intel's PL/M-80
-        V3.1 takes `.memory' there, as in an AT).
+        It is the declaration names.resolve_names binds it to
+        (``uplm80_decl``, :meth:`_declaration_symbol`), not what code
+        generation has laid out so far: the module's own DATA is laid out
+        before its other variables, an INITIAL list may name a variable
+        declared further down, and so may a procedure's or a DO block's
+        DATA, which PL/M-80 scopes to the whole block (9.1).  A variable not
+        yet in the symbol table was taken for a byte, `.arr(2)' of an
+        ADDRESS array ARR+2, or for another block's of its name, and a name
+        the program declares that is also a built-in's, MEMORY or SIZE, for
+        the built-in: `declare memory (4) byte; declare w address data
+        (.memory)' was the end of the program, and `.size(2)' of `size (3)
+        byte' SIZE+4.  MEMORY is the linker's end of the program only where
+        the program does not declare it (Intel's PL/M-80 V3.1 takes
+        `.memory' there, as in an AT).
         """
         label = getattr(expr, "uplm80_asm", None)
         if label is not None:
@@ -3344,13 +3358,12 @@ class CodeGenerator:
         name = ident_text(expr.name)
         if name in self.literal_macros:
             return None, self.literal_macros[name], 0, 1
-        sym = self._lookup_scoped(name)
-        if sym is None or sym.kind == SymbolKind.BUILTIN or sym is self._predeclared.get(sym.name):
-            found = self._module_declaration(name)
-            sym = found[0] if found is not None else None
-        if sym is None and name.upper() == "MEMORY":
+        if self._location_builtin(expr) == "MEMORY":
             self._use_end_symbol()
             return None, "__END__", 0, 1
+        bound = getattr(expr, "uplm80_decl", None)
+        sym = (self._declaration_symbol(bound[0], name, bound[1]) if bound is not None
+               else self._lookup_scoped(name))
         asm = sym.asm_name if sym is not None and sym.asm_name else self._mangle_name(name)
         return sym, asm, 0, self._element_width(sym) if sym is not None else 1
 

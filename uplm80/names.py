@@ -213,6 +213,7 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     dim: int | None = None      # a variable's: None for a scalar
     members: dict | None = None     # a structure's: member -> its dimension
     node: object = None         # a procedure's declaration
+    item: object = None         # a variable's DeclItem
 
     def __post_init__(self) -> None:
         self.orig = self.name
@@ -657,7 +658,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             kind = "label" if dtype == DataType.LABEL else "var"
             self._declare(block, name, kind, (node, "name"), public=attrs.is_public,
                           external=attrs.is_external, storage=storage and kind == "var",
-                          dim=_dimension(item), members=_members(item))
+                          dim=_dimension(item), members=_members(item), item=item)
         if item.based is not None:
             self._visit(item.based.base, block)
         self._byte_values.update(_byte_values(item))
@@ -1520,6 +1521,17 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         Such a label is at the outer level of the main program (the GOTO
         rule), where nothing else is on the stack.  A PUBLIC label may be
         reached by a GOTO in another module's procedure, compiled apart.
+
+        And tell it which declaration a name in a DATA or INITIAL list or
+        an AT address means: ``uplm80_decl``, the variable's DeclItem and
+        whether it is at module level, or ``uplm80_builtin``, the
+        built-in.  PL/M-80 scopes a name to its whole block (9.1), and a
+        DATA list or an AT comes before a declaration further down the
+        block, which code generation has not reached there: it took a
+        procedure's MEMORY declared after its DATA for the end of the
+        program, `.arr(2)' for the module's array of the name, and, in a
+        multi-file compile, the MEMORY another module makes PUBLIC for
+        this one's, which does not declare it.
         """
         for d in self.decls:
             if d.kind != "label":
@@ -1533,6 +1545,16 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             for r in self.refs_of.get(id(d), []):
                 if not r.goto:
                     r.node.uplm80_asm = name
+        for r in self.refs:
+            if r.goto or not (r.in_list or r.in_at):
+                continue
+            # A location in a DATA or INITIAL list or an AT address: the
+            # declaration it names, which may be further down its block.
+            d = r.decl
+            if d is None and _key(getattr(r.node, r.attr)) in _BUILTINS:
+                r.node.uplm80_builtin = True
+            elif d is not None and d.kind == "var" and d.item is not None:
+                r.node.uplm80_decl = (d.item, d.block.kind == "module")
 
     def write_back(self) -> None:
         """Spell every renamed declaration's new name wherever it is named."""
