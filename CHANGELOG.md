@@ -100,12 +100,11 @@ of the same forms to print what uplm80's builds print.
   an ADDRESS by a constant set DE to 0 after it, which nothing reads (80un's
   `lbr.plm`), as uplm80 0.2 made it do to look like the multiply routine a
   product by a power of 2 stands for.  What wants a BYTE in HL widens it,
-  as before.  Of the 88 MP/M II
-  and 80un compiles, those that have either are smaller and the rest the
-  same: at `-O0` 39 (34 of MP/M II's, 822 bytes in all; 5 of 80un's, 210),
-  at `-O2` 37 (32, 786; 5, 213), at `-O3` 38 (33, 955; 5, 213).  80un's
-  two programs built with it extract and detokenize its test files as
-  0.4.3's builds do.
+  as before.  Of the 88 MP/M II and 80un compiles, those that have either
+  are smaller and the rest the same: at `-O0` 39 (34 of MP/M II's, 822
+  bytes in all; 5 of 80un's, 210), at `-O2` 37 (32, 786; 5, 213), at
+  `-O3` 38 (33, 955; 5, 213).  80un's two programs built with it extract
+  and detokenize its test files as 0.4.3's builds do.
 
 ### Fixed
 
@@ -152,7 +151,8 @@ of the same forms to print what uplm80's builds print.
   0.4.3 has it, `shr(z, 4) - 1`, or in its flags - and ZERO, SIGN and
   PARITY after such a SHL, which 0.4.2's 16-bit shift left as the
   operation before it had.  Of the programs checked, the warnings are
-  0.4.3's: MP/M II's 7, none in 80un 0.3.3's sources.
+  0.4.3's: MP/M II's 7, and of 80un 0.3.3 none but the 20 of the old
+  single-file source it keeps, `src/plm/archive/80un.plm`.
 
 - **The columns after a LITERALLY's text are the source's.**  The text
   takes the place of the name, on one line however many it runs over,
@@ -162,6 +162,52 @@ of the same forms to print what uplm80's builds print.
   its text moved them back.  What a message is about in the text itself
   is placed at the name.  A word declared LITERALLY 'LITERALLY' and a
   procedure's name given by a LITERALLY are counted as their texts.
+
+### Verified
+
+On c38d2f5, with upeepz80 0.2.7 and um80 0.3.52, against 0.4.3 (4afe3c7).
+
+- The suite: 1781 tests pass, where 0.4.3 had 1462.  Without Intel's
+  binaries 102 of the oracle's tests that need them skip, as does
+  `tests/test_divmod_dri.py`'s check of `PLM80.LIB`'s divide, and 1678
+  pass.  pylint rates the package 9.76 (0.4.3: 9.75), with no message
+  kind 0.4.3 did not have; `fixme` is gone with the TODO over `ld de,0`.
+- `tests/run_tests.sh`: all 22 programs pass.
+- `scripts/difftest.py`, `scripts/abifuzz.py` and `scripts/namestest.py`,
+  200 seeds each (110000-110199, 111000-111199, 112000-112199; and
+  namestest's `--modules`, 40, 112500-112539): every program prints what
+  the model, its `-O0` build or its scopes say.
+- `scripts/intel_oracle.py --random 300` (seeds 113001-113300), leaving
+  out `shift9`, `wide-limit`, `sub-zero`, `zero-dividend` and
+  `neg-widened`: 298 programs print at `-O0` to `-O3` what Intel's PL/M-80
+  V3.1 build prints.  The two others are V3.1's `INX SP` bug (README,
+  Known differences): seed 113053's `INX SP` in `else b4 = (ew := b4);`,
+  and seed 113246's `DCX SP` in a DO's limit, `((length(ab) = 08001h) mod
+  0ech) and 0fh`; with those statements written so that V3.1 codes
+  neither, each prints what V3.1's build prints.
+- `scripts/intel_oracle.py --corpus --normalize`: of the 67 programs of
+  `tests/` and `sample_code/`, 38 print what V3.1's build prints, V3.1
+  rejects 28, and `tests/test_move_builtin.plm` differs where V3.1's MOVE
+  of 0 bytes moves 65536, as with 0.4.3.
+- The 88 compiles of MP/M II's and 80un's PL/M (0.4.3's 87, and 80un
+  0.3.3's `names.plm`, one at a time): the assembly of those with a
+  widened BYTE or an `ld de,0` dead after it is smaller (Changed), and
+  DP.PLM's at `-O2` and `-O3` spells two instructions otherwise; the rest
+  is 0.4.3's.  The 11 that stop, 0.4.3's ten and `names.plm`, a module
+  of 80un's that names the others', stop with 0.4.3's errors, and every
+  compile gives the messages it gave: no new error and no new warning.  The code at `-O2`
+  is 165,092 bytes (0.4.3: 166,091), the data 45,264.
+- `sample_code/` and the programs of `tests/`, 67: the same messages, and
+  18 of them smaller.  The suite's own programs warn of a SHL of a BYTE as
+  0.4.3's did, but in the tests of the new warnings
+  (`tests/test_shl_of_a_byte.py`, and a column in
+  `tests/test_diagnostics.py`).
+- 80un's two programs, built from 80un 0.3.3 at `-O0`, `-O2` and `-O3`,
+  extract the 130 files of 80un's 21 test archives and compressed files,
+  detokenize `PALLOPS.BAS` and MBASIC 5.21's tokenized copies of its four
+  text `.bas` files, and refuse the text files, byte for byte as 0.4.3's
+  `-O2` build does (cpmemu, binary mode); what they print differs only in
+  the size cpmemu says it loaded.
 
 ### Known issues
 
