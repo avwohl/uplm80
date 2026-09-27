@@ -201,11 +201,18 @@ where:
   `a(1)(2)` is an error, and INPUT and OUTPUT take one port.
 - SHL and SHR of a BYTE are a BYTE (11.1.4), and the bits shifted out of
   it are lost; `SHL(DOUBLE(b), n)` keeps them.  uplm80 before 0.4.3
-  shifted a BYTE in 16 bits, and where a SHL of a BYTE can shift a set bit
+  shifted a BYTE in 16 bits.  Where a SHL of a BYTE can shift a set bit
   out and the bits above its low byte are used - stored to an ADDRESS,
-  compared, used as a subscript, ... - or the flags of an operation on it
-  are read - by PLUS, MINUS, CARRY, ZERO, ... - the compiler warns
+  compared, used as a subscript, ... - the compiler warns at the SHL; and
+  it warns at every flag reader - PLUS, MINUS, CARRY, ZERO, SIGN, PARITY,
+  SCL, SCR, DEC - the flags of a SHL or SHR of a BYTE, or of an 8-bit
+  operation on one, may reach, which are an 8-bit operation's since 0.4.3
   (CHANGELOG, 0.4.3 and 0.4.4).
+- A flag reader reads at every `-O` level the flags it reads at `-O0`:
+  the optimizer leaves as it is any operation whose flags a reader can
+  read, where it folded `x OR 0`, `x XOR 0` or `SHL(3, 2)` from `-O1` on,
+  and at `-O3` an operation of a variable whose value it knew, a loop it
+  unrolled or a test it decided (0.4.4).
 
 ## Conditional Compilation
 
@@ -661,42 +668,43 @@ result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
 | | `b = 0ECH; w = (ew := b) + b;` (ew, w ADDRESS) | `01D8H` | `00D8H` | V3.1 widens b to store it in ew and adds that 16-bit copy to itself, `SHLD EW; MOV D,H; MOV E,L; DAD D` (0.4.3's campaign, seed 50252); the manual (4.6.3): the embedded assignment is its right half, a BYTE, and BYTE + BYTE is a BYTE |
 | | `w2 = 0FFFEH; w2, w3 = (ew := w2);` (w2, w3, ew ADDRESS) | w3 `0000` | w3 `0FFFEH` | Where a multiple assignment's value is an embedded assignment of one of its targets but the last, V3.1 takes that target's value for an address, `LHLD W2; SHLD EW; MOV D,H; MOV E,L; XCHG` and 52 `INX H`: it copies the word there, at 0032H, onto itself and into each target after w2, and does not store w2.  With a BYTE, `w2, w3 = (eb := w2);`, it stores that address, 0032H, at itself and in w3.  How far from the value it goes changes with the program: 54 bytes on in another, 9 back in 0.4.3's release check's seed 80353, which stored 0FFF5H.  `w3, w2 = (ew := w2);` is right; the manual: the embedded assignment is w2 (4.6.3), which each target gets |
 | | `CALL MOVE(0, .s, .d);` | moves 65536 bytes | moves none | Intel's MOVE counts down before it tests |
+| | `b = SHL(k, 1); c = d OR 0; e = CARRY;` (k = 0FFH, d = 1) | `0FFH` | `0` | V3.1 compiles no instruction for `x OR 0`, `x XOR 0`, `x + 0`, `x - 0`, `x AND 0FFH` and an operation of constants, `DEC(34H + 21H)`, and a flag read after one reads the flags of what came before; uplm80 computes each, as its `-O0` build always did and every level does since 0.4.4.  And the control code of a loop leaves other flags: `DO i = 1 TO 2; c = 5; END; e = CARRY;` is 0FFH with V3.1 and 0 with uplm80, `DO WHILE z; ...; END; e = ZERO;` of z = 0 the other way round.  The manual: the flags are not to be relied on (12.1) |
 | | `rw = ((08B1FH - b3) XOR (-((b4 >= ms(3)) AND 0))) + 0;` (b3 = 20H, b4 = 0, `ms DATA('x=1; y=2$')`) | `0` | `8AFFH` | V3.1's count of what it has on the stack goes below zero (its listing counts 0, 255, 254, ...) and it pops what it never pushed, a run of `POP PSW` (seed 20090); 8AFFH is the manual's value |
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
-after a statement or among a DO CASE's cases (26; uplm80 refuses a DO
-CASE of declarations alone as a DO CASE with no case, 201), `NOT NOT x`
-(102), and a `CALL` of a typed procedure the program declares (129); and
-what the CHANGELOG lists under Known issues: more `INITIAL` or `DATA`
-values than a scalar holds (209), and, at `-O1` and up, SHL and SHR in a
-DATA or INITIAL list or an AT address (151).  uplm80 compiles, with a
-warning that names
-V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
-`INITIAL` in a procedure or a DO block (73), on which programs written
-for it rely, and a subscript on a scalar, `x(1)` (127), and a member of
-an array of structures without its subscript, `s2.m(1)` (133), which its
-own tests test.  It rejects, as V3.1 does, a name declared nowhere,
-empty parentheses after a variable or a built-in, `.label` in an
-expression, an `INTERRUPT` procedure below module level, a parameter no
-`DECLARE` declares, and a `LITERALLY` used before its declaration (since
-0.4.1); a dimension of 0, the address of a built-in but MEMORY, and a
-PUBLIC or EXTERNAL procedure or variable below module level (since
-0.4.2); and an `END` that names another block (20), a DO CASE with no
-case (201), `.p(1)` of a procedure (104), anything in parentheses in a
-subscript of the argument of SIZE, LENGTH or LAST, `size(ab(f(1)))` (32),
-a procedure with no statements (174), two subscripts on a scalar (127,
-114), an array or a member array without a subscript (133, 134), and a
-call of a procedure declared further on (169) (since 0.4.3); and more than
-one subscript (114), a subscript on a scalar member (127) or after a
+after a statement or among a DO CASE's cases (26; uplm80 refuses a DO CASE
+of declarations alone as a DO CASE with no case, 201), `NOT NOT x` (102),
+and a `CALL` of a typed procedure the program declares (129); and what the
+CHANGELOG lists under Known issues: more `INITIAL` or `DATA` values than a
+scalar holds (209), at `-O1` and up SHL and SHR in a DATA or INITIAL list
+or an AT address (151), and a typed procedure with no RETURN (156).
+uplm80 compiles, with a warning that names V3.1's error, `f()` and `CALL
+g()` of a procedure (102, 153) and `INITIAL` in a procedure or a DO block
+(73), on which programs written for it rely, and a subscript on a scalar,
+`x(1)` (127), and a member of an array of structures without its
+subscript, `s2.m(1)` (133), which its own tests test.  It rejects, as V3.1
+does, a name declared nowhere, empty parentheses after a variable or a
+built-in, `.label` in an expression, an `INTERRUPT` procedure below module
+level, a parameter no `DECLARE` declares, and a `LITERALLY` used before
+its declaration (since 0.4.1); a dimension of 0, the address of a built-in
+but MEMORY, and a PUBLIC or EXTERNAL procedure or variable below module
+level (since 0.4.2); and an `END` that names another block (20), a DO CASE
+with no case (201), `.p(1)` of a procedure (104), anything in parentheses
+in a subscript of the argument of SIZE, LENGTH or LAST, `size(ab(f(1)))`
+(32), a procedure with no statements (174), two subscripts on a scalar
+(127, 114), an array or a member array without a subscript (133, 134), and
+a call of a procedure declared further on (169) (since 0.4.3); and more
+than one subscript (114), a subscript on a scalar member (127) or after a
 subscript (32), a second port of INPUT or OUTPUT (108), a CALL through
 what is not an ADDRESS scalar (118) or of a built-in with a type, `CALL
-STACKPTR` (129), a built-in with too few or too many arguments (154,
-153, 124, 126) and INPUT or OUTPUT without a port (109), MEMORY without
-a subscript (133), a non-REENTRANT procedure's call of itself (170), a
+STACKPTR` (129), a built-in with too few or too many arguments (154, 153,
+124, 126) and INPUT or OUTPUT without a port (109), MEMORY without a
+subscript (133), a non-REENTRANT procedure's call of itself (170), a
 procedure nested in a REENTRANT one or a REENTRANT one nested in another
-(88, 39), and an `END` that names the first of two labels on a DO, `a:
-c: do; ... end a;` (20) (since 0.4.4).
+(88, 39), an `END` that names the first of two labels on a DO, `a: c: do;
+... end a;` (20), and an assignment to a built-in or a procedure,
+`INPUT(1) = b` (128, and 131 of one without a type) (since 0.4.4).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),

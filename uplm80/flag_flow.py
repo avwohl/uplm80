@@ -7,27 +7,35 @@ DEC adjusts by it and the half carry (Programming Manual 9800268B, 12.1 to
 them to each reader control flow can take them to: through the statements
 after it, round loops, into both arms of an IF and each case of a DO CASE,
 from a GOTO to every label of its name, into a procedure called, which is
-entered with them, and from its RETURNs and its END back to every call of
-it.  A CALL through an address may call any procedure whose address the
-program takes, and an EXTERNAL procedure's code any PUBLIC one.  An
-INTERRUPT procedure is entered with whatever flags the code it interrupts
-has.  What sets no flag, or only some, passes them on - a load, a store, a
-call, a statement - and so does whatever the checker cannot tell apart.
+entered with them, and from its RETURNs and its END back to the call.  A
+CALL through an address may call any procedure whose address the program
+takes, and an EXTERNAL procedure's code any PUBLIC one; an INTERRUPT
+procedure is entered with whatever flags the code it interrupts has.  What
+sets no flag, or only some, passes them on - a load, a store, a call, a
+comparison, a statement - and so does whatever the checker cannot tell
+apart.
 
-One operation stops them: an addition, subtraction, AND, OR or XOR of two
-BYTE operands - BYTE variables, elements of BYTE arrays, BYTE constants,
-and such operations of them - not both constants, that is the value of an
-assignment statement, the argument of DEC or the left operand of a PLUS or
-MINUS of BYTEs (:meth:`FlagFlow._kills`).  Code generation makes it an
-8-bit `add', `sub', `and', `or' or `xor', which sets the carry, zero, sign,
-parity and half carry; the optimizer leaves as they are the operations
-whose flags a reader can read (:meth:`FlagFlow.live`), and the peephole
-optimizer changes no flag an instruction after it reads.
+One operation stops them: an addition, subtraction, AND, OR or XOR whose
+operands code generation is certain to take for BYTEs
+(:meth:`FlagFlow._bytes`), that is the value of an assignment statement,
+or DEC of one, or a PLUS or MINUS of BYTEs whose left operand is one
+(:meth:`FlagFlow._sets`).  Code generation makes it an 8-bit `add',
+`sub', `and', `or' or `xor' in A, the last thing the value's code does,
+which sets the carry, zero, sign, parity and half carry; the optimizer
+leaves as they are the operations whose flags a reader can read
+(:meth:`FlagFlow.live`), and the peephole optimizer changes no flag an
+instruction after it reads.  A CALL of procedures each of which ends in
+one every way stops them too.
 
-Over-approximate: a reader is taken to read the flags of any operation of
-its own statement, in whatever order the statement's operands are
-evaluated, but for the argument of DEC or the left operand of PLUS or MINUS
-that is such an operation, which it reads the flags of.
+:meth:`FlagFlow.shift_readers` follows the flags of each shift of a BYTE
+to the readers they reach, each procedure's body once from its entry, and
+what it returns with stands for it at each call.  A reader reads only such
+an operation's flags where it is DEC of one, or a PLUS or MINUS of BYTEs
+whose left operand is one, of operands that call, shift and read nothing
+(:meth:`FlagFlow._kills`); any other is taken to read the flags of any
+operation of its own statement, in whatever order the statement's
+operands are evaluated.  :meth:`FlagFlow.live`, for the optimizer, goes
+back from the readers, a procedure's exit to every call of it.
 """
 
 from __future__ import annotations

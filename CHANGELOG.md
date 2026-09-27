@@ -11,10 +11,11 @@ errors Intel's PL/M-80 V3.1 gives, V3.1's numbers and texts, at every
 level - more than one subscript, a CALL through what is not an ADDRESS
 scalar or of a built-in with a type, a built-in with too few or too many
 arguments, MEMORY without a subscript, a procedure that calls itself, a
-REENTRANT procedure where V3.1 refuses one.  The SHL of a BYTE warning
-follows the flags, and what it does not see is stated.  Smaller code
-after an 8-bit operation, and the columns after a LITERALLY's text are
-the source's.
+REENTRANT procedure where V3.1 refuses one, an assignment to a built-in
+or a procedure.  Every flag reader the flags of a SHL or SHR of a BYTE
+may reach is warned of, and every `-O` level reads the flags `-O0`
+reads.  Smaller code after an 8-bit operation, and the columns after a
+LITERALLY's text are the source's.
 
 ### Incompatible: more errors Intel's PL/M-80 gives
 
@@ -22,17 +23,19 @@ What uplm80 compiled and Intel's PL/M-80 V3.1 rejects is refused as V3.1
 refuses it, with the number and text of each error V3.1 gives, at every
 `-O` level.  No program of MP/M II (DRI's tree and mpm2's overrides), of
 80un 0.3.3 or of `sample_code` has any of these, and none of the 88
-compiles of their PL/M gives a new message; one test's program, which
+compiles of their PL/M gives a new error; one test's program, which
 called through an array's element to have its address found in DE, calls
 through a BASED ADDRESS now.  V3.1 rejects each program of
 `tests/test_names.py` with the errors the message names, and no other
 (`tests/test_intel_oracle.py`), and builds the programs of what it takes
-of the same forms to print what uplm80's builds print.  Two of 0.4.3's
+of the same forms to print what uplm80's builds print.  Three of 0.4.3's
 messages name more of V3.1's errors: an EXTERNAL procedure in a procedure
 or a DO block #174, INVALID NULL PROCEDURE, besides #39, as V3.1 takes it
-for a procedure with no statements; and LENGTH and LAST of a reference
-with anything in parentheses in a subscript #125, ILLEGAL ARGUMENT FOR
-BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
+for a procedure with no statements, and a typed one #156, MISSING RETURN
+STATEMENT IN TYPED PROCEDURE, too; a typed procedure with no statements
+#156 besides #174; and LENGTH and LAST of a reference with anything in
+parentheses in a subscript #125, ILLEGAL ARGUMENT FOR BUILT-IN
+PROCEDURE, besides #32 (SIZE only #32).
 
 - **More than one subscript** (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
   SUBSCRIPTS ILLEGAL), wherever a subscript goes: of an array, a BASED
@@ -115,6 +118,14 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   PROCEDURE NESTING, ILLEGAL IN REENTRANT PROCEDURE); both of a REENTRANT
   procedure in a REENTRANT one (0.4.3's Known issues), and of an
   INTERRUPT, PUBLIC or EXTERNAL one, which 0.4.3 refused with #39 alone.
+- **An assignment to a built-in or a procedure** (ERROR #128, INVALID
+  LEFT-HAND OPERAND OF ASSIGNMENT, and #131, ILLEGAL REFERENCE TO UNTYPED
+  PROCEDURE, of one without a type), as a statement's target or an
+  embedded assignment's: `input(1) = b`, `low(w) = b`, `b, carry = 1`,
+  `time(1) = b`, `f = b` of a procedure F, which uplm80 compiled to a
+  store to a symbol of the name that only the link found undefined (found
+  checking 0.4.4; 0.4.3 the same).  MEMORY, OUTPUT and STACKPTR are
+  assigned as before.
 - **An END that names the first of two labels on a DO**, `m: n: do; ...
   end m;` (ERROR #20, MISMATCHED IDENTIFIER AT END OF BLOCK): V3.1 takes
   only the label next to DO, `end n;` (0.4.3's Known issues).
@@ -138,29 +149,68 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
 
 ### Fixed
 
-- **The SHL of a BYTE warning is given where only the flags tell the two
-  meanings apart** (0.4.3's release check).  An operation on a SHL of a
-  BYTE that can lose bits is one of eight bits where it was one of
-  sixteen: its carry comes out of bit 7, and it sets ZERO, SIGN and PARITY
-  where a 16-bit addition left them.  PLUS, MINUS, SCL, SCR and DEC read
-  the carry, and CARRY, ZERO, SIGN and PARITY the flags, of the operation
-  before them, and where that is one the SHL is part of, the compiler
-  warns: `b = (shl(k, 4) + 10h) plus 0` with k = 0FFH was 00 and is 01,
-  `b = shl(k, 1); c = carry;` 00 and 0FFH, `b = shl(k, 1); b = scl(1,
+- **Every flag reader the flags of a shift of a BYTE may reach is warned
+  of** (0.4.3's release check, and checking 0.4.4).  A SHL or SHR of a
+  BYTE is a shift of eight bits since 0.4.3, and it, and what is computed
+  of it in eight bits where it was sixteen, sets the carry, ZERO, SIGN,
+  PARITY and the half carry of eight bits, whatever the shift loses.  The
+  compiler warns at each flag reader - PLUS, MINUS, CARRY, ZERO, SIGN,
+  PARITY, SCL, SCR and DEC - those flags may reach, naming the shifts:
+  `b = shl(k, 1); c = carry;` with k = 0FFH was 00 and is 0FFH, `c =
+  shr(d, 7) plus 0` with d = 0FFH 01 and 02, `b = shl(k, 1); b = scl(1,
   1);` 02 and 03.  The flags are followed through the statements after
-  the operation, past what sets none of them or the carry alone - a load
-  or a store, NOT (`cpl`), a minus (`cpl / inc a`), a product of BYTEs
-  (`add hl,hl`), an operation of sixteen bits - through IF, DO CASE and
-  loops, into a procedure called and to a RETURN and from the call, where
-  a procedure that sets none returns with its caller's, `b = shl(k, 1);
-  call g; c = carry;` of a G that stores a constant, and from any GOTO to
-  a label.  A CALL through an address may call any procedure whose
-  address is taken.
+  the shift, round loops, through IF and DO CASE, from a GOTO to every
+  label of its name, into a procedure called and back out of it - where
+  it may set none, with the caller's flags - through a CALL through an
+  address into every procedure whose address is taken, and from an
+  EXTERNAL procedure's code into every PUBLIC one; an INTERRUPT procedure
+  is entered with the flags of any.  One operation stops them: an
+  addition, subtraction, AND, OR or XOR of two BYTEs that is the value of
+  an assignment statement (or DEC of one, or a PLUS or MINUS of BYTEs
+  whose left operand is one), which code generation makes an 8-bit `add`,
+  `sub`, `and`, `or` or `xor` and every level keeps (the next entry); and
+  so does a CALL of procedures each of which ends in one every way.
+  Anything else passes the flags on - a store, a comparison, a MOVE, a
+  16-bit operation, a shift by 0 - where 0.4.4 before this took some of
+  them to set the flags, and gave no warning of a reader that read those
+  of the shift before them (found checking 0.4.4: a MOVE of a constant
+  count, `ldir`, a shift by 0 and an operation folded to a constant set
+  none).  A reader may be warned of that in fact reads the flags of
+  something else; none a shift's flags reach is left out, but in code the
+  program does not have, an EXTERNAL procedure's or what a CALL through an
+  address reaches outside it (uplm80/flag_flow.py).
 
-      warning: SHL(K, 1): SHL of a BYTE is a BYTE (Programming Manual
-      9800268B, 11.1.4), and CARRY reads the flags of an operation of eight
-      bits on it; SHL(DOUBLE(K), 1) is shifted in 16 bits, as uplm80
-      before 0.4.3 shifted a BYTE
+      warning: CARRY may read the flags of SHL(K, 1) (line 12): since
+      uplm80 0.4.3 a shift of a BYTE is one of 8 bits (Programming Manual
+      9800268B, 11.1.4), and it, and an operation on it, set the flags of
+      an 8-bit operation, where it was one of 16 bits; SHL(DOUBLE(K), 1)
+      shifts in 16 bits
+
+  Of the programs checked, MP/M II's SHOW (DRI's and mpm2's), MSCHD and
+  TOD are warned of, once each: they read a number as `b = shl(b, 3) +
+  shl(b, 1); if carry then ...`, and the sum carries out of eight bits
+  from b = 26 on, where 0.4.2's did not out of sixteen (V3.1's build as
+  0.4.4's); and the suite's `tests/test_byte_shifts.plm`, six times,
+  whose SCL and SCR read the carry the calls before them leave.
+- **Every level reads the flags `-O0` reads** (found checking 0.4.4;
+  0.4.3 the same).  The optimizer folded `d or 0`, `d xor 0`, `shl(3,
+  2)` and `3 + 4` from `-O1` on, and at `-O3` an operation of a variable
+  whose value it knew, `c = z` of z = 0 to `xor a`, a loop it unrolled or
+  a test it decided, so that a flag read after one read, at some levels,
+  the flags of what came before it: `b = shl(k, 1); c = d or 0; e =
+  carry;` with k = 0FFH left e 0 at `-O0` and 0FFH at `-O1` to `-O3`, and
+  `do i = 1 to 2; c = 5; end; e = carry;` 0 at `-O0` to `-O2` and 0FFH at
+  `-O3`.  It leaves as it is each operation whose flags a reader can
+  read, by the rule of the entry before (uplm80/flag_flow.py), and each
+  reader: not folded, rewritten, unrolled or inlined, and of operands of
+  the same kind - `w + one` is `add hl,de`, where `w + 1` is `inc hl` -
+  in the other modules of a multi-file compile too.  Where no reader can
+  read them, the code is as it was: of the 88 compiles of MP/M II's and
+  80un's PL/M, and of `sample_code`, none changes; of the suite's
+  programs, `test_dec_bcd.plm` and `test_byte_shifts.plm`, where
+  `dec(34h + 21h)` is `ld a,34h / add a,21h / daa` at every level.  V3.1
+  folds some of these itself, and differs from every level as from `-O0`
+  (README, Known differences).
 
 - **A test that assigns the variable it bounds no longer bounds it**:
   `k = 1; if k < 4 and (k := 200) > 0 then w = shl(k, 6);` was 3200H and
@@ -174,32 +224,40 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   6);` was 3200H and is 0, with no warning, as in 0.4.3, and so was `k =
   1; if k < 4 and f > 0 then w = shl(k, 6);` of an f that calls through
   q; and after a CALL through a structure's member, `call s.g`, what the
-  statements before it had left still held.  A test `(n and 0e0h) <> 0`
-  bounds n by what the mask leaves (31), and a procedure that ends in a
-  call of MON1 with the function 0, BDOS's system reset, or of such a
-  procedure, and has no RETURN nor a label on its END, which a GOTO
-  reaches past the call, does not return: MP/M II's SHOW, MSCHD and TOD
-  read a number as `if (b and 1110$0000b) <> 0 then call terminate; b =
-  shl(b, 3) + shl(b, 1); if carry then ...`, and b is below 32 at those
-  SHLs, which lose nothing - though the sum carries out of eight bits from
-  b = 26 on, where 0.4.2's did not out of sixteen, as V3.1's does: the
-  last of the limits below.
+  statements before it had left still held.  **Each name is what it
+  names where it is used** (found checking 0.4.4): a parameter or a
+  variable called through that has the name of a procedure was taken for
+  a call of the procedure, and, as in 0.4.3, a variable a DO block
+  declares for the one of its name after the block.  With v = .setk and a
+  procedure P that assigns another variable, `k = 1; call r2(v); w =
+  shl(k, 6);` of `r2: procedure (p); declare p address; call p; end r2;`
+  was 3200H and is 0, with no warning, and so was `k = 1; call s2; w =
+  shl(k, 6);` of `s2: procedure; do; declare k byte; k = 5; end; k =
+  200; end s2;`, and the K of an INTERRUPT procedure written so kept its
+  bound; and a procedure whose last statement calls through a parameter
+  named like a procedure that does not return was taken not to return
+  itself.  A test `(n and 0e0h) <> 0` bounds n by what the mask leaves
+  (31), and a procedure that ends in a call of MON1 with the function 0,
+  BDOS's system reset, or of such a procedure, and has no RETURN nor a
+  label on its END, which a GOTO reaches past the call, does not return:
+  MP/M II's SHOW, MSCHD and TOD read a number as `if (b and 1110$0000b)
+  <> 0 then call terminate; b = shl(b, 3) + shl(b, 1); if carry then
+  ...`, and b is below 32 at those SHLs, which lose nothing (the flags
+  warning, above, is of their CARRY).
 
-  What the warning does not see, of the places where the two meanings
-  can differ: a store that reaches the variable other than by its name -
-  past the end of an array, through MEMORY or a BASED variable whose base
-  is not its address (the layout is uplm80's, Known issues); the flags an
-  EXTERNAL procedure returns with, or code the program does not have that
-  a CALL through an address reaches; an EXTERNAL MON1 that is not BDOS's
-  entry, and returns from the function 0 - MON1 is the name DRI's
-  programs give BDOS's entry, and it is taken for that in every mode,
-  `-m bare` too, where DRI's programs call BDOS through it as well; and
-  arithmetic around a SHL that loses nothing, which can overflow eight
-  bits, in its value, as 0.4.3 has it, `shr(z, 4) - 1`, or in its flags -
-  and ZERO, SIGN and PARITY after such a SHL, which 0.4.2's 16-bit shift
-  left as the operation before it had.  Of the programs checked, the
-  warnings are 0.4.3's: MP/M II's 7, and of 80un 0.3.3 none but the 20 of
-  the old single-file source it keeps, `src/plm/archive/80un.plm`.
+  What the warning of the value does not see, of the places where the two
+  meanings can differ: a store that reaches the variable other than by
+  its name - past the end of an array, through MEMORY or a BASED variable
+  whose base is not its address (the layout is uplm80's, Known issues);
+  an EXTERNAL MON1 that is not BDOS's entry, and returns from the function
+  0 - MON1 is the name DRI's programs give BDOS's entry, and it is taken
+  for that in every mode, `-m bare` too, where DRI's programs call BDOS
+  through it as well; and arithmetic around a SHL that loses nothing,
+  which can overflow eight bits in its value, as 0.4.3 has it, `shr(z,
+  4) - 1` (of its flags the flags warning warns).  Of the programs
+  checked, these warnings are 0.4.3's: MP/M II's 7, and of 80un 0.3.3
+  none but the 20 of the old single-file source it keeps,
+  `src/plm/archive/80un.plm`.
 
 - **The columns after a LITERALLY's text are the source's.**  The text
   takes the place of the name, on one line however many it runs over,
@@ -273,15 +331,9 @@ Found checking 0.4.4, and left for a later release (0.4.3 the same):
   `size(a(1, 2))`, `size(s(1, 2).n)`, `length(s(1, 2).m)`, which V3.1
   takes, not evaluating the subscripts, are refused, with uplm80's own
   message (`SIZE() needs a variable, ...`), not V3.1's value.
-- At `-O3`, a flag read after an operation the optimizer folds to a
-  constant reads the flags of what came before it, where V3.1 and `-O0`
-  to `-O2` read the operation's: after a SHL, `k = 0c0h; b = shl(k, 1);
-  if sign then ...`, `b = scl(1, 1)` after `shl(k, 1)` of k = 0FFH; and
-  after a comparison, which then reads the SHL's before it with no
-  warning: `k = input(0) or 0ffh; i = 1; b = shl(k, 1); if i = 1 then c
-  = carry;` leaves c 0 at `-O0` to `-O2`, as V3.1's build and 0.4.2's
-  do, and 0FFH at `-O3`.  The manual warns that the flags are not to be
-  relied on (12.1).
+- A typed procedure with no RETURN, `h: procedure byte; b = 1; end h;`,
+  which V3.1 rejects (ERROR #156, MISSING RETURN STATEMENT IN TYPED
+  PROCEDURE), is compiled, and returns what A or HL holds at its end.
 
 ## 0.4.3 — 2026-09-26
 
