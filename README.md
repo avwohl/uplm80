@@ -665,12 +665,9 @@ untyped `DATA` (61), a program that is not a module (89), a declaration
 after a statement or among a DO CASE's cases (26; uplm80 refuses a DO
 CASE of declarations alone as a DO CASE with no case, 201), `NOT NOT x`
 (102), and a `CALL` of a typed procedure (129); and what the CHANGELOG
-lists under Known issues: a non-REENTRANT procedure's call of itself
-(170), a procedure nested in a REENTRANT one or a REENTRANT one nested in
-another (88, 39), more `INITIAL` or `DATA` values than a scalar holds
-(209), an `END` that names the first of two labels on a DO, `a: c: do;
-... end a;` (20), and, at `-O1` and up, SHL and SHR in a DATA or INITIAL
-list or an AT address (151).  uplm80 compiles, with a warning that names
+lists under Known issues: more `INITIAL` or `DATA` values than a scalar
+holds (209), and, at `-O1` and up, SHL and SHR in a DATA or INITIAL list
+or an AT address (151).  uplm80 compiles, with a warning that names
 V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
 `INITIAL` in a procedure or a DO block (73), on which programs written
 for it rely, and a subscript on a scalar, `x(1)` (127), and a member of
@@ -686,7 +683,14 @@ case (201), `.p(1)` of a procedure (104), anything in parentheses in a
 subscript of the argument of SIZE, LENGTH or LAST, `size(ab(f(1)))` (32),
 a procedure with no statements (174), two subscripts on a scalar (127,
 114), an array or a member array without a subscript (133, 134), and a
-call of a procedure declared further on (169) (since 0.4.3).
+call of a procedure declared further on (169) (since 0.4.3); and more than
+one subscript (114), a subscript on a scalar member (127) or after a
+subscript (32), a second port of INPUT or OUTPUT (108), a CALL through
+what is not an ADDRESS scalar (118), MEMORY without a subscript (133), a
+non-REENTRANT procedure's call of itself (170), a procedure nested in a
+REENTRANT one or a REENTRANT one nested in another (88, 39), and an `END`
+that names the first of two labels on a DO, `a: c: do; ... end a;` (20)
+(since 0.4.4).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),

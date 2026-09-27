@@ -5,7 +5,15 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 
 ## 0.4.4 — unreleased
 
-What 0.4.3's final release check found and left for a later release.
+What 0.4.3's final release check found and left for a later release, and
+what 0.4.3's Known issues listed as compiled without a word: more of the
+errors Intel's PL/M-80 V3.1 gives, V3.1's numbers and texts, at every
+level - more than one subscript, a CALL through what is not an ADDRESS
+scalar, MEMORY without a subscript, a procedure that calls itself, a
+REENTRANT procedure where V3.1 refuses one.  The SHL of a BYTE warning
+follows the flags, and what it does not see is stated.  Smaller code
+after an 8-bit operation, and the columns after a LITERALLY's text are
+the source's.
 
 ### Incompatible: more errors Intel's PL/M-80 gives
 
@@ -154,6 +162,20 @@ of the same forms to print what uplm80's builds print.
   its text moved them back.  What a message is about in the text itself
   is placed at the name.  A word declared LITERALLY 'LITERALLY' and a
   procedure's name given by a LITERALLY are counted as their texts.
+
+### Known issues
+
+Found checking 0.4.4, and left for a later release (0.4.3 the same):
+
+- LENGTH, LAST and SIZE of a reference with more than one subscript,
+  `size(a(1, 2))`, `size(s(1, 2).n)`, `length(s(1, 2).m)`, which V3.1
+  takes, not evaluating the subscripts, are refused, with uplm80's own
+  message (`SIZE() needs a variable, ...`), not V3.1's value.
+- At `-O3`, a flag read after a SHL the optimizer folds to a constant -
+  `k = 0c0h; b = shl(k, 1); if sign then ...`, `b = scl(1, 1)` after
+  `shl(k, 1)` of k = 0FFH - reads the flags of what came before the
+  shift, where V3.1 and `-O0` to `-O2` read the shift's; the manual
+  warns that the flags are not to be relied on (12.1).
 
 ## 0.4.3 — 2026-09-26
 
