@@ -136,8 +136,14 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   warns: `b = (shl(k, 4) + 10h) plus 0` with k = 0FFH was 00 and is 01,
   `b = shl(k, 1); c = carry;` 00 and 0FFH, `b = shl(k, 1); b = scl(1,
   1);` 02 and 03.  The flags are followed through the statements after
-  the operation, through IF, DO CASE and loops, to a RETURN and from the
-  call, and from any GOTO to a label.
+  the operation, past what sets none of them or the carry alone - a load
+  or a store, NOT (`cpl`), a minus (`cpl / inc a`), a product of BYTEs
+  (`add hl,hl`), an operation of sixteen bits - through IF, DO CASE and
+  loops, into a procedure called and to a RETURN and from the call, where
+  a procedure that sets none returns with its caller's, `b = shl(k, 1);
+  call g; c = carry;` of a G that stores a constant, and from any GOTO to
+  a label.  A CALL through an address may call any procedure whose
+  address is taken.
 
       warning: SHL(K, 1): SHL of a BYTE is a BYTE (Programming Manual
       9800268B, 11.1.4), and CARRY reads the flags of an operation of eight
@@ -170,10 +176,10 @@ BUILT-IN PROCEDURE, besides #32 (SIZE only #32).
   What the warning does not see, of the places where the two meanings
   can differ: a store that reaches the variable other than by its name -
   past the end of an array, through MEMORY or a BASED variable whose base
-  is not its address (the layout is uplm80's, Known issues); the flags a
-  procedure is entered with, and those an EXTERNAL procedure, or one
-  called through an address, returns with; an EXTERNAL MON1 that is not
-  BDOS's entry, and returns from the function 0 - MON1 is the name DRI's
+  is not its address (the layout is uplm80's, Known issues); the flags an
+  EXTERNAL procedure returns with, or code the program does not have that
+  a CALL through an address reaches; an EXTERNAL MON1 that is not BDOS's
+  entry, and returns from the function 0 - MON1 is the name DRI's
   programs give BDOS's entry, and it is taken for that in every mode,
   `-m bare` too, where DRI's programs call BDOS through it as well; and
   arithmetic around a SHL that loses nothing, which can overflow eight

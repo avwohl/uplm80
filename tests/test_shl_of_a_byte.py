@@ -140,6 +140,24 @@ def test_each_shl_is_warned_of_once(capsys):
     ("do c = 0 to n; c = shl(b, 1); end; c = carry;", "SHL(B, 1)", "CARRY"),
     ("sh: procedure byte; return shl(b, 1); end sh; c = sh plus 0;", "SHL(B, 1)", "PLUS"),
     ("c = shl(b, 1); goto l1; l1: c = carry;", "SHL(B, 1)", "CARRY"),
+    # What sets no flag, or the carry alone, between (found checking
+    # 0.4.4): NOT of a BYTE, `cpl', its minus, `cpl / inc a', and a product
+    # of BYTEs, an ADDRESS, `add hl,hl'.
+    ("c = shl(b, 1); c = not n; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("c = shl(b, 1) or n; c = not n; if sign then c = 1;", "SHL(B, 1)", "SIGN"),
+    ("c = shl(b, 1); c = (not n) plus 0;", "SHL(B, 1)", "PLUS"),
+    ("c = shl(b, 1); c = (-n) plus 0;", "SHL(B, 1)", "PLUS"),
+    ("c = shl(b, 2) and 0f0h; w = n * 2; if zero then c = 1;", "SHL(B, 2)", "ZERO"),
+    # A procedure that sets no flag returns with its caller's (G, and a
+    # typed one), is entered with them, and one called through an address
+    # too.
+    ("c = shl(b, 1); call g; c = carry;", "SHL(B, 1)", "CARRY"),
+    ("r3: procedure byte; return 3; end r3; c = shl(b, 1); c = r3; if sign then c = 1;",
+     "SHL(B, 1)", "SIGN"),
+    ("en: procedure; c = carry; end en; c = shl(b, 1); call en;", "SHL(B, 1)", "CARRY"),
+    ("en: procedure; call g; end en; c = shl(b, 1); call en; c = carry;", "SHL(B, 1)",
+     "CARRY"),
+    ("v = .h; c = shl(b, 1); call v; c = carry;", "SHL(B, 1)", "CARRY"),
 ])
 def test_what_reads_the_flags_of_a_shl_of_a_byte_is_warned_of(stmts, shl, reader, opt,
                                                               capsys):
@@ -175,8 +193,10 @@ def test_a_test_that_assigns_what_it_bounds_does_not_bound_it(stmts, shl, opt, c
     "if (b and 0e0h) <> 0 then return; c = shl(b, 3) + shl(b, 1); c = carry;",
     "if (b and 0e0h) = 0 then c = shl(b, 3) plus 0;",
     "c = 1; if c < 4 then w = shl(c, 6);",
-    "c = shl(b, 1); call g; c = carry;",            # G's own flags
-    # What a CALL through an address may call: H, which does not set K.
+    # A procedure's own flags, and those of the call before a procedure
+    # that sets none.
+    "fl: procedure; k = k + 3; end fl; c = shl(b, 1); call fl; c = carry;",
+    "c = shl(b, 1); call g; c = c + 1; call g; c = carry;",
     "pr: procedure; call v; end pr; v = .h; k = 1; call pr; w = shl(k, 6);",
 ])
 def test_what_reads_other_flags_is_not(stmts, opt, capsys):
