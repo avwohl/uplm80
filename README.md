@@ -175,18 +175,22 @@ where:
   an address.
 - A DATA or INITIAL value, an AT address and a constant of a constant
   list `.(...)` are restricted expressions (4.1.3, 6.2.8, 6.2.9): numbers,
-  added and subtracted, a minus sign before a number, and a string alone;
-  in a DATA or INITIAL list a location plus or minus numbers,
-  `.s.m(1) + 2`, `.memory` among them, and in an AT a location; and in a
+  added and subtracted, and a minus sign before a number; in a DATA or
+  INITIAL list and a constant list a string alone; in a DATA or INITIAL
+  list a location plus or minus numbers, `.s.m(1) + 2`, `.memory` among
+  them, and in an AT one of a variable, not BASED, or of MEMORY; and in a
   constant list, or where the value fills a BYTE, what a byte holds.  A
   built-in, a name not after a dot, parentheses, an operator but + and -,
-  a string in a sum, a location anywhere but first and a constant list
-  in a DATA list are errors at every `-O` level, as V3.1 makes them:
-  `data (shl(0f0h, 4))`, `data (x)`, `.(x, 7)`, `.(2 * 3)`, `.(300)`.  A
-  location in a DATA or INITIAL list or an AT address is the variable the
-  name means in its block (9.1), declared before it or after, there or
-  in a block around it: `.arr(2)` of an ADDRESS array is ARR+4, and a
-  procedure's `.memory` its own MEMORY where it declares one further on.
+  a string in a sum or in an AT, a location anywhere but first, one with
+  two subscripts or with a subscript on what is not an array, a constant
+  list in a DATA list, and in an AT the location of a procedure or a label
+  are errors at every `-O` level, as V3.1 makes them: `data (shl(0f0h,
+  4))`, `data (x)`, `.(x, 7)`, `.(2 * 3)`, `.(300)`, `data (.a(1)(1))`,
+  `data (.x(1))`, `at (.p)`.  A location in a DATA or INITIAL list or an
+  AT address is the variable the name means in its block (9.1), declared
+  before it or after, there or in a block around it: `.arr(2)` of an
+  ADDRESS array is ARR+4, and a procedure's `.memory` its own MEMORY where
+  it declares one further on.
 - An INTERRUPT procedure is declared at the outer level of its module and
   has no parameters (8.1.6); so is a PUBLIC or EXTERNAL procedure or
   variable, not in a procedure or a DO block.  INITIAL there initializes
@@ -679,7 +683,8 @@ end a;` (20), and an AT that names a variable AT something further down
 (213).  uplm80 compiles, with a warning that names V3.1's error, `f()` and
 `CALL g()` of a procedure (102, 153) and `INITIAL` in a procedure or a DO
 block (73), on which programs written for it rely, and a subscript on a
-scalar, `x(1)` (127), and a member of an array of structures without its
+scalar, `x(1)` (127), but for the location of one in a restricted
+expression, and a member of an array of structures without its
 subscript, `s2.m(1)` (133), which its own tests test.  It rejects, as V3.1
 does, a name declared nowhere, empty parentheses after a variable or a
 built-in, `.label` in an expression, an `INTERRUPT` procedure below module
@@ -698,11 +703,18 @@ expression does not take, with the errors V3.1 gives for the list (since
 (151); parentheses, `.((1 + 2), 7)`, an operator but + and -, `.(2 * 3)`,
 `data (6 / 3)`, NOT, `.(not 0f0h)`, a string in a sum, `data ('A' + 1)`,
 and a location anywhere but first, `at (3 + .buf(1))` (152, 146, 151); a
-constant list in a DATA list, `data (.(5))` (147); and in a constant list,
-or where the value fills a BYTE, a location or a number a byte does not
-hold, `.(300, 7)`, `byte data (.w)` (210).  It refuses the location of a
-built-in but MEMORY in a DATA or INITIAL list, `data (.stackptr)`, which
-V3.1 takes for an address of its own: uplm80 has none to give it.  And
+location with two subscripts, `data (.a(1)(1))` (152, 146), or with a
+subscript on what is not an array, `data (.x(1))`, `data (.p(1))` (149);
+the location in an AT of a procedure or a label, `at (.p)` (211), or of a
+BASED variable (212); a constant list in a DATA list, `data (.(5))`
+(147); and in a constant list, or where the value fills a BYTE, a
+location or a number a byte does not hold, `.(300, 7)`, `byte data (.w)`
+(210).  It refuses the location of a built-in but MEMORY in a DATA or
+INITIAL list, `data (.stackptr)`, which V3.1 takes for an address of its
+own: uplm80 has none to give it; and the location of a REENTRANT
+procedure's local in a DATA or INITIAL list or an AT, and of a BASED
+variable in a list, which V3.1 gives an address: uplm80 has the local on
+the stack, and no address of a BASED variable to give.  And
 V3.1 computes a restricted expression as a constant, a number below 256 a
 BYTE and BYTE arithmetic in eight bits, `address data (200 + 100)` 002CH
 and `-1` 00FFH, where uplm80 computes in sixteen bits, 012CH and 0FFFFH,
