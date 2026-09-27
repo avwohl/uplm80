@@ -2149,6 +2149,55 @@ def test_a_factored_based_variable_is_at_the_address_its_base_holds():
     _check(V31_FACTORED_BASED, [5, 6, 1, 7, 2])
 
 
+# A base is the declaration of its name made before the variable BASED on
+# it, in its block or one around it, as Intel's PL/M-80 V3.1 reads it, and
+# prints what is expected (tests/test_intel_oracle.py).  Code generation
+# looked the base up by its name where the variable was used: in a
+# procedure that declares a variable of the name, `a = 77h' stored through
+# that one (0.4.3 the same).  And where the block declares the name
+# further down, V3.1 takes the outer block's for the base, and uplm80 took
+# the later one (0.4.3 the same, but that it took `(c based s.p) byte' for
+# a variable of its own).
+V31_BASES = {
+    "used-in-a-procedure": ("""
+declare buf (4) byte, q address, s structure (k byte, p address);
+declare a based q byte, (c based s.p) byte;
+p: procedure;
+  declare q address, s structure (k byte, p address);
+  q = .buf(2); s.p = .buf(3);
+  a = 77h; c = 66h;
+end p;
+q = .buf(0); s.p = .buf(1);
+call p;
+call ph(buf(0)); call ph(buf(1)); call ph(buf(2)); call ph(buf(3));
+""", [0x77, 0x66, 0, 0]),
+    "declared-again-further-down": ("""
+declare buf (4) byte, q address, s structure (k byte, p address);
+p: procedure;
+  declare a based q byte, (c based s.p) byte;
+  declare q address, s structure (j address, p address);
+  q = .buf(2); s.p = .buf(3);
+  a = 77h; c = 66h;
+end p;
+q = .buf(0); s.p = .buf(1);
+call p;
+do;
+  declare (d based q) byte;
+  declare q address;
+  q = .buf(2);
+  d = 55h;
+end;
+call ph(buf(0)); call ph(buf(1)); call ph(buf(2)); call ph(buf(3));
+""", [0x55, 0x66, 0, 0]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(V31_BASES))
+def test_a_base_is_the_declaration_before_the_based_variable(name):
+    body, expect = V31_BASES[name]
+    _check(body, expect)
+
+
 def test_an_initial_location_names_its_procedures_memory_further_down(capsys):
     """INITIAL in a procedure, which V3.1 rejects (#73) and uplm80 takes
     with a warning, resolves a location as DATA does: the procedure's own

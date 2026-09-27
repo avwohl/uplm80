@@ -27,7 +27,7 @@ from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
-from tests.test_names import (NO_FIXED_ADDRESS, PAST_THE_SPACE, V31_ALLOWS,
+from tests.test_names import (NO_FIXED_ADDRESS, PAST_THE_SPACE, V31_ALLOWS, V31_BASES,
                               V31_BLOCK_LOCATIONS, V31_DECLARED_BUILTINS, V31_DECLS,
                               V31_FACTORED_BASED, V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED,
                               V31_WARNS)
@@ -58,6 +58,7 @@ RELEASE_PROGRAMS = {
     **{f"declared-builtins-{k}": v[0] for k, v in V31_DECLARED_BUILTINS.items()},
     **{f"block-locations-{k}": v[0] for k, v in V31_BLOCK_LOCATIONS.items()},
     "factored-based": V31_FACTORED_BASED,        # 0.4.4, (a based s.p) byte
+    **{f"bases-{k}": v[0] for k, v in V31_BASES.items()},     # 0.4.4, a based q in p
 }
 # V3.1's bugs the README's Known differences has and the generator does not
 # leave out: a program, after _PRELUDE; how the README writes it; what

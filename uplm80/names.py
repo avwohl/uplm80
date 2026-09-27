@@ -689,7 +689,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         """The base of ``based``, a BASED variable, `p' or `s.m', whose
         declaration is the ``order``-th, by default ``based``'s own: visit
         it, and mark the use of the name it starts from (bind,
-        _check_bases)."""
+        _check_bases, _settle_bases)."""
         start = len(self.refs)
         self._visit(base, block)
         root = base
@@ -1648,7 +1648,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         self.used = {d.name for d in self.decls}
         for _ in range(len(self.decls) + 1):
             if not (self._settle_procedures() or self._settle_labels()
-                    or self._settle_lookups()):
+                    or self._settle_lookups() or self._settle_bases()):
                 return
 
     def _settle_procedures(self) -> bool:
@@ -1737,6 +1737,42 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 return d
             b = b.parent
         return procs.get(name)
+
+    def _settle_bases(self) -> bool:
+        """Every base found where it is looked up by its name: by code
+        generation where the BASED variable is used, and by local storage
+        where it is declared (local_storage._read_base), each taking the
+        innermost declaration of the name there.  A block that declares the
+        name hid the base: a procedure's `q' where a BASED variable of the
+        module's `q' is used in it, `a = 77h', which stored through the
+        procedure's; and a variable declared further down the block, which
+        Intel's PL/M-80 V3.1 does not take for the base, but the one of an
+        outer block (bind).  What hides the base is renamed, or the base,
+        where what hides it is PUBLIC or EXTERNAL."""
+        for r in self.refs:
+            if r.base is None or r.decl is None:
+                continue
+            for use in [r] + self.refs_of.get(id(r.base[0]), []):
+                found = self._scope_lookup(r.decl.name, use.block)
+                if found is None or found is r.decl:
+                    continue
+                hider = r.decl if found.shared else found
+                if not hider.shared:
+                    self.rename(hider, self.fresh(hider.name))
+                    return True
+        return False
+
+    @staticmethod
+    def _scope_lookup(name: str, block: _Block) -> _Decl | None:
+        """What code generation's scopes, which hold everything but
+        procedures, give for ``name`` in ``block`` (SymbolTable.lookup)."""
+        b: _Block | None = block
+        while b is not None:
+            d = b.decls.get(name)
+            if d is not None and d.kind != "proc":
+                return d
+            b = b.parent
+        return None
 
     # ---- GOTO ----------------------------------------------------------
 
