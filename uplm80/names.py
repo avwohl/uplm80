@@ -59,6 +59,7 @@ from .ast_view import (
     decl_attrs,
     decl_item_struct_members,
     decl_item_type,
+    dotted_ident_parts,
     expr_text,
     ident_text,
     is_end_of_block,
@@ -215,6 +216,8 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     node: object = None         # a procedure's declaration
     item: object = None         # a variable's DeclItem, or DeclItemBasedGroup
     based: bool = False         # a BASED variable
+    # A parameter's DeclItem, and how many declarations were made before it
+    typed: tuple | None = None
 
     def __post_init__(self) -> None:
         self.orig = self.name
@@ -271,6 +274,9 @@ class _Ref:  # pylint: disable=too-many-instance-attributes
     call: object = None         # the subscripted reference or call it names
     called: bool = False        # a CALL's: `call q(1, 2)' of an ADDRESS calls through it
     member: object = None       # the member of what it names, `s.m', if any
+    # The base it starts, `p' or `s.m': (the BASED variable's declaration,
+    # the base, how many declarations were made before its declaration's)
+    base: tuple | None = None
 
 
 def _key(tok) -> str:
@@ -377,10 +383,13 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         elif isinstance(n, P.DeclItem):
             self._decl_item(n, block)
         elif isinstance(n, P.DeclItemBasedGroup):
+            # V3.1 knows none of the names before their bases: `(a based
+            # b, b based a) byte' is ERROR 54 twice.
+            order = len(self.decls)
             for bd in n.based_decls or []:
-                self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False,
-                              dim=_dimension(n), members=_members(n), item=n, based=True)
-                self._visit(bd.base, block)
+                d = self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False,
+                                  dim=_dimension(n), members=_members(n), item=n, based=True)
+                self._base(bd.base, block, d, order)
             self._visit([n.array_size, n.tail], block)
         elif isinstance(n, P.LiterallyDecl):
             self._declare(block, _key(n.name), "lit", (n, "name"), literal=literally_value(n))
@@ -551,6 +560,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
     INTEL_ERRORS = {
         20: "MISMATCHED IDENTIFIER AT END OF BLOCK",
         32: "INVALID SYNTAX, TEXT IGNORED UNTIL ';'",
+        50: "INVALID ATTRIBUTES FOR BASE",
+        52: "INVALID BASE, MEMBER OF BASED STRUCTURE OR ARRAY OF STRUCTURES",
+        54: "UNDECLARED BASE",
+        55: "UNDECLARED STRUCTURE MEMBER IN BASE",
         104: "ILLEGAL PROCEDURE INVOCATION WITH DOT OPERATOR",
         114: "INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS ILLEGAL",
         125: "ILLEGAL ARGUMENT FOR BUILT-IN PROCEDURE",
@@ -656,6 +669,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             old = block.decls.get(name)
             if old is not None and old.kind == "param":
                 self._declare_param(old, item, node)
+                old.typed = (item, len(self.decls))
                 continue
             if block.kind != "module":
                 self._below_module_level(node, attrs, block)
@@ -665,11 +679,26 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                           dim=_dimension(item), members=_members(item), item=item,
                           based=item.based is not None)
         if item.based is not None:
-            self._visit(item.based.base, block)
+            self._base(item.based.base, block, block.decls[_key(nodes[0].name)])
         slots, past = _value_slots(item)
         self._slots.update(slots)
         self._past |= past
         self._visit([item.array_size, item.tail], block)
+
+    def _base(self, base, block: _Block, based: _Decl, order: int | None = None) -> None:
+        """The base of ``based``, a BASED variable, `p' or `s.m', whose
+        declaration is the ``order``-th, by default ``based``'s own: visit
+        it, and mark the use of the name it starts from (bind,
+        _check_bases)."""
+        start = len(self.refs)
+        self._visit(base, block)
+        root = base
+        while isinstance(root, P.DottedMember):
+            root = root.base
+        for r in self.refs[start:]:
+            if r.node is root:
+                r.base = (based, base, based.order if order is None else order)
+                return
 
     @staticmethod
     def _where(block: _Block) -> str:
@@ -748,19 +777,29 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 if cur is None or (d.public and not cur.public):
                     self.globals.decls[d.name] = d
         for r in self.refs:
-            r.decl = self.lookup(_key(getattr(r.node, r.attr)), r.block)
+            name = _key(getattr(r.node, r.attr))
+            r.decl = self.lookup(name, r.block)
+            if r.base is not None:
+                # A base is the declaration of its name made before the
+                # variable BASED on it, as Intel's PL/M-80 V3.1 reads it,
+                # which takes one further down the block for another name
+                # (ERROR 54, UNDECLARED BASE: _check_bases), and an outer
+                # block's of the name, if any, for the base.
+                r.decl = self.lookup(name, r.block, before=r.base[2]) or r.decl
             if r.decl is not None:
                 self.refs_of.setdefault(id(r.decl), []).append(r)
 
     @staticmethod
-    def lookup(name: str, block: _Block | None) -> _Decl | None:
-        """The declaration ``name`` means in ``block``: the innermost.  What
-        another module makes PUBLIC does not hide a built-in: a module that
-        does not declare SHL means the built-in, as it does compiled alone
+    def lookup(name: str, block: _Block | None, before: int | None = None) -> _Decl | None:
+        """The declaration ``name`` means in ``block``: the innermost, or,
+        ``before`` given, the innermost of those made before the
+        ``before``-th, or another module's.  What another module makes
+        PUBLIC does not hide a built-in: a module that does not declare
+        SHL means the built-in, as it does compiled alone
         (CodeGenerator._kept_builtins)."""
         while block is not None:
             d = block.decls.get(name)
-            if d is not None:
+            if d is not None and (before is None or block.kind == "global" or d.order < before):
                 return None if block.kind == "global" and name in _BUILTINS else d
             block = block.parent
         return None
@@ -932,6 +971,96 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                     "or a procedure (Programming Manual 9800268B, 4.1.3); the address "
                     "of a label may be given only in a DATA or an INITIAL list",
                     source_location(r.node))
+
+    def check_declarations(self) -> None:
+        """The base of each BASED variable, as Intel's PL/M-80 V3.1 takes
+        it (:meth:`_check_bases`)."""
+        self._check_bases()
+
+    def _check_bases(self) -> None:
+        """The base of each BASED variable is what Intel's PL/M-80 V3.1
+        takes: an ADDRESS scalar, a variable or a parameter, or an ADDRESS
+        scalar member of a structure that is neither BASED nor an array,
+        declared before the variable BASED on it (bind); anything else is
+        an error, with V3.1's error.  uplm80 did not check a base.  One
+        that is BASED, or a member of what is, `declare s based sp
+        structure (k byte, p address); declare a based s.p byte', has no
+        address of its own to read the pointer from: um80's "Undefined
+        symbol 'S'" (0.4.3 the same), in a factored declaration too, `(a
+        based s.p) byte', since 0.4.4's b9c4a36 (0.4.3 took it for a
+        variable of its own), and `a based a' recursed until Python gave
+        up.  A member of an array of structures, or an array, was refused
+        naming #133, V3.1's error in an expression; a BYTE, a structure, a
+        member array, a procedure, a label, a member the structure does
+        not have (its first word) and a name declared only further down
+        were compiled."""
+        for r in self.refs:
+            if r.base is None:
+                continue
+            fault = self._base_fault(r)
+            if fault is not None:
+                based, base, _ = r.base
+                why, number = fault
+                self.intel(r.node, f"{based.orig} BASED {_base_text(base)}: {why}", number)
+
+    def _base_fault(self, r: _Ref) -> tuple[str, int] | None:  # pylint: disable=too-many-return-statements,too-many-branches
+        """What V3.1 does not take of the base ``r`` starts: (why, the error
+        V3.1 gives), or None."""
+        based, base, order = r.base
+        parts = [p.upper() for p in dotted_ident_parts(base)]
+        name, members = parts[0], parts[1:]
+        d = r.decl
+        if d is not None and d.block.kind != "global" and d.order >= order:
+            # Declared only further down, where V3.1 does not know it yet.
+            if name in _BUILTINS:
+                d = None
+            elif d is based:
+                return "a variable is not its own base", 54
+            else:
+                return (f"{name} is declared after {based.orig}, and a base is declared "
+                        "before the variable BASED on it"), 54
+        if d is None:
+            if name in _BUILTINS:
+                return f"{name} is a built-in, and a base is a variable", 50
+            return None     # declared nowhere: check_uses
+        if d.kind == "lit" or len(members) > 1:
+            return None     # a LITERALLY declared after it: check_uses
+        if members and (d.kind != "var" or d.members is None):
+            return f"{name} is not a structure", 55
+        if d.kind in ("proc", "label"):
+            what = "a procedure" if d.kind == "proc" else "a label"
+            return f"{name} is {what}, and a base is a variable", 50
+        if d.kind == "param":
+            if d.typed is None or d.typed[1] > order:
+                return (f"{name} is declared a BYTE or an ADDRESS only after "
+                        f"{based.orig}, and a base is declared an ADDRESS before the "
+                        "variable BASED on it"), 50
+            if decl_item_type(d.typed[0])[0] != DataType.ADDRESS:
+                return f"{name} is a BYTE, and a base is an ADDRESS", 50
+            return None
+        if members:
+            member = members[0]
+            if member not in d.members:
+                return f"{name} has no member {member}", 55
+            if d.members[member] is not None:
+                return f"{name}.{member} is an array, and a base is a scalar", 50
+            if _member_type(d.item, member) != DataType.ADDRESS:
+                return f"{name}.{member} is a BYTE, and a base is an ADDRESS", 50
+            if d.based:
+                return f"{name} is BASED, and a base is not a member of what is BASED", 52
+            if d.dim is not None:
+                return (f"{name} is an array, and a base is not a member of an array of "
+                        "structures"), 52
+            return None
+        if d.based:
+            return f"{name} is BASED, and a base is not", 50
+        if d.members is not None:
+            return f"{name} is a structure, and a base is an ADDRESS scalar", 50
+        if d.dim is not None:
+            return f"{name} is an array, and a base is a scalar", 50
+        if decl_item_type(d.item)[0] != DataType.ADDRESS:
+            return f"{name} is a BYTE, and a base is an ADDRESS", 50
+        return None
 
     def check_forms(self) -> None:
         """How each name is used, as Intel's PL/M-80 V3.1 allows (0.4.2's
@@ -1920,6 +2049,19 @@ def _dimension(item) -> int | None:
     return dim
 
 
+def _member_type(item, member: str) -> DataType | None:
+    """The type of the structure member ``member`` of ``item``."""
+    for m in decl_item_struct_members(item) or []:
+        if member in (n.upper() for n in struct_member_names(m)):
+            return struct_member_type(m)
+    return None
+
+
+def _base_text(base) -> str:
+    """A BASED declaration's base as the source spells it, `S.P'."""
+    return ".".join(dotted_ident_parts(base))
+
+
 def _members(item) -> dict | None:
     """A structure's members, and the dimension of each (None, a scalar)."""
     nodes = decl_item_struct_members(item)
@@ -1963,8 +2105,9 @@ def check_names(modules: list, multi: bool = False) -> list[tuple]:
     built-in's aside), an INTERRUPT procedure, or a PUBLIC or EXTERNAL
     one or variable, anywhere but at the outer level of its module, a
     dimension of 0, the address of a label anywhere but in a DATA or an
-    INITIAL list, the address of a built-in but MEMORY, and empty
-    parentheses after a variable or a built-in.  ``multi``: the modules
+    INITIAL list, the address of a built-in but MEMORY, empty
+    parentheses after a variable or a built-in, and a base Intel's PL/M-80
+    V3.1 does not take.  ``multi``: the modules
     are compiled together (see resolve_names).  Returns warnings,
     (location, text) pairs, for what Intel's PL/M-80 V3.1 rejects and
     uplm80 compiles, as programs written for it rely on: a procedure's
@@ -1979,6 +2122,7 @@ def check_names(modules: list, multi: bool = False) -> list[tuple]:
         r.check_private()
     r.check_restricted()
     r.check_uses()
+    r.check_declarations()
     r.check_forms()
     return r.intel_warnings
 

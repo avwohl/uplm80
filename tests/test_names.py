@@ -1740,6 +1740,88 @@ V31_REJECTS = {
     "based-member-in-at": ("declare bs based w structure (k byte, m address);\n"
                            "declare d byte at (.bs.m);\nb = d;\n", (212,),
                            "T.PLM:9:21: error: .BS: BS is BASED"),
+    # A base that is not an ADDRESS scalar, a variable or a parameter, nor an
+    # ADDRESS scalar member of a structure that is neither BASED nor an
+    # array, declared before the variable BASED on it.  0.4.3 failed in um80
+    # on one BASED, or a member of what is ("Undefined symbol 'BS'"), and so
+    # did 0.4.4's b9c4a36 on the factored `(a based bs.p) byte', which 0.4.3
+    # took for a variable of its own; `a based a' recursed until Python gave
+    # up; a member of an array of structures, or an array, it refused naming
+    # #133, V3.1's error in an expression; the rest it compiled.
+    "base-a-member-of-a-based-structure": (
+        "declare bs based w structure (k byte, p address);\ndeclare a based bs.p byte;\n"
+        "a = 1;\n", (52,),
+        "T.PLM:9:17: error: A BASED BS.P: BS is BASED, and a base is not a member of what is "
+        "BASED; Intel's PL/M-80 V3.1 rejects it (ERROR #52, INVALID BASE, MEMBER OF BASED "
+        "STRUCTURE OR ARRAY OF STRUCTURES)"),
+    "factored-base-a-member-of-a-based-structure": (
+        "declare bs based w structure (k byte, p address);\n"
+        "declare (a based bs.p, a2 based bs.p) (2) address;\na(1) = 1;\n", (52,),
+        "T.PLM:9:18: error: A BASED BS.P: BS is BASED, and a base is not a member of what is "
+        "BASED"),
+    "base-a-member-of-a-based-structure-in-a-procedure": (
+        "declare bs based w structure (k byte, p address);\np: procedure;\n"
+        "  declare a based bs.p byte;\n  a = 1;\nend p;\ncall p;\n", (52,),
+        "T.PLM:10:19: error: A BASED BS.P: BS is BASED"),
+    "base-a-byte-member-of-a-based-structure": (
+        "declare bs based w structure (k byte, p address);\ndeclare a based bs.k byte;\n"
+        "a = 1;\n", (50,),
+        "T.PLM:9:17: error: A BASED BS.K: BS.K is a BYTE, and a base is an ADDRESS; Intel's "
+        "PL/M-80 V3.1 rejects it (ERROR #50, INVALID ATTRIBUTES FOR BASE)"),
+    "base-a-member-of-an-array-of-structures": (
+        "declare sa (2) structure (k byte, p address);\ndeclare a based sa.p byte;\na = 1;\n",
+        (52,), "T.PLM:9:17: error: A BASED SA.P: SA is an array, and a base is not a member of "
+        "an array of structures; Intel's PL/M-80 V3.1 rejects it (ERROR #52"),
+    "base-a-based-variable": (
+        "declare q based w address;\ndeclare a based q byte;\na = 1;\n", (50,),
+        "T.PLM:9:17: error: A BASED Q: Q is BASED, and a base is not; Intel's PL/M-80 V3.1 "
+        "rejects it (ERROR #50, INVALID ATTRIBUTES FOR BASE)"),
+    "factored-base-a-based-variable": (
+        "declare q based w address;\ndeclare (a based q, a2 based w) byte;\na = 1;\n", (50,),
+        "T.PLM:9:18: error: A BASED Q: Q is BASED, and a base is not"),
+    "base-itself": ("declare a based a address;\na = 1;\n", (54,),
+                    "T.PLM:8:17: error: A BASED A: a variable is not its own base; Intel's "
+                    "PL/M-80 V3.1 rejects it (ERROR #54, UNDECLARED BASE)"),
+    "base-memory": ("declare a based memory byte;\na = 1;\n", (50,),
+                    "T.PLM:8:17: error: A BASED MEMORY: MEMORY is a built-in, and a base is a "
+                    "variable"),
+    "base-an-array": ("declare q (2) address;\ndeclare a based q byte;\na = 1;\n", (50,),
+                      "T.PLM:9:17: error: A BASED Q: Q is an array, and a base is a scalar"),
+    "base-a-byte": ("declare a based b byte;\na = 1;\n", (50,),
+                    "T.PLM:8:17: error: A BASED B: B is a BYTE, and a base is an ADDRESS"),
+    "base-a-structure": ("declare q structure (p address);\ndeclare a based q byte;\na = 1;\n",
+                         (50,), "T.PLM:9:17: error: A BASED Q: Q is a structure, and a base is "
+                         "an ADDRESS scalar"),
+    "base-a-member-array": ("declare q structure (p (2) address);\ndeclare a based q.p byte;\n"
+                            "a = 1;\n", (50,),
+                            "T.PLM:9:17: error: A BASED Q.P: Q.P is an array, and a base is a "
+                            "scalar"),
+    "base-a-member-it-does-not-have": (
+        "declare q structure (p address);\ndeclare a based q.zz byte;\na = 1;\n", (55,),
+        "T.PLM:9:17: error: A BASED Q.ZZ: Q has no member ZZ; Intel's PL/M-80 V3.1 rejects it "
+        "(ERROR #55, UNDECLARED STRUCTURE MEMBER IN BASE)"),
+    "base-a-member-of-a-scalar": ("declare a based w.p byte;\na = 1;\n", (55,),
+                                  "T.PLM:8:17: error: A BASED W.P: W is not a structure"),
+    "base-a-procedure": ("declare a based f byte;\na = 1;\n", (50,),
+                         "T.PLM:8:17: error: A BASED F: F is a procedure, and a base is a "
+                         "variable"),
+    "base-a-label": ("declare lb label;\ndeclare a based lb byte;\nlb: a = 1;\n", (50,),
+                     "T.PLM:9:17: error: A BASED LB: LB is a label, and a base is a variable"),
+    "base-declared-after": (
+        "declare a based q byte;\ndeclare q address;\na = 1;\n", (54,),
+        "T.PLM:8:17: error: A BASED Q: Q is declared after A, and a base is declared before "
+        "the variable BASED on it; Intel's PL/M-80 V3.1 rejects it (ERROR #54, UNDECLARED "
+        "BASE)"),
+    "factored-bases-declared-after": (
+        "declare (a based a2, a2 based w) byte;\na = 1;\n", (54,),
+        "T.PLM:8:18: error: A BASED A2: A2 is declared after A"),
+    "base-a-parameter-declared-after": (
+        "p: procedure (q);\n  declare a based q byte;\n  declare q address;\n  a = 1;\n"
+        "end p;\ncall p(0);\n", (50,),
+        "T.PLM:9:19: error: A BASED Q: Q is declared a BYTE or an ADDRESS only after A"),
+    "base-a-byte-parameter": (
+        "p: procedure (q);\n  declare q byte;\n  declare a based q byte;\n  a = 1;\nend p;\n"
+        "call p(0);\n", (50,), "T.PLM:10:19: error: A BASED Q: Q is a BYTE"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
