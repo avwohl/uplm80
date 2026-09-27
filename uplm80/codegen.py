@@ -3126,12 +3126,20 @@ class CodeGenerator:
                 # Itself AT, further down: where it is, not its name.
                 root, offset = at
                 return base_sym, root or "", offset, self._element_width(base_sym)
-        if base_sym.based_on or base_sym.stack_offset is not None:
+        if base_sym.based_on or self._in_frame(base_sym):
             raise CodeGenError(
                 f"AT(.{name}): {name} has no fixed address "
                 f"({'BASED' if base_sym.based_on else 'a REENTRANT local'})")
         asm = base_sym.asm_name or self._mangle_name(name)
         return base_sym, asm, 0, self._element_width(base_sym)
+
+    def _in_frame(self, sym: Symbol) -> bool:
+        """Whether ``sym`` is a REENTRANT procedure's local or parameter,
+        in its frame on the stack: at a stack offset, or, an array or a
+        structure, to be put after the scalars when the procedure's
+        declarations are done (:meth:`_gen_one_var`)."""
+        return sym.stack_offset is not None or any(
+            s is sym for s in self._reentrant_deferred or ())
 
     def _designator(self, expr, root, where: str) -> tuple[Symbol | None, str, int, int]:
         """Resolve a constant `.designator' to (base symbol, name, offset, elem).
@@ -3364,6 +3372,13 @@ class CodeGenerator:
         bound = getattr(expr, "uplm80_decl", None)
         sym = (self._declaration_symbol(bound[0], name, bound[1]) if bound is not None
                else self._lookup_scoped(name))
+        if sym is not None and (sym.based_on or self._in_frame(sym)):
+            # As in an AT (:meth:`_at_root`): it was `dw X', a name no
+            # declaration defines, and um80's "Undefined symbol".  V3.1
+            # takes either for an address (CHANGELOG, Known issues).
+            raise CodeGenError(
+                f"DATA(.{name}): {name} has no fixed address "
+                f"({'BASED' if sym.based_on else 'a REENTRANT local'})")
         asm = sym.asm_name if sym is not None and sym.asm_name else self._mangle_name(name)
         return sym, asm, 0, self._element_width(sym) if sym is not None else 1
 

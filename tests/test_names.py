@@ -2091,6 +2091,61 @@ def test_the_location_of_a_built_in_in_a_list_is_uplm80s_own_refusal(name):
     assert "rejects" not in err, err
 
 
+# The location of what has no fixed address in uplm80, in a DATA or INITIAL
+# list or an AT: a REENTRANT procedure's local or parameter, on the stack
+# at each call, and a BASED variable, at the address its base holds.  V3.1
+# takes each for an address (tests/test_intel_oracle.py, the CHANGELOG's
+# Known issues); uplm80 refuses each, a scalar in an AT as it did, and in a
+# list since 0.4.4, where it was `dw X', which um80 did not know
+# ("Undefined symbol").  Each: the statements, after PRELUDE and V31_DECLS;
+# the name; why; and whether V3.1 compiles it (INITIAL in a procedure it
+# does not, #73).
+NO_FIXED_ADDRESS = {
+    "reentrant-local": ("p: procedure reentrant;\n  declare x address;\n"
+                        "  declare d address data (.x);\n  x = d;\nend p;\ncall p;\n",
+                        "X", "a REENTRANT local", True),
+    "reentrant-local-further-down": ("p: procedure reentrant;\n  declare d address data (.x);\n"
+                                     "  declare x address;\n  x = d;\nend p;\ncall p;\n",
+                                     "X", "a REENTRANT local", True),
+    "reentrant-element": ("p: procedure reentrant;\n  declare x (3) address;\n"
+                          "  declare d address data (.x(1));\n  x(0) = d;\nend p;\ncall p;\n",
+                          "X", "a REENTRANT local", True),
+    "reentrant-parameter": ("p: procedure (x) reentrant;\n  declare x address;\n"
+                            "  declare d address data (.x);\n  x = d;\nend p;\ncall p(1);\n",
+                            "X", "a REENTRANT local", True),
+    "reentrant-local-in-a-do-block": ("p: procedure reentrant;\n  declare x address;\n  do;\n"
+                                      "    declare d address data (.x);\n    x = d;\n  end;\n"
+                                      "end p;\ncall p;\n", "X", "a REENTRANT local", True),
+    "reentrant-initial": ("p: procedure reentrant;\n  declare x address;\n"
+                          "  declare d address initial (.x);\n  x = d;\nend p;\ncall p;\n",
+                          "X", "a REENTRANT local", False),
+    "reentrant-at": ("p: procedure reentrant;\n  declare x address;\n"
+                     "  declare z address at (.x);\n  x = z;\nend p;\ncall p;\n",
+                     "X", "a REENTRANT local", True),
+    "reentrant-element-at": ("p: procedure reentrant;\n  declare x (3) address;\n"
+                             "  declare z address at (.x(1));\n  x(0) = z;\nend p;\ncall p;\n",
+                             "X", "a REENTRANT local", True),
+    "based-data": ("declare bb based w byte;\ndeclare d address data (.bb);\nw = d;\n",
+                   "BB", "BASED", True),
+    "based-initial": ("declare bb based w byte;\ndeclare d address initial (.bb);\nw = d;\n",
+                      "BB", "BASED", True),
+    "based-element": ("declare ba based w (3) byte;\ndeclare d address data (.ba(1));\nw = d;\n",
+                      "BA", "BASED", True),
+}
+
+
+@pytest.mark.parametrize("opt", LEVELS)
+@pytest.mark.parametrize("name", sorted(NO_FIXED_ADDRESS))
+def test_a_location_with_no_fixed_address_is_uplm80s_own_refusal(opt, name):
+    """uplm80 refuses, at every level, the location of what it gives no
+    fixed address, a REENTRANT procedure's local or a BASED variable, in a
+    list as in an AT; in a list it compiled to `dw X', and um80 failed, and
+    in an AT so did an array or a structure, `at (.x(1))', `EQU X+2'."""
+    stmts, var, why, _ = NO_FIXED_ADDRESS[name]
+    err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
+    line = next(l for l in err.splitlines() if ": error: " in l)
+    assert line.endswith(f"{var} has no fixed address ({why})"), err
+
 
 def test_an_untyped_data_string_is_an_array():
     """uplm80 takes `declare hx data ('0123')', which V3.1 does not (ERROR

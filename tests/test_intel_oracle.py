@@ -27,9 +27,9 @@ from tests.plm_intel import generate, zero_dividend
 from tests.test_calls_and_loops import END_LABELS, MEMORY_RUNS_BACK, MEMORY_RUNS_ON
 from tests.test_expression_types import _PRELUDE, BYTE_SHIFTS, EMBEDDED_TARGET, QUALIFIED_SIZES
 from tests.test_names import PRELUDE as NAMES_PRELUDE
-from tests.test_names import (PAST_THE_SPACE, V31_ALLOWS, V31_BLOCK_LOCATIONS,
-                              V31_DECLARED_BUILTINS, V31_DECLS, V31_LOCATIONS, V31_REJECTS,
-                              V31_RESTRICTED, V31_WARNS)
+from tests.test_names import (NO_FIXED_ADDRESS, PAST_THE_SPACE, V31_ALLOWS,
+                              V31_BLOCK_LOCATIONS, V31_DECLARED_BUILTINS, V31_DECLS,
+                              V31_LOCATIONS, V31_REJECTS, V31_RESTRICTED, V31_WARNS)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
@@ -129,6 +129,18 @@ def test_v31_takes_the_location_of_a_built_in_in_a_list(tools, name):
     """0.4.3's Known issues: V3.1 takes `data (.stackptr)' for an address
     of its own, which uplm80 has none to give, and refuses."""
     text = _PRELUDE + f"declare d address data (.{name});\ncall ph(d);\nend t;\n"
+    res = oracle.check_text(tools, text, name, levels=(0,))
+    assert res.verdict == "uplm80-rejects", oracle.format_result(res)
+
+
+@pytest.mark.parametrize("name", sorted(k for k, v in NO_FIXED_ADDRESS.items() if v[3]))
+def test_v31_takes_a_location_uplm80_gives_no_fixed_address(tools, name):
+    """0.4.4's Known issues: V3.1 takes the location of a REENTRANT
+    procedure's local, and of a BASED variable in a list, for an address;
+    uplm80, which has the local on the stack and no address of a BASED
+    variable to give, refuses both."""
+    stmts = NO_FIXED_ADDRESS[name][0]
+    text = oracle.prepare_text(NAMES_PRELUDE + V31_DECLS + stmts + "end t;\n")
     res = oracle.check_text(tools, text, name, levels=(0,))
     assert res.verdict == "uplm80-rejects", oracle.format_result(res)
 
