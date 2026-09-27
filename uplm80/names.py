@@ -1163,7 +1163,10 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         IDENTIFIER, where the program names it.  uplm80 took it without a
         word; the location of it in a DATA list, `dw LB', was um80's
         "Undefined symbol", and a GOTO to it was refused only where no
-        optimization had left the GOTO out (resolve_names).  A PUBLIC one is
+        optimization had left the GOTO out (resolve_names).  A CALL of it is
+        ERROR 118, INVALID INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR,
+        besides, as of a label that labels one (_check_called), and 32,
+        INVALID SYNTAX, of what follows it in parentheses.  A PUBLIC one is
         check_public_labels'."""
         for d in self.decls:
             if d.kind != "label" or d.defined or d.shared:
@@ -1179,6 +1182,13 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 self.intel(node, f"{text} is declared a LABEL but labels no statement{also}", 172)
                 continue
             r = uses[0]
+            if r.called:
+                what = expr_text(r.call) if r.call is not None else text
+                self.intel(r.node, f"CALL {what}: {text} is declared a LABEL but labels no "
+                           f"statement{also}, and a CALL calls a procedure, or through an "
+                           "ADDRESS scalar (Programming Manual 9800268B, 8.2.1)",
+                           *((105, 118, 32, 172) if r.call is not None else (105, 118, 172)))
+                continue
             what = f"GOTO {text}" if r.goto else f".{text}" if r.dot else text
             self.intel(r.node, f"{what}: {text} is declared a LABEL but labels no statement"
                        f"{also}", 105, 172)
@@ -1511,14 +1521,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         "text": ((147,), (147,), (147,), (147,)),                          # .'AB'
         "subscripts": ((152,), (146,), (152,), ()),                        # .a(1)(1)
         "subscripting": ((149,), (149,), (149,), ()),                      # .x(1), .p(1)
+        "subscript-list": ((150,), (150,), (150,), ()),                    # .a(1, 2)
         "at-name": ((), (211,), (), ()),                   # at (.stackptr), at (.p), at (.lbl)
         "at-based": ((), (212,), (), ()),                                  # at (.bb)
         "constant-location": ((), (), (), ()),                             # .(.a)
     }
     _CONTEXTS = ("list", "at", "consts", "subscript")
     # What V3.1 reads past, going on to the rest of the value.
-    _READ_PAST = frozenset({"name", "negation", "constant-location", "subscripting", "at-name",
-                            "at-based"})
+    _READ_PAST = frozenset({"name", "negation", "constant-location", "subscripting",
+                            "subscript-list", "at-name", "at-based"})
     # The order V3.1 lists its errors in.
     _V31_ORDER = (149, 151, 152, 146, 150, 147, 32, 210, 209, 211, 212, 172)
     _RULES = {
@@ -1763,7 +1774,13 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         built-in's but MEMORY's (V3.1: ERROR 211) or a BASED variable's
         (212); a subscript on what is not an array (149); a second
         subscript, where V3.1 stops as at an operator it does not take
-        (152, in an AT 146); and a subscript's faults."""
+        (152, in an AT 146); the first subscript's faults; and more than
+        one in its parentheses, `.a(1, 2)', where V3.1 misses the `)' after
+        the first (150) and goes on after the one that ends the rest,
+        which it does not read, `.a(1, x)' #150 alone - but of a built-in
+        but MEMORY, which uplm80 refuses in its own words
+        (:meth:`_check_builtin_use`): V3.1 gives #149 besides of
+        `.input(1, 2)', and not of `.stackptr(1, 2)'."""
         d = unwrap_paren(d)
         if isinstance(d, P.Identifier):
             r = refs.get(id(d))
@@ -1780,10 +1797,13 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
                 return
             if not self._an_array(callee, refs):
                 faults.append(("subscripting", d, ctx))
-            for a in d.args:
+            for a in d.args[:1]:
                 if faults and faults[-1][0] not in self._READ_PAST:
                     return
                 self._restricted(a, "subscript", "top", refs, faults)
+            if len(d.args) > 1 and not _a_builtin(callee, refs) \
+                    and not (faults and faults[-1][0] not in self._READ_PAST):
+                faults.append(("subscript-list", d, ctx))
         elif isinstance(d, P.MemberAccess):
             self._restricted_location(d.base, ctx, refs, faults)
 
@@ -1888,6 +1908,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             return f".{text}: {text} is BASED, and has no fixed address for an AT address to name"
         if kind == "subscripts":
             return f"{what}: a location takes one subscript, not two"
+        if kind == "subscript-list":
+            return f"{what}: a location takes one subscript"
         if kind == "subscripting":
             callee = unwrap_paren(node.callee)
             d = refs.get(id(callee)).decl if isinstance(callee, P.Identifier) else None
@@ -2360,6 +2382,13 @@ def _names_undeclared(expr, refs: dict) -> bool:
         return r.decl.kind == "lit" if r.decl is not None else _key(expr.name) not in _BUILTINS
     return any(_names_undeclared(getattr(expr, f), refs)
                for f in getattr(expr, "__dataclass_fields__", ()) if f != "pos")
+
+
+def _a_builtin(ref, refs: dict) -> bool:
+    """Whether the reference ``ref`` is a name that means a built-in but
+    MEMORY."""
+    r = refs.get(id(ref)) if isinstance(ref, P.Identifier) else None
+    return r is not None and r.decl is None and _key(ref.name) in _BUILTINS - {"MEMORY"}
 
 
 def _two_subscripts(expr) -> bool:

@@ -61,7 +61,9 @@ besides #32 (SIZE only #32).
   w`, `.a(1, 2)`, `s.m(1, 2)`, `sa(1, 2).m(0)`, `sa(1).m(0, 1)`,
   `memory(1, 2)`.  uplm80 took the subscripts for arguments and called,
   at every level, through the value of `a(0)` (0.4.3's release check);
-  0.4.3 made the same of a scalar an error.
+  0.4.3 made the same of a scalar an error.  In a DATA or INITIAL list,
+  an AT address or a constant list, `data (.a(1, 2))`, it is V3.1's #150
+  (Incompatible: V3.1's errors in a restricted expression).
 
       A(1, 2): A is an array, and an array takes one subscript; Intel's
       PL/M-80 V3.1 rejects it (ERROR #114, INVALID SUBSCRIPT, MULTIPLE
@@ -217,6 +219,13 @@ refused in words of its own:
   further on, of an ADDRESS array .a+2 in a DATA list, .a+3 in an INITIAL
   one, .a+4 in an AT, and refused of a member in a DATA or INITIAL list,
   `.s.m(1)(1)`;
+- more than one subscript in a location's parentheses, `data (.a(1,
+  2))`, `at (.a(1, 2) + 1)`, `.(7, .a(1, 2))`, `data (.memory(1, 2))`
+  (#150, MISSING ')' AT END OF RESTRICTED SUBSCRIPT), where V3.1 reads the
+  first subscript and goes on after the `)` that ends the rest, which it
+  does not read, `.a(1, x)` #150 alone; 0.4.3 refused it in a DATA or
+  INITIAL list and an AT in words of its own ("Unsupported subscript in
+  DATA location expression: Call(...)"), and took it in a constant list;
 - a subscript on the location of what is not an array (#149, INVALID
   SUBSCRIPTING IN RESTRICTED REFERENCE): a scalar or a structure, `data
   (.x(1))`, `at (.s(1))`, which 0.4.3 took for the element that far past
@@ -318,7 +327,10 @@ A LABEL declared in a block, not PUBLIC nor EXTERNAL, that labels no
 statement of the block - a label of its name on a statement of a DO block
 in it is another label, the DO block's - is refused as V3.1 refuses it,
 #172, INVALID LABEL: UNDEFINED, and where the program names it #105,
-UNDECLARED IDENTIFIER, besides.  uplm80 took it without a word: its
+UNDECLARED IDENTIFIER, besides, and where a CALL calls it #118, INVALID
+INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR, as of a label that labels
+one (Incompatible: more errors Intel's PL/M-80 gives), and #32 of what
+follows it in parentheses.  uplm80 took it without a word: its
 location in a DATA list, `declare lb label; declare w address data
 (.lb);`, was `dw LB`, which um80 did not know, at every level (0.4.3 the
 same); a GOTO to it was refused in words of its own, but not where
@@ -639,18 +651,22 @@ a later release (0.4.3 the same):
 
 - **What a restricted expression does not take that is an error
   anywhere** - a member a structure does not have, `data (.s.zz)` (V3.1:
-  #112), or of what is not a structure, `.a(1).k` (#148), two subscripts
-  in one pair of parentheses, `.a(1, 2)` (#150), empty ones, `.a()`
-  (#151), a name declared nowhere (#105, and #149 of `.zz(1)`), or a
-  LITERALLY declared after the list (#105) - uplm80 refuses in words of
-  its own, as it did, and the message names none of V3.1's errors, nor
-  those of the rest of the list: `.(.zz(1))` is #105, #149 and #210 to
-  V3.1, and to uplm80 a name not declared.
+  #112), or of what is not a structure, `.a(1).k` (#148), empty
+  parentheses, `.a()` (#151), a name declared nowhere (#105, and #149 of
+  `.zz(1)`), or a LITERALLY declared after the list (#105) - uplm80
+  refuses in words of its own, as it did, and the message names none of
+  V3.1's errors, nor those of the rest of the list: `.(.zz(1))` is #105,
+  #149 and #210 to V3.1, and to uplm80 a name not declared.
 - A number above 0FFFFH, `declare d address data (70000)`, `w = 70000`,
   which V3.1 rejects (#94, ILLEGAL CONSTANT, VALUE > 65535), uplm80
   compiles to its low sixteen bits, 1170H.
 - An empty string in a DATA list, `declare w (*) byte data ('', 7)`, which
   V3.1 rejects (#209), uplm80 takes for no bytes, `w(0)` 7.
+- A label as a value or as an assignment's target, `lb: ...; w = lb;`,
+  `lb = 1`, which V3.1 rejects (#132, ILLEGAL USE OF LABEL), uplm80
+  compiles, to a read of the code at the label or a store into it (0.4.3
+  the same); of a LABEL that labels no statement, `w = lb`, the message
+  names #105 and #172, not #132 (found checking 0.4.4).
 
 ### Verified
 

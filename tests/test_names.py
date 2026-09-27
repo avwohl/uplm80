@@ -1249,6 +1249,25 @@ V31_REJECTS = {
                                            (39, 88), "error: X: an INTERRUPT procedure " + _OUTER
                                            + "procedure R, and R, a REENTRANT procedure, has no "
                                            "procedure declared in it"),
+    # Of a procedure with no statements V3.1 gives #174 whatever its
+    # attribute, and #156 of a typed one.
+    "public-procedure-with-no-statements-in-a-procedure": (
+        "p: procedure;\n  q: procedure public;\n  end q;\n  call q;\nend p;\ncall p;\n", (39, 174),
+        "T.PLM:9:3: error: Q: a PUBLIC procedure " + _OUTER + "procedure P; Intel's PL/M-80 "
+        "V3.1 rejects it (ERROR #39, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL, "
+        "and #174, INVALID NULL PROCEDURE)"),
+    "typed-public-procedure-with-no-statements": (
+        "p: procedure;\n  q: procedure byte public;\n  end q;\n  b = q;\nend p;\ncall p;\n",
+        (39, 174, 156),
+        "T.PLM:9:3: error: Q: a PUBLIC procedure " + _OUTER + "procedure P; Intel's PL/M-80 "
+        "V3.1 rejects it (ERROR #39, INVALID ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL, "
+        "and #174, INVALID NULL PROCEDURE, and #156, MISSING RETURN STATEMENT IN TYPED "
+        "PROCEDURE)"),
+    "interrupt-procedure-with-no-statements-in-do": (
+        "do;\n  q: procedure interrupt 3;\n  end q;\n  b = 1;\nend;\n", (39, 174),
+        "T.PLM:9:3: error: Q: an INTERRUPT procedure " + _OUTER + "a DO block (Programming "
+        "Manual 9800268B, 8.1.6); Intel's PL/M-80 V3.1 rejects it (ERROR #39, INVALID "
+        "ATTRIBUTE OR INITIALIZATION, NOT AT MODULE LEVEL, and #174, INVALID NULL PROCEDURE)"),
     # 0.4.2's Known issues, 0.4.3.
     "end-names-another-procedure": ("p: procedure;\n  b = 1;\nend q;\ncall p;\n", (20,),
                                     "T.PLM:10:5: error: END Q: the END of procedure P names Q; "
@@ -1929,6 +1948,49 @@ V31_REJECTS = {
                                               "INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, "
                                               "MISSING ')' AFTER CONSTANT LIST, and #150, MISSING "
                                               "')' AT END OF RESTRICTED SUBSCRIPT)"),
+    # More than one subscript in a location's parentheses, which 0.4.3
+    # refused in a DATA or INITIAL list and an AT in its own words and took
+    # in a constant list, and #114, V3.1's error in an expression, is not
+    # V3.1's error there: it reads the first subscript, misses the `)'
+    # after it (#150) and goes on after the one that ends the rest, which
+    # it does not read.
+    "subscript-list-in-data": (
+        "declare ar (3) address;\ndeclare d address data (.ar(1, 2));\nw = d;\n", (150,),
+        "T.PLM:9:26: error: AR(1, 2): a location takes one subscript; Intel's PL/M-80 V3.1 "
+        "rejects it (ERROR #150, MISSING ')' AT END OF RESTRICTED SUBSCRIPT)"),
+    "subscript-list-in-initial": (
+        "declare ar (3) address;\ndeclare d address initial (.ar(1, 2));\nw = d;\n", (150,),
+        "T.PLM:9:29: error: AR(1, 2): a location takes one subscript"),
+    "subscript-list-in-at": (
+        "declare ar (3) address;\ndeclare d byte at (.ar(1, 2) + 1);\nb = d;\n", (150,),
+        "T.PLM:9:21: error: AR(1, 2): a location takes one subscript"),
+    "subscript-list-on-a-member-in-data": (
+        "declare s structure (m (3) address);\ndeclare d address data (.s.m(1, 2));\nw = d;\n",
+        (150,), "T.PLM:9:26: error: S.M(1, 2): a location takes one subscript"),
+    "subscript-list-of-memory-in-data": (
+        "declare d address data (.memory(1, 2));\nw = d;\n", (150,),
+        "T.PLM:8:26: error: MEMORY(1, 2): a location takes one subscript"),
+    "subscript-list-then-a-variable-in-data": (
+        "declare ar (3) address;\ndeclare d (2) address data (.ar(1, 2), b);\nw = d(0);\n",
+        (151, 150), "T.PLM:9:30: error: AR(1, 2): a location takes one subscript"),
+    "subscript-list-after-a-name-in-data": (
+        "declare ar (3) address;\ndeclare d address data (.ar(b, 2));\nw = d;\n", (151, 150),
+        "T.PLM:9:29: error: B: B is a variable"),
+    "subscript-list-of-a-name-in-data": (
+        "declare ar (3) address;\ndeclare d address data (.ar(1, b));\nw = d;\n", (150,),
+        "T.PLM:9:26: error: AR(1, B): a location takes one subscript"),
+    "subscript-list-on-a-scalar-in-data": (
+        "declare d address data (.w(1, 2));\nw = d;\n", (149, 150),
+        "T.PLM:8:26: error: W(1, 2): W is not an array"),
+    "subscript-list-in-a-byte": (
+        "declare ar (3) address;\ndeclare d byte data (.ar(1, 2));\nb = d;\n", (150, 210),
+        "T.PLM:9:23: error: AR(1, 2): a location takes one subscript"),
+    "subscript-list-in-a-constant-list": (
+        "declare ar (3) address;\nw = .(7, .ar(1, 2));\n", (150, 209),
+        "T.PLM:9:11: error: AR(1, 2): a location takes one subscript"),
+    "subscript-list-alone-in-a-constant-list": (
+        "declare ar (3) address;\nw = .(.ar(1, 2));\n", (150, 210),
+        "T.PLM:9:8: error: AR(1, 2): a location takes one subscript"),
     # A subscript on the location of what is not an array - a scalar, a
     # structure, a member, a procedure, a label - which 0.4.3 took for the
     # element that far past it, of a scalar or a structure with a warning
@@ -2096,6 +2158,20 @@ V31_REJECTS = {
         "declare lb label;\ndo;\n  declare d address data (.lb);\n  lb: w = d;\nend;\n", (172,),
         "T.PLM:8:9: error: LB is declared a LABEL but labels no statement (the LB: in a DO "
         "block is another label, that block's); Intel's PL/M-80 V3.1 rejects it (ERROR #172"),
+    # A CALL of it is #118 besides, as of a label that labels one, and #32
+    # of what follows it in parentheses.
+    "call-a-label-that-labels-no-statement": (
+        "declare lb label;\ncall lb;\n", (105, 118, 172),
+        "T.PLM:9:6: error: CALL LB: LB is declared a LABEL but labels no statement, and a CALL "
+        "calls a procedure, or through an ADDRESS scalar (Programming Manual 9800268B, 8.2.1); "
+        "Intel's PL/M-80 V3.1 rejects it (ERROR #105, UNDECLARED IDENTIFIER, and #118, INVALID "
+        "INDIRECT CALL, IDENTIFIER NOT AN ADDRESS SCALAR, and #172, INVALID LABEL: UNDEFINED)"),
+    "call-a-label-that-labels-no-statement-with-arguments": (
+        "declare lb label;\ncall lb(1);\n", (105, 118, 32, 172),
+        "T.PLM:9:6: error: CALL LB(1): LB is declared a LABEL but labels no statement"),
+    "call-a-label-that-labels-no-statement-in-a-procedure": (
+        "p: procedure;\n  declare lb label;\n  call lb;\nend p;\ncall p;\n", (105, 118, 172),
+        "T.PLM:10:8: error: CALL LB: LB is declared a LABEL but labels no statement"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and

@@ -190,11 +190,12 @@ where:
   constant list, or where the value fills a BYTE, what a byte holds.  A
   built-in, a name not after a dot, parentheses, an operator but + and -,
   a string in a sum or in an AT, a location anywhere but first, one with
-  two subscripts or with a subscript on what is not an array, a constant
-  list in a DATA list, and in an AT the location of a procedure or a label
-  are errors at every `-O` level, as V3.1 makes them: `data (shl(0f0h,
-  4))`, `data (x)`, `.(x, 7)`, `.(2 * 3)`, `.(300)`, `data (.a(1)(1))`,
-  `data (.x(1))`, `at (.p)`.  A location in a DATA or INITIAL list or an
+  two subscripts, with more than one in its parentheses or with a
+  subscript on what is not an array, a constant list in a DATA list, and
+  in an AT the location of a procedure or a label are errors at every `-O`
+  level, as V3.1 makes them: `data (shl(0f0h, 4))`, `data (x)`, `.(x, 7)`,
+  `.(2 * 3)`, `.(300)`, `data (.a(1)(1))`, `data (.a(1, 2))`, `data
+  (.x(1))`, `at (.p)`.  A location in a DATA or INITIAL list or an
   AT address is the variable the name means in its block (9.1), declared
   before it or after, there or in a block around it, whatever the form of
   its declaration: `.arr(2)` of an ADDRESS array is ARR+4, and a
@@ -739,8 +740,9 @@ list (since 0.4.4): a built-in or a name, `data (shl(0f0h, 4))`, `data
 -, `.(2 * 3)`, `data (6 / 3)`, NOT, `.(not 0f0h)`, a string in a sum,
 `data ('A' + 1)`, and a location anywhere but first, `at (3 + .buf(1))`
 (152, 146, 151); a location with two subscripts, `data (.a(1)(1))` (152,
-146), or with a subscript on what is not an array, `data (.x(1))`, `data
-(.p(1))` (149); the location in an AT of a procedure or a label, `at
+146), with more than one in its parentheses, `data (.a(1, 2))` (150), or
+with a subscript on what is not an array, `data (.x(1))`, `data (.p(1))`
+(149); the location in an AT of a procedure or a label, `at
 (.p)` (211), or of a BASED variable (212); a constant list in a DATA
 list, `data (.(5))` (147); and in a constant list, or where the value
 fills a BYTE, a location or a number a byte does not hold, `.(300, 7)`,
@@ -749,14 +751,15 @@ BASED, or a member of what is, `a based s.p` of a BASED `s` (50, 52), a
 member of an array of structures (52), a BYTE, an array, a structure, a
 built-in, a procedure or a label (50), a member its structure does not
 have (55) or a name declared only further down (54); and a LABEL that
-labels no statement (172, and 105 where the program names it).  It
-refuses the location of a built-in but MEMORY in a DATA or INITIAL list,
-`data (.stackptr)`, which V3.1 takes for an address of its own: uplm80
-has none to give it; and the location of a REENTRANT procedure's local
-in a DATA or INITIAL list or an AT, and of a BASED variable, a factored
-BASED declaration's too, in a DATA or INITIAL list, which V3.1 gives an
-address (INITIAL in a procedure it rejects, 73): uplm80 has the local on
-the stack, and no address of a BASED variable to give.  And V3.1 computes
+labels no statement (172, and 105 where the program names it, and 118
+where a CALL calls it).  It refuses the location of a built-in but MEMORY
+in a DATA or INITIAL list, `data (.stackptr)`, which V3.1 takes for an
+address of its own: uplm80 has none to give it; and the location of a
+REENTRANT procedure's local in a DATA or INITIAL list or an AT, and of a
+BASED variable, a factored BASED declaration's too, in a DATA or INITIAL
+list, which V3.1 gives an address (INITIAL in a procedure it rejects, 73):
+uplm80 has the local on the stack, and no address of a BASED variable to
+give.  And V3.1 computes
 a restricted expression as a constant, a number below 256 a BYTE and BYTE
 arithmetic in eight bits, `address data (200 + 100)` 002CH and `-1`
 00FFH, where uplm80 computes in sixteen bits, 012CH and 0FFFFH, and a
