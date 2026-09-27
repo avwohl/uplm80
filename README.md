@@ -188,9 +188,9 @@ where:
   4))`, `data (x)`, `.(x, 7)`, `.(2 * 3)`, `.(300)`, `data (.a(1)(1))`,
   `data (.x(1))`, `at (.p)`.  A location in a DATA or INITIAL list or an
   AT address is the variable the name means in its block (9.1), declared
-  before it or after, there or in a block around it: `.arr(2)` of an
-  ADDRESS array is ARR+4, and a procedure's `.memory` its own MEMORY where
-  it declares one further on.
+  before it or after, there or in a block around it, whatever the form of
+  its declaration: `.arr(2)` of an ADDRESS array is ARR+4, and a
+  procedure's `.memory` its own MEMORY where it declares one further on.
 - An INTERRUPT procedure is declared at the outer level of its module and
   has no parameters (8.1.6); so is a PUBLIC or EXTERNAL procedure or
   variable, not in a procedure or a DO block.  INITIAL there initializes
@@ -713,14 +713,15 @@ location or a number a byte does not hold, `.(300, 7)`, `byte data (.w)`
 INITIAL list, `data (.stackptr)`, which V3.1 takes for an address of its
 own: uplm80 has none to give it; and the location of a REENTRANT
 procedure's local in a DATA or INITIAL list or an AT, and of a BASED
-variable in a list, which V3.1 gives an address: uplm80 has the local on
-the stack, and no address of a BASED variable to give.  And
-V3.1 computes a restricted expression as a constant, a number below 256 a
-BYTE and BYTE arithmetic in eight bits, `address data (200 + 100)` 002CH
-and `-1` 00FFH, where uplm80 computes in sixteen bits, 012CH and 0FFFFH,
-and a string that fills an ADDRESS there as a constant, `address data
-('AB')` 4142H, where uplm80 lays out 'A' and 'B' in order, 4241H
-(CHANGELOG, Known issues).
+variable, a factored BASED declaration's too, in a DATA or INITIAL list,
+which V3.1 gives an address (INITIAL in a procedure it rejects, 73):
+uplm80 has the local on the stack, and no address of a BASED variable to
+give.  And V3.1 computes a restricted expression as a constant, a number
+below 256 a BYTE and BYTE arithmetic in eight bits, `address data (200 +
+100)` 002CH and `-1` 00FFH, where uplm80 computes in sixteen bits, 012CH
+and 0FFFFH, and a string that fills an ADDRESS there as a constant,
+`address data ('AB')` 4142H, where uplm80 lays out 'A' and 'B' in order,
+4241H (CHANGELOG, Known issues).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),

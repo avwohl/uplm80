@@ -1372,8 +1372,8 @@ V31_REJECTS = {
                                   "rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED "
                                   "EXPRESSION, and #209, ILLEGAL INITIALIZATION OF MORE SPACE "
                                   "THAN DECLARED)"),
-    # 0.4.3, again: what else a restricted expression does not take, which
-    # uplm80 compiled - a name, as its address in a DATA list and as its
+    # 0.4.4: what else a restricted expression does not take, which 0.4.3
+    # compiled - a name, as its address in a DATA list and as its
     # value in a constant list at -O3, where -O0 to -O2 refused it; a byte
     # of a larger number; parentheses, a product, NOT, a string in a sum -
     # at every level, or at some.  In a constant list V3.1 gives more
@@ -1639,12 +1639,13 @@ V31_REJECTS = {
                               "EXPRESSION)"),
     "string-in-at": ("declare d byte at ('AB');\nb = d;\n", (151, 146),
                      "T.PLM:8:20: error: 'AB': an AT address has no string in it"),
-    # A location with two subscripts, which uplm80 took for an element
-    # further on: `.ar(1)(1)' of an ADDRESS array AR+4 (0.4.3: AR+2 in a
-    # DATA list, AR+3 in an INITIAL one, AR+4 in an AT, and `.s.m(1)(1)'
-    # refused).  V3.1 reads the location to its first subscript and stops
-    # at the second as at an operator it does not take (#152, in an AT
-    # #146), and gives that error too after one in a subscript.
+    # A location with two subscripts, which 0.4.3 took for an element
+    # further on, `.ar(1)(1)' of an ADDRESS array AR+2 in a DATA list, AR+3
+    # in an INITIAL one, AR+4 in an AT, and refused of a member in a DATA or
+    # INITIAL list, `.s.m(1)(1)', in its own words.  V3.1 reads the location
+    # to its first subscript and stops at the second as at an operator it
+    # does not take (#152, in an AT #146), and gives that error too after
+    # one in a subscript.
     "two-subscripts-in-data": ("declare ar (3) address;\ndeclare d address data (.ar(1)(1));\n"
                                "w = d;\n", (152,),
                                "T.PLM:9:26: error: AR(1)(1): a location takes one subscript, "
@@ -1677,10 +1678,12 @@ V31_REJECTS = {
                                               "MISSING ')' AFTER CONSTANT LIST, and #150, MISSING "
                                               "')' AT END OF RESTRICTED SUBSCRIPT)"),
     # A subscript on the location of what is not an array - a scalar, a
-    # structure, a member, a procedure, a label - which uplm80 took for the
-    # element that far past it, with a warning that named #127, V3.1's
-    # error in an expression (`.w(1)' of an ADDRESS W+2, in 0.4.3's DATA
-    # list W+1), or, of a procedure, refused naming #104.
+    # structure, a member, a procedure, a label - which 0.4.3 took for the
+    # element that far past it, of a scalar or a structure with a warning
+    # that named #127, V3.1's error in an expression (`.w(1)' of an ADDRESS
+    # W+1 in a DATA list, W+2 in an INITIAL list or an AT), of a member in
+    # an AT or a label without a word; or refused, a member in a DATA list
+    # in its own words, a procedure naming #104.
     "subscripted-scalar-in-data": ("declare d address data (.w(1));\nw = d;\n", (149,),
                                    "T.PLM:8:26: error: W(1): W is not an array, and only an "
                                    "array's location takes a subscript; Intel's PL/M-80 V3.1 "
