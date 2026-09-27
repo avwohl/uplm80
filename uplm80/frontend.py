@@ -27,6 +27,7 @@ diagnostic names (:func:`source_location`).
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 from . import _plm_parser
 from . import _plm_parser as P
@@ -48,17 +49,19 @@ def parse_source(
     pre1 = uplm_preprocess(source, filename, defines=defines, include_paths=include_paths,
                            line_map=line_map)
     substitutions: list[tuple[int, str, str]] = []
-    src = macro_pass(pre1, substitutions)
+    expanded: dict[int, list[tuple[int, int, int, int]]] = {}
+    src = macro_pass(pre1, substitutions, expanded)
     put_in: dict[int, list[int]] = {}
     src, ends = label_the_ends(src, substitutions, put_in)
+    columns = Columns(put_in, expanded)
     try:
         tree = _plm_parser.parse(src, filename=filename)
     except Exception as e:  # ScanError or ParseError
         raise _syntax_error(e, line_map, filename,
-                            _literally_at(e, src, substitutions), put_in) from e
+                            _literally_at(e, src, substitutions), columns) from e
     if ends:
         _mark_ends(tree, ends)
-    note_origins(tree, line_map, put_in)
+    note_origins(tree, line_map, columns)
     tree.uplm80_file = filename
     return tree
 
@@ -190,16 +193,38 @@ def _literally_at(e: Exception, src: str, substitutions) -> str:
             f"LITERALLY's scope {where}")
 
 
-def source_column(put_in: dict[int, list[int]] | None, line: int, column: int) -> int:
+@dataclass
+class Columns:
+    """How the columns of the text the parser sees are not the source's:
+    by line, the `;'s label_the_ends put in (``put_in``), and the
+    LITERALLYs' texts macro_pass put in (``expanded``)."""
+
+    put_in: dict[int, list[int]] = field(default_factory=dict)
+    expanded: dict[int, list[tuple[int, int, int, int]]] = field(default_factory=dict)
+
+
+def source_column(columns: Columns | None, line: int, column: int) -> int:
     """The source's column for ``column`` of line ``line`` of the text the
-    parser saw, which has the `;'s ``put_in`` says (label_the_ends): each
-    before it moved it on one.  A `;' put in is at the column of what
-    followed the colon."""
-    return column - sum(1 for c in (put_in or {}).get(line, ()) if c < column)
+    parser saw.  Each `;' put in before it (label_the_ends) moved it on
+    one; a `;' put in is at the column of what followed the colon.  Each
+    LITERALLY's text before it moved it on by how much longer the text is
+    than the name it takes the place of, and a column in a text is the
+    name's."""
+    if columns is None:
+        return column
+    column -= sum(1 for c in columns.put_in.get(line, ()) if c < column)
+    shift = 0
+    for at, length, name_col, name_len in columns.expanded.get(line, ()):
+        if column < at:
+            break
+        if column < at + length:
+            return name_col
+        shift += length - name_len
+    return column - shift
 
 
 def _syntax_error(e: Exception, line_map, filename: str, why: str = "",
-                  put_in: dict[int, list[int]] | None = None) -> ParserError:
+                  columns: Columns | None = None) -> ParserError:
     """A scanner or parser error, placed where its text came from.
 
     uplox reports a line of the preprocessed text, which past an
@@ -215,13 +240,13 @@ def _syntax_error(e: Exception, line_map, filename: str, why: str = "",
     message = re.sub(r"^[^\s:]*:\d+:\d+:\s*", "", message)
     file, orig = _origin(line_map, line, filename)
     return ParserError(message + why, SourceLocation(
-        orig, source_column(put_in, line, column or 1), file))
+        orig, source_column(columns, line, column or 1), file))
 
 
 def note_origins(tree, line_map: list[tuple[str, int]],
-                 put_in: dict[int, list[int]] | None = None) -> None:
+                 columns: Columns | None = None) -> None:
     """Give every node position of ``tree`` the (file, line, column) it
-    came from, as ``pos.origin`` (``put_in``: see source_column).
+    came from, as ``pos.origin`` (``columns``: see source_column).
 
     The optimizer carries a node's position over to what it rewrites the
     node into, so what code generation reports on still knows its origin.
@@ -248,7 +273,7 @@ def note_origins(tree, line_map: list[tuple[str, int]],
                 pos.start_line, pos.start_column = first.start_line, first.start_column
         if pos is not None and getattr(pos, "start_line", 0):
             pos.origin = _origin(line_map, pos.start_line, "") + (
-                source_column(put_in, pos.start_line, pos.start_column),)
+                source_column(columns, pos.start_line, pos.start_column),)
         stack.extend(getattr(n, f, None) for f in fields if f != "pos")
 
 

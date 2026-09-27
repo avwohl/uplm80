@@ -419,18 +419,28 @@ _PLM_KEYWORDS_LOWER = frozenset(
 
 
 class _Out(list):
-    """The macro pass's output pieces, and how long they are together."""
+    """The macro pass's output pieces, how long they are together, and the
+    line and column the next piece begins at."""
 
     def __init__(self) -> None:
         super().__init__()
         self.length = 0
+        self.line = 1
+        self.col = 1
 
     def append(self, text: str) -> None:  # type: ignore[override]
         super().append(text)
         self.length += len(text)
+        end = text.rfind("\n")
+        if end < 0:
+            self.col += len(text)
+        else:
+            self.line += text.count("\n")
+            self.col = len(text) - end
 
 
-def macro_pass(source: str, substitutions: list | None = None) -> str:
+def macro_pass(source: str, substitutions: list | None = None,
+               expanded: dict | None = None) -> str:
     """Case-fold and apply block-scoped LITERALLY substitution.
 
     Tokenises the source with a small PL/M-aware scanner (the bare
@@ -449,6 +459,13 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
     substitution: where in the output the LITERALLY ``name``'s ``text``
     begins.  A nested macro's comes after its outer one's, at the same
     offset when it begins the outer one's text.
+
+    ``expanded``, if given, gets by line of the output a (column, length,
+    name's column, name's length) for each name of the source whose
+    LITERALLY's text is put in, the texts it names included: where on the
+    line the text begins and how long it is, and where the name was and
+    how long (:func:`frontend.source_column`).  A line end in a text is
+    a blank, so the lines are the source's.
     """
     # PL/M source files end at the first Ctrl-Z (0x1A) — that's the
     # CP/M end-of-file marker, and any bytes after it are garbage
@@ -485,6 +502,15 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
     i = 0
     n = len(tokens)
     pending: list[_Tok] = []  # putback queue for substituted-body tokens
+    # The text being put in for a name of the source: (line, column,
+    # offset) where it begins in the output, and the name's column and
+    # length.  Its end is where the queue is empty again.
+    opened: tuple | None = None
+
+    def close() -> None:
+        line, col, offset, name_col, name_len = opened
+        if expanded is not None:
+            expanded.setdefault(line, []).append((col, out.length - offset, name_col, name_len))
 
     def next_tok() -> "_Tok | None":
         nonlocal i
@@ -497,6 +523,9 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
         return tok
 
     while True:
+        if opened is not None and not pending:
+            close()
+            opened = None
         tok = next_tok()
         if tok is None:
             break
@@ -548,6 +577,8 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
                 out.append(text)
                 # Whitespace between tok and peek1
                 _emit_between(tokens, i, advance1 - 1, pending, out)
+                if opened is None and len(peek1.text) != len("LITERALLY"):
+                    opened = (out.line, out.col, out.length, peek1.col, len(peek1.text))
                 out.append("LITERALLY")
                 _emit_between(tokens, advance1, advance2 - 1, pending, out)
                 out.append(peek2.text)
@@ -571,6 +602,8 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
         if body is not None:
             if substitutions is not None:
                 substitutions.append((out.length, text, body))
+            if opened is None:
+                opened = (out.line, out.col, out.length, tok.col, len(tok.text))
             # The whole body, in an INITIAL or DATA list as anywhere else.
             # It used to be cut at its first top-level comma there, to match
             # an earlier uplm80 that parsed a macro body as one expression.
@@ -611,6 +644,8 @@ def macro_pass(source: str, substitutions: list | None = None) -> str:
         # Plain identifier — emit as-is.
         out.append(text)
 
+    if opened is not None:
+        close()
     return "".join(out)
 
 

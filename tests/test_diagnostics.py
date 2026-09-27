@@ -107,3 +107,47 @@ def test_after_a_colon_against_an_end_the_columns_are_the_sources():
     r = _compile({"c.plm": "t: do;\ndeclare b byte;\np: procedure;\n  b = 1;\n"
                            "out:end p; b = = 2;\nend t;\n"}, "c.plm")
     assert "c.plm:5:16: error: unexpected token 'EQ'" in r.stderr, r.stderr
+
+
+LIT = "declare lit literally '1 +\n  2 +\n  3';\n"
+
+
+def test_after_a_literallys_text_the_columns_are_the_sources():
+    """A LITERALLY's text takes the place of its name, on one line
+    however many it runs over, and moved every column after it on the line
+    by how much longer it is than the name: `b = lit; b = zz;' was 6:24,
+    where zz is at column 14 (0.4.3's release check), and a name longer
+    than its text moved them back."""
+    cases = [
+        ("b = lit; b = zz;\n", "c.plm:6:14: error: ZZ is not declared"),
+        ("b = lit; b = = 2;\n", "c.plm:6:14: error: unexpected token 'EQ'"),
+        ("b = lit; if b = 300 then b = 2;\n",
+         "c.plm:6:17: warning: comparison BYTE = 300 is always false"),
+        ("declare longname literally '1';\nb = longname; b = zz;\n",
+         "c.plm:7:19: error: ZZ is not declared"),
+        # A text that names another: the outer name's length is what counts.
+        ("declare two literally 'lit + lit';\nb = two; b = zz;\n",
+         "c.plm:7:14: error: ZZ is not declared"),
+        # With a colon against an END on the line too.
+        ("p: procedure;\n  b = 1;\nout:end p; b = lit; b = zz;\n",
+         "c.plm:8:25: error: ZZ is not declared"),
+        # A word declared LITERALLY 'LITERALLY', and a procedure's name.
+        ("declare lt literally 'literally';\ndeclare five lt '5';\nb = five; b = zz;\n",
+         "c.plm:8:15: error: ZZ is not declared"),
+        ("declare mon1 literally 'ldmon1x';\nmon1: procedure external; end mon1; b = zz;\n",
+         "c.plm:7:41: error: ZZ is not declared"),
+    ]
+    for stmts, message in cases:
+        r = _compile({"c.plm": "t: do;\ndeclare b byte;\n" + LIT + stmts + "end t;\n"}, "c.plm")
+        assert message in r.stderr, (stmts, r.stderr)
+
+
+def test_a_column_in_a_literallys_text_is_the_names():
+    """What a message is about in a LITERALLY's text is placed at the
+    name; the byte-shift check's warnings are placed as the rest."""
+    r = _compile({"c.plm": "t: do;\ndeclare (b, k) byte, w address;\n" + LIT
+                           + "k = input(1); b = lit; w = shl(k, 4) + 1;\nend t;\n"}, "c.plm")
+    assert "c.plm:6:28: warning: SHL(K, 4): SHL of a BYTE is a BYTE" in r.stderr, r.stderr
+    r = _compile({"c.plm": "t: do;\ndeclare b byte;\n" + LIT
+                           + "declare bad literally 'zz + 1';\nb = lit + bad;\nend t;\n"}, "c.plm")
+    assert "c.plm:7:11: error: ZZ is not declared" in r.stderr, r.stderr

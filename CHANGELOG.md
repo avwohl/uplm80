@@ -56,6 +56,17 @@ program of the calls it takes to print what uplm80's build prints.
       IDENTIFIER NOT AN ADDRESS SCALAR, and #32, INVALID SYNTAX, TEXT
       IGNORED UNTIL ';')
 
+### Fixed
+
+- **The columns after a LITERALLY's text are the source's.**  The text
+  takes the place of the name, on one line however many it runs over,
+  and every column after it on the line was the text's: with `lit` a
+  text of three lines, `b = lit; b = zz;` was reported at 6:24, where
+  `zz` is at column 14 (0.4.3's release check), and a name longer than
+  its text moved them back.  What a message is about in the text itself
+  is placed at the name.  A word declared LITERALLY 'LITERALLY' and a
+  procedure's name given by a LITERALLY are counted as their texts.
+
 ## 0.4.3 — 2026-09-26
 
 SHL and SHR of a BYTE are a BYTE, as the manual and Intel's PL/M-80 V3.1
