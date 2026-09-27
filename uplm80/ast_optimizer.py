@@ -2295,9 +2295,7 @@ class ASTOptimizer:
         left = self._optimize_expr(expr.left)
         right = self._optimize_expr(expr.right)
         if self._live(expr):
-            # A flag reader can read its flags, or it reads them itself.
-            return make_binary(kind, self._keep(expr.left, left), self._keep(expr.right, right),
-                               pos=expr.pos)
+            return self._live_binary(expr, kind, left, right)
 
         # In a region that reads a flag (CARRY, PLUS...), an arithmetic
         # operation's carry is observable, so the operation has to survive
@@ -2355,6 +2353,29 @@ class ASTOptimizer:
                     self.cse_counter += 1
 
         return result_expr
+
+    _BYTE_OPS = frozenset({BinaryOpKind.ADD, BinaryOpKind.SUB, BinaryOpKind.AND,
+                           BinaryOpKind.OR, BinaryOpKind.XOR, BinaryOpKind.PLUS,
+                           BinaryOpKind.MINUS})
+
+    def _live_binary(self, expr: P.BinaryOp, kind: BinaryOpKind, left, right):
+        """``expr``, whose flags a reader can read, or which reads them, of
+        its operands optimized, ``left`` and ``right``: computed as it is
+        written.  An 8-bit +, -, AND, OR, XOR, PLUS or MINUS of BYTEs reads
+        and sets the same flags whatever its operands are, so long as one
+        of them is not a constant - code generation would fold two with
+        each other in the argument of LOW, say, and makes `0 PLUS 0' `sbc
+        a,a / and 1' - and whichever way round an operator that commutes
+        takes them; any other keeps its operands of the kind they were
+        (_keep)."""
+        if (kind in self._BYTE_OPS and self._type_of(left) is BYTE
+                and self._type_of(right) is BYTE
+                and (typed_const(left) is None or typed_const(right) is None)):
+            if self.opt_level >= 3:
+                left, right = self._normalize_commutative(kind, left, right)
+            return make_binary(kind, left, right, pos=expr.pos)
+        return make_binary(kind, self._keep(expr.left, left), self._keep(expr.right, right),
+                           pos=expr.pos)
 
     def _fold_binary(self, kind: BinaryOpKind, left, right, pos):
         """``left kind right`` as a constant, if both operands are.
