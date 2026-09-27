@@ -155,6 +155,14 @@ where:
 - Each parameter is declared once, by a DECLARE of its procedure, as a
   BYTE or an ADDRESS scalar, not BASED and with no other attribute
   (8.1.1).
+- A BASED variable's base is an ADDRESS scalar, a variable or a parameter,
+  or an ADDRESS scalar member of a structure that is neither BASED nor an
+  array, declared before the BASED variable, in its block or one around
+  it, as V3.1 takes it; the base is that declaration wherever the BASED
+  variable is used.
+- A LABEL declared in a block, not PUBLIC nor EXTERNAL, labels a statement
+  of the block (9.3); a label of its name in a DO block of it is another
+  label, the DO block's.
 - A declaration hides the built-in of its name (9.2): a procedure DOUBLE
   or a variable OUTPUT, MEMORY or STACKPTR that a module declares is the
   module's there, and the compiler never takes it for the built-in.
@@ -709,12 +717,17 @@ the location in an AT of a procedure or a label, `at (.p)` (211), or of a
 BASED variable (212); a constant list in a DATA list, `data (.(5))`
 (147); and in a constant list, or where the value fills a BYTE, a
 location or a number a byte does not hold, `.(300, 7)`, `byte data (.w)`
-(210).  It refuses the location of a built-in but MEMORY in a DATA or
-INITIAL list, `data (.stackptr)`, which V3.1 takes for an address of its
-own: uplm80 has none to give it; and the location of a REENTRANT
-procedure's local in a DATA or INITIAL list or an AT, and of a BASED
-variable, a factored BASED declaration's too, in a DATA or INITIAL list,
-which V3.1 gives an address (INITIAL in a procedure it rejects, 73):
+(210); and a base V3.1 does not take (since 0.4.4): BASED, or a member of
+what is, `a based s.p` of a BASED `s` (50, 52), a member of an array of
+structures (52), a BYTE, an array, a structure, a built-in, a procedure or
+a label (50), a member its structure does not have (55) or a name declared
+only further down (54); and a LABEL that labels no statement (172, and 105
+where the program names it).  It refuses the location of a built-in but
+MEMORY in a DATA or INITIAL list, `data (.stackptr)`, which V3.1 takes for
+an address of its own: uplm80 has none to give it; and the location of a
+REENTRANT procedure's local in a DATA or INITIAL list or an AT, and of a
+BASED variable, a factored BASED declaration's too, in a DATA or INITIAL
+list, which V3.1 gives an address (INITIAL in a procedure it rejects, 73):
 uplm80 has the local on the stack, and no address of a BASED variable to
 give.  And V3.1 computes a restricted expression as a constant, a number
 below 256 a BYTE and BYTE arithmetic in eight bits, `address data (200 +

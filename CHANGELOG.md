@@ -15,8 +15,13 @@ AT address is the variable the name means, declared in its block or one
 around it, before the list or after it, whatever the form of its
 declaration; that of a REENTRANT procedure's local or a BASED variable in
 a list, of a factored BASED declaration too, is uplm80's own refusal, as
-in an AT, not um80's "Undefined symbol" or another block's variable.  And
-a factored BASED declaration on a member, `(a based s.p) byte`, is BASED.
+in an AT, not um80's "Undefined symbol" or another block's variable.  A
+factored BASED declaration on a member, `(a based s.p) byte`, is BASED.  A
+base is the declaration of its name made before the variable BASED on it,
+wherever that variable is used, and one V3.1 does not take - BASED or a
+member of what is, on which um80 failed, a BYTE, a name declared further
+down - is V3.1's error, as a LABEL that labels no statement is, on which
+in a DATA list um80 failed.
 
 ### Incompatible: V3.1's errors in a restricted expression
 
@@ -154,6 +159,64 @@ DATA list is tested as V3.1's error.
     RESTRICTED EXPRESSION, and #209, ILLEGAL INITIALIZATION OF MORE
     SPACE THAN DECLARED)
 
+### Incompatible: V3.1's errors for a base and a LABEL
+
+A BASED variable's base that V3.1 does not take is refused as V3.1 refuses
+it, with its error, when the parser gives the program, at every `-O`
+level.  V3.1 takes an ADDRESS scalar, a variable or a parameter, or an
+ADDRESS scalar member of a structure that is neither BASED nor an array,
+declared before the variable BASED on it, in its block or one around it -
+in a factored declaration before the declaration, whose names it does not
+know yet.  uplm80 checked no base, and compiled the rest, or failed:
+
+- BASED, or a member of what is BASED (#50, INVALID ATTRIBUTES FOR BASE,
+  and of an ADDRESS scalar member #52, INVALID BASE, MEMBER OF BASED
+  STRUCTURE OR ARRAY OF STRUCTURES): `declare s based sp structure (k
+  byte, p address); declare a based s.p byte;`, and `a based q` of a BASED
+  `q`, for which uplm80 read the pointer from `S+1` and `Q`, which nothing
+  defines: um80's "Undefined symbol" at every level (0.4.3 the same), and
+  since b9c4a36 of the factored `(a based s.p) byte` too, which 0.4.3 took
+  for a variable of its own (Fixed).  `declare a based a address` (#54,
+  UNDECLARED BASE), used, recursed until Python gave up;
+- a member of an array of structures (#52), or an array (#50), `a based
+  sa.p`, `a based q` of `q (2) address`, which uplm80 refused naming #133,
+  V3.1's error in an expression;
+- MEMORY, or another built-in (#50), `a based memory`, um80's "Undefined
+  symbol 'MEMORY'";
+- a BYTE, a structure, a member that is a BYTE or an array, a procedure or
+  a label (#50), `a based b` of a BYTE, for which uplm80 took the word at
+  its address for the pointer; a member the structure does not have, or a
+  member of what is not a structure (#55, UNDECLARED STRUCTURE MEMBER IN
+  BASE), `a based s.zz`, the structure's first word; and a name declared
+  only further down the block, `declare a based q byte; declare q
+  address;`, or in the same factored declaration, `(a based a2, a2 based
+  w) byte` (#54), or a parameter declared an ADDRESS only after the
+  variable BASED on it (#50), which uplm80 took for the base.
+
+A base declared nowhere, #54 to V3.1, is refused as it was, as any name
+declared nowhere is, in uplm80's own words.
+
+A LABEL declared in a block, not PUBLIC nor EXTERNAL, that labels no
+statement of the block - a label of its name on a statement of a DO block
+in it is another label, the DO block's - is refused as V3.1 refuses it,
+#172, INVALID LABEL: UNDEFINED, and where the program names it #105,
+UNDECLARED IDENTIFIER, besides.  uplm80 took it without a word: its
+location in a DATA list, `declare lb label; declare w address data
+(.lb);`, was `dw LB`, which um80 did not know, at every level (0.4.3 the
+same); a GOTO to it was refused in words of its own, but not where
+optimization left the GOTO out as dead code, `if 0 then goto lb` at `-O2`.
+
+No program of MP/M II (DRI's tree and mpm2's overrides), of 80un, of
+`sample_code` or of `tests/` has any of these: each compiles to the
+assembly it did.
+
+    A BASED S.P: S is BASED, and a base is not a member of what is BASED;
+    Intel's PL/M-80 V3.1 rejects it (ERROR #52, INVALID BASE, MEMBER OF
+    BASED STRUCTURE OR ARRAY OF STRUCTURES)
+    .LB: LB is declared a LABEL but labels no statement; Intel's PL/M-80
+    V3.1 rejects it (ERROR #105, UNDECLARED IDENTIFIER, and #172, INVALID
+    LABEL: UNDEFINED)
+
 ### Fixed
 
 - **A location in a DATA or INITIAL list or an AT address is the
@@ -172,16 +235,16 @@ DATA list is tested as V3.1's error.
   name declared nowhere else, MEMORY among them, um80's "Undefined symbol"
   or "not declared".  At module level `at (.memory(3))` before `declare
   memory (4) byte` was the end of the program, 0007 where V3.1 prints
-  0003.  A subscript steps by an element's width, an array of
-  structures' by the structure's, `.sa(2)`, which took each for a word; a
-  member, `.s.k`, `.s.m(1)`, `.sa(1).y`, which was refused ("Unsupported
-  operand in DATA location expression: MemberAccess(...)"), is its
-  offset, as in an AT; and a subscript is a constant expression at `-O0`
-  too, `.a(1 + 1)`, which `-O0` refused.  Code generation finds each such
-  name through the declaration it means, whatever its form - a variable's,
-  plain or factored, BASED or not, an array's, a structure's, a
-  parameter's, a procedure's, a label's - and a built-in's name only where
-  the program declares none.
+  0003.  A subscript steps by an element's width, an array of structures'
+  by the structure's, `.sa(2)`, which took each for a word; a member,
+  `.s.k`, `.s.m(1)`, `.sa(1).y`, which was refused ("Unsupported operand
+  in DATA location expression: MemberAccess(...)"), is its offset, as in
+  an AT; and a subscript is a constant expression at `-O0` too, `.a(1 +
+  1)`, which `-O0` refused.  Code generation finds each such name through
+  the declaration it means, whatever its form - a variable's, plain or
+  factored, BASED or not, an array's, a structure's, a parameter's, a
+  procedure's, a label's - and a built-in's name only where the program
+  declares none.
 - **`.memory` in a DATA or INITIAL list**, `declare p address data
   (.memory + 2)`, is the end of the program, `__END__`, as in an AT and an
   expression, and as V3.1 takes it.  It was `dw MEMORY`, which um80 did
@@ -214,7 +277,20 @@ DATA list is tested as V3.1's error.
   byte`, is BASED, as `declare a based s.p byte` is: each name is at the
   address the member holds.  It was a variable of its own, and `a = 5`
   stored there (0.4.3 the same); one on a variable, `(a based p) byte`,
-  was BASED.
+  was BASED.  One on a member of a BASED structure, which V3.1 rejects, is
+  refused, as the plain form is (Incompatible).
+- **A base is the declaration of its name made before the variable BASED
+  on it**, in its block or one around it, as V3.1 takes it, at every
+  level, and wherever that variable is used.  Code generation looked the
+  base up by its name where the variable was used: `declare q address;
+  declare a based q byte;` used in a procedure that declares a `q` of its
+  own, `a = 77h` stored through that `q` (0.4.3 the same).  And a
+  declaration of the name further down the block was the base, where V3.1
+  takes an outer block's: `p: procedure; declare a based q byte; declare q
+  address;` of a module's `q` took the procedure's (0.4.3 the same, but
+  that `(a based s.p) byte` was a variable of its own).  A declaration
+  that hides the base where it is looked up is renamed, `Q?2`, as one code
+  generation would take for another is.
 - **`data (.stackptr)`**, `data (.shl)`, the location of a built-in but
   MEMORY in a DATA or INITIAL list, which uplm80 refuses since 0.4.2,
   says so in its own words: the message said V3.1 rejects it (#123), which
@@ -271,13 +347,16 @@ found (0.4.3 the same):
   of one in a constant list.  V3.1 takes such a declaration for a scalar,
   and the location of an element of it, `data (.hx(1))`, for a subscript
   on what is not an array besides (#149).
-- **A constant list that names an array declared with a DATA or INITIAL
-  list of more than one value**, `.(.a(1))`, `.(a(1))`, which both
-  reject, V3.1 gives #209 besides, on the array's declaration: in the
-  programs checked, not of a structure, a factored declaration or one
-  value, nor of an array of `(*)` declared after the constant list.  The
-  message names the errors of the constant list only.  (0.4.3 compiled
-  such a list, the location left out: Incompatible.)
+- **A constant list that names an array whose DATA or INITIAL list gives
+  it more than one value**, `.(.a(1))`, `.(a(1))`, which both reject, V3.1
+  gives #209 besides, on the array's declaration: `a (2) byte data (1,
+  2)`, `a (3) byte data (1, 2)`, and of a factored declaration, where the
+  list gives its last name more than one, `(a, b) (2) byte data (1, 2, 3,
+  4)` whether the constant list names A or B, not `(1, 2, 3)`, whose B has
+  one; in the programs checked, not of a structure, nor of an array of
+  `(*)` declared after the constant list.  The message names the errors of
+  the constant list only.  (0.4.3 compiled such a list, the location left
+  out: Incompatible.)
 - A label in a constant list, `.(lbl, 7)`, `.(7, .lbl)`, which uplm80
   refuses as it does a variable's name or location there, V3.1 fails on,
   writing no listing.
@@ -314,28 +393,30 @@ found (0.4.3 the same):
 
 ### Verified
 
-On 1bc31ab, with upeepz80 0.2.7 and um80 0.3.52, Intel's binaries found.
+On 91c282a, with upeepz80 0.2.7 and um80 0.3.52, Intel's binaries found.
 
-- The suite: 2319 tests pass, and 3 skip, the check that the message
-  names V3.1's errors of `carry()`, `zero()` and `dec()`, whose messages
-  name none (0.4.1).  pylint rates the package 9.76 (0.4.3: 9.75), with
-  no message 0.4.3 has not.
+- The suite: 2473 tests pass, and 3 skip, the check that the message names
+  V3.1's errors of `carry()`, `zero()` and `dec()`, whose messages name
+  none (0.4.1).  pylint rates the package 9.77 (0.4.3: 9.75), with no
+  message 0.4.3 has not.
 - `tests/run_tests.sh`: all 22 programs pass.
 - `scripts/difftest.py`, 100 seeds (53000-53099), and
   `scripts/namestest.py`, 100 (53200-53299) and 20 with `--modules`
   (53500-53519): every program prints what the model or its scopes say.
 - The 88 compiles of MP/M II's and 80un's PL/M - DRI's tree and mpm2's
-  overrides, 50 files, and 80un 0.3.3's 36 alone and its two programs -
-  at `-O0`, `-O2` and `-O3`, and the 66 programs of `sample_code` and
-  `tests/`, give 0.4.3's assembly byte for byte, and its errors where
-  they stop (11 and 14 at each level): none has what a restricted
-  expression does not take, nor a location in a list or an AT that
-  moved, nor one uplm80 gives no fixed address, nor a factored BASED
-  declaration on a member.
+  overrides, 50 files, and 80un 0.3.3's 36 alone and its two programs - at
+  `-O0`, `-O2` and `-O3`, and the 66 programs of `sample_code` and
+  `tests/`, give 0.4.3's assembly byte for byte, and its errors where they
+  stop (11 and 14 at each level): none has what a restricted expression
+  does not take, nor a location in a list or an AT that moved, nor one
+  uplm80 gives no fixed address, nor a factored BASED declaration on a
+  member, nor a base V3.1 does not take or one a block hides, nor a LABEL
+  that labels no statement.
 - `scripts/intel_oracle.py`: V3.1 rejects each program of
   `tests/test_names.py` with the errors its message names and no other,
-  and compiles each of its programs of a location uplm80 gives no fixed
-  address.
+  compiles each of its programs of a location uplm80 gives no fixed
+  address, and its builds of those of a factored BASED declaration and of
+  bases (`V31_BASES`) print what uplm80's print.
 - Each form of declaration - a scalar, a factored one, BASED on a variable
   or on a member, factored BASED on either, an array, one of `(*)`, an
   untyped DATA, a structure, an array of structures and a member of each,
@@ -358,10 +439,15 @@ On 1bc31ab, with upeepz80 0.2.7 and um80 0.3.52, Intel's binaries found.
   after the list in its own words (45), leaves out the #209 V3.1 puts on
   an initialized array's declaration (88), and stops at a PUBLIC or
   EXTERNAL variable below module level (#73) before the constant list V3.1
-  gives #210 for too (21).  f452a39 printed another address than V3.1's,
-  failed in um80 or refused with a false message 195 of them, each naming
-  a factored BASED declaration's name, and compiled 53 more, a name BASED
-  on a member, as a variable of its own.
+  gives #210 for too (21).  f452a39 did otherwise with 244 of them, each
+  naming a factored BASED declaration's name: it compiled 173, 86 of them
+  of a name BASED on a member, which it took for a variable of its own,
+  failed in um80 on 45, and refused 26 for what they are not, 18 as naming
+  a member the structure has not ("no member M") and 8 as a REENTRANT
+  local; and 20 more it refused in the words it does now, but that it
+  named an INITIAL list DATA.  On 91c282a the 1594 of them with a BASED or
+  a LABEL declaration give at each level what they gave on 1bc31ab, and
+  what changed since does not reach the rest.
 - The programs of these checks' earlier rounds and of the release check's
   (1037 lists and declarations, 25 and 92 programs, the 836 of its second
   round and the 793 of its third) give on 1bc31ab, at each level checked,
@@ -389,7 +475,25 @@ On 1bc31ab, with upeepz80 0.2.7 and um80 0.3.52, Intel's binaries found.
   Of the 836, at `-O0` and `-O2` uplm80 does what V3.1 does but for 52: 46
   of the Known issues and of the README's, 3 that print an address V3.1
   lays out elsewhere, and 3 that both reject, uplm80 first for another
-  error or in its parser.
+  error or in its parser.  On 91c282a the 1378 of these with a BASED or a
+  LABEL declaration give at each level what they gave on 1bc31ab, and what
+  changed since does not reach the rest.
+- The release check's fourth round's 1078 programs give on 91c282a what
+  they gave on 98beb8c, but for 35, which now print what V3.1's builds
+  print or are refused as V3.1 refuses them, with its errors: 7 of a base
+  whose name its block declares again further down (Fixed), 20 of a base
+  V3.1 does not take and 8 of a LABEL that labels no statement
+  (Incompatible) - of those, one V3.1 gives #32 and #118 besides, of a
+  `call w(1)` of an array, which uplm80 takes.
+- 74 programs of a base - of each form Incompatible lists, of one hidden
+  where the BASED variable is used or declared, plain and factored, at
+  module level and in a procedure - with V3.1: uplm80 at `-O0` to `-O3`
+  prints what V3.1's builds print (12) or refuses what V3.1 refuses with
+  V3.1's errors (56), but for 5 - a base declared nowhere, twice, refused
+  as not declared, where V3.1 gives #54; one of an untyped DATA (#61,
+  Known issues); and two in a procedure with no statement, refused for
+  that (#174) - and one that V3.1 builds but cannot link, of an EXTERNAL
+  base nothing defines.
 
 ## 0.4.3 — 2026-09-26
 
