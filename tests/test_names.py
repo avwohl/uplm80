@@ -335,29 +335,28 @@ def test_the_address_of_every_kind_of_procedure_and_a_call_through_it(opt):
     `CALL q' was `call Q', which ran the bytes of Q itself, and `CALL s.p'
     a `jp (hl)' with no return address.  Here every kind of procedure -
     nested, outer, PUBLIC, REENTRANT, EXTERNAL - has its address taken in
-    an expression, a DATA and an INITIAL list and an AT, and is called
-    through it, with an argument where it takes one."""
+    an expression and a DATA and an INITIAL list, and is called through
+    it, with an argument where it takes one.  (An AT, which this had too,
+    V3.1 does not take of a procedure, #211, nor uplm80 since 0.4.4:
+    V31_REJECTS.)"""
     src = PRELUDE + """
 extp: procedure external; end extp;
 declare q address;
 declare s structure (p address);
 declare mt (3) address data (.top, .extp, .pub);
 declare mi address initial (.top);
-declare atop byte at (.top);
 top: procedure; call pc('T'); end top;
 pub: procedure (w) public; declare w address; call pc(low(w)); end pub;
 re: procedure (c) reentrant; declare c byte; call pc(c); end re;
 outer: procedure;
   declare t (2) address data (.show, .inner2);
   declare r address initial (.show);
-  declare atx byte at (.show);
   show: procedure; call pc('S'); end show;
   inner2: procedure (c); declare c byte; call pc(c); end inner2;
   q = .show; call q;
   q = t(0); call q;
   q = t(1); call q('I');
   q = r; call q;
-  if .atx = .show then call pc('=');
   s.p = .show; call s.p;
 end outer;
 call outer;
@@ -370,12 +369,11 @@ q = mi; call q;
 q = .pub; call q('p');
 q = .re; call q('R');
 q = .extp; call q;
-if .atop = .top then call pc('=');
 s.p = .extp; call s.p;
 call pc('.');
 end t;
 """
-    assert run_plm(src, opt, extra_asm=EXTP) == "SSIS=S/TTEPTpRE=E."
+    assert run_plm(src, opt, extra_asm=EXTP) == "SSISS/TTEPTpREE."
 
 
 def test_a_call_through_an_address_with_two_arguments_does_not_warn():
@@ -1641,6 +1639,104 @@ V31_REJECTS = {
                               "EXPRESSION)"),
     "string-in-at": ("declare d byte at ('AB');\nb = d;\n", (151, 146),
                      "T.PLM:8:20: error: 'AB': an AT address has no string in it"),
+    # A location with two subscripts, which uplm80 took for an element
+    # further on: `.ar(1)(1)' of an ADDRESS array AR+4 (0.4.3: AR+2 in a
+    # DATA list, AR+3 in an INITIAL one, AR+4 in an AT, and `.s.m(1)(1)'
+    # refused).  V3.1 reads the location to its first subscript and stops
+    # at the second as at an operator it does not take (#152, in an AT
+    # #146), and gives that error too after one in a subscript.
+    "two-subscripts-in-data": ("declare ar (3) address;\ndeclare d address data (.ar(1)(1));\n"
+                               "w = d;\n", (152,),
+                               "T.PLM:9:26: error: AR(1)(1): a location takes one subscript, "
+                               "not two; Intel's PL/M-80 V3.1 rejects it (ERROR #152, MISSING "
+                               "')' AFTER CONSTANT LIST)"),
+    "two-subscripts-in-initial": ("declare ar (3) address;\n"
+                                  "declare d address initial (.ar(1)(1));\nw = d;\n", (152,),
+                                  "T.PLM:9:29: error: AR(1)(1): a location takes one subscript"),
+    "two-subscripts-in-at": ("declare ar (3) address;\ndeclare d byte at (.ar(1)(1));\nb = d;\n",
+                             (146,),
+                             "T.PLM:9:21: error: AR(1)(1): a location takes one subscript, not "
+                             "two; Intel's PL/M-80 V3.1 rejects it (ERROR #146, MISSING ')' "
+                             "AFTER 'AT' RESTRICTED EXPRESSION)"),
+    "two-subscripts-on-a-member-in-data": ("declare s structure (m (3) address);\n"
+                                           "declare d address data (.s.m(1)(1));\nw = d;\n",
+                                           (152,),
+                                           "T.PLM:9:26: error: S.M(1)(1): a location takes one "
+                                           "subscript, not two"),
+    "two-subscripts-in-a-constant-list": ("declare ar (3) address;\nw = .(7, .ar(1)(1));\n",
+                                          (152, 32, 209),
+                                          "T.PLM:9:11: error: AR(1)(1): a location takes one "
+                                          "subscript, not two"),
+    "two-subscripts-in-a-subscript-in-data": ("declare ar (3) address;\n"
+                                              "declare d address data (.ar(.ar(1)(1)));\n"
+                                              "w = d;\n", (151, 150, 152),
+                                              "T.PLM:9:29: error: .AR(1)(1): the subscript of a "
+                                              "location in a DATA or INITIAL value is numbers "
+                                              "only; Intel's PL/M-80 V3.1 rejects it (ERROR #151, "
+                                              "INVALID OPERAND IN RESTRICTED EXPRESSION, and #152, "
+                                              "MISSING ')' AFTER CONSTANT LIST, and #150, MISSING "
+                                              "')' AT END OF RESTRICTED SUBSCRIPT)"),
+    # A subscript on the location of what is not an array - a scalar, a
+    # structure, a member, a procedure, a label - which uplm80 took for the
+    # element that far past it, with a warning that named #127, V3.1's
+    # error in an expression (`.w(1)' of an ADDRESS W+2, in 0.4.3's DATA
+    # list W+1), or, of a procedure, refused naming #104.
+    "subscripted-scalar-in-data": ("declare d address data (.w(1));\nw = d;\n", (149,),
+                                   "T.PLM:8:26: error: W(1): W is not an array, and only an "
+                                   "array's location takes a subscript; Intel's PL/M-80 V3.1 "
+                                   "rejects it (ERROR #149, INVALID SUBSCRIPTING IN RESTRICTED "
+                                   "REFERENCE)"),
+    "subscripted-scalar-in-initial": ("declare d address initial (.w(1));\nw = d;\n", (149,),
+                                      "T.PLM:8:29: error: W(1): W is not an array"),
+    "subscripted-scalar-in-at": ("declare d byte at (.w(1));\nb = d;\n", (149,),
+                                 "T.PLM:8:21: error: W(1): W is not an array"),
+    "subscripted-structure-in-data": ("declare s structure (k byte, m address);\n"
+                                      "declare d address data (.s(1));\nw = d;\n", (149,),
+                                      "T.PLM:9:26: error: S(1): S is not an array"),
+    "subscripted-member-in-at": ("declare s structure (k byte, m address);\n"
+                                 "declare d byte at (.s.k(1));\nb = d;\n", (149,),
+                                 "T.PLM:9:21: error: S.K(1): S.K is not an array"),
+    "subscripted-scalar-then-a-variable-in-data": ("declare d (2) address data (.w(1), b);\n"
+                                                   "w = d(0);\n", (149, 151),
+                                                   "T.PLM:8:30: error: W(1): W is not an array"),
+    "subscripted-scalar-in-a-constant-list": ("w = .(7, .w(1));\n", (149, 209),
+                                              "T.PLM:8:11: error: W(1): W is not an array"),
+    "twice-subscripted-scalar-in-data": ("declare d address data (.w(1)(1));\nw = d;\n",
+                                         (149, 152),
+                                         "T.PLM:8:26: error: W(1): W is not an array"),
+    "subscripted-procedure-in-data": ("declare d address data (.g(1));\nw = d;\n", (149,),
+                                      "T.PLM:8:26: error: G(1): G is a procedure, and only an "
+                                      "array's location takes a subscript; Intel's PL/M-80 V3.1 "
+                                      "rejects it (ERROR #149,"),
+    "subscripted-procedure-in-at": ("declare d byte at (.g(1));\nb = d;\n", (149, 211),
+                                    "T.PLM:8:21: error: .G: G is a procedure, and the location "
+                                    "in an AT address is a variable's, or MEMORY's; Intel's "
+                                    "PL/M-80 V3.1 rejects it (ERROR #149, INVALID SUBSCRIPTING IN "
+                                    "RESTRICTED REFERENCE, and #211,"),
+    "subscripted-label-in-data": ("declare d address data (.lb(1));\nlb: w = d;\n", (149,),
+                                  "T.PLM:8:26: error: LB(1): LB is a label, and only an array's "
+                                  "location takes a subscript"),
+    # The location in an AT of a procedure, which uplm80 took for its
+    # address, of a label and of a BASED variable, which it refused in
+    # words of its own.
+    "procedure-in-at": ("declare d byte at (.f);\nb = d;\n", (211,),
+                        "T.PLM:8:21: error: .F: F is a procedure, and the location in an AT "
+                        "address is a variable's, or MEMORY's; Intel's PL/M-80 V3.1 rejects it "
+                        "(ERROR #211, INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE)"),
+    "procedure-plus-a-variable-in-at": ("declare d byte at (.f + b);\nc = d;\n", (211, 151),
+                                        "T.PLM:8:21: error: .F: F is a procedure"),
+    "label-in-at": ("declare d byte at (.lb);\nlb: b = d;\n", (211,),
+                    "T.PLM:8:21: error: .LB: LB is a label, and the location in an AT address "
+                    "is a variable's, or MEMORY's"),
+    "based-in-at": ("declare bb based w byte;\ndeclare d byte at (.bb);\nb = d;\n", (212,),
+                    "T.PLM:9:21: error: .BB: BB is BASED, and has no fixed address for an AT "
+                    "address to name; Intel's PL/M-80 V3.1 rejects it (ERROR #212, INVALID "
+                    "RESTRICTED REFERENCE IN 'AT', BASE ILLEGAL)"),
+    "subscripted-based-in-at": ("declare bb based w byte;\ndeclare d byte at (.bb(1));\nb = d;\n",
+                                (149, 212), "T.PLM:9:21: error: .BB: BB is BASED"),
+    "based-member-in-at": ("declare bs based w structure (k byte, m address);\n"
+                           "declare d byte at (.bs.m);\nb = d;\n", (212,),
+                           "T.PLM:9:21: error: .BS: BS is BASED"),
 }
 # What V3.1 rejects and uplm80 compiles, with a warning, as programs written
 # for it rely on it: tests/test_implicit_calls.plm's `callee$func()', and
@@ -1685,9 +1781,11 @@ def test_what_v31_rejects_is_an_error(opt, name):
     or a member array without a subscript; a procedure called before its
     declaration (0.4.2's).  uplm80 compiled each.  A built-in in a DATA or
     INITIAL list, an AT address or a constant list (0.4.3's), which -O1
-    and up folded and -O0 refused, or took for something else.  Intel's
-    PL/M-80 V3.1 rejects each, with the errors the message names.  No
-    program of MP/M II, 80un, sample_code or tests/ has one (as tests/
+    and up folded and -O0 refused, or took for something else; there a
+    location with two subscripts, or one on what is not an array, and in
+    an AT the location of a procedure, a label or a BASED variable.
+    Intel's PL/M-80 V3.1 rejects each, with the errors the message names.
+    No program of MP/M II, 80un, sample_code or tests/ has one (as tests/
     now)."""
     stmts, _, message = V31_REJECTS[name]
     err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
@@ -1991,6 +2089,7 @@ def test_the_location_of_a_built_in_in_a_list_is_uplm80s_own_refusal(name):
     err = _compile_error(PRELUDE + f"declare d address data (.{name});\nend t;\n", 0)
     assert f"uplm80 has none to give {name.upper()} in a DATA or INITIAL list" in err, err
     assert "rejects" not in err, err
+
 
 
 def test_an_untyped_data_string_is_an_array():

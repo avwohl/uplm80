@@ -214,6 +214,7 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     members: dict | None = None     # a structure's: member -> its dimension
     node: object = None         # a procedure's declaration
     item: object = None         # a variable's DeclItem
+    based: bool = False         # a BASED variable
 
     def __post_init__(self) -> None:
         self.orig = self.name
@@ -378,7 +379,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         elif isinstance(n, P.DeclItemBasedGroup):
             for bd in n.based_decls or []:
                 self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False,
-                              dim=_dimension(n), members=_members(n))
+                              dim=_dimension(n), members=_members(n), based=True)
                 self._visit(bd.base, block)
             self._visit([n.array_size, n.tail], block)
         elif isinstance(n, P.LiterallyDecl):
@@ -558,6 +559,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         134: "ILLEGAL REFERENCE TO UNSUBSCRIPTED MEMBER ARRAY",
         146: "MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION",
         147: "MISSING IDENTIFIER FOLLOWING DOT OPERATOR",
+        149: "INVALID SUBSCRIPTING IN RESTRICTED REFERENCE",
         150: "MISSING ')' AT END OF RESTRICTED SUBSCRIPT",
         151: "INVALID OPERAND IN RESTRICTED EXPRESSION",
         152: "MISSING ')' AFTER CONSTANT LIST",
@@ -568,6 +570,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         209: "ILLEGAL INITIALIZATION OF MORE SPACE THAN DECLARED",
         210: "ILLEGAL INITIALIZATION OF A BYTE TO A VALUE > 255",
         211: "INVALID IDENTIFIER IN 'AT' RESTRICTED REFERENCE",
+        212: "INVALID RESTRICTED REFERENCE IN 'AT', BASE ILLEGAL",
     }
 
     def intel(self, node, text: str, *numbers: int, warn: bool = False) -> None:
@@ -659,7 +662,8 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             kind = "label" if dtype == DataType.LABEL else "var"
             self._declare(block, name, kind, (node, "name"), public=attrs.is_public,
                           external=attrs.is_external, storage=storage and kind == "var",
-                          dim=_dimension(item), members=_members(item), item=item)
+                          dim=_dimension(item), members=_members(item), item=item,
+                          based=item.based is not None)
         if item.based is not None:
             self._visit(item.based.base, block)
         slots, past = _value_slots(item)
@@ -1070,14 +1074,18 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         "negation": ((151,), (151,), (151,), (151,)),                      # - -1
         "constants": ((147,), (147,), (147,), (147,)),                     # .(5)
         "text": ((147,), (147,), (147,), (147,)),                          # .'AB'
-        "at-builtin": ((), (211,), (), ()),                                # at (.stackptr)
+        "subscripts": ((152,), (146,), (152,), ()),                        # .a(1)(1)
+        "subscripting": ((149,), (149,), (149,), ()),                      # .x(1), .p(1)
+        "at-name": ((), (211,), (), ()),                   # at (.stackptr), at (.p), at (.lbl)
+        "at-based": ((), (212,), (), ()),                                  # at (.bb)
         "constant-location": ((), (), (), ()),                             # .(.a)
     }
     _CONTEXTS = ("list", "at", "consts", "subscript")
     # What V3.1 reads past, going on to the rest of the value.
-    _READ_PAST = frozenset({"name", "negation", "constant-location", "at-builtin"})
+    _READ_PAST = frozenset({"name", "negation", "constant-location", "subscripting", "at-name",
+                            "at-based"})
     # The order V3.1 lists its errors in.
-    _V31_ORDER = (151, 152, 146, 150, 147, 32, 210, 209, 211, 172)
+    _V31_ORDER = (149, 151, 152, 146, 150, 147, 32, 210, 209, 211, 212, 172)
     _RULES = {
         "list": ("a DATA or INITIAL value", "is a restricted expression, of constants and "
                  "locations only"),
@@ -1101,12 +1109,15 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         sum, a location anywhere but first, a constant list or `.'text''
         (V3.1 takes neither there), and in a constant list, or in a value
         that fills a BYTE, a location or what a byte does not hold,
-        `.(300)', `byte data (300)'.  uplm80 took most of them, for
-        the address of a name, the low byte of a number, or, at -O1 and
-        up, a built-in folded (0.4.3's Known issues).  The message names
-        every error V3.1 gives for the list the value is in, as V3.1 reads
-        it (:meth:`_check_value_list`, :meth:`_check_constant_list`).  A
-        name the program does not declare is left to check_uses."""
+        `.(300)', `byte data (300)'.  So is a location with two subscripts,
+        `.a(1)(1)', or with one on what is not an array, `.x(1)', `.p(1)',
+        and in an AT the location of a procedure, a label, a built-in but
+        MEMORY or a BASED variable.  uplm80 took most of them, for the
+        address of a name, the low byte of a number, or, at -O1 and up, a
+        built-in folded (0.4.3's Known issues).  The message names every
+        error V3.1 gives for the list the value is in, as V3.1 reads it
+        (:meth:`_check_value_list`, :meth:`_check_constant_list`).  A name
+        the program does not declare is left to check_uses."""
         refs = {id(r.node): r for r in self.refs if r.attr == "name" and not r.goto}
         for where, node in self.restricted:
             if where == "consts":
@@ -1129,6 +1140,11 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         for kind, node, ctx in faults:
             numbers.update(self._RESTRICTED[kind][self._CONTEXTS.index(ctx)])
             if kind not in self._READ_PAST:
+                if ctx == "subscript" and _two_subscripts(node):
+                    # What V3.1 does not take in the subscript of a location
+                    # has two subscripts itself, `.a(.a(1)(1))', `.a(b(1)(1))':
+                    # V3.1 gives the second's error too, as in the value.
+                    numbers.update(self._RESTRICTED["subscripts"][self._CONTEXTS.index(where)])
                 return faults, numbers, node
         return faults, numbers, None
 
@@ -1300,24 +1316,71 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             faults.append((kind, e, ctx))
 
     def _restricted_location(self, d, ctx: str, refs: dict, faults: list) -> None:
-        """The faults of what a dot takes the location of, in ``ctx``: its
-        subscripts', and, in an AT, a built-in's but MEMORY's (V3.1: ERROR
-        211)."""
+        """The faults of what a dot takes the location of, in ``ctx``, in
+        the order V3.1 reads them: in an AT, a procedure's, a label's, a
+        built-in's but MEMORY's (V3.1: ERROR 211) or a BASED variable's
+        (212); a subscript on what is not an array (149); a second
+        subscript, where V3.1 stops as at an operator it does not take
+        (152, in an AT 146); and a subscript's faults."""
         d = unwrap_paren(d)
         if isinstance(d, P.Identifier):
             r = refs.get(id(d))
-            name = _key(d.name)
-            if ctx == "at" and r is not None and r.decl is None and name in _BUILTINS \
-                    and name != "MEMORY":
-                faults.append(("at-builtin", d, ctx))
+            kind = self._at_fault(d, r) if ctx == "at" and r is not None else None
+            if kind is not None:
+                faults.append((kind, d, ctx))
         elif isinstance(d, P.Call):
-            self._restricted_location(d.callee, ctx, refs, faults)
+            callee = unwrap_paren(d.callee)
+            self._restricted_location(callee, ctx, refs, faults)
+            if faults and faults[-1][0] not in self._READ_PAST:
+                return
+            if isinstance(callee, P.Call):
+                faults.append(("subscripts", d, ctx))
+                return
+            if not self._an_array(callee, refs):
+                faults.append(("subscripting", d, ctx))
             for a in d.args:
                 if faults and faults[-1][0] not in self._READ_PAST:
                     return
                 self._restricted(a, "subscript", "top", refs, faults)
         elif isinstance(d, P.MemberAccess):
             self._restricted_location(d.base, ctx, refs, faults)
+
+    @staticmethod
+    def _at_fault(d: P.Identifier, r: _Ref) -> str | None:
+        """What V3.1 does not take of the location of ``d``, bound as
+        ``r``, in an AT: "at-name", a procedure's, a label's or a built-in's
+        but MEMORY's, "at-based", a BASED variable's, or None."""
+        if r.decl is None:
+            name = _key(d.name)
+            return "at-name" if name in _BUILTINS and name != "MEMORY" else None
+        if r.decl.kind in ("proc", "label"):
+            return "at-name"
+        return "at-based" if r.decl.based else None
+
+    def _an_array(self, ref, refs: dict) -> bool:
+        """Whether the reference ``ref`` a subscript follows in a location
+        is of an array, or of what check_uses or code generation refuse
+        anyway: a name declared nowhere, a member the structure does not
+        have.  Of the built-ins MEMORY is an array; V3.1 takes the location
+        of another, subscripted or not, `.stackptr(1)', for an address of
+        its own, which uplm80 refuses (:meth:`_check_builtin_use`)."""
+        if isinstance(ref, P.Identifier):
+            r = refs.get(id(ref))
+            d = r.decl if r is not None else None
+            if d is None or d.kind == "lit":
+                return True
+            return d.kind == "var" and d.dim is not None
+        if isinstance(ref, P.MemberAccess):
+            root = unwrap_paren(ref.base)
+            while isinstance(root, (P.Call, P.MemberAccess)):
+                root = unwrap_paren(root.callee if isinstance(root, P.Call) else root.base)
+            r = refs.get(id(root)) if isinstance(root, P.Identifier) else None
+            d = r.decl if r is not None else None
+            member = _key(ref.member)
+            if d is None or not d.members or member not in d.members:
+                return True
+            return d.members[member] is not None
+        return True
 
     @staticmethod
     def _restricted_name(r: _Ref | None) -> bool:
@@ -1374,10 +1437,23 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             return f"{what}: {subject} {rule}, and {what} is a location"
         if kind in ("constants", "text"):
             return f"{what}: {subject} does not take the location of constants"
-        if kind == "at-builtin":
+        if kind == "at-name":
             text = ident_text(node.name)
-            return (f".{text}: {text} is a built-in, and the location in an AT address is a "
-                    "variable's, or MEMORY's")
+            return (f".{text}: {text} is {self._name_kind(refs.get(id(node)))}, and the location "
+                    "in an AT address is a variable's, or MEMORY's")
+        if kind == "at-based":
+            text = ident_text(node.name)
+            return f".{text}: {text} is BASED, and has no fixed address for an AT address to name"
+        if kind == "subscripts":
+            return f"{what}: a location takes one subscript, not two"
+        if kind == "subscripting":
+            callee = unwrap_paren(node.callee)
+            d = refs.get(id(callee)).decl if isinstance(callee, P.Identifier) else None
+            name = expr_text(callee)
+            if d is not None and d.kind in ("proc", "label"):
+                return (f"{what}: {name} is {self._name_kind(refs.get(id(callee)))}, and only an "
+                        "array's location takes a subscript")
+            return f"{what}: {name} is not an array, and only an array's location takes a subscript"
         if kind == "byte-location":
             return f"{what}: a location is an address, and this value fills a BYTE"
         value = f"{_v31_read(node, None)[0][0]:X}H"
@@ -1760,6 +1836,17 @@ def _v31_read(expr, stop) -> tuple[tuple[int, bool] | None, bool]:  # pylint: di
         value = left[0] + right[0] if binop_kind(expr) == BinaryOpKind.ADD else left[0] - right[0]
         return (value & (0xFF if byte else 0xFFFF), byte), stopped
     return None, True
+
+
+def _two_subscripts(expr) -> bool:
+    """Whether ``expr`` has a reference with two subscripts in it,
+    `a(1)(1)'."""
+    if isinstance(expr, P.Call) and isinstance(unwrap_paren(expr.callee), P.Call):
+        return True
+    if isinstance(expr, (list, tuple)):
+        return any(_two_subscripts(x) for x in expr)
+    return any(_two_subscripts(getattr(expr, f)) for f in getattr(expr, "__dataclass_fields__", ())
+               if f != "pos")
 
 
 def _has_parentheses(expr) -> bool:
