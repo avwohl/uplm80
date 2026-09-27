@@ -180,6 +180,19 @@ def test_what_reads_the_flags_of_a_shl_of_a_byte_is_warned_of(stmts, shl, reader
     ("pr: procedure; call v; end pr; v = .g; k = 1; call pr; w = shl(k, 6);", "SHL(K, 6)"),
     ("declare sg structure (g address); sg.g = .g; k = 1; call sg.g; w = shl(k, 6);",
      "SHL(K, 6)"),
+    # A name is what it names where it is used (found checking 0.4.4): a
+    # parameter or a local called through is not the procedure H of the
+    # same name, and a variable a DO block declares is not the K after it.
+    ("r2: procedure (h); declare h address; call h; end r2;\n"
+     "v = .g; k = 1; call r2(v); w = shl(k, 6);", "SHL(K, 6)"),
+    ("r2: procedure (h); declare h address; call h; end r2;\n"
+     "v = .g; k = 1; if k < 4 then call r2(v); w = shl(k, 6);", "SHL(K, 6)"),
+    ("r3: procedure; declare h address; h = v; call h; end r3;\n"
+     "v = .g; k = 1; call r3; w = shl(k, 6);", "SHL(K, 6)"),
+    ("s2: procedure; do; declare k byte; k = 5; end; k = 200; end s2;\n"
+     "k = 1; call s2; w = shl(k, 6);", "SHL(K, 6)"),
+    ("v = .g; k = 1;\ndo while n > 0; w = shl(k, 6); n = n - 1;\n"
+     "  do; declare h address; h = v; call h; end;\nend;", "SHL(K, 6)"),
 ])
 def test_a_test_that_assigns_what_it_bounds_does_not_bound_it(stmts, shl, opt, capsys):
     got = _warnings(stmts, opt, capsys)
@@ -226,6 +239,38 @@ def test_a_variable_an_interrupt_procedure_assigns_has_no_bound(capsys):
     got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
     assert [line.split(": warning: ")[1].split(":")[0] for line in got] == [
         "SHL(K, 6)", "SHL(J, 6)", "SHL(N, 6)"], got
+
+
+def test_what_an_interrupt_procedure_declares_in_a_do_block_is_its_own(capsys):
+    """An INTERRUPT procedure that declares K and J in a DO block, and
+    assigns the module's K after it, may change the module's K between any
+    two statements (found checking 0.4.4; 0.4.3 the same): it has no
+    bound.  The module's J it does not assign."""
+    capsys.readouterr()
+    src = ("t: do;\ndeclare (k, j) byte, w address;\n"
+           "i: procedure interrupt 1;\n  do; declare (k, j) byte; k = 5; j = 5; end;\n"
+           "  k = 3;\nend i;\n"
+           "k = 1; w = shl(k, 6);\nj = 1; w = shl(j, 6);\nend t;\n")
+    assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
+    got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
+    assert [line.split(": warning: ")[1].split(":")[0] for line in got] == ["SHL(K, 6)"], got
+
+
+def test_a_parameter_called_through_does_not_reset_the_system(capsys):
+    """R4's last statement calls through its parameter TERMINATE, not the
+    procedure TERMINATE that calls MON1 with the function 0: R4 returns
+    (found checking 0.4.4), and K, which SETK assigns, can be anything."""
+    capsys.readouterr()
+    src = ("t: do;\ndeclare (b, k) byte, (w, v) address;\n"
+           "mon1: procedure (f, a) external; declare f byte, a address; end mon1;\n"
+           "terminate: procedure; call mon1(0, 0); end terminate;\n"
+           "setk: procedure; k = 200; end setk;\n"
+           "r4: procedure (terminate); declare terminate address; call terminate; end r4;\n"
+           "v = .setk; k = 1; b = input(1); if b > 3 then call r4(v); w = shl(k, 6);\n"
+           "end t;\n")
+    assert Compiler(opt_level=2).compile(src, "T.PLM") is not None
+    got = [line for line in capsys.readouterr().err.splitlines() if "SHL of a BYTE" in line]
+    assert [line.split(": warning: ")[1].split(":")[0] for line in got] == ["SHL(K, 6)"], got
 
 
 @pytest.mark.parametrize("function, warned", [

@@ -41,15 +41,17 @@ and 0e0h) <> 0 then return;`` 31 - where nothing can have changed it in
 between: not the test itself, by an embedded assignment or in a procedure
 it calls.  That is followed only for a scalar whose address is never
 taken, nor AT, BASED, PUBLIC or EXTERNAL, nor assigned by an INTERRUPT
-procedure or what it calls, and a call of a procedure forgets it, but for
-a local of the procedure the call is in where the procedure called is not
-nested in it.  A CALL through an address, a variable's or a member's,
-forgets everything, and in a procedure it may call any procedure whose
-address the program takes, and an EXTERNAL one's code, which may call back
-a PUBLIC one.  A procedure that ends in a call of MON1 with the function
-0, BDOS's system reset, or of such a procedure, and has no RETURN nor a
-label on its END, does not return.  A SHR of a BYTE has the same value
-either way.
+procedure or what it calls, and a call of a procedure forgets what the
+procedure may assign, itself or in what it calls - each name taken for
+what it names where it is used: a variable a DO block declares is not the
+one of its name after the block, nor a parameter called through the
+procedure of its name.  A CALL through an address, a variable's or a
+member's, forgets everything, and in a procedure it may call any
+procedure whose address the program takes, and an EXTERNAL one's code,
+which may call back a PUBLIC one.  A procedure that ends in a call of
+MON1 with the function 0, BDOS's system reset, or of such a procedure,
+and has no RETURN nor a label on its END, does not return.  A SHR of a
+BYTE has the same value either way.
 
 What is not seen: a store that reaches the variable other than by its
 name - past the end of an array, through MEMORY or a BASED variable whose
@@ -146,9 +148,10 @@ class _Val:
     narrow: tuple = ()
 
 
-def _item_syms(item, pinned: set[str]) -> dict[str, _Sym]:
+def _item_syms(item, pinned: set) -> dict[str, _Sym]:
     """The names a DeclItem or DeclItemBasedGroup declares; ``pinned``, the
-    names whose address the module takes."""
+    names whose address the module takes, and the declarations (a _Sym's
+    key) an INTERRUPT procedure assigns."""
     dt, dim = decl_item_type(item)
     if isinstance(getattr(item, "tail", None), P.DeclTailData):
         dt = BYTE       # an untyped DATA is BYTE
@@ -167,7 +170,8 @@ def _item_syms(item, pinned: set[str]) -> dict[str, _Sym]:
              and not attrs.is_public and not attrs.is_external and attrs.data_values is None)
     init = max((_const(v) if _const(v) is not None else 0xFFFF
                 for v in attrs.initial_values or []), default=0)
-    return {n: _Sym("var", dt, dim, members, plain=plain and n not in pinned,
+    return {n: _Sym("var", dt, dim, members,
+                    plain=plain and n not in pinned and (id(item), n) not in pinned,
                     key=(id(item), n), init=init, name=n) for n in names}
 
 
@@ -187,7 +191,7 @@ def _proc_sym(proc: P.ProcDecl) -> _Sym:
                 name=proc_name(proc), node=proc)
 
 
-def _scope_of(items, pinned: set[str]) -> dict[str, _Sym]:
+def _scope_of(items, pinned: set) -> dict[str, _Sym]:
     """The names a block's declarations introduce."""
     scope: dict[str, _Sym] = {}
     for it in items:
@@ -216,21 +220,6 @@ def _pinned(tree) -> set[str]:
                                     else root.operand)
             if isinstance(root, (P.Identifier, P.DottedIdent)):
                 out.add(ident_text(root.name))
-    return out
-
-
-def _assigned(tree, into_procs: bool = True) -> set[str]:
-    """The names ``tree`` assigns to, and the indexes of its loops."""
-    out: set[str] = set()
-    for n in _nodes(tree, into_procs):
-        targets = (n.targets if isinstance(n, P.AssignStmt) else
-                   [n.target] if isinstance(n, P.EmbeddedAssign) else [])
-        for t in targets:
-            t = unwrap_paren(t)
-            if isinstance(t, P.Identifier):
-                out.add(ident_text(t.name))
-        if isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
-            out.add(ident_text(n.index))
     return out
 
 
@@ -270,7 +259,7 @@ class _Entry:
 class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-attributes
     """One walk over the modules of a compilation."""
 
-    def __init__(self, shared: dict[str, _Sym], pinned: set[str]) -> None:
+    def __init__(self, shared: dict[str, _Sym], pinned: set) -> None:
         self.scopes: list[dict[str, _Sym]] = [shared]
         self.procs: list[_Sym | None] = [None]
         self.returns: list[DataType | None] = []
@@ -283,8 +272,8 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         # by its key, as the last walk found (bounds) and this one (seen).
         self.bounds: dict[tuple, int] = {}
         self.seen: dict[tuple, int] = {}
-        # The names each procedure, by its declaration, may assign, itself
-        # or through what it calls (_modsets).
+        # The variables each procedure, by its declaration, may assign, by
+        # theirs (a _Sym's key), itself or through what it calls (_modsets).
         self.modsets: dict[int, frozenset] = {}
         # The SHLs of a BYTE the flags as they stand may differ by: those
         # the last operation had among its operands, and, after an
@@ -344,7 +333,7 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
     def call_of(self, callee: _Sym) -> None:
         """A call of the procedure ``callee``: what it may assign is
         forgotten, and the flags are those it returns with."""
-        self.called(callee)
+        self.called(callee.node)
         if callee.node is not None:
             self.enter(callee.node)
             self.flags = self.flags_after(callee.node)
@@ -371,16 +360,16 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                          else (f,))
         return out
 
-    def called(self, callee: _Sym | None) -> None:
-        """A call of ``callee``, or of what is not known (None): forget what
-        it may assign."""
+    def called(self, node: P.ProcDecl | None) -> None:
+        """A call of the procedure ``node``, or of what is not known (None):
+        forget what it may assign."""
         if self.facts is None:
             return
-        names = self.modsets.get(id(callee.node)) if callee is not None else None
-        if names is None:
+        keys = self.modsets.get(id(node)) if node is not None else None
+        if keys is None:
             self.facts = {}
         else:
-            self.facts = {k: v for k, v in self.facts.items() if k.name not in names}
+            self.facts = {k: v for k, v in self.facts.items() if k.key not in keys}
 
     def top(self, sym: _Sym) -> int:
         """The largest value the plain variable ``sym`` can have here."""
@@ -416,19 +405,19 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         or in a procedure it calls, after or before the test of it."""
         if self.facts is None:
             return
-        changed = set(_assigned(cond))
-        for name, _ in _callees(cond):
-            sym = self.lookup(name)
-            if sym is not None and sym.kind == "proc":
-                names = self.modsets.get(id(sym.node))
-                if names is None:
-                    return          # not known: it may assign anything
-                changed |= names
-            elif sym is None and name.upper() not in _BUILTINS:
+        eff = _Effects(self.scopes)
+        eff.walk(cond)
+        if eff.through:
+            return                  # not known: it may assign anything
+        changed = set(eff.assigned)
+        for key in eff.calls:
+            keys = self.modsets.get(key)
+            if keys is None:
                 return
+            changed |= keys
         self._refine(cond, holds, changed)
 
-    def _refine(self, cond, holds: bool, changed: set[str]) -> None:
+    def _refine(self, cond, holds: bool, changed: set) -> None:
         c = unwrap_paren(cond)
         if isinstance(c, P.UnaryOp) and unop_kind(c) == UnaryOpKind.NOT:
             self._refine(c.operand, not holds, changed)
@@ -450,20 +439,20 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
                     BinaryOpKind.EQ, BinaryOpKind.NE):
                 self._refine_mask(var, changed)
             return
-        name = ident_text(var.name) if isinstance(var, P.Identifier) else None
-        sym = self.lookup(name) if name is not None and name not in changed else None
+        sym = self.lookup(ident_text(var.name)) if isinstance(var, P.Identifier) else None
+        sym = None if sym is None or sym.key in changed else sym
         delta = (_BOUND_IF_TRUE if holds else _BOUND_IF_FALSE).get(kind)
         if k is None or sym is None or not sym.plain or delta is None or k + delta < 0:
             return
         self.facts[sym] = min(self.top(sym), k + delta)
 
-    def _refine_mask(self, e: P.BinaryOp, changed: set[str]) -> None:
+    def _refine_mask(self, e: P.BinaryOp, changed: set) -> None:
         """`x AND m' is 0: x has no bit of m set."""
         var, m = unwrap_paren(e.left), _const(e.right)
         if m is None:
             var, m = unwrap_paren(e.right), _const(e.left)
-        name = ident_text(var.name) if isinstance(var, P.Identifier) else None
-        sym = self.lookup(name) if name is not None and name not in changed else None
+        sym = self.lookup(ident_text(var.name)) if isinstance(var, P.Identifier) else None
+        sym = None if sym is None or sym.key in changed else sym
         if m is None or sym is None or not sym.plain:
             return
         top = mask(sym.dtype) & ~m
@@ -631,17 +620,14 @@ class _Checker:  # pylint: disable=too-many-public-methods,too-many-instance-att
         at each pass, and after it.  The flags at its head are those it is
         entered with and those a pass leaves, and after it those of its
         test."""
-        changed = _assigned(s)
         if self.facts is not None:
-            self.facts = {k: v for k, v in self.facts.items()
-                          if not any(k is self.lookup(n) for n in changed)}
-            for name, call in _callees(s):
-                sym = self.lookup(name)
-                if sym is not None and sym.kind == "proc":
-                    self.called(sym)
-                elif (sym is None and name.upper() not in _BUILTINS) or (
-                        sym is not None and call):
-                    self.called(None)       # through an address, or not known
+            eff = _Effects(self.scopes)
+            eff.walk(s)
+            self.facts = {k: v for k, v in self.facts.items() if k.key not in eff.assigned}
+            for node in eff.calls.values():
+                self.called(node)
+            if eff.through:
+                self.called(None)           # through an address, or not known
         start = dict(self.facts) if self.facts is not None else None
         flags = self.flags
         while True:
@@ -969,41 +955,105 @@ def _through_member(s: P.CallStmt) -> bool:
     return isinstance(callee, P.MemberAccess)
 
 
-def _callees(tree) -> set[tuple[str, bool]]:
-    """(name, CALLed) of what ``tree`` calls, or may: the names of CALLs and
-    calls, and every name it uses without arguments, which may be a typed
-    procedure's; of a CALL through a member, the structure's.  Not in the
-    procedures it declares, which it does not run."""
-    out: set[tuple[str, bool]] = set()
-    for n in _nodes(tree, into_procs=False):
-        if isinstance(n, P.Identifier):
-            out.add((ident_text(n.name), False))
-        elif isinstance(n, P.CallStmt) and _called_name(n):
-            out.add((_called_name(n), True))
-    return out
+_BLOCKS = (P.DoBlock, P.DoWhileBlock, P.DoIterBlock, P.DoIterByBlock, P.DoCaseBlock)
 
 
-def _calls_through(items, procs: dict) -> bool:
-    """Whether ``items`` CALL through an address: through a member, or a
-    name no procedure of ``procs`` has and no built-in."""
-    return any(isinstance(n, P.CallStmt) and (
-        _through_member(n) or (_called_name(n) not in procs
-                               and _called_name(n).upper() not in _BUILTINS))
-        for n in _nodes(items, into_procs=False))
+class _Effects:
+    """What a part of the program may do, each name taken for what it names
+    where it is used, as the checker takes it: the variables it assigns, by
+    their declarations (a _Sym's key), the procedures it calls, by name or
+    as a typed one's value, by id of theirs, and whether it CALLs through an
+    address, or uses a name not known.  Not what the procedures it declares
+    do, which ``procs`` has, with the scopes they are declared in."""
 
+    def __init__(self, scopes: list) -> None:
+        self.scopes = list(scopes)
+        self.assigned: set[tuple] = set()
+        self.calls: dict[int, P.ProcDecl] = {}
+        self.through = False
+        self.procs: list[tuple[P.ProcDecl, list]] = []
 
-def _declared(items) -> set[str]:
-    """The names a procedure's body declares, in it or in a DO block in it."""
-    out: set[str] = set()
-    for n in _nodes(items, into_procs=False):
+    def lookup(self, name: str) -> _Sym | None:
+        """The declaration ``name`` means where the walk is."""
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def store(self, name: str) -> None:
+        """A store to ``name``."""
+        sym = self.lookup(name)
+        if sym is not None and sym.kind == "var":
+            self.assigned.add(sym.key)
+
+    def use(self, name: str) -> None:
+        """A use of ``name``, which may be a call of a typed procedure."""
+        sym = self.lookup(name)
+        if sym is not None and sym.kind == "proc" and sym.node is not None:
+            self.calls[id(sym.node)] = sym.node
+        elif sym is None and name.upper() not in _BUILTINS:
+            self.through = True
+
+    def statement(self, n) -> None:
+        """What an assignment, an iterative DO or a CALL does itself."""
+        if isinstance(n, (P.AssignStmt, P.EmbeddedAssign)):
+            for t in n.targets if isinstance(n, P.AssignStmt) else [n.target]:
+                t = unwrap_paren(t)
+                if isinstance(t, P.Identifier):
+                    self.store(ident_text(t.name))
+        elif isinstance(n, (P.DoIterBlock, P.DoIterByBlock)):
+            self.store(ident_text(n.index))
+        elif isinstance(n, P.CallStmt):
+            name = _called_name(n)
+            sym = self.lookup(name)
+            if _through_member(n) or (sym is not None and sym.kind != "proc") or (
+                    sym is None and name.upper() not in _BUILTINS):
+                self.through = True
+
+    def walk(self, n) -> None:
+        """Walk ``n``: a node, or a list of them."""
+        if isinstance(n, (list, tuple)):
+            for x in n:
+                self.walk(x)
+            return
+        if not hasattr(n, "__dataclass_fields__") or hasattr(n, "file_id"):
+            return
         if isinstance(n, P.ProcDecl):
-            out.add(proc_name(n))
-        elif isinstance(n, P.DeclItem):
-            out.update(decl_item_names(n))
-        elif isinstance(n, P.DeclItemBasedGroup):
-            out.update(ident_text(b.name) for b in n.based_decls or [])
-        elif isinstance(n, P.LiterallyDecl):
-            out.add(ident_text(n.name))
+            self.procs.append((n, list(self.scopes)))
+            return
+        if isinstance(n, P.Identifier):
+            self.use(ident_text(n.name))
+            return
+        self.statement(n)
+        fields = [f for f in n.__dataclass_fields__ if f != "pos"]
+        if isinstance(n, _BLOCKS):
+            # Its head is in the scope around it, its statements in its own.
+            for f in fields:
+                if f != "items":
+                    self.walk(getattr(n, f))
+            self.scopes.append(_scope_of(n.items, set()))
+            self.walk(n.items)
+            self.scopes.pop()
+            return
+        for f in fields:
+            self.walk(getattr(n, f))
+
+
+def _summaries(modules, shared: dict[str, _Sym]) -> dict[int, tuple]:
+    """(declaration, _Effects of its body) of each procedure, by id of its
+    declaration."""
+    out: dict[int, tuple] = {}
+    pending: list = []
+    for m in modules:
+        top = _Effects([shared, _scope_of(_module_body(m), set())])
+        top.walk(_module_body(m))
+        pending.extend(top.procs)
+    while pending:
+        p, scopes = pending.pop()
+        eff = _Effects(scopes + [_scope_of(p.body.items, set())])
+        eff.walk(p.body.items)
+        out[id(p)] = (p, eff)
+        pending.extend(eff.procs)
     return out
 
 
@@ -1014,38 +1064,24 @@ def _addressed(modules) -> list:
     return [n for n in _nodes(modules) if isinstance(n, P.ProcDecl) and proc_name(n) in names]
 
 
-def _modsets(modules) -> dict[int, frozenset]:
-    """The names each procedure (by id of its declaration) may assign that
-    it does not declare, itself or through the procedures it calls, by
-    name.  An EXTERNAL procedure may call back any PUBLIC one, and a CALL
-    through an address may call any procedure whose address is taken, or
-    an EXTERNAL one's code."""
-    procs = [n for n in _nodes(modules) if isinstance(n, P.ProcDecl)]
-    by_name: dict[str, list] = {}
-    for p in procs:
-        by_name.setdefault(proc_name(p), []).append(p)
-    local = {id(p): _declared(p.body.items) | set(proc_param_names(p)) for p in procs}
-    direct = {id(p): _assigned(p.body.items, into_procs=False) - local[id(p)]
-              for p in procs}
-    calls = {id(p): {n for n, _ in _callees(p.body.items) if n in by_name} for p in procs}
-    through = {id(p) for p in procs if _calls_through(p.body.items, by_name)}
-    public = [p for p in procs if proc_attrs(p).is_public]
-    addressed = _addressed(modules)
-    mod: dict[int, frozenset] = {id(p): frozenset(direct[id(p)]) for p in procs}
+def _modsets(summaries: dict, addressed: list) -> dict[int, frozenset]:
+    """The variables each procedure (by id of its declaration) may assign,
+    by theirs, itself or in the procedures it calls.  An EXTERNAL procedure
+    may call back any PUBLIC one, and a CALL through an address may call
+    any procedure whose address is taken, or an EXTERNAL one's code."""
+    public = [k for k, (p, _) in summaries.items() if proc_attrs(p).is_public]
+    through = [id(p) for p in addressed if id(p) in summaries]
+    mod: dict[int, frozenset] = {k: frozenset(e.assigned) for k, (_, e) in summaries.items()}
     while True:
         new = {}
-        for p in procs:
-            got = set(direct[id(p)])
-            for c in calls[id(p)]:
-                for q in by_name[c]:
-                    got |= mod[id(q)] - local[id(p)]
-            if id(p) in through:
-                for q in addressed:
-                    got |= mod[id(q)] - local[id(p)]
-            if proc_attrs(p).is_external or id(p) in through:
-                for q in public:
-                    got |= mod[id(q)]
-            new[id(p)] = frozenset(got)
+        for k, (p, e) in summaries.items():
+            got = set(e.assigned)
+            for c in e.calls:
+                got |= mod.get(c, frozenset())
+            for q in (through if e.through else []) + (
+                    public if e.through or proc_attrs(p).is_external else []):
+                got |= mod[q]
+            new[k] = frozenset(got)
         if new == mod:
             return mod
         mod = new
@@ -1060,18 +1096,13 @@ def _system_reset(s: P.CallStmt) -> bool:
             and bool(c.args) and _const(c.args[0]) == 0)
 
 
-def _no_return(modules) -> set[int]:
+def _no_return(summaries: dict) -> set[int]:
     """The procedures, by id of their declarations, that do not return:
     with no RETURN and no label on the END, which a GOTO reaches past the
     last statement, whose last statement is a call of one that does not,
     or of an EXTERNAL MON1 with the function 0, system reset."""
-    procs = [n for n in _nodes(modules) if isinstance(n, P.ProcDecl)]
-    by_name: dict[str, list] = {}
-    for p in procs:
-        by_name.setdefault(proc_name(p).upper(), []).append(p)
-    external_mon1 = all(proc_attrs(p).is_external for p in by_name.get("MON1", []))
-    last: dict[int, P.CallStmt] = {}
-    for p in procs:
+    last: dict[int, tuple] = {}
+    for key, (p, eff) in summaries.items():
         stmts = [it for it in p.body.items
                  if not isinstance(it, (P.DeclareStmt, P.ProcDecl)) and not is_end_of_block(it)]
         s = stmts[-1] if stmts else None
@@ -1081,16 +1112,14 @@ def _no_return(modules) -> set[int]:
                 isinstance(n, (P.ReturnStmt, P.ReturnStmtValue))
                 for n in _nodes(p.body.items, into_procs=False)) and not any(
                     is_end_of_block(it) for it in p.body.items):
-            last[id(p)] = s
+            sym = None if _through_member(s) else eff.lookup(_called_name(s))
+            if sym is not None and sym.kind == "proc" and sym.node is not None:
+                last[key] = (s, sym.node)
     out: set[int] = set()
     while True:
         new = set(out)
-        for key, s in last.items():
-            c = unwrap_paren(s.callee)
-            callee = unwrap_paren(c.callee) if isinstance(c, P.Call) else c
-            name = ident_text(callee.name).upper() if isinstance(callee, P.Identifier) else ""
-            if (_system_reset(s) and external_mon1) or (
-                    by_name.get(name) and all(id(q) in out for q in by_name[name])):
+        for key, (s, callee) in last.items():
+            if (_system_reset(s) and proc_attrs(callee).is_external) or id(callee) in out:
                 new.add(key)
         if new == out:
             return out
@@ -1124,17 +1153,18 @@ def check_byte_shifts(modules: list) -> list[tuple]:
     bits are read, or whose flags are (see the module docstring), in the
     order found."""
     shared = _shared(modules)
-    modsets = _modsets(modules)
+    summaries = _summaries(modules, shared)
+    modsets = _modsets(summaries, _addressed(modules))
     # What an INTERRUPT procedure assigns, or what it calls, may change at
     # any time: no bound holds of it.
     pinned = _pinned(modules).union(*(
-        modsets[id(p)] for p in _nodes(modules)
-        if isinstance(p, P.ProcDecl) and proc_attrs(p).interrupt_num is not None))
+        modsets[k] for k, (p, _) in summaries.items()
+        if proc_attrs(p).interrupt_num is not None))
     bounds: dict[tuple, int] = {}
     changes: dict[tuple, int] = {}
     last = _Checker(shared, pinned)     # what the flags may differ by, so far
     last.addressed = _addressed(modules)
-    no_return = _no_return(modules)
+    no_return = _no_return(summaries)
     while True:
         # Each walk finds what the variables are assigned, taking them to be
         # at most what the last one found; until it finds no more.  One
