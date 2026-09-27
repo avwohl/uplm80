@@ -3,6 +3,245 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## 0.4.4 — unreleased
+
+Intel's PL/M-80 V3.1's errors for what a restricted expression - a DATA
+or INITIAL value, an AT address, a constant list - does not take: a
+built-in, which `-O1` and up folded, a name, parentheses, an operator but
++ and -, and a number a byte does not hold among them.  A location in a
+DATA or INITIAL list or an AT address is the variable the name means,
+declared in its block or one around it, before the list or after it.
+
+### Incompatible: V3.1's errors in a restricted expression
+
+What a restricted expression does not take - a DATA or INITIAL value, an
+AT address, a constant of a constant list `.(...)` (Programming Manual
+9800268B, 4.1.3, 6.2.8, 6.2.9) - is refused as V3.1 refuses it, with its
+errors' numbers and texts, when the parser gives the program, at every
+`-O` level; 0.4.3's Known issues had it for SHL and SHR.  V3.1 takes
+there numbers, added and subtracted, a minus sign before a number, and a
+string alone, in a DATA or INITIAL list a location plus or minus numbers,
+`.a(1 + 1) - 2`, `.s.m(1)`, `.memory`, and in an AT a location, and
+rejects the rest, which uplm80 compiled, at every level or some:
+
+- a built-in (ERROR #151, INVALID OPERAND IN RESTRICTED EXPRESSION):
+  `declare w address data (shl(0f0h, 4))`, `initial (size(a))`, `at
+  (double(12h))`, `data (.a(low(1)))`, `data (memory)`, `p = .(shl(1, 2),
+  3)`.  `-O1` and up folded SHL, SHR, ROL, ROR, LOW, HIGH and DOUBLE of
+  constants there, SHL and SHR of a BYTE in 16 bits - `shl(0f0h, 4)` was
+  0F00H, where the same SHL in a statement is 0 - and `-O0` refused them
+  with messages of its own, but for `at (double(12h))`, 12H, and `data
+  (.a + low(3))`, another address.  The other built-ins every level
+  refused, or um80 did, and a constant list lost what was not folded,
+  the next constant in its place: `.(shl(1, 2), 3)` at `-O0` and
+  `.(memory, 7)` at every level were `.(3)` and `.(7)` (0.4.2 the same,
+  but that its `.(shl(1, 2), 3)` was `.(3)` at every level).  The
+  location of a built-in in an AT, `at (.stackptr)`, is #211, INVALID
+  IDENTIFIER IN 'AT' RESTRICTED REFERENCE;
+- a name not after a dot, a variable's, a procedure's, a label's
+  (#151): `data (x)` and `initial (x)`, which uplm80 took for x's
+  address; `x = 3; p = .(x, 7)` and `.(x + 1, 7)`, which `-O0` to `-O2`
+  took for `.(7)`, the name left out and the next constant in its place,
+  and `-O3` for `.(3, 7)` and `.(4, 7)` - a variable the program calls
+  MEMORY too; `.(a(1), 7)` and `.(p, 7)` of a procedure, `.(7)` at every
+  level; and `data (a)` and `.(a, 7)` of an array, which uplm80 refused
+  as an array without its subscript, #133 (0.4.3's Known issues had
+  `initial (a)`);
+- parentheses (#151 and #152, MISSING ')' AFTER CONSTANT LIST, in an AT
+  #146, MISSING ')' AFTER 'AT' RESTRICTED EXPRESSION, in a subscript
+  #150, MISSING ')' AT END OF RESTRICTED SUBSCRIPT): `.((1 + 2), 7)` and
+  `.(-(1), 7)`, `.(7)` at `-O0` and `.(3, 7)` and `.(0FFH, 7)` at `-O1`
+  and up; `data ((1 + 2))`; `data (.a((1)))`, which `-O0` refused;
+- an operator but + and - (#152, in an AT #146), and NOT (and #151):
+  `.(2 * 3)`, left out at every level; `.(not 0f0h)`, left out at `-O0`
+  and `.(0FH)` at `-O1` and up; `data (6 / 3)`, `initial (0ffh and 7)`,
+  `at (2 * 3)`, taken for their values;
+- a string in a sum, `data ('A' + 1)` (#152), taken for 'B', and a
+  location anywhere but first, `at (3 + .buf(1))`, and `data (-1 +
+  .a)`, which `-O0` refused (#151, and #152 or #146);
+- a constant list or `.'text'` in a DATA or INITIAL list, `data (.(5))`,
+  `data (.('one$'))` (#147, MISSING IDENTIFIER FOLLOWING DOT OPERATOR),
+  which uplm80 took for the location of the constants;
+- in a constant list a location, `.(.a, 7)`, left out at every level
+  (#210, ILLEGAL INITIALIZATION OF A BYTE TO A VALUE > 255, and #209,
+  ILLEGAL INITIALIZATION OF MORE SPACE THAN DECLARED), and a number a
+  byte does not hold, `.(300, 7)`, `.(0ffffh, 7)`, `.(299 + 1, 7)` (#210),
+  and the same in a DATA or INITIAL value that fills a BYTE, `declare b
+  byte data (300)`, `byte initial (.w)`, of which uplm80 kept the low byte
+  (and `.(299 + 1, 7)` was `.(7)` at `-O0`).  V3.1 computes such a number
+  as it does a constant, a number below 256 a BYTE, BYTE arithmetic in
+  eight bits: `.(-1)`, `.(1 - 2)`, `.(-255)` and `.(0ffffh + 1)` are
+  taken, as they are in a BYTE.
+
+The message names every error V3.1 gives for the list the value is in, a
+typed declaration's or a constant list, as V3.1 reads it (each rule
+checked with `scripts/intel_oracle.py`, Verified).  It reads a list's
+values up to the first it does not read to the end, and a name it reads
+past is a BYTE 0 to it: `.(300 + x)` and `declare b byte data (300 + x)`
+are #151 and #210.  A DATA or INITIAL list with more values than its
+declaration holds is #209 besides, `declare b (2) byte data (1, 2, x)`,
+and V3.1 checks nothing past the space; alone, it is 0.4.3's Known issue,
+which uplm80 lays out after the declaration.  A constant list V3.1 lays
+out as it does an untyped DATA list: a value with a name in it, or a
+location first, is a word, and a string after the last such value makes
+the list bytes again; where it does not, there is room for the first value
+only, and each value after it is #209 and not checked further, `.(x, 7)`,
+`.(7, x)`, `.(7, 300, x)`, where `.(x, '$')` is #151 alone and `.(x, '$',
+300)` #151 and #210.  After what it does not take it looks for the list's
+`)`, and one of a parenthesis further on leaves the rest of the statement
+#32, INVALID SYNTAX, TEXT IGNORED UNTIL ';', `.((1), 7)`, `.(-.a, (1))`;
+and a list of one value whose last name is a built-in's but MEMORY's is
+#172, INVALID LABEL: UNDEFINED, `.(stackptr)`, `.(1 + time)`, `.(.shl)`,
+`.(shl(1, 2), 3)`.  The messages for LENGTH or LAST of a subscript with
+parentheses in it, `length(sa((b)).z)`, and for an EXTERNAL procedure
+below module level name V3.1's other error too, #125, ILLEGAL ARGUMENT FOR
+BUILT-IN PROCEDURE, and #174, INVALID NULL PROCEDURE, as V3.1 then takes
+it for a procedure with no statements.  V3.1 rejects each program of
+`tests/test_names.py` with the errors its message names and no other
+(`tests/test_intel_oracle.py`).
+
+No program of MP/M II (DRI's tree and mpm2's overrides), of 80un or of
+`sample_code` has any of these but `.memory` in an AT (MP/M II's GENSYS,
+PIP and DSE, CP/M's PIP), so none is kept with a warning.  Of `tests/`,
+`tests/test_declaration_storage.py` had a constant list in a DATA list
+(since 0.3.7), `3+.buf(1)` in an AT, and NOT and AND in a DATA or
+INITIAL list and a location in a BYTE's, and `tests/test_divmod_dri.py`
+divisions in DATA and INITIAL lists; they have them no more, and the
+constant list in a DATA list is tested as V3.1's error.
+
+    SHL(0f0h, 4): SHL is a built-in, and a DATA or INITIAL value is a
+    restricted expression, of constants and locations only; Intel's
+    PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN RESTRICTED
+    EXPRESSION, and #152, MISSING ')' AFTER CONSTANT LIST)
+    X: X is a variable, and a constant list holds constants only;
+    Intel's PL/M-80 V3.1 rejects it (ERROR #151, INVALID OPERAND IN
+    RESTRICTED EXPRESSION, and #209, ILLEGAL INITIALIZATION OF MORE
+    SPACE THAN DECLARED)
+
+### Fixed
+
+- **A location in a DATA or INITIAL list or an AT address is the
+  variable the name means**, at every level: PL/M-80 scopes a name to its
+  whole block (9.1), and a list or an AT may name a variable its block
+  declares further down, as V3.1 takes it.  The names were looked up
+  among what code generation had laid out so far, and a module's DATA is
+  laid out before its other variables, a procedure's or a DO block's DATA
+  or AT before its later declarations.  The element of an array not yet
+  laid out was taken for a byte: at module level `.arr(2)` of an ADDRESS
+  array ARR+2, not ARR+4, and `.size(2)` of the program's `size (3) byte`,
+  taken for the built-in's, SIZE+4.  In a procedure or a DO block a name
+  the block declares further down was another block's: `.arr(2)` and
+  `.size(2)` the module's ARR and SIZE of the other type, FFFF and FFFE
+  where V3.1 prints 0004 and 0002, `at (.buf(3))` the module's BUF, and a
+  name declared nowhere else, MEMORY among them, um80's "Undefined symbol"
+  or "not declared".  At module level `at (.memory(3))` before `declare
+  memory (4) byte` was the end of the program, 0007 where V3.1 prints
+  0003.  A subscript steps by an element's width, an array of
+  structures' by the structure's, `.sa(2)`, which took each for a word; a
+  member, `.s.k`, `.s.m(1)`, `.sa(1).y`, which was refused ("Unsupported
+  operand in DATA location expression: MemberAccess(...)"), is its
+  offset, as in an AT; and a subscript is a constant expression at `-O0`
+  too, `.a(1 + 1)`, which `-O0` refused.
+- **`.memory` in a DATA or INITIAL list**, `declare p address data
+  (.memory + 2)`, is the end of the program, `__END__`, as in an AT and an
+  expression, and as V3.1 takes it.  It was `dw MEMORY`, which um80 did
+  not know.  Where the block, or one around it, declares a MEMORY, before
+  the list or after it, it is that variable.  In a multi-file compile a
+  module that does not declare MEMORY means the built-in in its lists
+  too, as in its code and its ATs; another module's PUBLIC MEMORY was
+  `dw MEMORY` there.
+- **An expression in a constant list at `-O0`**, `p = .(1 + 2, -1)`, is
+  its value, as in a DATA list and at `-O1` and up.  It was left out, and
+  the next constant took its place: `.(1 + 2, 7)` was `.(7)`.
+- **`data (.stackptr)`**, `data (.shl)`, the location of a built-in but
+  MEMORY in a DATA or INITIAL list, which uplm80 refuses since 0.4.2,
+  says so in its own words: the message said V3.1 rejects it (#123), which
+  V3.1 does in an expression only, and in a list takes it for an address
+  of its own (Known issues).
+
+### Known issues
+
+0.4.3's Known issues stand, but for SHL and SHR in a DATA or INITIAL list
+or an AT address, which are V3.1's errors now, and `declare p address
+initial (a)` of an array, whose message names V3.1's #151 now
+(Incompatible).  More INITIAL or DATA values than a scalar holds (#209)
+is so of an array's too, `declare b (2) byte data (1, 2, 3)`, which
+uplm80 lays out after it.  And these, which checking 0.4.4 against V3.1
+found (0.4.3 the same):
+
+- **V3.1's arithmetic in a restricted expression** is a constant's, a
+  number below 256 a BYTE and BYTE arithmetic in eight bits, in a DATA or
+  INITIAL value, an AT address and a subscript of a location, where
+  uplm80 computes in sixteen: `declare w address data (200 + 100)` is
+  002CH to V3.1 and 012CH to uplm80, `255 + 1` 0000H and 0100H, `1 - 2 +
+  256` 01FFH and 00FFH, `initial (128 + 128 + 1)` 0001H and 0101H, `-1`
+  00FFH and 0FFFFH, `data (.a(200 + 100))` .a+2CH and .a+12CH, `at (200 +
+  100)` 002CH and 012CH.  In a statement uplm80 computes `w = 200 + 100`
+  and `w = -1` as V3.1 does, 002CH and 00FFH.  No program of MP/M II,
+  80un or `sample_code` has one.
+- **A string that fills an ADDRESS in a DATA or INITIAL list** is a
+  constant to V3.1, its first character in the high byte, as in an
+  expression: `declare w (2) address data ('ABCD')` is 4142H, 4344H, and
+  `'ABC'` 4142H, 0043H, where uplm80 lays the characters out in order,
+  4241H, 4443H.  In a statement uplm80 computes `q = 'PQ'` as V3.1 does,
+  5051H.  No program of MP/M II, 80un or `sample_code` has one.
+- **The location of a built-in but MEMORY in a DATA or INITIAL list**,
+  `data (.stackptr)`, `data (.shl)`, `data (.double)`, V3.1 takes for an
+  address of its own, 057CH, 0103H and 057CH in the programs checked, and
+  uplm80, which has none to give, refuses (since 0.4.2);
+  `tests/test_intel_oracle.py` holds V3.1 to taking them.
+
+      .STACKPTR: STACKPTR is a built-in, and of the built-ins only MEMORY
+      has an address; uplm80 has none to give STACKPTR in a DATA or
+      INITIAL list, where Intel's PL/M-80 V3.1 takes .STACKPTR for an
+      address of its own
+
+- **An AT that names a variable AT something further down**, `declare z
+  byte at (.y(1)); declare y (2) address at (.buf(2));`, V3.1 rejects
+  (#213, UNDEFINED RESTRICTED REFERENCE IN 'AT'); uplm80 puts z at
+  `.buf(4)`, where V3.1 puts it with y declared first.
+- **An untyped DATA list**, which V3.1 rejects (#61, MISSING TYPE) and
+  uplm80 takes for an array as long as it is: its values are held to a
+  BYTE array's rules, and a message for one names V3.1's errors of such
+  an array, not #61, nor the #209 V3.1 gives of a word in it as it does
+  of one in a constant list.
+- A label in a constant list, `.(lbl, 7)`, `.(7, .lbl)`, which uplm80
+  refuses as it does a variable's name or location there, V3.1 fails on,
+  writing no listing.
+
+### Verified
+
+On 783ddef, with upeepz80 0.2.7 and um80 0.3.52, Intel's binaries found.
+
+- The suite: 2053 tests pass, and 3 skip, the check that the
+  message names V3.1's errors of `carry()`, `zero()` and `dec()`, whose
+  messages name none (0.4.1).  pylint rates the package 9.76, with no
+  message 0.4.3 has not.
+- `tests/run_tests.sh`: all 22 programs pass.
+- `scripts/difftest.py`, 100 seeds (47000-47099), and
+  `scripts/namestest.py`, 100 (48000-48099) and 20 with `--modules`
+  (48500-48519): every program prints what the model or its scopes say.
+- The 88 compiles of MP/M II's and 80un's PL/M - DRI's tree and mpm2's
+  overrides, 50 files, and 80un 0.3.3's 36 alone and its two programs -
+  at `-O0`, `-O2` and `-O3`, and the 66 programs of `sample_code` and
+  `tests/`, give 0.4.3's assembly byte for byte, and its errors where
+  they stop (11 and 14 at each level): none has what a restricted
+  expression does not take, nor a location in a list or an AT that
+  moved.
+- `scripts/intel_oracle.py`: V3.1 rejects each program of
+  `tests/test_names.py` with the errors its message names and no other.
+  Of 1037 lists and declarations - the release check's 144 constant
+  lists and 155 DATA, INITIAL and AT values, 238 these checks wrote and
+  500 random ones - at `-O0` and `-O2`, uplm80 refuses those V3.1
+  refuses, with V3.1's errors, and compiles those V3.1 compiles to print
+  what V3.1's builds print, but for 41 of the Known issues: 28 with more
+  values than a declaration holds, 5 untyped DATA lists, 4 `.stackptr`s
+  in a DATA list and 4 labels in a constant list.  Of 25 programs whose
+  lists and ATs name what a procedure, a DO block or the module declares
+  further down, or in a block around them, 24 print at `-O0` to `-O3`
+  what V3.1's builds print, and V3.1 rejects the other, an AT naming a
+  later AT (#213, Known issues).
+
 ## 0.4.3 — 2026-09-26
 
 SHL and SHR of a BYTE are a BYTE, as the manual and Intel's PL/M-80 V3.1

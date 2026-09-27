@@ -173,6 +173,20 @@ where:
 - The address of a label, `.label`, may be given in a DATA or an INITIAL
   list, not in an expression (4.1.3); of the built-ins, only MEMORY has
   an address.
+- A DATA or INITIAL value, an AT address and a constant of a constant
+  list `.(...)` are restricted expressions (4.1.3, 6.2.8, 6.2.9): numbers,
+  added and subtracted, a minus sign before a number, and a string alone;
+  in a DATA or INITIAL list a location plus or minus numbers,
+  `.s.m(1) + 2`, `.memory` among them, and in an AT a location; and in a
+  constant list, or where the value fills a BYTE, what a byte holds.  A
+  built-in, a name not after a dot, parentheses, an operator but + and -,
+  a string in a sum, a location anywhere but first and a constant list
+  in a DATA list are errors at every `-O` level, as V3.1 makes them:
+  `data (shl(0f0h, 4))`, `data (x)`, `.(x, 7)`, `.(2 * 3)`, `.(300)`.  A
+  location in a DATA or INITIAL list or an AT address is the variable the
+  name means in its block (9.1), declared before it or after, there or
+  in a block around it: `.arr(2)` of an ADDRESS array is ARR+4, and a
+  procedure's `.memory` its own MEMORY where it declares one further on.
 - An INTERRUPT procedure is declared at the outer level of its module and
   has no parameters (8.1.6); so is a PUBLIC or EXTERNAL procedure or
   variable, not in a procedure or a DO block.  INITIAL there initializes
@@ -576,8 +590,8 @@ programs of the two V3.1 bugs 0.4.3's checks found print what they did
 (and, needing no tools, that the table below has them), each program of
 a release's tests whose output the release transcribed from Intel's
 build, and, for each program `tests/test_names.py` expects uplm80 to
-reject or warn of as V3.1 rejects it, that V3.1 does, with the error
-uplm80's message names.
+reject or warn of as V3.1 rejects it, that V3.1 does, with the errors
+uplm80's message names and no other.
 
 Intel's binaries are not part of this repository.  The oracle finds them
 through `--tools DIR` or `$PLM80_TOOLS`, or on DRI's MP/M II work disk at
@@ -654,31 +668,47 @@ result, are a BYTE since 0.4.3, as the manual (11.1.4) and V3.1 make them
 
 V3.1 also rejects what only uplm80 takes: `.'string'` (ERROR 101), an
 untyped `DATA` (61), a program that is not a module (89), a declaration
-after a statement or among a DO CASE's cases (26; uplm80 refuses a DO
-CASE of declarations alone as a DO CASE with no case, 201), `NOT NOT x`
-(102), and a `CALL` of a typed procedure (129); and what the CHANGELOG
-lists under Known issues: a non-REENTRANT procedure's call of itself
-(170), a procedure nested in a REENTRANT one or a REENTRANT one nested in
-another (88, 39), more `INITIAL` or `DATA` values than a scalar holds
-(209), an `END` that names the first of two labels on a DO, `a: c: do;
-... end a;` (20), and, at `-O1` and up, SHL and SHR in a DATA or INITIAL
-list or an AT address (151).  uplm80 compiles, with a warning that names
-V3.1's error, `f()` and `CALL g()` of a procedure (102, 153) and
-`INITIAL` in a procedure or a DO block (73), on which programs written
-for it rely, and a subscript on a scalar, `x(1)` (127), and a member of
-an array of structures without its subscript, `s2.m(1)` (133), which its
-own tests test.  It rejects, as V3.1 does, a name declared nowhere,
-empty parentheses after a variable or a built-in, `.label` in an
-expression, an `INTERRUPT` procedure below module level, a parameter no
-`DECLARE` declares, and a `LITERALLY` used before its declaration (since
-0.4.1); a dimension of 0, the address of a built-in but MEMORY, and a
-PUBLIC or EXTERNAL procedure or variable below module level (since
-0.4.2); and an `END` that names another block (20), a DO CASE with no
-case (201), `.p(1)` of a procedure (104), anything in parentheses in a
-subscript of the argument of SIZE, LENGTH or LAST, `size(ab(f(1)))` (32),
-a procedure with no statements (174), two subscripts on a scalar (127,
-114), an array or a member array without a subscript (133, 134), and a
-call of a procedure declared further on (169) (since 0.4.3).
+after a statement or among a DO CASE's cases (26; uplm80 refuses a DO CASE
+of declarations alone as a DO CASE with no case, 201), `NOT NOT x` (102),
+and a `CALL` of a typed procedure (129); and what the CHANGELOG lists
+under Known issues: a non-REENTRANT procedure's call of itself (170), a
+procedure nested in a REENTRANT one or a REENTRANT one nested in another
+(88, 39), more `INITIAL` or `DATA` values than a scalar or an array holds
+(209), an `END` that names the first of two labels on a DO, `a: c: do; ...
+end a;` (20), and an AT that names a variable AT something further down
+(213).  uplm80 compiles, with a warning that names V3.1's error, `f()` and
+`CALL g()` of a procedure (102, 153) and `INITIAL` in a procedure or a DO
+block (73), on which programs written for it rely, and a subscript on a
+scalar, `x(1)` (127), and a member of an array of structures without its
+subscript, `s2.m(1)` (133), which its own tests test.  It rejects, as V3.1
+does, a name declared nowhere, empty parentheses after a variable or a
+built-in, `.label` in an expression, an `INTERRUPT` procedure below module
+level, a parameter no `DECLARE` declares, and a `LITERALLY` used before
+its declaration (since 0.4.1); a dimension of 0, the address of a built-in
+but MEMORY, and a PUBLIC or EXTERNAL procedure or variable below module
+level (since 0.4.2); and an `END` that names another block (20), a DO CASE
+with no case (201), `.p(1)` of a procedure (104), anything in parentheses
+in a subscript of the argument of SIZE, LENGTH or LAST, `size(ab(f(1)))`
+(32), a procedure with no statements (174), two subscripts on a scalar
+(127, 114), an array or a member array without a subscript (133, 134), and
+a call of a procedure declared further on (169) (since 0.4.3); and in a
+DATA or INITIAL list, an AT address or a constant list what a restricted
+expression does not take, with the errors V3.1 gives for the list (since
+0.4.4): a built-in or a name, `data (shl(0f0h, 4))`, `data (x)`, `.(x, 7)`
+(151); parentheses, `.((1 + 2), 7)`, an operator but + and -, `.(2 * 3)`,
+`data (6 / 3)`, NOT, `.(not 0f0h)`, a string in a sum, `data ('A' + 1)`,
+and a location anywhere but first, `at (3 + .buf(1))` (152, 146, 151); a
+constant list in a DATA list, `data (.(5))` (147); and in a constant list,
+or where the value fills a BYTE, a location or a number a byte does not
+hold, `.(300, 7)`, `byte data (.w)` (210).  It refuses the location of a
+built-in but MEMORY in a DATA or INITIAL list, `data (.stackptr)`, which
+V3.1 takes for an address of its own: uplm80 has none to give it.  And
+V3.1 computes a restricted expression as a constant, a number below 256 a
+BYTE and BYTE arithmetic in eight bits, `address data (200 + 100)` 002CH
+and `-1` 00FFH, where uplm80 computes in sixteen bits, 012CH and 0FFFFH,
+and a string that fills an ADDRESS there as a constant, `address data
+('AB')` 4142H, where uplm80 lays out 'A' and 'B' in order, 4241H
+(CHANGELOG, Known issues).
 
 A store through a pointer or an overrun in or from `??AUTO` reaches what
 uplm80's layout puts there, not what DRI's does (CHANGELOG, Known issues),
