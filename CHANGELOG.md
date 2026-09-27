@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## 0.4.3 — unreleased
+## 0.4.3 — 2026-09-26
 
 SHL and SHR of a BYTE are a BYTE, as the manual and Intel's PL/M-80 V3.1
 make them, with a warning where what a program written for uplm80
@@ -37,8 +37,8 @@ sources shift `SHL(DOUBLE(x), n)` where they want the bits kept, since its
 branch fix/byte-shifts (80un 0.3.3, unreleased).  To keep the old meaning,
 write `SHL(DOUBLE(x), n)`, which is right under any compiler.
 
-The compiler warns where the two meanings can differ
-(`uplm80/byte_shifts.py`): at a SHL of a BYTE that can shift a set bit out,
+The compiler warns where the two meanings can differ, but for the few
+places Known issues lists (`uplm80/byte_shifts.py`): at a SHL of a BYTE that can shift a set bit out,
 whose result, through what it is part of, reaches a place that uses the
 bits above its low byte - a store to an ADDRESS, an ADDRESS argument or
 RETURN, a subscript, a relation, `/` and `MOD`, SHR, SCL, SCR, HIGH and
@@ -184,10 +184,6 @@ takes to print what uplm80's build prints.
   reaches, `fin: end t;`, the HLT made a warm boot is the one after the
   `LXI SP` V3.1 puts at the END, and Intel's build no longer runs on to
   `timeout`.
-- `UPEEPZ80_MIN`, the upeepz80 the compiler takes at its word, is 0.2.7,
-  the floor `pyproject.toml` has required since 0.4.2; it said 0.2.6, and
-  `tests/test_upeepz80_version.py` failed.  An upeepz80 numbered below it
-  is still taken if it keeps the probe's `call`, as 0.2.6 does.
 
 ### Known issues
 
@@ -240,6 +236,24 @@ And this V3.1 compiles to other code (0.4.2 the same):
   still runs its count, 000B 0014 at `-O0` to `-O2`, where V3.1's build,
   whose layout has `i` there too, prints 0003 0015. Counting no such loop
   would cost ED and PIP 18 and 17 bytes at `-O2`, and 80un 20.
+
+Found by 0.4.3's final release check, and left for a later release:
+
+- `b = a(1, 2)` of an array (#114, INVALID SUBSCRIPT, MULTIPLE SUBSCRIPTS
+  ILLEGAL) compiles, to a call through the value of `a(0)`; 0.4.3 makes
+  the same of a scalar an error, not of an array (0.4.2 the same).
+- `declare p address initial (a)` of an array is refused, but the message
+  names V3.1's #133, where V3.1 gives #151.
+- The SHL warning is not given where only these tell the two meanings
+  apart; 0.4.3 computes V3.1's value at each: PLUS, MINUS or CARRY after
+  an operation on a SHL of a BYTE (`b = (shl(k, 4) + 10h) plus 0` with k =
+  0FFH was 00 and is 01; `b = shl(k, 1); c = carry;` was 00 and is 0FFH),
+  the carry now coming from an 8-bit operation; a test that assigns the
+  variable it bounds, `if k < 4 and (k := 200) > 0 then w = shl(k, 6);`;
+  a store past an array's end into the variable shifted; and an INTERRUPT
+  procedure's assignments.
+- An 8-bit SHR can leave a `ld l,a / ld h,0` before it that nothing reads
+  (DA.PLM): bytes, not wrong code.
 
 ### Verified
 
@@ -305,6 +319,22 @@ check's campaign again on 5408683, whose `uplm80/` and `scripts/` are
   warning of `x(1)` in `tests/test_optimizer_soundness.py`, of `s2.m(4)`
   in `tests/test_calls_and_loops.py`, and of `size(i(1))` in
   `tests/test_expression_types.py`, whose program is an error anyway.
+- The final release check, on 161ee2a (the release less its upeepz80
+  floor commit, which is not in it, and with `uplm80/` and `scripts/` as
+  56fad40's): the suite, 1463 tests, with Intel's binaries, and 1402
+  with 61 skipped without them; pylint 9.75; `run_tests.sh` 22 of 22;
+  difftest and abifuzz 300 seeds each, namestest 200 and 40 `--modules`,
+  the storage fuzzer 200, none failing; `intel_oracle.py --random 600`
+  (seeds 105001-105600, the same left out): 594 print what V3.1's build
+  prints, 5 differ by V3.1's `INX SP`/`DCX SP` bug and 1 by its 50252 bug;
+  `--random 100` with nothing left out (106001-106100): the 56 that
+  differ are each a documented difference. The 87 MP/M II and 80un
+  compiles as above, and 80un's programs extracting 201 files per build
+  as 0.4.2's build of 80un's own sources does. MP/M II V2.0 and V2.1 built
+  from source with 0.4.2 and with 0.4.3 (`tools/build.py`, `build_all.sh
+  --tree=src`), `run_tests.sh all` and `src` passing at both versions
+  with the same results, 44 and 30, and `verify_dri.py` the same; 16
+  utilities differ, each one that shifts a BYTE.
 
 ## 0.4.2 — 2026-09-26
 
@@ -529,10 +559,6 @@ In the oracle, `scripts/intel_oracle.py`:
   puts the module's END. For `fin: end t;` V3.1 puts an `LXI SP` there,
   before its `EI; HLT`, and the build runs past the HLT: the verdict is
   `timeout`, where uplm80's build prints what it should.
-
-### Changed
-
-- Requires upeepz80 0.2.7, the release 0.4.2 is checked with.
 
 ### Verified
 
