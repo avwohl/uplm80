@@ -2022,6 +2022,18 @@ declare z byte at (.memory(3));
 declare memory (4) byte;
 call ph(.z - .memory);
 """, [3]),
+    # A parameter and a procedure, over the module's variables of their
+    # names: code generation finds them through their declarations too.
+    "parameter-and-procedure": ("""
+declare a (4) byte, f (4) byte;
+p: procedure (a);
+  declare w address data (.a), wf address data (.f);
+  declare a address;
+  f: procedure; call ph(0f1h); end f;
+  call ph(w - .a); call ph(wf - .f); call wf;
+end p;
+call p(1);
+""", [0, 0, 0xF1]),
 }
 
 
@@ -2152,6 +2164,45 @@ NO_FIXED_ADDRESS = {
                       "BB", "BASED", True),
     "based-element": ("declare ba based w (3) byte;\ndeclare d address data (.ba(1));\nw = d;\n",
                       "BA", "BASED", True),
+    # A factored BASED declaration's name, which code generation was not
+    # told the declaration of (0.4.4 before this): MEMORY was the end of
+    # the program, `dw __END__', where 0.4.3 had `dw MEMORY', which um80
+    # did not know, and at module level, where the module's DATA is laid
+    # out first, the others were um80's "Undefined symbol" (0.4.3 the
+    # same), a structure's member "no member M", and in a procedure or a
+    # DO block, declared further down, the module's variable of the name.
+    "factored-based-memory": ("declare (memory based w) byte;\n"
+                              "declare d address data (.memory);\nw = d;\n",
+                              "MEMORY", "BASED", True),
+    "factored-based-memory-initial": ("declare d address initial (.memory);\n"
+                                      "declare (memory based w) byte;\nw = d;\n",
+                                      "MEMORY", "BASED", True),
+    "factored-based-memory-further-down": ("p: procedure;\n"
+                                           "  declare d address data (.memory(2));\n"
+                                           "  declare (memory based w) (4) byte;\n  w = d;\n"
+                                           "end p;\ncall p;\n", "MEMORY", "BASED", True),
+    "factored-based": ("declare (b1 based w, b2 based w) byte;\n"
+                       "declare d address data (.b2);\nw = d;\n", "B2", "BASED", True),
+    "factored-based-further-down": ("declare d address data (.b2);\n"
+                                    "declare (b1 based w, b2 based w) byte;\nw = d;\n",
+                                    "B2", "BASED", True),
+    "factored-based-element": ("declare (b1 based w, b2 based w) (4) byte;\n"
+                               "declare d address data (.b2(1));\nw = d;\n", "B2", "BASED", True),
+    "factored-based-member": ("declare (s1 based w, s2 based w) structure (k byte, m address);\n"
+                              "declare d address data (.s2.m);\nw = d;\n", "S2", "BASED", True),
+    "factored-based-over-a-module-variable": ("declare b2 (4) byte;\np: procedure;\n"
+                                              "  declare d address data (.b2);\n"
+                                              "  declare (b1 based w, b2 based w) byte;\n"
+                                              "  w = d;\nend p;\ncall p;\n", "B2", "BASED", True),
+    "factored-based-over-a-module-variable-in-a-do-block": ("declare b2 (4) byte;\ndo;\n"
+                                                            "  declare d address data (.b2);\n"
+                                                            "  declare (b2 based w) byte;\n"
+                                                            "  w = d;\nend;\n", "B2", "BASED",
+                                                            True),
+    # One BASED on a member was not BASED at all (_gen_var_decl_names).
+    "factored-based-on-a-member": ("declare s structure (k byte, p address);\n"
+                                   "declare (b1 based s.p) byte;\n"
+                                   "declare d address data (.b1);\nw = d;\n", "B1", "BASED", True),
 }
 
 
@@ -2166,6 +2217,9 @@ def test_a_location_with_no_fixed_address_is_uplm80s_own_refusal(opt, name):
     err = _compile_error(PRELUDE + V31_DECLS + stmts + "end t;\n", opt)
     line = next(l for l in err.splitlines() if ": error: " in l)
     assert line.endswith(f"{var} has no fixed address ({why})"), err
+    # The list it is in: an INITIAL one was called DATA.
+    where = "AT" if " at (" in stmts else "INITIAL" if " initial (" in stmts else "DATA"
+    assert f": error: {where}(.{var}): " in line, err
 
 
 def test_an_untyped_data_string_is_an_array():

@@ -213,7 +213,7 @@ class _Decl:  # pylint: disable=too-many-instance-attributes
     dim: int | None = None      # a variable's: None for a scalar
     members: dict | None = None     # a structure's: member -> its dimension
     node: object = None         # a procedure's declaration
-    item: object = None         # a variable's DeclItem
+    item: object = None         # a variable's DeclItem, or DeclItemBasedGroup
     based: bool = False         # a BASED variable
 
     def __post_init__(self) -> None:
@@ -379,7 +379,7 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         elif isinstance(n, P.DeclItemBasedGroup):
             for bd in n.based_decls or []:
                 self._declare(block, _key(bd.name), "var", (bd, "name"), storage=False,
-                              dim=_dimension(n), members=_members(n), based=True)
+                              dim=_dimension(n), members=_members(n), item=n, based=True)
                 self._visit(bd.base, block)
             self._visit([n.array_size, n.tail], block)
         elif isinstance(n, P.LiterallyDecl):
@@ -1683,15 +1683,20 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
         reached by a GOTO in another module's procedure, compiled apart.
 
         And tell it which declaration a name in a DATA or INITIAL list or
-        an AT address means: ``uplm80_decl``, the variable's DeclItem and
-        whether it is at module level, or ``uplm80_builtin``, the
-        built-in.  PL/M-80 scopes a name to its whole block (9.1), and a
-        DATA list or an AT comes before a declaration further down the
-        block, which code generation has not reached there: it took a
-        procedure's MEMORY declared after its DATA for the end of the
-        program, `.arr(2)' for the module's array of the name, and, in a
-        multi-file compile, the MEMORY another module makes PUBLIC for
-        this one's, which does not declare it.
+        an AT address means, whatever its form (:meth:`_binding`):
+        ``uplm80_decl``, or ``uplm80_builtin``, the built-in.  PL/M-80
+        scopes a name to its whole block (9.1), and a DATA list or an AT
+        comes before a declaration further down the block, which code
+        generation has not reached there: it took a procedure's MEMORY
+        declared after its DATA for the end of the program, `.arr(2)' for
+        the module's array of the name, and, in a multi-file compile, the
+        MEMORY another module makes PUBLIC for this one's, which does not
+        declare it.  It looked up so each name it was not told of, a
+        factored BASED declaration's among them: `declare (memory based
+        bp) byte' further on, or at module level, where the module's DATA
+        is laid out first, was the end of the program; a `b2' declared so
+        further on in a procedure, the module's `b2'; and one no other
+        block declares, um80's "Undefined symbol".
         """
         for d in self.decls:
             if d.kind != "label":
@@ -1713,8 +1718,26 @@ class _Resolver:  # pylint: disable=too-many-instance-attributes
             d = r.decl
             if d is None and _key(getattr(r.node, r.attr)) in _BUILTINS:
                 r.node.uplm80_builtin = True
-            elif d is not None and d.kind == "var" and d.item is not None:
-                r.node.uplm80_decl = (d.item, d.block.kind == "module")
+            elif d is not None:
+                r.node.uplm80_decl = self._binding(d)
+
+    @staticmethod
+    def _binding(d: _Decl) -> tuple[str, object, bool]:
+        """What code generation resolves a name in a DATA or INITIAL list
+        or an AT bound to ``d`` through: (its kind, the node that declares
+        it, whether at module level).  A variable's is its DeclItem, or the
+        factored BASED declaration `(a based p, b based p) byte' it is one
+        of; a parameter's its procedure's declaration, a procedure's its
+        own.  A label's is its name in the assembly too (``uplm80_asm``);
+        a LITERALLY's name is not there, the macro pass having put its
+        text in its place, but where it is declared further down, which
+        check_uses refuses, as Intel's PL/M-80 V3.1 does (ERROR 105)."""
+        module = d.block.kind == "module"
+        if d.kind == "param":
+            return "param", d.block.proc.node, False
+        if d.kind == "proc":
+            return "proc", d.node, module
+        return d.kind, d.item, module
 
     def write_back(self) -> None:
         """Spell every renamed declaration's new name wherever it is named."""

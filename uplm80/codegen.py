@@ -744,9 +744,15 @@ class CodeGenerator:
         # peephole is "JR to 'AGAIN': its target is the external symbol".
         self._compile_publics: set[str] = set()
         # The symbol _gen_one_var made of each variable, by (id of its
-        # DeclItem, name): what names.resolve_names binds a name in a DATA
-        # or INITIAL list or an AT to (see _declaration_symbol).
+        # DeclItem or DeclItemBasedGroup, name), and of each parameter, by
+        # (id of its procedure's ProcDecl, name); and each procedure's, by
+        # id of its ProcDecl: what names.resolve_names binds a name in a
+        # DATA or INITIAL list or an AT to (see _bound_symbol).
         self._declared_symbols: dict[tuple[int, str], Symbol] = {}
+        self._proc_symbols: dict[int, Symbol] = {}
+        # The list a value being laid out is in, for a message: "DATA" or
+        # "INITIAL".
+        self._list_kind = "DATA"
         # The variables whose AT _declared_later is resolving, by the same
         # key, to stop a circle.
         self._resolving_at: set[tuple[int, str]] = set()
@@ -2171,6 +2177,7 @@ class CodeGenerator:
         while root_scope.parent is not None:
             root_scope = root_scope.parent
         root_scope.define(sym)
+        self._proc_symbols[id(decl)] = sym
 
         # Recursively collect nested procedures from the body items.
         # The new typed AST has a single flat body list mixing
@@ -2968,13 +2975,17 @@ class CodeGenerator:
         elif data_values_nodes or initial_values_nodes:
             # A factored list is laid out once, for all the names in turn.
             target_segment.append(AsmLine(label=asm_name))
-            self._emit_value_list(
-                data_values_nodes or initial_values_nodes,
-                self._scalar_widths(data_type or DataType.BYTE, struct_members,
-                                    dimension) * n_names,
-                spare=1 if (data_type or DataType.BYTE) == DataType.BYTE else 2,
-                target=target_segment,
-            )
+            self._list_kind = "DATA" if data_values_nodes else "INITIAL"
+            try:
+                self._emit_value_list(
+                    data_values_nodes or initial_values_nodes,
+                    self._scalar_widths(data_type or DataType.BYTE, struct_members,
+                                        dimension) * n_names,
+                    spare=1 if (data_type or DataType.BYTE) == DataType.BYTE else 2,
+                    target=target_segment,
+                )
+            finally:
+                self._list_kind = "DATA"
         elif use_shared:
             # Using shared automatic storage - no individual allocation needed
             pass
@@ -3007,9 +3018,10 @@ class CodeGenerator:
         return self._mangle_name(name), False, False
 
     def _declaration_symbol(self, item, name: str, module_level: bool) -> Symbol:
-        """The symbol of the variable ``name`` the DeclItem ``item``
-        declares, as names.resolve_names binds a name in a DATA or INITIAL
-        list or an AT to it (``uplm80_decl``): the one :meth:`_gen_one_var`
+        """The symbol of the variable ``name`` the DeclItem ``item``, or the
+        factored BASED declaration (DeclItemBasedGroup), declares, as
+        names.resolve_names binds a name in a DATA or INITIAL list or an AT
+        to it (``uplm80_decl``): the one :meth:`_gen_one_var`
         made, or, where code generation has not reached the declaration,
         one read from it - its shape, which a subscript or a member needs,
         and the assembly name _gen_one_var will give it.  PL/M-80 scopes a
@@ -3032,7 +3044,7 @@ class CodeGenerator:
                                         dimension=struct_member_dim(m))
                 for m in members for sn in struct_member_names(m)
             ]
-        based_on, _ = decl_item_based(item)
+        based_on, _ = decl_item_based(item, name)
         proc, procedure = ((None, None) if module_level
                            else (self.current_proc, self.current_proc_attrs))
         asm_name, _, in_frame = self._var_storage(name, attrs, based_on, proc, procedure)
@@ -3095,6 +3107,23 @@ class CodeGenerator:
         """
         return self._designator(expr, self._at_root, "AT(...)")
 
+    def _bound_symbol(self, expr) -> Symbol | None:
+        """The symbol of the declaration names.resolve_names binds the name
+        ``expr`` in a DATA or INITIAL list or an AT to (``uplm80_decl``),
+        whatever its form: a variable's (:meth:`_declaration_symbol`), a
+        parameter's, defined when its procedure's code began, a
+        procedure's, registered before any code.  None for a label, whose
+        name in the assembly the reference carries (``uplm80_asm``)."""
+        kind, node, module_level = expr.uplm80_decl
+        name = ident_text(expr.name)
+        if kind == "proc":
+            return self._proc_symbols.get(id(node))
+        if kind == "param":
+            return self._declared_symbols.get((id(node), name))
+        if kind == "var":
+            return self._declaration_symbol(node, name, module_level)
+        return None
+
     def _location_builtin(self, expr) -> str | None:
         """The built-in the name ``expr`` in a DATA or INITIAL list or an
         AT means, upper case, or None: names.resolve_names has said
@@ -3117,16 +3146,20 @@ class CodeGenerator:
             self._use_end_symbol()
             return None, "__END__", 0, 1
         bound = getattr(expr, "uplm80_decl", None)
-        base_sym = (self._declared_symbols.get((id(bound[0]), name)) if bound is not None
-                    else self._lookup_scoped(name))
+        if bound is None:
+            base_sym = self._lookup_scoped(name)
+        elif bound[0] == "var":
+            base_sym = self._declared_symbols.get((id(bound[1]), name))
+            if base_sym is None:
+                base_sym, at = self._declared_later(bound[1], name, bound[2])
+                if at is not None:
+                    # Itself AT, further down: where it is, not its name.
+                    root, offset = at
+                    return base_sym, root or "", offset, self._element_width(base_sym)
+        else:
+            base_sym = self._bound_symbol(expr)
         if base_sym is None:
-            if bound is None:
-                raise CodeGenError(f"AT(.{name}): {name} is not declared")
-            base_sym, at = self._declared_later(bound[0], name, bound[1])
-            if at is not None:
-                # Itself AT, further down: where it is, not its name.
-                root, offset = at
-                return base_sym, root or "", offset, self._element_width(base_sym)
+            raise CodeGenError(f"AT(.{name}): {name} is not declared")
         if base_sym.based_on or self._in_frame(base_sym):
             raise CodeGenError(
                 f"AT(.{name}): {name} has no fixed address "
@@ -3339,7 +3372,8 @@ class CodeGenerator:
         an ADDRESS array was ARR+2, and `.sa(2)' took each structure for a
         word.  A member was not taken at all.
         """
-        _, asm, offset, _ = self._designator(operand, self._list_root, "DATA(...)")
+        _, asm, offset, _ = self._designator(operand, self._list_root,
+                                             f"{self._list_kind}(...)")
         return self._sym_offset(asm, offset) if offset else asm
 
     def _list_root(self, expr) -> tuple[Symbol | None, str, int, int]:
@@ -3347,38 +3381,39 @@ class CodeGenerator:
         :meth:`_designator` takes it.
 
         It is the declaration names.resolve_names binds it to
-        (``uplm80_decl``, :meth:`_declaration_symbol`), not what code
-        generation has laid out so far: the module's own DATA is laid out
-        before its other variables, an INITIAL list may name a variable
-        declared further down, and so may a procedure's or a DO block's
-        DATA, which PL/M-80 scopes to the whole block (9.1).  A variable not
-        yet in the symbol table was taken for a byte, `.arr(2)' of an
-        ADDRESS array ARR+2, or for another block's of its name, and a name
-        the program declares that is also a built-in's, MEMORY or SIZE, for
-        the built-in: `declare memory (4) byte; declare w address data
+        (``uplm80_decl``, :meth:`_bound_symbol`), whatever its form, not
+        what code generation has laid out so far: the module's own DATA is
+        laid out before its other variables, an INITIAL list may name a
+        variable declared further down, and so may a procedure's or a DO
+        block's DATA, which PL/M-80 scopes to the whole block (9.1).  A
+        variable not yet in the symbol table was taken for a byte, `.arr(2)'
+        of an ADDRESS array ARR+2, or for another block's of its name, and a
+        name the program declares that is also a built-in's, MEMORY or SIZE,
+        for the built-in: `declare memory (4) byte; declare w address data
         (.memory)' was the end of the program, and `.size(2)' of `size (3)
         byte' SIZE+4.  MEMORY is the linker's end of the program only where
         the program does not declare it (Intel's PL/M-80 V3.1 takes
-        `.memory' there, as in an AT).
+        `.memory' there, as in an AT).  A name of a factored BASED
+        declaration, `(memory based bp) byte', was not bound, and was the
+        end of the program, another block's variable or no symbol at all.
         """
         label = getattr(expr, "uplm80_asm", None)
         if label is not None:
             return None, label, 0, 1       # a label: `@proc$label' in a procedure
         name = ident_text(expr.name)
-        if name in self.literal_macros:
+        bound = getattr(expr, "uplm80_decl", None)
+        if bound is None and name in self.literal_macros:
             return None, self.literal_macros[name], 0, 1
         if self._location_builtin(expr) == "MEMORY":
             self._use_end_symbol()
             return None, "__END__", 0, 1
-        bound = getattr(expr, "uplm80_decl", None)
-        sym = (self._declaration_symbol(bound[0], name, bound[1]) if bound is not None
-               else self._lookup_scoped(name))
+        sym = self._bound_symbol(expr) if bound is not None else self._lookup_scoped(name)
         if sym is not None and (sym.based_on or self._in_frame(sym)):
             # As in an AT (:meth:`_at_root`): it was `dw X', a name no
             # declaration defines, and um80's "Undefined symbol".  V3.1
             # takes either for an address (CHANGELOG, Known issues).
             raise CodeGenError(
-                f"DATA(.{name}): {name} has no fixed address "
+                f"{self._list_kind}(.{name}): {name} has no fixed address "
                 f"({'BASED' if sym.based_on else 'a REENTRANT local'})")
         asm = sym.asm_name if sym is not None and sym.asm_name else self._mangle_name(name)
         return sym, asm, 0, self._element_width(sym) if sym is not None else 1
@@ -3713,15 +3748,15 @@ class CodeGenerator:
                 stack_offset = reentrant_param_offset
                 reentrant_param_offset -= 2  # Move to next param (all slots are 2 bytes)
 
-                self.symbols.define(
-                    Symbol(
-                        name=param,
-                        kind=SymbolKind.PARAMETER,
-                        data_type=param_type,
-                        size=param_size,
-                        stack_offset=stack_offset,
-                    )
+                p_sym = Symbol(
+                    name=param,
+                    kind=SymbolKind.PARAMETER,
+                    data_type=param_type,
+                    size=param_size,
+                    stack_offset=stack_offset,
                 )
+                self.symbols.define(p_sym)
+                self._declared_symbols[(id(decl), param)] = p_sym
                 param_infos.append((param, None, param_type, param_size))
             else:
                 # Get asm_name from shared storage or create individual
@@ -3739,15 +3774,15 @@ class CodeGenerator:
                     )
                     self._note_storage(decl, start)
 
-                self.symbols.define(
-                    Symbol(
-                        name=param,
-                        kind=SymbolKind.PARAMETER,
-                        data_type=param_type,
-                        size=param_size,
-                        asm_name=asm_name,
-                    )
+                p_sym = Symbol(
+                    name=param,
+                    kind=SymbolKind.PARAMETER,
+                    data_type=param_type,
+                    size=param_size,
+                    asm_name=asm_name,
                 )
+                self.symbols.define(p_sym)
+                self._declared_symbols[(id(decl), param)] = p_sym
                 param_infos.append((param, asm_name, param_type, param_size))
 
         # Take the arguments into the parameters' storage (see _gen_args).
