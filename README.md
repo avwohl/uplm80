@@ -36,7 +36,7 @@ pip install uplm80 um80 upeepz80
 ```
 
 From source: `git clone https://github.com/avwohl/uplm80.git && cd uplm80 && pip install -e .`
-See [INSTALL.md](INSTALL.md) and [README_RASPBERRY_PI.md](README_RASPBERRY_PI.md) for more.
+See [INSTALL.md](https://github.com/avwohl/uplm80/blob/main/INSTALL.md) and [README_RASPBERRY_PI.md](https://github.com/avwohl/uplm80/blob/main/README_RASPBERRY_PI.md) for more.
 
 ## Usage
 
@@ -54,28 +54,28 @@ Options:
 - `-D SYMBOL` - define a conditional compilation symbol (repeatable)
 
 Each module carries the runtime routines it uses; link with it only what
-defines its EXTERNALs. See [examples/hellocpm.plm](examples/hellocpm.plm)
-and the drop-in [docs/example.Makefile](docs/example.Makefile) (contributed
+defines its EXTERNALs. See [examples/hellocpm.plm](https://github.com/avwohl/uplm80/blob/main/examples/hellocpm.plm)
+and the drop-in [docs/example.Makefile](https://github.com/avwohl/uplm80/blob/main/docs/example.Makefile) (contributed
 by Martin Homuth-Rosemann, [@Ho-Ro](https://github.com/Ho-Ro)).
 
 ## Documentation
 
-- [docs/language.md](docs/language.md) - rules the compiler checks, as Intel's V3.1 does; `$IF`/`$SET` conditional compilation
-- [docs/calling_convention.md](docs/calling_convention.md) - calling convention, writing assembly PL/M calls, runtime routines, names in the output
-- [docs/runtime_modes.md](docs/runtime_modes.md) - CP/M, bare and MP/M modes, memory layout, how procedure locals share `??AUTO`
-- [docs/multi_file_compilation.md](docs/multi_file_compilation.md) - compiling several modules together
-- [docs/intel_oracle.md](docs/intel_oracle.md) - differential testing against Intel's PL/M-80 V3.1, and the known differences
-- [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md) - calling CP/M BDOS from PL/M-80
-- [docs/project_structure.md](docs/project_structure.md) - source files and what each does
-- [docs/PLM80_FEATURE_INDEX.md](docs/PLM80_FEATURE_INDEX.md) - language features and their tests
-- [CHANGELOG.md](CHANGELOG.md) - releases and known issues
+- [docs/language.md](https://github.com/avwohl/uplm80/blob/main/docs/language.md) - rules the compiler checks, as Intel's V3.1 does; `$IF`/`$SET` conditional compilation
+- [docs/calling_convention.md](https://github.com/avwohl/uplm80/blob/main/docs/calling_convention.md) - calling convention, writing assembly PL/M calls, runtime routines, names in the output
+- [docs/runtime_modes.md](https://github.com/avwohl/uplm80/blob/main/docs/runtime_modes.md) - CP/M, bare and MP/M modes, memory layout, how procedure locals share `??AUTO`
+- [docs/multi_file_compilation.md](https://github.com/avwohl/uplm80/blob/main/docs/multi_file_compilation.md) - compiling several modules together
+- [docs/intel_oracle.md](https://github.com/avwohl/uplm80/blob/main/docs/intel_oracle.md) - differential testing against Intel's PL/M-80 V3.1, and the known differences
+- [docs/BDOS_REFERENCE.md](https://github.com/avwohl/uplm80/blob/main/docs/BDOS_REFERENCE.md) - calling CP/M BDOS from PL/M-80
+- [docs/project_structure.md](https://github.com/avwohl/uplm80/blob/main/docs/project_structure.md) - source files and what each does
+- [docs/PLM80_FEATURE_INDEX.md](https://github.com/avwohl/uplm80/blob/main/docs/PLM80_FEATURE_INDEX.md) - language features and their tests
+- [CHANGELOG.md](https://github.com/avwohl/uplm80/blob/main/CHANGELOG.md) - releases and known issues
 
 The front end is generated from [plox](https://github.com/avwohl/plox)
 grammars; peephole optimization is [upeepz80](https://github.com/avwohl/upeepz80).
 
 ## License
 
-GPL v3.0 or later - see [LICENSE](LICENSE). Issues and pull requests are welcome.
+GPL v3.0 or later - see [LICENSE](https://github.com/avwohl/uplm80/blob/main/LICENSE). Issues and pull requests are welcome.
 
 ## Related Projects
 
