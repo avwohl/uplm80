@@ -7,6 +7,15 @@ uplm80 supports compiling multiple PL/M source files together in a single compil
 - Shared ??AUTO temporary storage
 - Consistent calling conventions
 
+When multiple files are provided:
+- All files are parsed together before code generation
+- A unified call graph is built across all modules
+- Procedures that are never active at the same time share storage for their parameters and for the locals that may share it (`??AUTO`, see [Procedure locals](runtime_modes.md#procedure-locals)), across module boundaries
+- Calls between the modules are made as between modules compiled apart (see [calling_convention.md](calling_convention.md)), so a module can as well be compiled alone and linked with the others
+- A single combined output file is generated
+
+This produces better code than compiling files separately, as the compiler can share local variable storage between procedures in different modules that never call each other.
+
 ## Usage
 
 ```bash
@@ -60,8 +69,8 @@ end myproc;
 result = myproc(1, 2);
 ```
 
-Every call passes its arguments the way Intel's PL/M-80 does (README,
-Calling Convention): one argument in BC; of two or more, the last in DE,
+Every call passes its arguments the way Intel's PL/M-80 does
+([calling_convention.md](calling_convention.md)): one argument in BC; of two or more, the last in DE,
 the one before it in BC, and any earlier ones pushed left to right, one
 word each, which the callee takes off the stack.  A BYTE argument in a
 register is in C or E.  A BYTE result is returned in A, an ADDRESS one

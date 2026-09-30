@@ -27,7 +27,7 @@ For uplm80, we need a simpler approach because:
 | SP | Stack pointer | Implicit in PUSH/POP/CALL/RET |
 
 A call keeps only SP, IX and IY: A, the flags, BC, DE and HL are all
-destroyed (PL/M-80's calling convention; README, Calling Convention).
+destroyed (PL/M-80's calling convention; docs/calling_convention.md).
 While a call's last argument is evaluated, the one before it is in BC;
 the code generator saves BC round that code if it may write B or C.
 

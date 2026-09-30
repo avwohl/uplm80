@@ -3,7 +3,7 @@
 A few programs of tests/plm_intel.py's generator, and one of the corpus,
 built with both compilers and run: every -O level must print what Intel's
 build prints.  The generator leaves out the differences already known and
-documented (README, Testing against Intel's PL/M-80), so what fails here is
+documented (docs/intel_oracle.md), so what fails here is
 new.
 
 Part of the suite, and skipped - at once, building nothing - unless
@@ -41,7 +41,7 @@ oracle = importlib.util.module_from_spec(_spec)
 sys.modules.setdefault("intel_oracle", oracle)   # its dataclasses look themselves up there
 _spec.loader.exec_module(oracle)
 
-# The differences the README lists; each is a generator feature it can
+# The differences docs/intel_oracle.md lists; each is a generator feature it can
 # leave out.
 KNOWN = frozenset({"shift9", "wide-limit", "sub-zero", "zero-dividend", "neg-widened"})
 SEEDS = [3, 8, 10]
@@ -65,8 +65,8 @@ RELEASE_PROGRAMS = {
     "factored-based": V31_FACTORED_BASED,        # 0.4.4, (a based s.p) byte
     **{f"bases-{k}": v[0] for k, v in V31_BASES.items()},     # 0.4.4, a based q in p
 }
-# V3.1's bugs the README's Known differences has and the generator does not
-# leave out: a program, after _PRELUDE; how the README writes it; what
+# V3.1's bugs docs/intel_oracle.md's Known differences has and the generator does not
+# leave out: a program, after _PRELUDE; how docs/intel_oracle.md writes it; what
 # V3.1's build prints; and what uplm80's prints at every level, the
 # manual's value.
 V31_BUGS = {
@@ -324,12 +324,12 @@ def test_zero_dividend_leaves_out_a_product_that_overflows_to_0():
     assert "(('N' * 08000h) / (high(ab(0)) or 1))" in text
 
 
-def test_the_readme_has_each_v31_bug():
-    """Each V3.1 bug the tests know is a row of the README's Known
+def test_the_oracle_doc_has_each_v31_bug():
+    """Each V3.1 bug the tests know is a row of docs/intel_oracle.md's Known
     differences with no `--avoid' name."""
-    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, "docs", "intel_oracle.md"), encoding="utf-8") as f:
         text = f.read()
-    known = text.split("### Known differences from Intel's PL/M-80 V3.1")[1].split("\n## ")[0]
+    known = text.split("## Known differences from Intel's PL/M-80 V3.1")[1].split("\n## ")[0]
     rows = [line for line in known.splitlines() if line.startswith("| | ")]
     for name, (_, spelling, _, _) in V31_BUGS.items():
         assert any(row.startswith(f"| | {spelling} ") for row in rows), (name, spelling)

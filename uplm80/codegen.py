@@ -4188,7 +4188,7 @@ class CodeGenerator:
 
         self._gen_proc_call(sym, call_name, args)
 
-    # ---- Calls: PL/M-80's calling convention (README, Calling Convention) ----
+    # ---- Calls: PL/M-80's calling convention (docs/calling_convention.md) ----
     #
     # A call passes its arguments the way Intel's PL/M-80 does, so that code
     # compiled here links with assembly written for PL/M-80 and with what

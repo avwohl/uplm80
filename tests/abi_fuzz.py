@@ -6,8 +6,8 @@ the convention ties a call to the procedure it calls.  Module A and main
 module B each define some of the procedures - 0 to 6 parameters, BYTE and
 ADDRESS, untyped or returning either type - and declare the other's PUBLIC
 ones EXTERNAL.  Some are private to their module (one of those with one
-parameter and its address never taken takes it in A or HL: README, Calling
-Convention), some REENTRANT, some called through an address.  Some are reached through the
+parameter and its address never taken takes it in A or HL:
+docs/calling_convention.md), some REENTRANT, some called through an address.  Some are reached through the
 assembly module: callers call PN, a routine written to the convention by
 hand that reads each argument where the convention puts it, passes them on
 to the PL/M procedure IN with garbage in the high byte of every BYTE, and
@@ -130,7 +130,7 @@ class Generator:
             return f"acc = acc {op} {self.call(p, scope, module)};"
         if self.r.random() < .2:
             # Each procedure has its own variable: the address is evaluated
-            # after the arguments (README, Calling Convention), and a call
+            # after the arguments (docs/calling_convention.md), and a call
             # in one of them may set the variable again, which must not then
             # hold another procedure's address, of another number of
             # parameters (8.2.1: the compiler does not check it).

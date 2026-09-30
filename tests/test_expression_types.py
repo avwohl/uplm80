@@ -787,7 +787,7 @@ call run;
 
 # A multiple assignment whose value is an embedded assignment of one of its
 # targets, not the last.  Intel's PL/M-80 V3.1 takes that target's value for
-# an address (README, Known differences), and tests/test_intel_oracle.py
+# an address (docs/intel_oracle.md), and tests/test_intel_oracle.py
 # checks that its build of this program still does.
 EMBEDDED_TARGET = """
 declare (w2, w3, ew) address, eb byte;

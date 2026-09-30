@@ -80,7 +80,7 @@ MOVE is generated inline (`ldir`); `runtime.py` also has `??move` and
 ## Calling Convention
 
 Intel PL/M-80's, so code links with DRI's assembly and PL/M-80 objects
-(README, Calling Convention): one argument in BC (C for BYTE), two in BC
+(docs/calling_convention.md): one argument in BC (C for BYTE), two in BC
 then DE (E), more with the first ones pushed left to right; the callee
 removes the pushed words; BYTE results in A, ADDRESS in HL; a call keeps
 only SP, IX and IY.  Exception: a private, non-REENTRANT procedure with one
@@ -198,3 +198,6 @@ To compare against original Digital Research binaries, disassemble with ud80:
 ```bash
 ~/z80/RomWBW/Source/Images/d_cpm22/u0$ ud80 ED.COM -o ~/real_ed.mac
 ```
+
+## README stays short
+README.md is at most 150 lines. New detail goes in docs/<topic>.md with a one-line link from the README; never add sections to the README.

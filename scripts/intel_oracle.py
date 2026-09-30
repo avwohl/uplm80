@@ -40,7 +40,7 @@ spellings only uplm80 takes (see normalize_text).  uplm80's build links an
 X0100 of its own, the same equates as DRI's X0100.ASM.
 
 --random N checks programs from tests/plm_intel.py's generator (--avoid
-leaves out the features its docstring lists; the README's table says which
+leaves out the features its docstring lists; docs/intel_oracle.md's table says which
 difference each stands for).  --reduce cuts every program that differs, or
 that uplm80 rejects, down to what the difference needs: a generated one by
 its statements first, then any program by blocks and lines (ddmin), keeping

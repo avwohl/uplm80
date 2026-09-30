@@ -24,7 +24,7 @@ END MON3;
 ```
 
 A call passes FUNC in C and PARM in DE (PL/M-80's calling convention: see
-the README), which is how the BDOS at 0005H takes them, so all three are
+docs/calling_convention.md), which is how the BDOS at 0005H takes them, so all three are
 defined as `equ 5`, as DRI's `X0100.ASM` defines them. uplm80 compiles a
 call of MON1 or MON2 with a constant function number as the BDOS call
 itself: `ld de,parm / ld c,func / call 5`.

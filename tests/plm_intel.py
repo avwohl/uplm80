@@ -42,7 +42,7 @@ told to - the reducer in scripts/intel_oracle.py drops chunks while the
 difference persists.
 
 Features ``avoid`` can leave out - the first five are differences from V3.1
-the README lists:
+docs/intel_oracle.md lists:
 * shift9: SHL or SHR of a BYTE by more than 8, which V3.1 shifts by the
   count mod 8;
 * wide-limit: a BYTE index counted to a limit above 255, which V3.1

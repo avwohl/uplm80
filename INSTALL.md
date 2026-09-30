@@ -275,7 +275,7 @@ them.
 
 A CP/M program links with the BDOS interface it declares EXTERNAL, which is
 equates, as DRI's `X0100.ASM` defines them: a call of `MON1(f, a)` already
-has f in C and a in DE (see the README, Calling Convention).
+has f in C and a in DE (see docs/calling_convention.md).
 
 ```asm
         public  MON1, MON2, MON2A, MON3, BOOT
@@ -345,7 +345,7 @@ pip uninstall uplm80 um80 upeepz80
 
 ## Getting Help
 
-- **Documentation**: See [README.md](README.md) for language reference
+- **Documentation**: See [docs/language.md](docs/language.md) for the language rules
 - **BDOS Reference**: See [docs/BDOS_REFERENCE.md](docs/BDOS_REFERENCE.md)
 - **Examples**: Check the `examples/` directory
 - **Issues**: Report bugs at https://github.com/avwohl/uplm80/issues
