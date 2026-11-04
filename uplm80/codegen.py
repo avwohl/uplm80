@@ -386,8 +386,13 @@ class AsmLine:
     opcode: str = ""
     operands: str = ""
     comment: str = ""
+    # A line written as it is: a ``;#`` debug marker (-g), which has to be
+    # exactly ``;#kind fields`` and not the "; " + comment of ``comment``.
+    raw: str = ""
 
     def __str__(self) -> str:
+        if self.raw:
+            return self.raw
         parts: list[str] = []
         if self.label:
             parts.append(f"{self.label}:")
@@ -688,8 +693,15 @@ class CodeGenerator:
         self._page_zero_refs.add(name)
         return name
 
-    def __init__(self, mode: Mode = Mode.CPM, warn_trivial_if: bool = True, reg_debug: bool = False) -> None:
+    def __init__(self, mode: Mode = Mode.CPM, warn_trivial_if: bool = True, reg_debug: bool = False,
+                 debug_info: bool = False) -> None:
         self.mode = mode
+        # -g: write ``;#`` markers (um80_and_friends docs/debug_info.md).
+        # They are whole-line comments, so the code is the same without them.
+        self.debug_info = debug_info
+        self._dbg_files: dict[str, int] = {}     # file table of the markers
+        self._dbg_state: tuple | None = None     # position the last marker set
+        self._dbg_module_file = "<input>"
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
         self.reg_debug = reg_debug  # Enable register tracking debug output
         self.warnings: list[str] = []  # Collected warnings
@@ -2200,6 +2212,9 @@ class CodeGenerator:
         for loc, text in resolve_names([module]):
             self._warn(text, loc)
         self.output = []
+        self._dbg_files = {}
+        self._dbg_state = None
+        self._dbg_module(module)
         self.data_segment = []
         self.at_defs = []
         self.code_data_segment = []
@@ -2311,6 +2326,7 @@ class CodeGenerator:
         if shape.stmts:
             self._emit()
             self._emit(comment="Module initialization code")
+            self._dbg_main(shape.name, shape.stmts)
             if self.mode in (Mode.CPM, Mode.MPM):
                 # CP/M: Set stack from BDOS address at 0006H
                 self._emit_entry_stack()
@@ -2323,6 +2339,7 @@ class CodeGenerator:
             # For CPM mode, add warm boot after module statements
             if self.mode in (Mode.CPM, Mode.MPM):
                 self._emit("jp", self._pz(0x0000))  # Warm boot to return to CP/M
+            self._dbg_endfunc(shape.name)
 
         # Procedures hoisted out of DO blocks in the module body, then
         # the module's own procedures.
@@ -2396,6 +2413,7 @@ class CodeGenerator:
                 print(f"  {key}: {val}", file=sys.stderr)
 
         # Convert to string
+        self._dbg_put_file_table()
         return "\n".join(str(line) for line in self.output)
 
     def generate_multi(self, modules: list) -> str:
@@ -2418,6 +2436,8 @@ class CodeGenerator:
                       else decl_item_names(d) if isinstance(d, P.DeclItem)
                       and decl_attrs(d).is_public else [])}
         self.output = []
+        self._dbg_files = {}
+        self._dbg_state = None
         self.data_segment = []
         self.at_defs = []
         self.code_data_segment = []
@@ -2526,6 +2546,9 @@ class CodeGenerator:
             # Has module-level statements - emit init + statements
             self._emit()
             self._emit(comment="Module initialization")
+            self._dbg_module(first_module_with_stmts)
+            self._dbg_main(next(s.name for m, s in zip(modules, shapes)
+                                if m is first_module_with_stmts), first_module_stmts)
             if self.mode in (Mode.CPM, Mode.MPM):
                 self._emit_entry_stack()
             else:
@@ -2535,6 +2558,8 @@ class CodeGenerator:
                 self._gen_stmt(stmt)
             if self.mode in (Mode.CPM, Mode.MPM):
                 self._emit("jp", self._pz(0x0000))
+            self._dbg_endfunc(next(s.name for m, s in zip(modules, shapes)
+                                   if m is first_module_with_stmts))
         elif entry_proc:
             # No statements - call entry procedure
             self._emit()
@@ -2558,6 +2583,7 @@ class CodeGenerator:
         defined = {pname for _, _, pname, attrs in all_procedures if not attrs.is_external}
         for module, proc, pname, attrs in all_procedures:
             self.symbols.kept_builtins = module_kept[id(module)]
+            self._dbg_module(module)
             if attrs.is_external:
                 if pname not in defined:
                     defined.add(pname)
@@ -2621,6 +2647,7 @@ class CodeGenerator:
         self._emit()
         self._emit("end")
 
+        self._dbg_put_file_table()
         return "\n".join(str(line) for line in self.output)
 
     def _kept_builtins(self, shapes) -> list[frozenset[str]]:
@@ -3668,6 +3695,7 @@ class CodeGenerator:
 
         self._emit(comment=f"Procedure {name}")
         self._emit_label(proc_asm_name)
+        self._dbg_func(proc_asm_name, decl, attrs, len(params))
 
         # Enter new scope
         self.symbols.enter_scope(name)
@@ -3850,9 +3878,12 @@ class CodeGenerator:
             elif self.output[start] is frame_lines[0]:
                 del self.output[start:start + len(frame_lines)]
 
-        # Procedure epilogue (implicit return if no explicit RETURN at end)
+        # Procedure epilogue (implicit return if no explicit RETURN at end),
+        # which is the line of the END
         if not ends_with_return:
+            self._dbg_line(decl, end=True)
             self._gen_proc_epilogue(decl)
+        self._dbg_endfunc(proc_asm_name)
 
         # Now generate nested procedures (after outer procedure)
         for nested_proc in nested_procs:
@@ -3947,6 +3978,120 @@ class CodeGenerator:
             self._emit("ret")
 
     # ========================================================================
+    # Debug markers (-g)
+    # ========================================================================
+
+    def _dbg_file(self, path: str) -> int:
+        """The number of ``path`` in the file table, which is written at the
+        head of the output (:meth:`_dbg_put_file_table`)."""
+        return self._dbg_files.setdefault(path, len(self._dbg_files) + 1)
+
+    def _dbg_where(self, node, end: bool = False) -> tuple[int, int] | None:
+        """(file number, line) of ``node`` in the source, or None where the
+        node has no position (the optimizer made it).  The file and line are
+        where the text really came from: an $INCLUDE file's own line, and
+        for a LITERALLY's text the line of the name it replaced."""
+        return self._dbg_where_pos(getattr(node, "pos", None), end)
+
+    def _dbg_where_pos(self, pos, end: bool = False) -> tuple[int, int] | None:
+        """:meth:`_dbg_where` of a node's position."""
+        if pos is None:
+            return None
+        origin = getattr(pos, "end_origin" if end else "origin", None)
+        if origin is not None and origin[0]:
+            return self._dbg_file(origin[0]), origin[1]
+        line = getattr(pos, "end_line" if end else "start_line", 0)
+        if not line:
+            return None
+        return self._dbg_file(self._dbg_module_file), line
+
+    def _dbg_module(self, module) -> None:
+        """The file ``module`` was parsed from, for a node with no origin."""
+        self._dbg_module_file = getattr(module, "uplm80_file", None) or "<input>"
+
+    def _dbg_marker(self, text: str) -> None:
+        self.output.append(AsmLine(raw=";#" + text))
+
+    def _dbg_line(self, node, end: bool = False) -> None:
+        """Write ``;#line`` for ``node`` unless the position is the one the
+        last marker set."""
+        if not self.debug_info:
+            return
+        where = self._dbg_where(node, end)
+        if where is None or where == self._dbg_state:
+            return
+        self._dbg_state = where
+        self._dbg_marker(f"line {where[0]} {where[1]}")
+
+    def _dbg_no_line(self) -> None:
+        """The bytes that follow have no source line (a jump table)."""
+        if self.debug_info and self._dbg_state != (0, 0):
+            self._dbg_state = (0, 0)
+            self._dbg_marker("line 0 0")
+
+    def _dbg_func(self, name: str, decl, attrs, n_params: int) -> None:
+        """``;#func`` and the line of the declaration, after the label.
+
+        The first two arguments come in BC and DE, so ``pops`` counts the
+        third and later ones, which the callee takes off the stack.  A
+        REENTRANT procedure keeps its frame in IX.  No ixbegin/ixend: a
+        label there would stop the peephole optimizer and change the code.
+        """
+        if not self.debug_info:
+            return
+        where = self._dbg_where(decl) or (self._dbg_file(self._dbg_module_file), 0)
+        frame = "ix" if attrs.is_reentrant else "static"
+        self._dbg_marker(f"func {name} {where[0]} {where[1]} frame={frame} "
+                         f"pops={2 * max(0, n_params - 2)}")
+        self._dbg_state = None
+        self._dbg_line(decl)
+
+    def _dbg_main(self, name: str, stmts) -> None:
+        """``;#func`` for the module's own statements, which run as a routine
+        the entry code calls (or falls into) and have no label.  The name is
+        the module's."""
+        if not self.debug_info:
+            return
+        first = next((s for s in stmts if self._dbg_where(s)), None)
+        if first is None:
+            return
+        where = self._dbg_where(first)
+        self._dbg_marker(f"func {name} {where[0]} {where[1]} frame=none pops=0")
+        self._dbg_state = None
+        self._dbg_line(first)       # the stack set-up is the first statement's
+
+    def _dbg_endfunc(self, name: str) -> None:
+        if self.debug_info:
+            self._dbg_marker(f"endfunc {name}")
+            self._dbg_state = None
+
+    def _dbg_open_inline(self, name: str, call_pos) -> list:
+        """``;#inline`` for the call, at ``call_pos``, of ``name`` that the
+        -O3 inliner replaced by code; the state to go back to."""
+        saved = self._dbg_state
+        where = self._dbg_where_pos(call_pos)
+        if where is None:
+            return [saved, False]
+        self._dbg_marker(f"inline {where[0]} {where[1]} {name}")
+        self._dbg_state = None          # the first line inside is always written
+        return [saved, True]
+
+    def _dbg_close_inline(self, saved: list) -> None:
+        if saved[1]:
+            self._dbg_marker("endinline")
+            self._dbg_state = saved[0]
+
+    def _dbg_put_file_table(self) -> None:
+        """The ``;#file`` lines, at the head of ``self.output`` (after the
+        ``cseg`` line), now that every file a marker names is known."""
+        if not self.debug_info or not self._dbg_files:
+            return
+        lines = [AsmLine(raw=";#file %d \"%s\"" % (n, path.replace("\\", "\\\\").replace('"', '\\"')))
+                 for path, n in self._dbg_files.items()]
+        at = next((i + 1 for i, l in enumerate(self.output) if l.opcode == "cseg"), 0)
+        self.output[at:at] = lines
+
+    # ========================================================================
     # Statement Code Generation
     # ========================================================================
 
@@ -3957,7 +4102,16 @@ class CodeGenerator:
         statement."""
         outer = self._stmt_node
         self._stmt_node = stmt
-        self._gen_stmt_kind(stmt)
+        if self.debug_info:
+            inline = getattr(stmt, "uplm80_inline", None)
+            opened = self._dbg_open_inline(*inline) if inline else None
+            if not isinstance(stmt, (P.DeclareStmt, P.NullStmt)):
+                self._dbg_line(stmt)
+            self._gen_stmt_kind(stmt)
+            if opened is not None:
+                self._dbg_close_inline(opened)
+        else:
+            self._gen_stmt_kind(stmt)
         self._stmt_node = outer
 
     def _gen_stmt_kind(self, stmt) -> None:
@@ -5246,6 +5400,7 @@ class CodeGenerator:
             for s in stmts:
                 self._gen_stmt(s)
 
+            self._dbg_line(self._stmt_node)     # the jump back is the loop's
             self._emit("jp", loop_label)
             self._emit_label(end_label)
 
@@ -5399,6 +5554,7 @@ class CodeGenerator:
             # Step, and go round again unless it carried out. INC sets Z
             # when it wraps, ADD sets carry; storing a BYTE is all loads, so
             # the flags survive the store.
+            self._dbg_line(stmt)                # the step is the DO's
             self._emit_label(incr_label)
             operand = self._byte_var_operand(index_var) if step_val == 1 else None
             if operand is not None:
@@ -5471,6 +5627,7 @@ class CodeGenerator:
             self._gen_stmt(s)
 
         # Step, and go round again unless it carried out.
+        self._dbg_line(stmt)                    # the step is the DO's
         self._emit_label(incr_label)
         _index_to_hl()
         if not step_is_const:
@@ -5516,6 +5673,7 @@ class CodeGenerator:
         for s in body_stmts:
             self._gen_stmt(s)
         self._loop_words -= 1
+        self._dbg_line(self._stmt_node)         # the count is the DO's
         self._emit("pop", "bc")
 
         # Decrement B and jump if not zero
@@ -5675,12 +5833,15 @@ class CodeGenerator:
             self._emit("jp", "(hl)")
 
             # Jump table (in code segment, right after the jp (hl))
+            self._dbg_no_line()
             self._emit_label(table_label)
             for label in case_labels:
                 self.output.append(AsmLine(opcode="dw", operands=label))
 
         # Generate each case
         for i, (case_item, label) in enumerate(zip(cases, case_labels)):
+            if not isinstance(case_item, (P.DeclareStmt, P.NullStmt)):
+                self._dbg_line(case_item)       # in front of the label
             self._emit_label(label)
             self._gen_stmt(case_item)
             # Only emit JP end_label if last statement doesn't transfer control

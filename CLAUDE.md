@@ -49,6 +49,7 @@ cpmemu program.com arg1 arg2      # Run with arguments
    - `-m mpm` - MP/M II relocatable modules: page-zero references become `??BDOS`/`??MAXB`/`??BOOT` externals
    - `-O 0|1|2|3` - Optimization level (default: 2)
    - `-D SYMBOL` - Define conditional compilation symbol (can be repeated)
+   - `-g` - Write `;#` source-line markers into the `.mac` text; the code does not change (see `docs/debug_info.md`)
 
 2. Assemble to relocatable object:
    ```bash

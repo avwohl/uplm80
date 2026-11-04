@@ -274,6 +274,9 @@ def note_origins(tree, line_map: list[tuple[str, int]],
         if pos is not None and getattr(pos, "start_line", 0):
             pos.origin = _origin(line_map, pos.start_line, "") + (
                 source_column(columns, pos.start_line, pos.start_column),)
+            if getattr(pos, "end_line", 0):
+                # (file, line) of the last line: the END of a procedure (-g).
+                pos.end_origin = _origin(line_map, pos.end_line, "")
         stack.extend(getattr(n, f, None) for f in fields if f != "pos")
 
 

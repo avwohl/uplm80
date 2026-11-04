@@ -1415,8 +1415,13 @@ class ASTOptimizer:
         if not inlined_stmts:
             return P.NullStmt(pos=pos)
         if len(inlined_stmts) == 1:
-            return inlined_stmts[0]
-        return P.DoBlock(items=inlined_stmts, end_label=None, pos=pos)
+            result = inlined_stmts[0]
+        else:
+            result = P.DoBlock(items=inlined_stmts, end_label=None, pos=pos)
+        # For -g: the code generator writes ;#inline and ;#endinline round
+        # the code of this statement, with the call's position.
+        result.uplm80_inline = (proc_name(proc), pos)
+        return result
 
     def _substitute_params(self, node, param_map: dict[str, object]):
         """Substitute parameter references with argument expressions.
@@ -1614,6 +1619,11 @@ class ASTOptimizer:
         0.4.3 the same).
         """
         opt = self._optimize_stmt_form(stmt)
+        # A statement the -O3 inliner made stays marked as inlined (-g)
+        # when a later visit rebuilds it.
+        if (opt is not None and opt is not stmt and hasattr(stmt, "uplm80_inline")
+                and not hasattr(opt, "uplm80_inline")):
+            opt.uplm80_inline = stmt.uplm80_inline
         if opt is not None and opt is not stmt and self._live(stmt):
             self.flag_live.add(id(opt))
             self.rebuilt_live.append(opt)

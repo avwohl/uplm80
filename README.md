@@ -65,6 +65,7 @@ by Martin Homuth-Rosemann, [@Ho-Ro](https://github.com/Ho-Ro)).
 - [docs/runtime_modes.md](https://github.com/avwohl/uplm80/blob/main/docs/runtime_modes.md) - CP/M, bare and MP/M modes, memory layout, how procedure locals share `??AUTO`
 - [docs/multi_file_compilation.md](https://github.com/avwohl/uplm80/blob/main/docs/multi_file_compilation.md) - compiling several modules together
 - [docs/intel_oracle.md](https://github.com/avwohl/uplm80/blob/main/docs/intel_oracle.md) - differential testing against Intel's PL/M-80 V3.1, and the known differences
+- [docs/debug_info.md](https://github.com/avwohl/uplm80/blob/main/docs/debug_info.md) - `-g`: source-line markers for a debugger (`udb80`, GDB); the code does not change
 - [docs/BDOS_REFERENCE.md](https://github.com/avwohl/uplm80/blob/main/docs/BDOS_REFERENCE.md) - calling CP/M BDOS from PL/M-80
 - [docs/project_structure.md](https://github.com/avwohl/uplm80/blob/main/docs/project_structure.md) - source files and what each does
 - [docs/PLM80_FEATURE_INDEX.md](https://github.com/avwohl/uplm80/blob/main/docs/PLM80_FEATURE_INDEX.md) - language features and their tests

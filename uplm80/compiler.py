@@ -79,10 +79,91 @@ def require_upeepz80(opt_level: int) -> None:
         raise CompilerError(problem)
 
 
+# What upeepz80 0.2.7 does not do with markers, and the one in use must (-g):
+# a procedure's dead store behind a ;#line marker is removed, as without the
+# marker (0.2.7 keeps it, so a -g build would have other code), and each
+# marker stays, in its order.
+_MARKER_PROBE = ("P:\n;#line 1 3\n\tld (X),a\n;#line 1 4\n\tadd a,b\n\tret\n"
+                 "X:\tds 1\n")
+
+
+@functools.cache
+def upeepz80_markers_problem() -> str | None:
+    """Why the upeepz80 in use cannot be given ;# markers (-g), or None.
+
+    -g must not change the code (cpmemu docs/debugger_plan.md, D2).  The
+    upeepz80 of 0.2.7 and before keeps a marker but lets one hide a
+    procedure's dead store, so the code of a -g build has the store; the
+    probe is that text, which the right upeepz80 gives with the store
+    gone and both markers kept.
+    """
+    out = PeepholeOptimizer().optimize(_MARKER_PROBE)
+    lines = out.split("\n")
+    if (not re.search(r"^\s*ld\s+\(X\),a", out, re.MULTILINE)
+            and ";#line 1 3" in lines and ";#line 1 4" in lines
+            and lines.index(";#line 1 3") < lines.index(";#line 1 4")):
+        return None
+    found = str(getattr(upeepz80, "__version__", "")) or "(no version)"
+    return (f"upeepz80 {found} (in {Path(upeepz80.__file__).parent}) does not keep "
+            f"the code the same when -g puts ;# markers in the text: it leaves "
+            f"a procedure's dead store behind a marker in.  Use an upeepz80 "
+            f"newer than 0.2.7 (one with ab4de24, \"keep ;# debug markers\"), "
+            f"or compile without -g.")
+
+
+def require_upeepz80_markers(opt_level: int) -> None:
+    """Stop, with CompilerError, if -g at ``opt_level`` would use an
+    upeepz80 that does not keep the code the same (-O0 uses none)."""
+    problem = upeepz80_markers_problem() if opt_level > 0 else None
+    if problem is not None:
+        raise CompilerError(problem)
+
+
 def _print_warnings(warnings: list[tuple]) -> None:
     """Print ``warnings``, (location, text) pairs, as code generation's are."""
     for loc, text in warnings:
         print(f"{loc}: warning: {text}" if loc else f"warning: {text}", file=sys.stderr)
+
+
+
+def add_ix_range_labels(asm: str) -> str:
+    """For each ``;#func ... frame=ix`` routine, add ``ixbegin=`` and
+    ``ixend=`` to the marker and write the two labels: ``ixbegin`` after the
+    ``add ix,sp`` that sets the frame, ``ixend`` in front of the last
+    ``pop ix`` of the routine.  This runs after upeepz80, so a label does
+    not stop the peephole optimizer.  A label is not code: the bytes are the
+    same.  A routine with several exits has one range, so the ``ret``
+    after an earlier ``pop ix`` is inside the range."""
+    lines = asm.split("\n")
+    out: list[str] = []
+    i = 0
+    n = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith(";#func ") and " frame=ix" in line:
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith(";#endfunc"):
+                j += 1
+            body = lines[i + 1:j]
+            begin = next((k for k, t in enumerate(body)
+                          if t.split() == ["add", "ix,sp"]), None)
+            end = None
+            for k in range(len(body) - 1, -1, -1):
+                if body[k].split() == ["pop", "ix"]:
+                    end = k
+                    break
+            if begin is not None and end is not None and begin < end:
+                n += 1
+                lb, le = f"??IXB{n}", f"??IXE{n}"
+                body.insert(end, f"{le}:")
+                body.insert(begin + 1, f"{lb}:")
+                out.append(f"{line} ixbegin={lb} ixend={le}")
+                out.extend(body)
+                i = j
+                continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
 
 
 class Compiler:
@@ -104,8 +185,10 @@ class Compiler:
         debug: bool = False,
         defines: list[str] | None = None,
         include_paths: list[str] | None = None,
+        debug_info: bool = False,
     ) -> None:
         self.mode = mode
+        self.debug_info = debug_info  # -g: ;# markers for a debugger
         self.opt_level = opt_level
         self.debug = debug
         self.defines = defines or []  # Symbols to define for conditional compilation
@@ -134,6 +217,8 @@ class Compiler:
         """
         try:
             require_upeepz80(self.opt_level)
+            if self.debug_info:
+                require_upeepz80_markers(self.opt_level)
 
             # Phases 1-2: preprocess + uplox plm_full LR parse + AST lowering.
             if self.debug:
@@ -176,7 +261,8 @@ class Compiler:
                     file=sys.stderr,
                 )
 
-            codegen = CodeGenerator(self.mode, reg_debug=self.debug)
+            codegen = CodeGenerator(self.mode, reg_debug=self.debug,
+                                 debug_info=self.debug_info)
             asm_code = codegen.generate(ast)
 
             # Print any warnings from code generation
@@ -198,7 +284,10 @@ class Compiler:
                     for pattern, count in peephole.stats.items():
                         print(f"[DEBUG]   {pattern}: {count} applied", file=sys.stderr)
 
-            return fix_symbols(asm_code)
+            asm_code = fix_symbols(asm_code)
+            if self.debug_info:
+                asm_code = add_ix_range_labels(asm_code)
+            return asm_code
 
         except CompilerError as e:
             self.errors.add_error(e)
@@ -272,6 +361,8 @@ class Compiler:
 
         try:
             require_upeepz80(self.opt_level)
+            if self.debug_info:
+                require_upeepz80_markers(self.opt_level)
 
             modules, filenames = [], []
 
@@ -311,7 +402,8 @@ class Compiler:
             if self.debug:
                 print(f"[DEBUG] Phase 4: Code Generation (multi-module, {len(modules)} files)", file=sys.stderr)
 
-            codegen = CodeGenerator(self.mode, reg_debug=self.debug)
+            codegen = CodeGenerator(self.mode, reg_debug=self.debug,
+                                 debug_info=self.debug_info)
             asm_code = codegen.generate_multi(modules)
 
             # Print any warnings from code generation
@@ -329,6 +421,8 @@ class Compiler:
                 peephole = PeepholeOptimizer()
                 asm_code = peephole.optimize(asm_code)
             asm_code = fix_symbols(asm_code)
+            if self.debug_info:
+                asm_code = add_ix_range_labels(asm_code)
 
             # Determine output path
             if output_path is None:
@@ -401,6 +495,15 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "-g", "--debug-info",
+        action="store_true",
+        dest="debug_info",
+        help="Write ;# source-line markers for a debugger into the .mac "
+             "(the code is the same); assemble with um80 --debug-info and "
+             "link with ul80 --debug-info",
+    )
+
+    parser.add_argument(
         "-D", "--define",
         action="append",
         dest="defines",
@@ -429,6 +532,7 @@ def main() -> None:
         debug=args.debug,
         defines=args.defines,
         include_paths=args.include_paths,
+        debug_info=args.debug_info,
     )
 
     # Compile (supports multiple input files)

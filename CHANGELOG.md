@@ -3,6 +3,93 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## Unreleased
+
+### Added: `-g`, source-line markers for a debugger
+
+Phase 4 of the debugger plan (cpmemu `docs/debugger_plan.md`) for uplm80.
+`uplm80 -g` writes `;#` markers (um80_and_friends `docs/debug_info.md`)
+into the `.mac` text: `;#file` for the source file and each `$INCLUDE`
+file, `;#line` in front of each statement, `;#func` and `;#endfunc` round
+each procedure (`frame=ix` for a REENTRANT one, `frame=static` for the
+rest, `pops` the bytes of arguments past the second) and round the main
+program's statements, `;#inline` and `;#endinline` round a procedure the
+`-O3` inliner put into its caller, and `;#line 0 0` in front of the jump
+table of a big `DO CASE`.  The `;#func` of a REENTRANT procedure has
+`ixbegin=` and `ixend=`: `compiler.add_ix_range_labels` writes the two
+labels (`??IXB1`, `??IXE1`) after upeepz80 has run, so no label stops the
+peephole optimizer.  A line is the source's own: an `$INCLUDE` file's
+line in that file, and for a LITERALLY's text the line of the name it
+replaced.  Assemble with `um80 --debug-info` and link with `ul80
+--debug-info` to get `prog.dbg`.  `docs/debug_info.md` has the detail.
+
+Measured on 2026-11-04 (um80_and_friends 92196ca and 8c828b3, upeepz80
+ab4de24 on top of 0.2.7):
+
+- **The code does not change (D2).** 68 programs (`tests/*.plm`,
+  `sample_code`, `examples`, one of romwbw_emu) compiled with and without
+  `-g`, assembled and linked, at `-O0` to `-O3`: 272 builds, 272 with the
+  same `.COM` (the `.REL` for 3 programs that need an EXTERNAL data
+  symbol).  14 of the 68 (the CP/M 1.x sources) do not compile with or
+  without `-g`.  `tests/test_debug_info.py` repeats the test for the 22
+  programs of `tests/` that have an expected output, at four levels
+  (about 100 s), and the `.mac` text of a program without its marker lines
+  is the same as without `-g`.
+- **Coverage.** Of the instruction bytes in the routines (`;#func` to
+  `;#endfunc`, the main program's included) of the 51 programs that link,
+  100.00% have a source line in `prog.dbg`: 46172 of 46172 bytes at `-O2`
+  (50171 at `-O0`, 46220 at `-O1`, 45356 at `-O3`).  Outside the runtime,
+  46172 of 46182 bytes (99.98%) have one; the 10 others are the
+  entry code of `tests/test_array_bug.plm`, the one program with no main
+  statements.  A REENTRANT
+  program (`tests/test_reentrant.plm`: 909 of 909 bytes) is among them.
+- **Live.** `udb80` against `cpmemu --gdb` on a `-g -O2` program with a
+  REENTRANT recursive FACTORIAL: `break demo.plm:36`, `step` into `FACT`,
+  `next`, `finish`, and `bt` show `FACT` four deep above the main
+  program, with the PL/M lines.
+
+- **`ixbegin` and `ixend` (re-measured 2026-11-04).** 48 programs that link
+  with `-g`, `-O0` to `-O3`: 0 instruction bytes of the routines without a
+  source line (43301, 39902, 39858 and 38640 bytes), and every REENTRANT
+  routine has an IX range inside its own addresses in `prog.dbg`.  The
+  D2 byte test again: 53 programs at four levels, 212 builds with the same
+  `.COM` with and without `-g`, 0 different (14 programs do not compile,
+  with or without `-g`).  A routine with several exits has one IX range.
+- **Tests.** `tests/test_debug_info.py` also checks the line of a
+  statement the optimizers rewrite (CSE, a folded constant, an unrolled
+  loop; `-O2` and `-O3`), the IX range, and a two-module compile.  The
+  tests that need `um80` and `ul80` fail instead of skipping when
+  `UPLM80_REQUIRE_TOOLS=1`.
+- Against upeepz80 0.2.7 (PyPI), which lets a marker hide a dead store,
+  the `-g` tests at `-O1` and above skip with the reason (45 of 51), or
+  fail under `UPLM80_REQUIRE_TOOLS=1`.  todo.txt has the release item.
+
+### Changed
+
+- `AsmLine` has a `raw` field for a line written as it is (a marker is
+  `;#kind`, not the `; ` + comment of `comment`).  `note_origins` also gives
+  a node position an `end_origin`, the (file, line) of its last line.  The
+  `-O3` inliner marks the statement it puts in place of a call
+  (`uplm80_inline`).  None of the `AsmLine`, `note_origins` and inliner
+  changes changes the code without `-g`.
+
+### Not done
+
+- **`-g` needs a newer upeepz80 than the one the dependency names.** The
+  `upeepz80>=0.2.6` floor stays.  With `-g` at `-O1` and above the
+  compiler tests the installed upeepz80 (`upeepz80_markers_problem`) and
+  refuses 0.2.7 and before: 0.2.7 lets a `;#line` marker hide the dead
+  store at a procedure's entry, and the `.mac` text differs in 15 of 156
+  compiles (5 programs at `-O1` to `-O3`, measured).  The fix is upeepz80
+  ab4de24, not released at the time of writing.
+- No `nostmt` marker: the optimizer's loop-invariant pass only caches
+  expressions for CSE and moves no code out of a loop.
+- A runtime routine (`??mul16` and the others) has no marker, so a
+  debugger shows it at the assembler level.  In `udb80` (phase 3, not this
+  repository), `next` over a call of `??mul16` stopped at the routine's
+  first instruction (`FACT`'s `n * fact(n - 1)`, measured); `next` over a
+  call of a PL/M procedure, `FACT` recursion included, worked.
+
 ## 0.4.4 — 2026-09-27
 
 What 0.4.3's final release check found and left for a later release, what
