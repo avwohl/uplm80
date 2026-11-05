@@ -3,7 +3,7 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
-## Unreleased
+## 0.5.0 — 2026-11-05
 
 ### Changed: upeepz80 0.2.8 or later, and CI runs the `-g` tests
 
@@ -73,9 +73,10 @@ ab4de24 on top of 0.2.7):
   loop; `-O2` and `-O3`), the IX range, and a two-module compile.  The
   tests that need `um80` and `ul80` fail instead of skipping when
   `UPLM80_REQUIRE_TOOLS=1`.
-- Against upeepz80 0.2.7 (PyPI), which lets a marker hide a dead store,
-  the `-g` tests at `-O1` and above skip with the reason (45 of 51), or
-  fail under `UPLM80_REQUIRE_TOOLS=1`.  todo.txt has the release item.
+- Against upeepz80 0.2.7, which lets a marker hide a dead store, the `-g`
+  tests at `-O1` and above skip with the reason (45 of 51), or fail under
+  `UPLM80_REQUIRE_TOOLS=1`.  0.5.0 requires upeepz80 0.2.8 (see the first
+  section).
 
 ### Changed
 
@@ -88,13 +89,12 @@ ab4de24 on top of 0.2.7):
 
 ### Not done
 
-- **`-g` needs a newer upeepz80 than the one the dependency names.** The
-  `upeepz80>=0.2.6` floor stays.  With `-g` at `-O1` and above the
-  compiler tests the installed upeepz80 (`upeepz80_markers_problem`) and
-  refuses 0.2.7 and before: 0.2.7 lets a `;#line` marker hide the dead
-  store at a procedure's entry, and the `.mac` text differs in 15 of 156
-  compiles (5 programs at `-O1` to `-O3`, measured).  The fix is upeepz80
-  ab4de24, not released at the time of writing.
+- (Written before upeepz80 0.2.8, and closed by the first section.) With
+  `-g` at `-O1` and above the compiler tests the installed upeepz80
+  (`upeepz80_markers_problem`) and refuses 0.2.7 and before: 0.2.7 lets a
+  `;#line` marker hide the dead store at a procedure's entry, and the
+  `.mac` text differs in 15 of 156 compiles (5 programs at `-O1` to
+  `-O3`, measured).  The check stays for an older upeepz80 that pip keeps.
 - No `nostmt` marker: the optimizer's loop-invariant pass only caches
   expressions for CSE and moves no code out of a loop.
 - A runtime routine (`??mul16` and the others) has no marker, so a
