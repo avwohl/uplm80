@@ -57,6 +57,7 @@ from . import ast_nodes as _ast_nodes
 from .symbols import SymbolTable, Symbol, SymbolKind
 from .errors import CodeGenError, CompilerError
 from .frontend import source_location
+from .debug_vars import DebugVarsMixin
 from .local_storage import AUTO, PARAM, LocalStorage, folded_reference, runs_outside
 from .names import REGISTER_NAMES, data_name, resolve_names
 from .runtime import get_runtime_library, plm_div, plm_mod
@@ -450,7 +451,7 @@ class _ScopedLiterals(dict):
         return self[name] if name in self else default
 
 
-class CodeGenerator:
+class CodeGenerator(DebugVarsMixin):
     """
     Generates assembly code from PL/M-80 AST.
 
@@ -702,6 +703,7 @@ class CodeGenerator:
         self._dbg_files: dict[str, int] = {}     # file table of the markers
         self._dbg_state: tuple | None = None     # position the last marker set
         self._dbg_module_file = "<input>"
+        self._dbgv_reset()                       # the variables (debug_vars.py)
         self.warn_trivial_if = warn_trivial_if  # Warn on IF 0 / IF 1
         self.reg_debug = reg_debug  # Enable register tracking debug output
         self.warnings: list[str] = []  # Collected warnings
@@ -2214,6 +2216,7 @@ class CodeGenerator:
         self.output = []
         self._dbg_files = {}
         self._dbg_state = None
+        self._dbgv_reset()
         self._dbg_module(module)
         self.data_segment = []
         self.at_defs = []
@@ -2438,6 +2441,7 @@ class CodeGenerator:
         self.output = []
         self._dbg_files = {}
         self._dbg_state = None
+        self._dbgv_reset()
         self.data_segment = []
         self.at_defs = []
         self.code_data_segment = []
@@ -2953,6 +2957,12 @@ class CodeGenerator:
         )
         self.symbols.define(sym)
         self._declared_symbols[(id(item), name)] = sym
+        if self.debug_info:
+            self.dbgv_variable(
+                name, sym, item, token=self._dbgv_name_token(item, name),
+                data_type=data_type, dimension=dimension,
+                struct_members=struct_members, based_on=based_on,
+                based_member=based_member, attrs=attrs)
         if defer_to_frame_end:
             self._reentrant_deferred.append(sym)
 
@@ -3696,6 +3706,7 @@ class CodeGenerator:
         self._emit(comment=f"Procedure {name}")
         self._emit_label(proc_asm_name)
         self._dbg_func(proc_asm_name, decl, attrs, len(params))
+        self.dbgv_enter_proc(proc_asm_name, decl)
 
         # Enter new scope
         self.symbols.enter_scope(name)
@@ -3786,6 +3797,8 @@ class CodeGenerator:
                 self.symbols.define(p_sym)
                 self._declared_symbols[(id(decl), param)] = p_sym
                 param_infos.append((param, None, param_type, param_size))
+                self.dbgv_param(param, p_sym, decl, self._dbgv_param_node(decl, i),
+                                param_type, True)
             else:
                 # Get asm_name from shared storage or create individual
                 if use_shared_storage and param in self.storage_labels.get(full_proc_name, {}):
@@ -3812,6 +3825,8 @@ class CodeGenerator:
                 self.symbols.define(p_sym)
                 self._declared_symbols[(id(decl), param)] = p_sym
                 param_infos.append((param, asm_name, param_type, param_size))
+                self.dbgv_param(param, p_sym, decl, self._dbgv_param_node(decl, i),
+                                param_type, False)
 
         # Take the arguments into the parameters' storage (see _gen_args).
         if param_infos and not attrs.is_reentrant:
@@ -3884,6 +3899,7 @@ class CodeGenerator:
             self._dbg_line(decl, end=True)
             self._gen_proc_epilogue(decl)
         self._dbg_endfunc(proc_asm_name)
+        self.dbgv_leave_proc()
 
         # Now generate nested procedures (after outer procedure)
         for nested_proc in nested_procs:
@@ -4056,12 +4072,14 @@ class CodeGenerator:
         if first is None:
             return
         where = self._dbg_where(first)
+        self.dbgv_enter_main(name)
         self._dbg_marker(f"func {name} {where[0]} {where[1]} frame=none pops=0")
         self._dbg_state = None
         self._dbg_line(first)       # the stack set-up is the first statement's
 
     def _dbg_endfunc(self, name: str) -> None:
         if self.debug_info:
+            self.dbgv_leave_main(name)
             self._dbg_marker(f"endfunc {name}")
             self._dbg_state = None
 
@@ -5269,8 +5287,10 @@ class CodeGenerator:
             self.current_proc = f"{outer}B{block_id}"
 
         # Local declarations
+        self.dbgv_enter_block(stmt)
         for decl in decls:
             self._gen_declaration(decl)
+        self.dbgv_leave_block()
 
         # Restore current_proc for statements
         self.current_proc = old_proc
@@ -5347,8 +5367,10 @@ class CodeGenerator:
         self.loop_stack.append((loop_label, end_label))
 
         # Local declarations (emit storage before loop body).
+        self.dbgv_enter_block(stmt)
         for decl in decls:
             self._gen_declaration(decl)
+        self.dbgv_leave_block()
 
         # Check for optimized byte counter loop: DO WHILE (n := n - 1) <> 255
         # NOTE: This optimization is disabled because it doesn't save code -
@@ -5427,8 +5449,10 @@ class CodeGenerator:
         # PROCEDURE declared here has to be hoisted out and emitted, or the
         # call sites name a label nothing defines.
         iter_decls = self._hoist_block_procs(iter_decls)
+        self.dbgv_enter_block(stmt)
         for decl in iter_decls:
             self._gen_declaration(decl)
+        self.dbgv_leave_block()
 
         loop_label = self._new_label("FOR")
         test_label = self._new_label("TEST")

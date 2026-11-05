@@ -31,8 +31,10 @@ LEVELS = (0, 1, 2, 3)
 
 # A marker is ;, optional blanks, #, a kind in letters; the writer is exact.
 MARKER = re.compile(r"^;#(file|line|inline|endinline|func|endfunc)\b")
-# The labels that -g adds for ixbegin= and ixend= (the peephole pass is over).
-IX_LABEL = re.compile(r"^\?\?IX[BE]\d+:$")
+# The labels that -g adds for ixbegin= and ixend= and for the range= of a
+# parameter (the peephole pass is over), and the variable markers.
+IX_LABEL = re.compile(r"^\?\?(IX[BE]|VR)\d+:$")
+VAR_MARKER = re.compile(r"^;#(type|var)\b")
 
 
 def compile_g(src: str, opt: int = 2, name: str = "<test>", g: bool = True) -> str:
@@ -47,7 +49,8 @@ def markers(asm: str) -> list[str]:
 
 def strip_markers(asm: str) -> str:
     return "\n".join(ln for ln in asm.split("\n")
-                     if not MARKER.match(ln) and not IX_LABEL.match(ln))
+                     if not MARKER.match(ln) and not VAR_MARKER.match(ln)
+                     and not IX_LABEL.match(ln))
 
 
 PROGRAM = """0100H:

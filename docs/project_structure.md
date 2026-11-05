@@ -9,6 +9,7 @@ uplm80/
 ├── ast_optimizer.py # AST-level optimizations
 ├── codegen.py       # Z80 code generator
 ├── local_storage.py # Which procedure locals may share ??AUTO
+├── debug_vars.py    # -g: the ;#var and ;#type markers (variables for a debugger)
 ├── names.py         # Which declaration each name means; GOTO rules; assembler names
 ├── runtime.py       # Runtime helpers
 ├── symbols.py       # Symbol table

@@ -6,6 +6,7 @@ Main entry point for the uplm80 compiler.
 
 import argparse
 import functools
+import os
 import re
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ from .names import check_names, fix_symbols
 # Import AST optimizer (PL/M-80 specific)
 from .ast_optimizer import ASTOptimizer
 from .byte_shifts import check_byte_shifts
+from .debug_vars import add_vars
 
 # The oldest upeepz80 whose code is right under PL/M-80's calling convention,
 # as pyproject.toml's dependency has it (a test keeps the two the same).
@@ -166,6 +168,21 @@ def add_ix_range_labels(asm: str) -> str:
     return "\n".join(out)
 
 
+def _with_variables(asm: str, codegen) -> str:
+    """``asm`` with the ``;#var`` and ``;#type`` markers of ``-g``.  A fault
+    in them must not stop a build, since they are an aid for a debugger and
+    never change the code: the build then has none and a warning.
+    UPLM80_DEBUG_VARS_STRICT=1 raises the fault instead."""
+    try:
+        return add_vars(asm, codegen.dbg_var_info())
+    except Exception as e:  # noqa: BLE001
+        if os.environ.get("UPLM80_DEBUG_VARS_STRICT"):
+            raise
+        print(f"uplm80: warning: no variable records for -g "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+        return asm
+
+
 class Compiler:
     """
     PL/M-80 Compiler.
@@ -263,6 +280,7 @@ class Compiler:
 
             codegen = CodeGenerator(self.mode, reg_debug=self.debug,
                                  debug_info=self.debug_info)
+            codegen.dbg_sources = {filename: source}
             asm_code = codegen.generate(ast)
 
             # Print any warnings from code generation
@@ -287,6 +305,7 @@ class Compiler:
             asm_code = fix_symbols(asm_code)
             if self.debug_info:
                 asm_code = add_ix_range_labels(asm_code)
+                asm_code = _with_variables(asm_code, codegen)
             return asm_code
 
         except CompilerError as e:
@@ -365,6 +384,7 @@ class Compiler:
                 require_upeepz80_markers(self.opt_level)
 
             modules, filenames = [], []
+            sources = {}
 
             # Phase 1 & 2: Lex and parse all files
             for input_path in input_paths:
@@ -381,6 +401,7 @@ class Compiler:
 
                 filename = str(input_path)
                 filenames.append(filename)
+                sources[filename] = source
 
                 if self.debug:
                     print(f"[DEBUG] Front-end (uplox plm_full) {filename}", file=sys.stderr)
@@ -404,6 +425,7 @@ class Compiler:
 
             codegen = CodeGenerator(self.mode, reg_debug=self.debug,
                                  debug_info=self.debug_info)
+            codegen.dbg_sources = sources
             asm_code = codegen.generate_multi(modules)
 
             # Print any warnings from code generation
@@ -423,6 +445,7 @@ class Compiler:
             asm_code = fix_symbols(asm_code)
             if self.debug_info:
                 asm_code = add_ix_range_labels(asm_code)
+                asm_code = _with_variables(asm_code, codegen)
 
             # Determine output path
             if output_path is None:

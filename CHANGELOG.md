@@ -90,6 +90,112 @@ ab4de24 on top of 0.2.7):
   first instruction (`FACT`'s `n * fact(n - 1)`, measured); `next` over a
   call of a PL/M procedure, `FACT` recursion included, worked.
 
+### Added: `-g`, variables for a debugger
+
+Phase 8 of the debugger plan (cpmemu `docs/debugger_plan.md`) for uplm80.
+`uplm80 -g` also writes `;#var` and `;#type` markers
+(um80_and_friends `docs/debug_info.md`, Variables) for every variable
+(`uplm80/debug_vars.py`, `CodeGenerator` notes each one as it hands out
+the storage, `add_vars` writes the markers after upeepz80, with
+`add_ix_range_labels`, because only the final text says what is left).
+Each storage kind has a record:
+
+- module level, `INITIAL`, `DATA`, `AT`, `PUBLIC`, and a procedure's
+  locals that have their own label: `at=LABEL` (`kind=global` for PUBLIC,
+  `static` at module level, `local` in a procedure or DO block);
+- the shared area: `at=??AUTO+N`, in the routine of the owner;
+- a REENTRANT procedure: `ix=N` (parameters at IX+4 and up, locals below);
+- a parameter or a local of a static procedure (not INITIAL, DATA, AT,
+  PUBLIC or BASED): `range=` from the instruction after the first store to
+  its slot, to the end of the routine, so the record does not claim a value
+  before the store (the slot of `??AUTO` holds other routines' bytes
+  there);
+- a BASED variable: the format has no "address held in another variable",
+  so the record is a pointer (`*T`) at the place of the base, `at=CTL+2` for
+  a base that is a structure member;
+- a variable of a DO block of the main program, a nested procedure (and
+  a copy of the variables of the procedures around it, as locals), an
+  `$INCLUDE` file (`decl=` names the file);
+- `none why=no-storage` for a slot of `??AUTO` that no instruction of the
+  routine names, `none why=no-frame` for an `ix=` variable of a routine
+  that lost `ixbegin`.
+
+Types are `typedef:BYTE` (target `ushort:1`, so `udb80` prints numbers and
+lists of numbers, not C strings that stop at a zero byte) and
+`typedef:ADDRESS` (`uint:2`), `[N]T` for an array (PL/M's dimension is the
+number of elements), and `struct:TAG` for a STRUCTURE (the tag is the
+variable's name, `NAME.2` for another layout of the same name).  A name is
+shown as the source spells it, without the `$` (`udb80` has no `$` in
+names): the token's line and column, checked against the source text; the
+upper-case name when the check fails.  LITERALLY, LABEL, procedure,
+EXTERNAL and the built-ins `MEMORY` and `STACKPTR` have no record.  A fault in the
+variable code is a warning and a build with no variable records
+(`UPLM80_DEBUG_VARS_STRICT=1` raises it).  `docs/debug_info.md` has the
+detail.
+
+Measured on 2026-11-04 (um80_and_friends d39debc, upeepz80 0.2.7 plus
+ab4de24):
+
+- **The code does not change (D2).** 69 files (`tests/`, `sample_code`,
+  `examples`, one of romwbw_emu): 14 do not compile, with or without `-g`.
+  The other 55 at `-O0` to `-O3` are 220 builds, with and without `-g`
+  (through `um80 --debug-info` and `ul80 --debug-info`): 220 have the same
+  `.COM` (the `.REL` for programs that need an EXTERNAL data symbol), and
+  neither tool wrote a warning (measured again after the range of the
+  locals was added).  `tests/test_debug_info.py` (51 tests) passed
+  before and after.  `tests/test_debug_vars.py` repeats the byte test for
+  its program at four levels, and checks that the `.mac` text without the
+  marker lines and the `??VRn` labels is the text of a compile without `-g`.
+- **Records.** 55 programs give 2848 `;#var` lines at `-O2` (a copy for a
+  nested procedure counts): 999 in `??AUTO`, 1471 at a procedure's or
+  block's label, 331 at a module label, 15 in an IX frame, 32 `none`.
+  The 50 that link give 1416 rows in `prog.dbg` (1110 of the routines'
+  own variables and 306 copies in nested procedures), 764 of them with a
+  `range=` (264 before locals got one), 28 with no place at `-O2` (22 at `-O0`), all `no-storage`.
+  Of 1630 names, 387 are shown in the case the source has, 1235 are upper
+  case in the source, and 8 (a structure member from a LITERALLY) fell
+  back to the upper-case name.
+- **Live.** `udb80` (`python3 -m um80.udb80`) against `cpmemu --gdb`,
+  `-O0` to `-O3`: `print` of a BYTE, an ADDRESS, BYTE and ADDRESS arrays,
+  a DATA table, a STRUCTURE, an array of STRUCTUREs, a PUBLIC, an `AT`
+  variable, a factored INITIAL, a BASED variable (`print bb` the pointer,
+  `print *bb` the byte, `print *bw` the word), `info args` and
+  `info locals` in a static procedure (`??AUTO` and a label), `frame 1` in
+  the caller (its parameters, its array and its local), a REENTRANT
+  `FACT` four deep (`n` in the IX frame in frame 0 and 1), a REENTRANT
+  procedure with a BYTE and an ADDRESS parameter, the variable of a DO
+  block of the main program, and `print` of another procedure's local
+  gives `No symbol`.
+  `tests/test_debug_vars.py` has these.
+- **Tests.** `tests/test_debug_vars.py` (60 tests: the form of every marker,
+  each storage kind, the pass on a hand-made text, D2, the live session).
+  With `UPLM80_REQUIRE_TOOLS=1` the suite went from 3125 passed, 340
+  skipped to 3185 passed, 340 skipped.  Five mutations of
+  `debug_vars.py` (the BASED pointer, the start of a range, the check of
+  a slot, the sign of an IX offset, no range for a local) each fail a test.
+
+Not done, and found:
+
+- A parameter or local whose store the optimizer moved into the first
+  statement is `<not available>` at a breakpoint on that statement (seen at
+  `-O1` to `-O3` with one parameter, and with MID's three).  The record
+  could say `reg=HL` for the stretch before the store; the compiler does not
+  track the register.  A local used to print the old bytes of its slot there
+  (`TmpOne = 0` at `-O1` to `-O3`, where `-O0` printed 30); now it is
+  `<not available>`.
+- 8 of 1630 names (a structure member from a LITERALLY) are upper case.
+  `udb80` finds names with the case as written; a case-insensitive lookup
+  there would remove the need for the source spelling.
+- `;#func` of a nested or multi-module procedure has the assembler label
+  (`@OUTER$INNER`, `A?F`), so `bt` shows that label.
+- A BASED variable is a pointer for the debugger; `print bb` shows the
+  address, `print *bb` the value.
+- An EXTERNAL variable has no record; the PUBLIC record of the module that
+  defines it has the place.
+- `udb80 bt frame` lists `MID` twice for a static procedure with `pops=2`
+  (a third argument on the stack), where `bt shadow` is right; the same
+  with and without the variable markers (measured), and in um80_and_friends.
+
 ## 0.4.4 — 2026-09-27
 
 What 0.4.3's final release check found and left for a later release, what
