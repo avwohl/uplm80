@@ -2,6 +2,18 @@
 
 `uplm80 -g` writes debug markers into the assembler text. A debugger uses the markers to find the PL/M-80 source line of each instruction. The design is in [debugger_plan.md](https://github.com/avwohl/cpmemu/blob/main/docs/debugger_plan.md) of cpmemu. The marker format is in `docs/debug_info.md` of um80_and_friends.
 
+## Install
+
+`-g` is in uplm80 0.5.0 and later. An older release has no `-g`. Install the compiler and the assembler tools from PyPI:
+
+```
+pip install "uplm80>=0.5.0" "um80>=0.4.0"
+```
+
+uplm80 0.5.0 requires upeepz80 0.2.8 or later, so pip installs the correct upeepz80. um80 0.4.0 has `um80` and `ul80` with `--debug-info`, and the debugger `udb80`. To run the program under a debugger, use `cpmemu --gdb` from cpmemu 4.11.0 or later. The cpmemu document `docs/gdb_stub.md` lists the parts for udb80 and for GDB.
+
+A check on 2026-11-05 used only released packages: uplm80 0.5.0, um80 0.4.0 and upeepz80 0.2.8 from PyPI, and the cpmemu 4.11.0 macOS release. A REENTRANT recursive `FACT` was compiled with `-g -O2`. In `udb80`, `break fact.plm:5` stopped in the base case. `bt` showed 5 frames of `FACT` and the main program `DEMO`, and `p n` printed 0.
+
 ## Use
 
 `uplm80` writes the `.mac` file only. You run `um80` and `ul80` yourself. Give both programs the option `--debug-info`.
@@ -22,7 +34,7 @@ The `.com` file is the same, byte for byte, with and without `-g`, at each `-O` 
 
 Each marker is a whole line, never a trailing comment. The optimizer upeepz80 can remove a trailing comment.
 
-At `-O1` and above, `-g` needs an upeepz80 that keeps the markers and gives the same code with them. Use a version newer than 0.2.7 that has the change of commit ab4de24.
+At `-O1` and above, `-g` needs an upeepz80 that keeps the markers and gives the same code with them. upeepz80 0.2.8 is the first such release (the change of commit ab4de24). uplm80 0.5.0 requires upeepz80 0.2.8 or later.
 
 The upeepz80 of 0.2.7 lets a marker hide the dead store at the start of a procedure. A `-g` build then has a store that the build without `-g` does not have. `uplm80 -g` tests the installed upeepz80 on a small text. `uplm80 -g` refuses an upeepz80 that fails the test. `-O0` does not use upeepz80.
 

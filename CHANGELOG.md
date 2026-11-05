@@ -3,6 +3,19 @@
 Notable changes to uplm80. Releases before 0.3.2 are described on the
 [GitHub releases page](https://github.com/avwohl/uplm80/releases).
 
+## Unreleased
+
+### Docs: `-g` is in 0.5.0
+
+`docs/debug_info.md` gained an Install section: `-g` is in uplm80 0.5.0 and
+later, `pip install "uplm80>=0.5.0" "um80>=0.4.0"`, and cpmemu 4.11.0 or
+later for `--gdb`. Its upeepz80 paragraph names 0.2.8 as the first release
+that keeps the markers, where it said "a version newer than 0.2.7". The
+README lists `-g` among the options. Measured with released packages only
+(uplm80 0.5.0, um80 0.4.0, upeepz80 0.2.8 from PyPI, the cpmemu 4.11.0
+macOS tarball): a REENTRANT recursive FACT at `-g -O2` stopped at
+`break fact.plm:5` in udb80, with 5 FACT frames and DEMO in `bt`.
+
 ## 0.5.0 — 2026-11-05
 
 ### Changed: upeepz80 0.2.8 or later, and CI runs the `-g` tests

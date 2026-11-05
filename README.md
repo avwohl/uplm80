@@ -52,6 +52,7 @@ Options:
 - `-m cpm|bare|mpm` - runtime mode (default `cpm`); `bare` rebuilds DRI's utilities, `mpm` makes MP/M II `.PRL`/`.RSP`/`.SPR` modules
 - `-O 0|1|2|3` - optimization level (default 2)
 - `-D SYMBOL` - define a conditional compilation symbol (repeatable)
+- `-g` - debug markers for `udb80` and GDB (0.5.0 and later); see [docs/debug_info.md](https://github.com/avwohl/uplm80/blob/main/docs/debug_info.md)
 
 Each module carries the runtime routines it uses; link with it only what
 defines its EXTERNALs. See [examples/hellocpm.plm](https://github.com/avwohl/uplm80/blob/main/examples/hellocpm.plm)
@@ -65,7 +66,7 @@ by Martin Homuth-Rosemann, [@Ho-Ro](https://github.com/Ho-Ro)).
 - [docs/runtime_modes.md](https://github.com/avwohl/uplm80/blob/main/docs/runtime_modes.md) - CP/M, bare and MP/M modes, memory layout, how procedure locals share `??AUTO`
 - [docs/multi_file_compilation.md](https://github.com/avwohl/uplm80/blob/main/docs/multi_file_compilation.md) - compiling several modules together
 - [docs/intel_oracle.md](https://github.com/avwohl/uplm80/blob/main/docs/intel_oracle.md) - differential testing against Intel's PL/M-80 V3.1, and the known differences
-- [docs/debug_info.md](https://github.com/avwohl/uplm80/blob/main/docs/debug_info.md) - `-g`: source-line and variable markers for a debugger (`udb80`, GDB); the code does not change
+- [docs/debug_info.md](https://github.com/avwohl/uplm80/blob/main/docs/debug_info.md) - `-g` (0.5.0 and later): source-line and variable markers for a debugger (`udb80`, GDB); the code does not change
 - [docs/BDOS_REFERENCE.md](https://github.com/avwohl/uplm80/blob/main/docs/BDOS_REFERENCE.md) - calling CP/M BDOS from PL/M-80
 - [docs/project_structure.md](https://github.com/avwohl/uplm80/blob/main/docs/project_structure.md) - source files and what each does
 - [docs/PLM80_FEATURE_INDEX.md](https://github.com/avwohl/uplm80/blob/main/docs/PLM80_FEATURE_INDEX.md) - language features and their tests
