@@ -5,6 +5,19 @@ Notable changes to uplm80. Releases before 0.3.2 are described on the
 
 ## Unreleased
 
+### Changed: upeepz80 0.2.8 or later, and CI runs the `-g` tests
+
+upeepz80 0.2.8 and um80 0.4.0 are on PyPI (2026-11-04).  `pyproject.toml`
+now requires `upeepz80>=0.2.8`, the first release that keeps `-g`'s `;#`
+markers without changing the code, and `UPLM80_MIN` in `compiler.py` follows
+it.  Below the floor the tail-call probe still decides, so 0.2.6 and 0.2.7
+pass without `-g`.  The Tests workflow installs `um80>=0.4.0`, builds cpmemu
+from its repository and sets `UPLM80_REQUIRE_TOOLS=1`, so the D2 byte test,
+the `prog.dbg` tests and the live udb80 tests run there and fail rather than
+skip when a tool is missing.  Measured in a Python 3.12 virtual environment
+with the PyPI packages and a fresh cpmemu, as the workflow has them: 3185
+passed, 340 skipped.  The todo item for the release is closed.
+
 ### Added: `-g`, source-line markers for a debugger
 
 Phase 4 of the debugger plan (cpmemu `docs/debugger_plan.md`) for uplm80.

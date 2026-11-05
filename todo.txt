@@ -1,12 +1,3 @@
-[RELEASE] uplm80 -g needs an upeepz80 release.  upeepz80 0.2.7, the one on
-  PyPI, lets a ;# marker hide a dead store, so compile() refuses -g at -O1
-  and above with it, and tests/test_debug_info.py skips those cases with
-  the reason (45 of 51 skip against 0.2.7, measured 2026-11-04).  The fix is
-  upeepz80 ab4de24, not yet released.  CI also installs no um80/ul80, so the
-  D2 byte test skips there.  Missing: an upeepz80 release with ab4de24 and
-  a um80 release with --debug-info; then pin both in pyproject.toml, install
-  them in .github/workflows, and set UPLM80_REQUIRE_TOOLS=1 in CI.
-
 2026-09-22 - two loose ends from the string-literal fix, neither owned by this
 repo.
 

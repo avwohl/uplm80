@@ -26,9 +26,11 @@ from .ast_optimizer import ASTOptimizer
 from .byte_shifts import check_byte_shifts
 from .debug_vars import add_vars
 
-# The oldest upeepz80 whose code is right under PL/M-80's calling convention,
-# as pyproject.toml's dependency has it (a test keeps the two the same).
-UPEEPZ80_MIN = "0.2.6"
+# pyproject.toml's floor for upeepz80 (a test keeps the two the same).  0.2.6
+# is the oldest whose code is right under PL/M-80's calling convention; 0.2.8
+# is the first release that keeps -g's ;# markers without changing the code.
+# Below the floor the probe below decides, so a 0.2.6 or 0.2.7 still passes.
+UPEEPZ80_MIN = "0.2.8"
 
 # A call of a procedure of three parameters, one of them pushed, which ends
 # its routine.  upeepz80 0.2.6 leaves the `call'; 0.2.5 makes it `jp P3'.

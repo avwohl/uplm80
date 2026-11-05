@@ -114,8 +114,8 @@ def test_a_development_tree_with_the_fix_is_accepted(fake_upeepz80):
     assert out is not None, errors
 
 
-@pytest.mark.parametrize("version", ["0.2.6", "0.2.10", "0.3.0", "1.0"])
+@pytest.mark.parametrize("version", ["0.2.8", "0.2.10", "0.3.0", "1.0"])
 def test_a_version_at_or_past_the_floor_is_taken_at_its_word(fake_upeepz80, version):
-    """No probe: the version says the fix is there (0.2.10 is past 0.2.6)."""
+    """No probe: the version says the fix is there (0.2.10 is past 0.2.8)."""
     fake_upeepz80(version, _TailCalling)
     assert C.upeepz80_problem() is None

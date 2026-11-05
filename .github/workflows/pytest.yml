@@ -22,6 +22,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest
           pip install -e .
+          # um80, ul80 and udb80 for the -g tests (D2 bytes, prog.dbg, udb80)
+          pip install "um80>=0.4.0"
 
+      # cpmemu runs the programs and is the GDB stub udb80 talks to
+      - name: Build cpmemu
+        run: |
+          git clone --depth 1 https://github.com/avwohl/cpmemu.git "$RUNNER_TEMP/cpmemu"
+          make -C "$RUNNER_TEMP/cpmemu/src"
+          echo "CPMEMU=$RUNNER_TEMP/cpmemu/src/cpmemu" >> "$GITHUB_ENV"
+
+      # With the tools installed, a -g test that would skip for a missing
+      # tool fails instead: a skip exits 0.
       - name: Run tests
+        env:
+          UPLM80_REQUIRE_TOOLS: "1"
         run: pytest tests/ -v
